@@ -1,6 +1,7 @@
-import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
 import path from 'node:path'
+
+import type { BoundedProcessResult, GitCommandRunner } from './development-process.ts'
 
 export const MAX_WORKTREES_PER_TASK = 16
 export const MAX_VERIFICATIONS_PER_TASK = 32
@@ -40,6 +41,10 @@ const WORKTREE_RECORD_KEYS = [
   'worktreePath'
 ] as const
 const VERIFICATION_RECORD_KEYS = ['command', 'cwd', 'registeredAt', 'repository'] as const
+const DECISION_FILE = 'decision.json'
+const DECISION_RECORD_KEYS = ['question', 'requestedAt'] as const
+const MAX_DECISION_QUESTION_LENGTH = 2000
+const MAX_DECISION_FILE_BYTES = 64 * 1024
 
 export type WorktreeRecord = {
   repository: string
@@ -59,9 +64,16 @@ export type VerificationRecord = {
   registeredAt: string
 }
 
+// SHIKI が araya_request_decision で記録した、人への質問（状態 directory の decision.json）
+export type DecisionRecord = {
+  question: string
+  requestedAt: string
+}
+
 type GitContext = {
   executable: string
   env: Record<string, string | undefined>
+  run: GitCommandRunner
 }
 
 type GitResult = {
@@ -263,42 +275,49 @@ function createGitEnv(env: Readonly<Record<string, string | undefined>>) {
   return gitEnv
 }
 
-function runGit(
+async function runGit(
   git: GitContext,
   cwd: string,
   args: readonly string[],
   options: { timeoutMs?: number; acceptedExitCodes?: readonly number[] } = {}
 ) {
   const acceptedExitCodes = options.acceptedExitCodes ?? [0]
+  const description = `git ${truncate(args.join(' '), MAX_ERROR_DETAIL_LENGTH)}`
+  let result: BoundedProcessResult
 
-  return new Promise<GitResult>((resolve, reject) => {
-    execFile(git.executable, ['-C', cwd, ...args], {
+  try {
+    result = await git.run(git.executable, ['-C', cwd, ...args], {
       env: git.env,
-      encoding: 'utf8',
-      maxBuffer: MAX_GIT_OUTPUT_BYTES,
-      timeout: options.timeoutMs ?? GIT_TIMEOUT_MS,
-      killSignal: 'SIGKILL',
-      windowsHide: true
-    }, (error, stdout, stderr) => {
-      if (error === null) {
-        resolve({ exitCode: 0, stdout, stderr })
-        return
-      }
-
-      if (typeof error.code === 'number' && error.killed !== true && acceptedExitCodes.includes(error.code)) {
-        resolve({ exitCode: error.code, stdout, stderr })
-        return
-      }
-
-      const reason = error.killed === true
-        ? 'was killed (timeout or output limit)'
-        : typeof error.code === 'number'
-          ? `exited with ${error.code}`
-          : `failed (${String(error.code ?? error.message)})`
-      const detail = stderr.trim() === '' ? '' : `: ${truncate(stderr.trim(), MAX_ERROR_DETAIL_LENGTH)}`
-      reject(new Error(`git_command_failed: git ${truncate(args.join(' '), MAX_ERROR_DETAIL_LENGTH)} ${reason}${detail}`))
+      timeoutMs: options.timeoutMs ?? GIT_TIMEOUT_MS,
+      // timeout と出力の上限では、猶予を置かずに SIGKILL まで進める
+      terminationGraceMs: 0,
+      stdout: { mode: 'strict', limitBytes: MAX_GIT_OUTPUT_BYTES },
+      stderr: { mode: 'tail', limitBytes: MAX_GIT_OUTPUT_BYTES }
     })
-  })
+  } catch (error) {
+    throw createError('git_command_failed', `${description} failed (${error instanceof Error ? error.message : String(error)})`)
+  }
+
+  const { exitCode, signal, terminationReason, terminationConfirmed } = result
+
+  if (terminationConfirmed && terminationReason === undefined && signal === null && exitCode !== null && acceptedExitCodes.includes(exitCode)) {
+    const gitResult: GitResult = { exitCode, stdout: result.stdout, stderr: result.stderr }
+
+    return gitResult
+  }
+
+  const reason = !terminationConfirmed
+    ? 'termination could not be confirmed'
+    : terminationReason === 'invalid_utf8'
+      ? 'printed output that is not valid UTF-8'
+      : terminationReason !== undefined
+        ? 'was killed (timeout or output limit)'
+        : exitCode !== null
+          ? `exited with ${exitCode}`
+          : `was killed by ${signal ?? 'a signal'}`
+  const detail = result.stderr.trim() === '' ? '' : `: ${truncate(result.stderr.trim(), MAX_ERROR_DETAIL_LENGTH)}`
+
+  throw createError('git_command_failed', `${description} ${reason}${detail}`)
 }
 
 async function resolveDevRoot(devRoot: string) {
@@ -678,6 +697,82 @@ export async function readTaskState(options: { devRoot: string; stateDir: string
   return readValidatedState(await resolveDevRoot(options.devRoot), options.stateDir, options.taskKey)
 }
 
+export function validateDecisionQuestion(question: unknown) {
+  if (
+    typeof question !== 'string' ||
+    !/\S/u.test(question) ||
+    question.length > MAX_DECISION_QUESTION_LENGTH ||
+    question.includes('\0')
+  ) {
+    throw createError('question_invalid', `question must be a string of at most ${MAX_DECISION_QUESTION_LENGTH} characters with a non-whitespace character and without NUL`)
+  }
+
+  return question
+}
+
+// 人への質問を decision.json に記録する。2回目以降は失敗にして、最初の質問を残す。
+// 一時 file に書いてから link するので、書きかけの decision.json は残らない
+export async function recordDecision(stateDir: string, question: unknown, now: Date) {
+  const record: DecisionRecord = { question: validateDecisionQuestion(question), requestedAt: now.toISOString() }
+  const target = path.join(stateDir, DECISION_FILE)
+  const temporary = path.join(stateDir, `.${DECISION_FILE}.${process.pid}.${Date.now()}.tmp`)
+  await fs.writeFile(temporary, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+
+  try {
+    await fs.link(temporary, target)
+  } catch (error) {
+    if (isErrno(error, 'EEXIST')) {
+      throw createError('decision_already_requested', 'a question has already been recorded for this task; the first question is kept')
+    }
+
+    throw error
+  } finally {
+    await fs.rm(temporary, { force: true })
+  }
+
+  return record
+}
+
+// decision.json を読む。無ければ null。形式が不正なら task_state_invalid
+export async function readDecision(stateDir: string) {
+  const target = path.join(stateDir, DECISION_FILE)
+  let stat
+
+  try {
+    stat = await fs.lstat(target)
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) {
+      return null
+    }
+
+    throw error
+  }
+
+  if (!stat.isFile() || stat.size > MAX_DECISION_FILE_BYTES) {
+    throw createError('task_state_invalid', `${DECISION_FILE} must be a regular file of at most ${MAX_DECISION_FILE_BYTES} bytes`)
+  }
+
+  let value: unknown
+
+  try {
+    value = JSON.parse(await fs.readFile(target, 'utf8'))
+  } catch {
+    throw createError('task_state_invalid', `${DECISION_FILE} is not valid JSON`)
+  }
+
+  if (!isRecord(value) || !hasExactKeys(value, DECISION_RECORD_KEYS) || typeof value.requestedAt !== 'string') {
+    throw createError('task_state_invalid', `${DECISION_FILE} must have exactly ${DECISION_RECORD_KEYS.join(', ')}`)
+  }
+
+  try {
+    const record: DecisionRecord = { question: validateDecisionQuestion(value.question), requestedAt: value.requestedAt }
+
+    return record
+  } catch {
+    throw createError('task_state_invalid', `${DECISION_FILE} has an invalid question`)
+  }
+}
+
 async function appendRecord(filePath: string, record: WorktreeRecord | VerificationRecord) {
   await fs.appendFile(filePath, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 })
 }
@@ -693,6 +788,8 @@ export function createWorktreeService(options: {
   stateDir: string
   taskKey: string
   env: Readonly<Record<string, string | undefined>>
+  // git を起動する関数。runner は試行の scope の中で起動する関数を渡す
+  runGit: GitCommandRunner
   now?: () => Date
 }) {
   validateTaskKey(options.taskKey)
@@ -718,7 +815,9 @@ export function createWorktreeService(options: {
     gitExecutable ??= findGitExecutable()
 
     try {
-      return { executable: await gitExecutable, env: gitEnv }
+      const git: GitContext = { executable: await gitExecutable, env: gitEnv, run: options.runGit }
+
+      return git
     } catch (error) {
       gitExecutable = undefined
       throw error

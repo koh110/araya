@@ -1,6 +1,6 @@
 # 人が投入する開発課題を処理する自動ループ
 
-> 注記: この文書のうち、worker（Pi の SDK の session）で課題を動かす部分は、worker を撤去する手順で撤去し、[Task の台帳と SHIKI の実行](task-ledger-and-shiki-runner.md)の仕様（Task の台帳と常駐する runner）に置き換えた。SHIKI の作業と完了の判定（worktree、検証の登録と実行、結果の判定）は、この文書を基準のままにする。inbox の development の課題は、今は実行されずに `blocked` になる。
+> 注記: この文書のうち、worker（Pi の SDK の session）で課題を動かす部分は、worker を撤去する手順で撤去し、[Task の台帳と SHIKI の実行](task-ledger-and-shiki-runner.md)の仕様（Task の台帳と常駐する runner）に置き換えた。SHIKI の作業と完了の判定（worktree、検証の登録と実行、結果の判定）は、この文書を基準のままにする。inbox の development の課題は実行されずに `blocked` になる。開発の課題は `araya task create` で Task の台帳に登録し、`araya runner install` で入れた runner（systemd の user service）が SHIKI を動かす。
 
 ## 概要
 

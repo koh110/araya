@@ -5,22 +5,30 @@ import path from 'node:path'
 import { TextDecoder } from 'node:util'
 
 import type { SessionModel } from './development-model.ts'
-import type {
-  BoundedCommandOptions,
-  BoundedProcessResult,
-  VerificationCommandInput,
-  VerificationCommandResult
+import {
+  VERIFICATION_OUTPUT_BYTES,
+  type GitCommandRunner,
+  type VerificationCommandInput,
+  type VerificationCommandResult
 } from './development-process.ts'
-import { readTaskState, type VerificationRecord, type WorktreeRecord } from './development-worktrees.ts'
+import {
+  readDecision,
+  readTaskState,
+  type DecisionRecord,
+  type VerificationRecord,
+  type WorktreeRecord
+} from './development-worktrees.ts'
+import type { CutSide } from './redaction.ts'
 
 const MAX_TASK_TIMEOUT_MS = 60 * 60 * 1000
 const MAX_SUMMARY_CHARS = 4000
 const MAX_FAILURE_DETAIL_CHARS = 500
 const MAX_GIT_OUTPUT_BYTES = 2 * 1024 * 1024
+const MAX_GIT_STDERR_BYTES = 8 * 1024
 const MAX_CHANGED_FILES = 1000
 const MAX_CHANGED_PATH_BYTES = 128 * 1024
-const MAX_DIFF_BYTES = 256 * 1024
-const DIFF_TRUNCATION_MARKER = `\n[diff truncated: the evidence limit is ${MAX_DIFF_BYTES} bytes across all worktrees]\n`
+export const MAX_DIFF_BYTES = 256 * 1024
+export const DIFF_TRUNCATION_MARKER = `\n[diff truncated: the evidence limit is ${MAX_DIFF_BYTES} bytes across all worktrees]\n`
 const MAX_UNTRACKED_FILE_BYTES = 64 * 1024
 const GIT_TIMEOUT_MS = 60_000
 const GIT_CANDIDATES = ['/usr/bin/git', '/bin/git', '/usr/local/bin/git'] as const
@@ -39,21 +47,19 @@ const GIT_REPOSITORY_ENV_KEYS = [
 // SHIKI が使った model と、それを選んだ設定の出どころ
 export type AgentModelEvidence = SessionModel & { source: 'araya-config' | 'pi-settings' }
 
-// SHIKI の終わり方。差分の収集と検証は、これを受け取ってから行う
+// SHIKI の終わり方。差分の収集と検証は、これを受け取ってから行う。
+// error は agent_timeout・model_unavailable・submission の reason など、errorMessage はその詳細（秘密を置き換えたもの）
 export type AgentOutcome =
   | { status: 'completed'; summary: string; model: AgentModelEvidence }
-  | { status: 'failed' | 'timeout'; error: string; model?: AgentModelEvidence }
-
-// git を起動する関数。runBoundedCommand と同じ形。runner は試行の scope の中で起動する関数を渡す
-export type GitCommandRunner = (
-  command: string,
-  args: readonly string[],
-  options: BoundedCommandOptions
-) => Promise<BoundedProcessResult>
+  | { status: 'failed' | 'timeout'; error: string; errorMessage?: string; model?: AgentModelEvidence }
 
 export type DevelopmentResult = {
-  status: 'completed' | 'failed'
+  status: 'completed' | 'failed' | 'blocked'
   evidence: Record<string, unknown>
+  // SHIKI が人に求めた判断の質問。decision.json が無ければ null
+  decisionQuestion: string | null
+  // 差分を集めたかどうか。集めた試行だけが、差分と検証の出力の本文を evidence.json に残す
+  collected: boolean
 }
 
 export type DevelopmentResultInput = {
@@ -64,11 +70,19 @@ export type DevelopmentResultInput = {
   agent: AgentOutcome
   env: Readonly<Record<string, string | undefined>>
   verificationTimeoutMs: number
+  // 中止されたら、実行中の検証のコマンドを timeout と同じ手順で止める（Harness を閉じたとき、試行を中止したとき）
+  signal?: AbortSignal
+  // 秘密の置き換え。誤りの message を切り詰める前に使う（切り詰めで秘密の一部や URL の @ が境界の外に出ないように）
+  redact: (text: string) => string
+  // 上限で切って読んだ本文（差分、検証の出力、git の stderr）の置き換え。cut は切った側で、その境界に接する部分も置き換える
+  redactTruncated: (text: string, cut: CutSide) => string
 }
 
 export type DevelopmentResultDependencies = {
+  // 差分の収集の git を起動する関数。runner は試行の scope の中で起動する関数を渡す
   runGit: GitCommandRunner
-  runVerification: (input: VerificationCommandInput) => Promise<VerificationCommandResult>
+  // index は verifications.jsonl の中の登録の順番（0 から）。runner は検証の scope の名前に使う
+  runVerification: (input: VerificationCommandInput & { index: number }) => Promise<VerificationCommandResult>
   // 差分の収集に使う git（test 用）。省略時は GIT_CANDIDATES から選ぶ
   gitExecutable?: string
 }
@@ -87,6 +101,8 @@ type GitContext = {
   executable: string
   env: Record<string, string | undefined>
   run: GitCommandRunner
+  redact: (text: string) => string
+  redactTruncated: (text: string, cut: CutSide) => string
 }
 
 type DiffEvidence = {
@@ -123,10 +139,11 @@ function isErrno(error: unknown, code: string) {
   return error instanceof Error && 'code' in error && error.code === code
 }
 
-function describeError(error: unknown) {
+// 秘密を置き換えてから切り詰める
+function describeError(error: unknown, redact: (text: string) => string) {
   const message = error instanceof Error ? error.message : String(error)
 
-  return message.slice(0, MAX_FAILURE_DETAIL_CHARS)
+  return redact(message).slice(0, MAX_FAILURE_DETAIL_CHARS)
 }
 
 function validateTimeout(timeoutMs: number, name: string) {
@@ -178,7 +195,7 @@ async function runGit(git: GitContext, worktreePath: string, args: readonly stri
     env: git.env,
     timeoutMs: GIT_TIMEOUT_MS,
     stdout: { mode: 'strict', limitBytes: stdoutLimitBytes },
-    stderr: { mode: 'tail', limitBytes: 8 * 1024 }
+    stderr: { mode: 'tail', limitBytes: MAX_GIT_STDERR_BYTES }
   })
 
   if (!result.terminationConfirmed) {
@@ -192,7 +209,11 @@ async function runGitChecked(git: GitContext, worktreePath: string, args: readon
   const result = await runGit(git, worktreePath, args)
 
   if (result.terminationReason !== undefined || result.exitCode !== 0) {
-    const detail = result.stderr.trim() === '' ? '' : `: ${result.stderr.trim().slice(0, MAX_FAILURE_DETAIL_CHARS)}`
+    // stderr は末尾だけを残すので、上限を超えたときは先頭の境界も置き換える
+    const stderr = result.stderrBytes > MAX_GIT_STDERR_BYTES
+      ? git.redactTruncated(result.stderr, 'start').trim()
+      : git.redact(result.stderr.trim())
+    const detail = stderr === '' ? '' : `: ${stderr.slice(0, MAX_FAILURE_DETAIL_CHARS)}`
     throw new Error(`git ${args.join(' ')} failed${detail}`)
   }
 
@@ -346,8 +367,10 @@ function truncateUtf8(value: string, maxBytes: number) {
 }
 
 // 切り詰めの印も含めて budget 以内に収める。印が入らない budget では diff を残さない。
-// git diff の出力が上限で止まったとき（forceMarker）は、budget 以内でも切り詰めたことが分かるように印を付ける
-function limitDiff(diff: string, budget: number, forceMarker: boolean) {
+// git diff の出力が上限で止まったとき（forceMarker）は、budget 以内でも切り詰めたことが分かるように印を付ける。
+// 切った末尾の境界は、印を付ける前に置き換える。git diff の出力が上限（budget）で止まったときも、ここで budget から印の分を
+// 除いた位置で切り直すので、git diff の出力の境界は diff に残らない
+function limitDiff(diff: string, budget: number, forceMarker: boolean, redactTruncated: GitContext['redactTruncated']) {
   if (!forceMarker && Buffer.byteLength(diff) <= budget) {
     return diff
   }
@@ -358,7 +381,7 @@ function limitDiff(diff: string, budget: number, forceMarker: boolean) {
     return ''
   }
 
-  return `${truncateUtf8(diff, budget - markerBytes)}${DIFF_TRUNCATION_MARKER}`
+  return `${redactTruncated(truncateUtf8(diff, budget - markerBytes), 'end')}${DIFF_TRUNCATION_MARKER}`
 }
 
 function summarizeDiff(diff: string, fileCount: number, truncated: boolean) {
@@ -442,7 +465,7 @@ async function collectWorktreeDiff(git: GitContext, record: WorktreeRecord, diff
   const untracked = await collectUntrackedDiff(worktreeReal, untrackedFiles)
   const diff = `${trackedDiff.stdout}${untracked.diff}`
   const trackedOverflowed = trackedDiff.terminationReason === 'output_overflow'
-  const limitedDiff = limitDiff(diff, diffBudget, trackedOverflowed)
+  const limitedDiff = limitDiff(diff, diffBudget, trackedOverflowed, git.redactTruncated)
   const diffTruncated = trackedOverflowed || untracked.truncated || limitedDiff !== diff
 
   const evidence: DiffEvidence = {
@@ -514,14 +537,64 @@ function toWorktreeLocation(record: WorktreeRecord) {
   }
 }
 
-function agentEvidence(agent: AgentOutcome) {
+// SHIKI の終わり方は agent にまとめる。summary だけは top level に置く
+export function agentEvidence(agent: AgentOutcome) {
   if (agent.status === 'completed') {
-    return { summary: agent.summary.slice(0, MAX_SUMMARY_CHARS), model: agent.model }
+    return { summary: agent.summary.slice(0, MAX_SUMMARY_CHARS), agent: { model: agent.model } }
   }
 
   return {
-    agentError: agent.error,
-    ...(agent.model === undefined ? {} : { model: agent.model })
+    agent: {
+      error: agent.error,
+      ...(agent.errorMessage === undefined ? {} : { errorMessage: agent.errorMessage }),
+      ...(agent.model === undefined ? {} : { model: agent.model })
+    }
+  }
+}
+
+// 差分の収集と検証を行わずに作る evidence（worktree だけの evidence）。状態 directory の worktrees.jsonl から
+// worktree の path と branch だけを残す。読めなければ worktree を空にし、その理由を detail に返す
+export async function buildWorktreeOnlyEvidence(input: {
+  taskKey: string
+  devRoot: string
+  stateDir: string | null
+  redact: (text: string) => string
+}) {
+  const worktrees: { worktreePath: string; branch: string }[] = []
+  let detail: string | null = null
+
+  if (input.stateDir !== null) {
+    try {
+      const content = await fs.readFile(path.join(input.stateDir, 'worktrees.jsonl'), 'utf8')
+
+      for (const line of content.split('\n')) {
+        if (line === '') {
+          continue
+        }
+
+        const value: unknown = JSON.parse(line)
+
+        if (
+          typeof value !== 'object' || value === null || Array.isArray(value) ||
+          !('worktreePath' in value) || typeof value.worktreePath !== 'string' ||
+          !('branch' in value) || typeof value.branch !== 'string'
+        ) {
+          throw new Error('a record does not have worktreePath and branch')
+        }
+
+        worktrees.push({ worktreePath: value.worktreePath, branch: value.branch })
+      }
+    } catch (error) {
+      if (!isErrno(error, 'ENOENT')) {
+        worktrees.length = 0
+        detail = `worktrees.jsonl could not be read: ${describeError(error, input.redact)}`
+      }
+    }
+  }
+
+  return {
+    evidence: { taskKey: input.taskKey, devRoot: input.devRoot, stateDir: input.stateDir, worktrees, bodiesStored: false },
+    detail
   }
 }
 
@@ -530,12 +603,17 @@ export async function collectDevelopmentResult(
   dependencies: DevelopmentResultDependencies
 ): Promise<DevelopmentResult> {
   validateTimeout(input.verificationTimeoutMs, 'verificationTimeoutMs')
-  const { taskKey, devRoot, stateDir, agent, verificationTimeoutMs } = input
+  const { taskKey, devRoot, stateDir, agent, verificationTimeoutMs, redact, redactTruncated } = input
 
-  function fail(failureReason: FailureReason, extra: Record<string, unknown> = {}) {
+  let decision: DecisionRecord | null = null
+
+  function fail(failureReason: FailureReason, collected: boolean, extra: Record<string, unknown> = {}) {
+    const decisionQuestion = decision?.question ?? null
     const developmentResult: DevelopmentResult = {
       status: 'failed',
-      evidence: { taskKey, devRoot, outcome: 'failed', failureReason, worktrees: [], ...extra }
+      evidence: { taskKey, devRoot, outcome: 'failed', failureReason, worktrees: [], decisionQuestion, ...extra },
+      decisionQuestion,
+      collected
     }
 
     return developmentResult
@@ -545,9 +623,14 @@ export async function collectDevelopmentResult(
 
   try {
     state = await readTaskState({ devRoot, stateDir, taskKey })
+    decision = await readDecision(stateDir)
   } catch (error) {
-    return fail('task_state_invalid', { ...agentEvidence(agent), failureDetail: describeError(error) })
+    decision = null
+    return fail('task_state_invalid', false, { ...agentEvidence(agent), failureDetail: describeError(error, redact) })
   }
+
+  // SHIKI が成功で終わって判断を求めていれば blocked。差分は集め、検証は実行しない
+  const decisionRequested = agent.status === 'completed' && decision !== null
 
   const diffs: DiffEvidence[] = []
 
@@ -555,7 +638,9 @@ export async function collectDevelopmentResult(
     const git: GitContext = {
       executable: dependencies.gitExecutable ?? await findGitExecutable(),
       env: createGitEnv(input.env),
-      run: dependencies.runGit
+      run: dependencies.runGit,
+      redact,
+      redactTruncated
     }
     let diffBudget = MAX_DIFF_BYTES
 
@@ -566,9 +651,9 @@ export async function collectDevelopmentResult(
     }
   } catch (error) {
     // 差分の収集に使う git の終了を確認できない場合も、差分の収集の失敗として扱う
-    return fail('evidence_collection_failed', {
+    return fail('evidence_collection_failed', false, {
       ...agentEvidence(agent),
-      failureDetail: describeError(error),
+      failureDetail: describeError(error, redact),
       worktrees: state.worktrees.map(toWorktreeLocation)
     })
   }
@@ -578,7 +663,7 @@ export async function collectDevelopmentResult(
   })
   const anyChanged = changed.includes(true)
   let verificationUnconfirmed = false
-  const worktrees = []
+  const worktrees: ReturnType<typeof toWorktreeEvidence>[] = []
 
   for (const [index, record] of state.worktrees.entries()) {
     const diff = diffs[index]
@@ -595,6 +680,11 @@ export async function collectDevelopmentResult(
     for (const verification of registered) {
       if (agent.status !== 'completed') {
         verifications.push(notRun(verification, agent.status === 'timeout' ? 'agent_timeout' : 'agent_failed'))
+        continue
+      }
+
+      if (decisionRequested) {
+        verifications.push(notRun(verification, 'decision_requested'))
         continue
       }
 
@@ -623,10 +713,12 @@ export async function collectDevelopmentResult(
           command: verification.command,
           cwd,
           env: input.env,
-          timeoutMs: verificationTimeoutMs
+          timeoutMs: verificationTimeoutMs,
+          index: state.verifications.indexOf(verification),
+          ...(input.signal === undefined ? {} : { signal: input.signal })
         })
       } catch (error) {
-        verifications.push({ ...notRun(verification, 'verification_error'), status: 'failed', stderr: describeError(error) })
+        verifications.push({ ...notRun(verification, 'verification_error'), status: 'failed', stderr: describeError(error, redact) })
         continue
       }
 
@@ -640,8 +732,9 @@ export async function collectDevelopmentResult(
         status: result.status,
         exitCode: result.exitCode,
         signal: result.signal,
-        stdout: result.stdout,
-        stderr: result.stderr,
+        // 検証の出力は末尾だけを残すので、上限を超えたときは先頭の境界を置き換える
+        stdout: result.stdoutBytes > VERIFICATION_OUTPUT_BYTES ? redactTruncated(result.stdout, 'start') : result.stdout,
+        stderr: result.stderrBytes > VERIFICATION_OUTPUT_BYTES ? redactTruncated(result.stderr, 'start') : result.stderr,
         ...(result.reason === undefined ? {} : { reason: result.reason })
       })
     }
@@ -649,37 +742,62 @@ export async function collectDevelopmentResult(
     worktrees.push(toWorktreeEvidence(record, diff, verifications))
   }
 
-  const failureReason: FailureReason | undefined = verificationUnconfirmed
-    ? 'termination_unconfirmed'
-    : agent.status === 'timeout'
-      ? 'agent_timeout'
-      : agent.status === 'failed'
-        ? 'agent_failed'
-        : !anyChanged
-          ? 'no_changes'
-          : worktrees.some((worktree, index) => {
-            return changed[index] === true && worktree.verifications.length === 0
-          })
-            ? 'verification_missing'
-            : worktrees.some((worktree) => {
-              return worktree.verifications.some((verification) => {
-                return verification.status !== 'passed' && verification.status !== 'not_run'
-              })
-            })
-              ? 'verification_failed'
-              : undefined
+  function decideFailureReason(): FailureReason | undefined {
+    if (verificationUnconfirmed) {
+      return 'termination_unconfirmed'
+    }
+
+    if (agent.status === 'timeout') {
+      return 'agent_timeout'
+    }
+
+    if (agent.status === 'failed') {
+      return 'agent_failed'
+    }
+
+    // 判断の依頼では、差分が無いことや検証が無いことを失敗にしない
+    if (decisionRequested) {
+      return undefined
+    }
+
+    if (!anyChanged) {
+      return 'no_changes'
+    }
+
+    const missing = worktrees.some((worktree, index) => {
+      return changed[index] === true && worktree.verifications.length === 0
+    })
+
+    if (missing) {
+      return 'verification_missing'
+    }
+
+    const failed = worktrees.some((worktree) => {
+      return worktree.verifications.some((verification) => {
+        return verification.status !== 'passed' && verification.status !== 'not_run'
+      })
+    })
+
+    return failed ? 'verification_failed' : undefined
+  }
+
+  const failureReason = decideFailureReason()
 
   if (failureReason !== undefined) {
-    return fail(failureReason, {
+    return fail(failureReason, true, {
       ...agentEvidence(agent),
       worktrees,
       ...(verificationUnconfirmed ? { terminationConfirmed: false } : {})
     })
   }
 
+  const status = decisionRequested ? 'blocked' : 'completed'
+  const decisionQuestion = decision?.question ?? null
   const developmentResult: DevelopmentResult = {
-    status: 'completed',
-    evidence: { taskKey, devRoot, outcome: 'completed', ...agentEvidence(agent), worktrees }
+    status,
+    evidence: { taskKey, devRoot, outcome: status, ...agentEvidence(agent), worktrees, decisionQuestion },
+    decisionQuestion,
+    collected: true
   }
 
   return developmentResult

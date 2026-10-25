@@ -223,6 +223,62 @@ test('CLI: help の環境変数一覧に ARAYA_DEV_ROOT がある', async () => 
   assert.match(lines.join('\n'), /^ {2}ARAYA_DEV_ROOT$/mu)
 })
 
+test('CLI: help に task と runner の command がある', async () => {
+  const lines: string[] = []
+  const originalLog = console.log
+  console.log = (...values: unknown[]) => {
+    lines.push(values.map(String).join(' '))
+  }
+
+  try {
+    await runCli(['--help'], async () => {})
+  } finally {
+    console.log = originalLog
+  }
+
+  const help = lines.join('\n')
+
+  for (const command of [
+    'araya task create --file <path|->',
+    'araya task list [--status <状態>] [--limit <1〜200>]',
+    'araya task show <taskId> [--events <0〜500>] [--full]',
+    'araya task retry <taskId> [--note <text> | --note-file <path|->] [--confirm-side-effects]',
+    'araya task cancel <taskId>',
+    'araya runner install',
+    'araya runner uninstall'
+  ]) {
+    assert.ok(help.includes(`\n  ${command}\n`), command)
+  }
+
+  // runner は linger を変えない。worker と、runner を実装中という説明は残さない
+  assert.match(help, /linger は変えない/u)
+  assert.doesNotMatch(help, /実装中|worker/u)
+})
+
+test('CLI: help の --note と SHIKI の説明、ARAYA_DATA_DIR を変えたときの runner の説明', async () => {
+  const lines: string[] = []
+  const originalLog = console.log
+  console.log = (...values: unknown[]) => {
+    lines.push(values.map(String).join(' '))
+  }
+
+  try {
+    await runCli(['--help'], async () => {})
+  } finally {
+    console.log = originalLog
+  }
+
+  const help = lines.join('\n')
+
+  // --note の答えは、SHIKI が判断を求めて blocked になった Task のもの（restart_limit の blocked には質問が無い）
+  assert.doesNotMatch(help, /blocked の質問への答え/u)
+  assert.match(help, /--note は追加の指示。SHIKI が判断を求めて blocked になった Task では、\s*質問（decisionQuestion）への答えを書く/u)
+  assert.match(help, /SHIKI（開発の agent）/u)
+  assert.doesNotMatch(help, /開発 agent/u)
+  // ARAYA_DATA_DIR を変えると unit の名前が変わり、前の runner が残る
+  assert.match(help, /ARAYA_DATA_DIR を変えると別の runner になる/u)
+})
+
 test('CLI: Pi SDK はグローバル pi コマンドなしで使える', async () => {
   const { result, stdout, stderr } = await runArayaCliWithoutPiBinary(['pi', '--version'])
 

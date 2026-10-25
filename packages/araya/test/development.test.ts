@@ -5,14 +5,16 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
-import { collectDevelopmentResult, type AgentOutcome } from '../src/development.ts'
+import { buildWorktreeOnlyEvidence, collectDevelopmentResult, type AgentOutcome } from '../src/development.ts'
 import {
   runBoundedCommand,
   runVerificationCommand,
+  VERIFICATION_OUTPUT_BYTES,
   type VerificationCommandInput,
   type VerificationCommandResult
 } from '../src/development-process.ts'
-import { createTaskState, createWorktreeService } from '../src/development-worktrees.ts'
+import { createTaskState, createWorktreeService, recordDecision } from '../src/development-worktrees.ts'
+import { createRedactor, type Redactor } from '../src/redaction.ts'
 
 const TASK_KEY = 'task-1-1-abcdef'
 const PASS_COMMAND = [process.execPath, '-e', "console.log('verified')"]
@@ -89,8 +91,10 @@ async function runTask(
   work: (input: WorkInput) => Promise<AgentOutcome>,
   options: {
     verificationTimeoutMs?: number
-    runVerification?: (input: VerificationCommandInput) => Promise<VerificationCommandResult>
+    runVerification?: (input: VerificationCommandInput & { index: number }) => Promise<VerificationCommandResult>
     gitExecutable?: string
+    signal?: AbortSignal
+    redactor?: Pick<Redactor, 'redact' | 'redactTruncated'>
   } = {}
 ) {
   const stateDir = await createTaskState(fixture.dataDir, TASK_KEY)
@@ -102,7 +106,10 @@ async function runTask(
     stateDir,
     agent,
     env: fixture.env,
-    verificationTimeoutMs: options.verificationTimeoutMs ?? 10_000
+    verificationTimeoutMs: options.verificationTimeoutMs ?? 10_000,
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+    redact: options.redactor?.redact ?? noRedaction,
+    redactTruncated: options.redactor?.redactTruncated ?? noRedaction
   }, {
     runGit: runBoundedCommand,
     runVerification: options.runVerification ?? runVerificationCommand,
@@ -110,12 +117,18 @@ async function runTask(
   })
 }
 
+// 秘密の置き換えは runner の test で確かめる。ここでは置き換えない
+function noRedaction(text: string) {
+  return text
+}
+
 function serviceFor(input: WorkInput) {
   return createWorktreeService({
     devRoot: input.devRoot,
     stateDir: input.stateDir,
     taskKey: input.taskKey,
-    env: input.env
+    env: input.env,
+    runGit: runBoundedCommand
   })
 }
 
@@ -229,7 +242,8 @@ test('collectDevelopmentResult: 2つの repository にまたがる課題が comp
     assert.equal(result.evidence.devRoot, fixture.devRoot)
     assert.equal(result.evidence.summary, 'repo-a と repo-b を変更しました。')
     assert.equal('failureReason' in result.evidence, false)
-    assert.deepEqual(result.evidence.model, AGENT_MODEL)
+    assert.deepEqual(result.evidence.agent, { model: AGENT_MODEL })
+    assert.equal('model' in result.evidence, false)
 
     const a = findWorktree(result.evidence, 'repo-a')
     assert.equal(a.worktreePath, worktreePathOf(repoA))
@@ -421,9 +435,9 @@ test('collectDevelopmentResult: agent の失敗では差分を集め、検証は
 
     assert.equal(result.status, 'failed')
     assert.equal(result.evidence.failureReason, 'agent_failed')
-    assert.equal(result.evidence.agentError, 'model_error')
+    assert.deepEqual(result.evidence.agent, { error: 'model_error' })
     assert.equal('summary' in result.evidence, false)
-    assert.equal('model' in result.evidence, false)
+    assert.equal('agentError' in result.evidence, false)
     const worktree = findWorktree(result.evidence, 'repo-a')
     assert.deepEqual(worktree.changedFiles, ['README.md'])
     assert.match(String(worktree.diff), /\+repo-a changed/u)
@@ -449,8 +463,7 @@ test('collectDevelopmentResult: agent の timeout は agent_timeout で、差分
 
     assert.equal(result.status, 'failed')
     assert.equal(result.evidence.failureReason, 'agent_timeout')
-    assert.equal(result.evidence.agentError, 'agent_timeout')
-    assert.equal('model' in result.evidence, false)
+    assert.deepEqual(result.evidence.agent, { error: 'agent_timeout' })
     const worktree = findWorktree(result.evidence, 'repo-a')
     assert.deepEqual(worktree.changedFiles, ['README.md'])
     assert.deepEqual(readVerifications(worktree).map(({ status, reason }) => {
@@ -487,8 +500,7 @@ test('collectDevelopmentResult: summary は 4000 文字に切り詰め、失敗�
 
     assert.equal(failed.status, 'failed')
     assert.equal(failed.evidence.failureReason, 'agent_failed')
-    assert.equal(failed.evidence.agentError, 'model_error')
-    assert.deepEqual(failed.evidence.model, AGENT_MODEL)
+    assert.deepEqual(failed.evidence.agent, { error: 'model_error', model: AGENT_MODEL })
   } finally {
     await removeFixture(failedFixture)
   }
@@ -868,6 +880,196 @@ test('collectDevelopmentResult: untracked の分で上限を超えても、切�
     assert.equal(a.diffTruncated, true)
     assert.ok(Buffer.byteLength(String(a.diff)) <= 256 * 1024)
     assert.match(String(a.diff), /\[diff truncated: the evidence limit is 262144 bytes across all worktrees\]\n$/u)
+  } finally {
+    await removeFixture(fixture)
+  }
+})
+
+test('collectDevelopmentResult: 切っていない差分と検証の出力は境界の部分を置き換えず、先頭を切った検証の出力だけ境界を置き換える', async () => {
+  const fixture = await createFixture()
+  await createRepository(fixture, 'repo-a')
+  const redactor = createRedactor(['Zq8kW3mX9pL2vN7r'])
+  // 1つ目は上限以内、2つ目は上限を超えて先頭を切った出力。どちらも先頭が秘密の値の末尾の部分と userinfo の途中から始まる
+  const outputs = [
+    { stdout: 'L2vN7r ok', stdoutBytes: 9, stderr: 'er:pass@example.invalid', stderrBytes: 23 },
+    { stdout: 'L2vN7r ok', stdoutBytes: VERIFICATION_OUTPUT_BYTES + 1, stderr: 'er:pass@example.invalid', stderrBytes: VERIFICATION_OUTPUT_BYTES + 1 }
+  ]
+
+  try {
+    const result = await runTask(fixture, async (input) => {
+      const service = serviceFor(input)
+      const a = await service.createWorktree({ repository: 'repo-a' })
+      await fs.appendFile(path.join(a.worktreePath, 'README.md'), 'tail Zq8kW3\n', 'utf8')
+      await service.registerVerification({ repository: 'repo-a', command: ['first'] })
+      await service.registerVerification({ repository: 'repo-a', command: ['second'] })
+      return completed('変更しました。')
+    }, {
+      redactor,
+      runVerification: async (input) => {
+        return { ...runPassed(), ...(outputs[input.index] ?? {}) }
+      }
+    })
+
+    assert.equal(result.status, 'completed')
+    const a = findWorktree(result.evidence, 'repo-a')
+    const verifications = readVerifications(a)
+
+    assert.equal(a.diffTruncated, false)
+    assert.match(String(a.diff), /\+tail Zq8kW3\n$/u)
+    assert.deepEqual(verifications.map((verification) => [verification.stdout, verification.stderr]), [
+      ['L2vN7r ok', 'er:pass@example.invalid'],
+      ['[REDACTED] ok', '[REDACTED]@example.invalid']
+    ])
+    assert.equal(redactor.count, 2)
+  } finally {
+    await removeFixture(fixture)
+  }
+})
+
+test('collectDevelopmentResult: 検証の実行に verifications.jsonl の中の登録の順番と中止の signal を渡す', async () => {
+  const fixture = await createFixture()
+  await createRepository(fixture, 'repo-a')
+  await createRepository(fixture, 'repo-b')
+  const controller = new AbortController()
+  const calls: { command: readonly string[]; index: number; signal: AbortSignal | undefined }[] = []
+
+  try {
+    const result = await runTask(fixture, async (input) => {
+      const service = serviceFor(input)
+      const a = await service.createWorktree({ repository: 'repo-a' })
+      const b = await service.createWorktree({ repository: 'repo-b' })
+      await fs.appendFile(path.join(a.worktreePath, 'README.md'), 'a\n', 'utf8')
+      await fs.appendFile(path.join(b.worktreePath, 'README.md'), 'b\n', 'utf8')
+      await service.registerVerification({ repository: 'repo-a', command: ['a-first'] })
+      await service.registerVerification({ repository: 'repo-b', command: ['b-first'] })
+      await service.registerVerification({ repository: 'repo-a', command: ['a-second'] })
+      return completed('変更しました。')
+    }, {
+      signal: controller.signal,
+      runVerification: async (input) => {
+        calls.push({ command: input.command, index: input.index, signal: input.signal })
+        return runPassed()
+      }
+    })
+
+    assert.equal(result.status, 'completed')
+    assert.deepEqual(calls.map(({ command, index }) => [command[0], index]), [['a-first', 0], ['a-second', 2], ['b-first', 1]])
+    assert.ok(calls.every((call) => call.signal === controller.signal))
+  } finally {
+    await removeFixture(fixture)
+  }
+})
+
+test('collectDevelopmentResult: SHIKI が成功で終わって判断を求めていれば blocked で、差分を集め、検証は decision_requested で実行しない', async () => {
+  const fixture = await createFixture()
+  await createRepository(fixture, 'repo-a')
+  await createRepository(fixture, 'repo-b')
+  const marker = path.join(fixture.root, 'verification-ran')
+
+  try {
+    const result = await runTask(fixture, async (input) => {
+      await changeRepository(input, 'repo-a', {
+        command: [process.execPath, '-e', "require('node:fs').writeFileSync(process.argv[1], '')", marker]
+      })
+      // 差分の無い worktree と検証の無い worktree も失敗にしない
+      await serviceFor(input).createWorktree({ repository: 'repo-b' })
+      await recordDecision(input.stateDir, 'どちらの API を使いますか', new Date('2026-01-01T00:00:00.000Z'))
+      return completed('質問しました。')
+    })
+
+    assert.equal(result.status, 'blocked')
+    assert.equal(result.decisionQuestion, 'どちらの API を使いますか')
+    assert.equal(result.collected, true)
+    assert.equal(result.evidence.outcome, 'blocked')
+    assert.equal('failureReason' in result.evidence, false)
+    assert.equal(result.evidence.decisionQuestion, 'どちらの API を使いますか')
+    assert.equal(result.evidence.summary, '質問しました。')
+    const worktree = findWorktree(result.evidence, 'repo-a')
+    assert.match(String(worktree.diff), /\+repo-a changed/u)
+    assert.deepEqual(readVerifications(worktree).map(({ status, reason }) => {
+      return { status, reason }
+    }), [{ status: 'not_run', reason: 'decision_requested' }])
+    assert.deepEqual(findWorktree(result.evidence, 'repo-b').changedFiles, [])
+    assert.equal(await exists(marker), false)
+  } finally {
+    await removeFixture(fixture)
+  }
+})
+
+test('collectDevelopmentResult: SHIKI が timeout や失敗で終われば、判断を求めていても failed で、質問は残す', async () => {
+  for (const agent of [
+    { status: 'timeout', error: 'agent_timeout' },
+    { status: 'failed', error: 'model_error', errorMessage: 'provider exploded' }
+  ] satisfies AgentOutcome[]) {
+    const fixture = await createFixture()
+    await createRepository(fixture, 'repo-a')
+
+    try {
+      const result = await runTask(fixture, async (input) => {
+        await changeRepository(input, 'repo-a', { command: PASS_COMMAND })
+        await recordDecision(input.stateDir, '続けてよいですか', new Date())
+        return agent
+      })
+
+      assert.equal(result.status, 'failed')
+      assert.equal(result.evidence.failureReason, agent.status === 'timeout' ? 'agent_timeout' : 'agent_failed')
+      assert.equal(result.decisionQuestion, '続けてよいですか')
+      assert.equal(result.evidence.decisionQuestion, '続けてよいですか')
+      assert.deepEqual(result.evidence.agent, agent.status === 'timeout'
+        ? { error: 'agent_timeout' }
+        : { error: 'model_error', errorMessage: 'provider exploded' })
+    } finally {
+      await removeFixture(fixture)
+    }
+  }
+})
+
+test('collectDevelopmentResult: decision.json の形式が不正なら task_state_invalid', async () => {
+  for (const content of ['{', '{"question":"q"}', '{"question":"  ","requestedAt":"x"}', '{"question":"q","requestedAt":"x","extra":1}']) {
+    const fixture = await createFixture()
+    await createRepository(fixture, 'repo-a')
+
+    try {
+      const result = await runTask(fixture, async (input) => {
+        await changeRepository(input, 'repo-a', { command: PASS_COMMAND })
+        await fs.writeFile(path.join(input.stateDir, 'decision.json'), content, 'utf8')
+        return completed('done')
+      })
+
+      assert.equal(result.status, 'failed', content)
+      assert.equal(result.evidence.failureReason, 'task_state_invalid', content)
+      assert.match(String(result.evidence.failureDetail), /decision\.json/u)
+      assert.equal(result.collected, false)
+    } finally {
+      await removeFixture(fixture)
+    }
+  }
+})
+
+test('buildWorktreeOnlyEvidence: worktrees.jsonl の path と branch だけを残し、無ければ空、読めなければ空にして理由を返す', async () => {
+  const fixture = await createFixture()
+  const repoA = await createRepository(fixture, 'repo-a')
+
+  try {
+    const stateDir = await createTaskState(fixture.dataDir, TASK_KEY)
+    const missing = await buildWorktreeOnlyEvidence({ taskKey: TASK_KEY, devRoot: fixture.devRoot, stateDir, redact: noRedaction })
+    assert.deepEqual(missing, {
+      evidence: { taskKey: TASK_KEY, devRoot: fixture.devRoot, stateDir, worktrees: [], bodiesStored: false },
+      detail: null
+    })
+
+    await serviceFor({ devRoot: fixture.devRoot, stateDir, taskKey: TASK_KEY, env: fixture.env }).createWorktree({ repository: 'repo-a' })
+    const recorded = await buildWorktreeOnlyEvidence({ taskKey: TASK_KEY, devRoot: fixture.devRoot, stateDir, redact: noRedaction })
+    assert.deepEqual(recorded.evidence.worktrees, [{ worktreePath: worktreePathOf(repoA), branch: `araya/${TASK_KEY}` }])
+    assert.equal(recorded.detail, null)
+
+    await fs.appendFile(path.join(stateDir, 'worktrees.jsonl'), 'not json\n', 'utf8')
+    const broken = await buildWorktreeOnlyEvidence({ taskKey: TASK_KEY, devRoot: fixture.devRoot, stateDir, redact: noRedaction })
+    assert.deepEqual(broken.evidence.worktrees, [])
+    assert.match(String(broken.detail), /worktrees\.jsonl could not be read/u)
+
+    const noState = await buildWorktreeOnlyEvidence({ taskKey: TASK_KEY, devRoot: fixture.devRoot, stateDir: null, redact: noRedaction })
+    assert.deepEqual(noState.evidence, { taskKey: TASK_KEY, devRoot: fixture.devRoot, stateDir: null, worktrees: [], bodiesStored: false })
   } finally {
     await removeFixture(fixture)
   }

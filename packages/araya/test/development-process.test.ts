@@ -215,3 +215,83 @@ test('runVerificationCommand: cwd が無ければ起動せずに cwd_missing', a
     await fs.rm(root, { recursive: true, force: true })
   }
 })
+
+test('runBoundedCommand: signal が中止されると timeout と同じ手順で process group を止め、aborted になる', async () => {
+  const root = await makeTempDir()
+  const marker = path.join(root, 'terminated')
+  const controller = new AbortController()
+
+  try {
+    const startedAt = Date.now()
+    const running = runBoundedCommand(process.execPath, [
+      '-e',
+      "process.on('SIGTERM', () => { require('node:fs').writeFileSync(process.argv[1], 'yes'); process.exit(0) }); setInterval(() => {}, 1000)",
+      marker
+    ], {
+      timeoutMs: 60_000,
+      terminationGraceMs: 10_000,
+      signal: controller.signal
+    })
+    setTimeout(() => {
+      controller.abort()
+    }, 300)
+    const result = await running
+
+    assert.equal(result.terminationReason, 'aborted')
+    assert.equal(result.terminationConfirmed, true)
+    assert.equal(result.exitCode, 0)
+    assert.equal(await fs.readFile(marker, 'utf8'), 'yes')
+    assert.ok(Date.now() - startedAt < 5000)
+  } finally {
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('runBoundedCommand: 中止された signal を受けると起動しない', async () => {
+  const root = await makeTempDir()
+  const marker = path.join(root, 'started')
+
+  try {
+    const result = await runBoundedCommand(process.execPath, ['-e', "require('node:fs').writeFileSync(process.argv[1], '')", marker], {
+      timeoutMs: 1000,
+      signal: AbortSignal.abort()
+    })
+
+    assert.equal(result.terminationReason, 'aborted')
+    assert.equal(result.exitCode, null)
+    assert.equal(await exists(marker), false)
+  } finally {
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('runVerificationCommand: launch で起動し、signal の中止で止めた検証は failed（aborted）', async () => {
+  const root = await makeTempDir()
+  const controller = new AbortController()
+  const launched: string[][] = []
+
+  try {
+    const running = runVerificationCommand({
+      command: [process.execPath, '-e', 'setInterval(() => {}, 1000)'],
+      cwd: root,
+      env: {},
+      timeoutMs: 60_000,
+      signal: controller.signal,
+      launch: (command, args, options) => {
+        launched.push([command, ...args])
+        return runBoundedCommand(command, args, options)
+      }
+    })
+    setTimeout(() => {
+      controller.abort()
+    }, 300)
+    const result = await running
+
+    assert.deepEqual(launched, [[process.execPath, '-e', 'setInterval(() => {}, 1000)']])
+    assert.equal(result.status, 'failed')
+    assert.equal(result.reason, 'aborted')
+    assert.equal(result.terminationConfirmed, true)
+  } finally {
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})

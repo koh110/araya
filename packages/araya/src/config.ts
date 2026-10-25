@@ -51,7 +51,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       maximum: 60 * 60 * 1000
     }),
     developmentModel: NO_DEVELOPMENT_MODEL,
-    // runner（実装中）が子 process（検証コマンド、git など）に引き継ぐ環境変数。今はどこからも使っていない
+    // araya task・araya runner の command が使う環境変数（unit file に書く変数の選別、秘密の値の置き換え）
     env: { ...env }
   }
 }

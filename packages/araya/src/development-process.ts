@@ -7,7 +7,7 @@ const MAX_STDERR_BYTES = 64 * 1024
 const MAX_TERMINATION_GRACE_MS = 60 * 1000
 const DEFAULT_TERMINATION_GRACE_MS = 250
 const ABANDONMENT_AFTER_KILL_MS = 3000
-const VERIFICATION_OUTPUT_BYTES = 8 * 1024
+export const VERIFICATION_OUTPUT_BYTES = 8 * 1024
 const VERIFICATION_TERMINATION_GRACE_MS = 2000
 
 export type OutputOptions = {
@@ -23,7 +23,8 @@ export type BoundedProcessResult = {
   stderr: string
   stdoutBytes: number
   stderrBytes: number
-  terminationReason: 'timeout' | 'output_overflow' | 'invalid_utf8' | undefined
+  // aborted: signal の中止で止めた
+  terminationReason: 'timeout' | 'output_overflow' | 'invalid_utf8' | 'aborted' | undefined
   terminationConfirmed: boolean
 }
 
@@ -35,13 +36,25 @@ export type BoundedCommandOptions = {
   terminationGraceMs?: number
   stdout?: OutputOptions
   stderr?: OutputOptions
+  // 中止されたら timeout と同じ手順（SIGTERM → 猶予 → SIGKILL）で止める。起動前に中止されていれば起動しない
+  signal?: AbortSignal
 }
+
+// command を起動する関数。runBoundedCommand と同じ形。runner は試行の scope の中で起動する関数を渡す
+export type GitCommandRunner = (
+  command: string,
+  args: readonly string[],
+  options: BoundedCommandOptions
+) => Promise<BoundedProcessResult>
 
 export type VerificationCommandInput = {
   command: readonly string[]
   cwd: string
   env: Readonly<Record<string, string | undefined>>
   timeoutMs: number
+  signal?: AbortSignal
+  // 検証のコマンドを起動する関数。省略時は runBoundedCommand
+  launch?: GitCommandRunner
 }
 
 export type VerificationCommandResult = {
@@ -164,6 +177,21 @@ export async function runBoundedCommand(
     throw new Error(`termination grace must be between 0 and ${MAX_TERMINATION_GRACE_MS} milliseconds`)
   }
 
+  if (options.signal?.aborted === true) {
+    const aborted: BoundedProcessResult = {
+      exitCode: null,
+      signal: null,
+      stdout: '',
+      stderr: '',
+      stdoutBytes: 0,
+      stderrBytes: 0,
+      terminationReason: 'aborted',
+      terminationConfirmed: true
+    }
+
+    return aborted
+  }
+
   let terminationReason: BoundedProcessResult['terminationReason']
   let settled = false
   let forceKillTimer: NodeJS.Timeout | undefined
@@ -215,6 +243,10 @@ export async function runBoundedCommand(
     }
   }
 
+  function onAbort() {
+    requestTermination('aborted')
+  }
+
   function settle(result: BoundedProcessResult) {
     if (settled) {
       return
@@ -222,6 +254,7 @@ export async function runBoundedCommand(
 
     settled = true
     clearTimers()
+    options.signal?.removeEventListener('abort', onAbort)
     resolveResult?.(result)
   }
 
@@ -245,7 +278,7 @@ export async function runBoundedCommand(
     })
   }
 
-  function requestTermination(reason: 'timeout' | 'output_overflow' | 'invalid_utf8') {
+  function requestTermination(reason: 'timeout' | 'output_overflow' | 'invalid_utf8' | 'aborted') {
     if (terminationReason !== undefined || settled) {
       return
     }
@@ -294,6 +327,7 @@ export async function runBoundedCommand(
   timeoutTimer = setTimeout(() => {
     requestTermination('timeout')
   }, options.timeoutMs)
+  options.signal?.addEventListener('abort', onAbort, { once: true })
 
   if (options.input === undefined) {
     child.stdin.end()
@@ -353,14 +387,17 @@ export async function runVerificationCommand(input: VerificationCommandInput) {
 
   let result: BoundedProcessResult
 
+  const launch = input.launch ?? runBoundedCommand
+
   try {
-    result = await runBoundedCommand(executable, input.command.slice(1), {
+    result = await launch(executable, input.command.slice(1), {
       cwd: input.cwd,
       env: input.env,
       timeoutMs: input.timeoutMs,
       terminationGraceMs: VERIFICATION_TERMINATION_GRACE_MS,
       stdout: { mode: 'tail', limitBytes: VERIFICATION_OUTPUT_BYTES },
-      stderr: { mode: 'tail', limitBytes: VERIFICATION_OUTPUT_BYTES }
+      stderr: { mode: 'tail', limitBytes: VERIFICATION_OUTPUT_BYTES },
+      ...(input.signal === undefined ? {} : { signal: input.signal })
     })
   } catch (error) {
     if (isErrno(error, 'subprocess_launch_failed')) {
@@ -385,7 +422,11 @@ export async function runVerificationCommand(input: VerificationCommandInput) {
     stdoutBytes: result.stdoutBytes,
     stderrBytes: result.stderrBytes,
     terminationConfirmed: result.terminationConfirmed,
-    ...(result.terminationConfirmed ? {} : { reason: 'termination_unconfirmed' })
+    ...(!result.terminationConfirmed
+      ? { reason: 'termination_unconfirmed' }
+      : result.terminationReason === 'aborted'
+        ? { reason: 'aborted' }
+        : {})
   }
 
   return verification

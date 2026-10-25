@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
+import { runBoundedCommand } from '../src/development-process.ts'
 import {
   MAX_VERIFICATIONS_PER_TASK,
   MAX_WORKTREES_PER_TASK,
@@ -79,6 +80,7 @@ function createService(fixture: Fixture, overrides: { taskKey?: string; stateDir
     stateDir: overrides.stateDir ?? fixture.stateDir,
     taskKey: overrides.taskKey ?? fixture.taskKey,
     env: fixture.env,
+    runGit: runBoundedCommand,
     now: () => {
       return FIXED_NOW
     }

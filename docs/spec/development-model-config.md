@@ -1,6 +1,6 @@
 # 設定ファイルによる開発 agent の model 指定
 
-> 注記: この文書のうち、worker の入力と出力で model を受け渡す部分は、worker を撤去する手順で撤去し、[Task の台帳と SHIKI の実行](task-ledger-and-shiki-runner.md)の仕様に置き換えた。設定ファイルの形と検証は、この文書を基準のままにする。
+> 注記: この文書のうち、worker の入力と出力で model を受け渡す部分は、worker を撤去する手順で撤去し、[Task の台帳と SHIKI の実行](task-ledger-and-shiki-runner.md)の仕様に置き換えた。設定ファイルの形と検証は、この文書を基準のままにする。runner は、この文書の subcommand とは別に、試行を取り込むたびに設定ファイルを読む（同じ仕様の「取り込み」）。
 
 ## 概要
 
