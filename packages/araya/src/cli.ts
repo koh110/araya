@@ -72,7 +72,7 @@ function printHelp() {
     runner（Task を動かす systemd の user service。araya-runner-<hash>.service）の unit file を書き、
     有効にして起動し直す。linger は変えない（無効なら logout で runner が止まり、次に起動したときに続きから進む）。
     unit file に書く環境変数は PATH・LANG・LANGUAGE・TZ・LC_*・ARAYA_*（秘密とみなす名前を除く）・PI_CODING_AGENT_DIR だけ。
-    環境変数を変えたときと araya を入れ直したときは、やり直す。ARAYA_DATA_DIR を変えると別の runner になる
+    環境変数を変えたときは、やり直す（npm run deploy は、araya を入れた後にこれを実行する）。ARAYA_DATA_DIR を変えると別の runner になる
     （前の runner を残さないときは、先に前の ARAYA_DATA_DIR で araya runner uninstall を実行する）。
 
   araya runner uninstall
@@ -108,6 +108,21 @@ function printHelp() {
 
 function printJson(value: unknown) {
   console.log(JSON.stringify(value, null, 2))
+}
+
+// この環境では araya task と araya runner を使えないことを表す誤りの code
+const UNSUPPORTED_ENVIRONMENT_CODES = ['unsupported_platform', 'systemd_unavailable']
+// その誤りの終了 code（sysexits.h の EX_UNAVAILABLE）。Node.js が自分の誤りに使う終了 code（14 以下、124、128 より大きい値）と重ならない。
+// npm run deploy は、この終了 code のときに runner を入れずに成功で終わる
+export const UNSUPPORTED_ENVIRONMENT_EXIT_CODE = 69
+
+// CLI の誤りの終了 code。この環境では使えない誤りは UNSUPPORTED_ENVIRONMENT_EXIT_CODE、それ以外は 1
+export function exitCodeOf(error: unknown) {
+  if (error instanceof Error && 'code' in error && typeof error.code === 'string' && UNSUPPORTED_ENVIRONMENT_CODES.includes(error.code)) {
+    return UNSUPPORTED_ENVIRONMENT_EXIT_CODE
+  }
+
+  return 1
 }
 
 const SUBCOMMANDS = ['init', 'tick', 'status', 'run', 'approve', 'reject']

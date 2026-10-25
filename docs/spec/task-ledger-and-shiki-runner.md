@@ -40,6 +40,7 @@ PR #7 で決めた方針:
 - 旧経路の worker は、この手順で、runner より先に撤去する（「旧経路との関係」）。SHIKI を動かすのは runner だけにし、旧経路と runner を同時に使っても SHIKI が同時に2つ動かないようにする。前の版では、worker を残して runner と実行枠を共有せず、SHIKI が同時に2つ動くことを手順4 までの既知の制限にしていた（その前の版では、旧経路の worker も同じ枠で数えていた）。
 - araya はまだ運用していないので、動いている旧経路からの入れ替え（後方互換性）は考えない。worker を撤去してから runner ができるまでは、development の課題を動かす経路が無くてよい。
 - worker の撤去（名前の統一を含む）は、この仕様を追加する PR（#8）に含める。この PR を「worker を撤去する PR」と呼ぶ。前の版では、別の PR にしていた。
+- `npm run deploy` は、araya を入れた後に runner も入れ直し、止めてある runner も起動する（「`npm run deploy`」）。前の版では、deploy の後に利用者が `araya runner install` を実行していた。
 
 ## 用語
 
@@ -606,7 +607,7 @@ Issue #1 の「Secrets を通常ログや Task 台帳に複製しない」のた
 
 - Linux 以外では、`araya task` と `araya runner` のどの command も何もせずに `unsupported_platform` で終わる。
 - 各 command は起動時に設定ファイルを読み、不正なら何もせずに終わる（既存の command と同じ）。
-- 出力は JSON 1件を stdout に出す（既存の `araya status` と同じ）。誤りは stderr にメッセージを出し、終了 code 1 で終わる。
+- 出力は JSON 1件を stdout に出す（既存の `araya status` と同じ）。誤りは stderr にメッセージを出し、終了 code 1 で終わる。ただし、この環境では使えないことを表す誤り（`unsupported_platform`、`systemd_unavailable`）では、終了 code 69（sysexits.h の EX_UNAVAILABLE）で終わる（`npm run deploy` は、この終了 code で見分ける。「`npm run deploy`」）。code のある誤り（`unsupported_platform`、`systemd_unavailable`、`task_not_found` など）のメッセージは、`<code>: <説明>` の形にする。
 - `<taskId>` は 1 以上の10進の整数。存在しない Task ID は `task_not_found`。
 - `araya task` の command は台帳だけを読み書きし、runner を起動しない。止めてある runner を、Task の登録で勝手に動かさないため。出力の `runner.state` が `running` でなければ、stderr に「runner が動いていません（<state>）。araya runner install で入れるか、systemctl --user start <unit> で起動してください」と出す（終了 code は変えない）。
 
@@ -651,6 +652,18 @@ command:
 - QueueView: `{"limit": <実行枠の上限>, "running": <running の試行の数>, "queued": <queued の試行の数>}`
 
 `araya --help` に `task` と `runner` の command を加える。
+
+## `npm run deploy`
+
+`npm run deploy`（`scripts/deploy.sh`）は、araya を build して prefix に入れた後（README の「グローバルインストール」）、入れた araya（`<prefix>/bin/araya`）で `araya runner install` を実行する。初めての deploy では runner を入れ、動いている runner も止めてある runner も、書き直した unit file と入れたコードで起動し直す（restart）。動いていた試行は一時停止の扱いになり、続きから進む（「止めるとき（一時停止）」）。
+
+- 対象の runner は、deploy を実行した環境の `ARAYA_DATA_DIR`（無ければ `~/.araya`）のもの。unit file の `Environment=` も、その環境の値で書き直す。
+- `PATH` は、`npm run` が先頭に足した entry を外して `araya runner install` に渡す（unit file の `PATH` になる）。`PATH` の先頭から、`/node_modules/.bin` か `/node-gyp-bin` で終わる entry が続く間を見て、その中の最後の `/node-gyp-bin` までを外す（「技術調査結果」の npm）。`/node-gyp-bin` が無ければ（`npm run` を通さずに実行したとき）、`PATH` を変えない。外さないと、checkout の `node_modules/.bin`（araya の開発用の道具）と npm の内部の directory が runner の `PATH` に入り、SHIKI の bash と検証のコマンドがそれを使う。checkout を移動・削除しても、入れた araya は影響を受けないという前提も崩れる。
+- `araya runner install` の stdout と stderr は、そのまま出す。
+- `araya runner install` が終了 code 69 で終わったとき（`unsupported_platform` か `systemd_unavailable`。「CLI」）は、「この環境では runner を使えないため、runner を入れずに終わります（araya は入れました）」と stderr に出し、終了 code 0 で終わる。stderr の文では見分けない（設定ファイルの key など、誤りのメッセージに入る利用者の値によっては、`<code>: ` で始まる行ができることがあるため）。
+- それ以外の終了 code で終わったとき（`unsupported_path`、`unit_not_loaded`、`systemctl` の失敗、設定ファイルの誤りなど）は、araya を入れたまま、「error: araya は入れましたが、runner を入れられませんでした。上の理由を直してから、araya runner install を実行してください」と stderr に出し、終了 code 1 で終わる。
+- npm の pack と install が失敗したときは、`araya runner install` を実行しない。
+- deploy は、runner が起動したことまでは確かめない（`araya runner install` は起動を 10 秒まで待ち、待てなくても成功で終わる。「CLI」）。
 
 ## 旧経路との関係
 
@@ -721,14 +734,16 @@ worker を撤去する PR で、旧名（`agentctl`）を次の箇所で `araya`
 - 差分の収集、検証、判定: executor の、SHIKI が終わった後の部分を `development.ts` の中で関数に切り出す（executor のほかの部分は撤去する。「旧経路との関係」）。git と検証のコマンドを起動する関数を必須の引数で受け取り、runner は scope の中で起動する関数を渡す。検証のコマンドの実行（`runBoundedCommand`）に、中止の signal を受け取る引数を足す
 - 旧経路の worker の撤去（worker を撤去する PR。runner より先）: 「旧経路との関係」の「撤去するもの」と「新しい経路に移して使うもの」
 - runner の entrypoint: `packages/araya/bin/task-runner.ts`
-- CLI: `packages/araya/src/cli.ts` に `task` と `runner` を加える
+- CLI: `packages/araya/src/cli.ts` に `task` と `runner` を加える。誤りの終了 code は `exitCodeOf`（`packages/araya/bin/cli.ts` が使う）
+- deploy: `scripts/deploy.sh`（test は `packages/araya/test/deploy.test.ts`。npm と、npm が入れる araya を偽物にする）
 
 ## 既知の制限
 
 - `araya task` と runner は、Linux と systemd（254 以降）の user manager が必要。logout した後も runner を動かすには、利用者が linger（`loginctl enable-linger`）を有効にする。araya は linger を変えない。linger が無効だと、logout で runner は止まり（一時停止）、次に user manager が起動したときに続きから進む。
 - worker を撤去した版から runner の版までは、development の課題を実行できない（利用者の判断。「旧経路との関係」）。
 - runner の環境変数は、unit file に書いた一覧のものと user manager の環境だけ。model の認証を環境変数だけで行っている場合は、SHIKI は model を使えず `agent_failed`（`model_unavailable`）になる。SHIKI の bash、git、検証のコマンドにも、ほかの環境変数（token、proxy の設定など）は渡らない。環境変数を変えたら `araya runner install` をやり直す。
-- araya を入れ直したとき（`npm run deploy`）は、`araya runner install`（か `systemctl --user restart <unit>`）をやり直すまで、runner は前に読み込んだコードで動き続ける。入れ直しで試行の task の定義が変わると、動いていた試行が `attempt_error` になることがある。
+- `npm run deploy` が起動し直すのは、deploy を実行した環境の `ARAYA_DATA_DIR` の runner だけ。ほかの `ARAYA_DATA_DIR` の runner と、deploy が runner を入れなかったとき（user manager に接続できない session から deploy したときなど）の runner は、`araya runner install`（か `systemctl --user restart <unit>`）をやり直すまで、前に読み込んだコードで動き続ける（次に起動したときからは、入れたコードで動く）。入れ直しで試行の task の定義が変わると、動いていた試行が `attempt_error` になることがある。
+- `npm run deploy` は、止めてある runner も起動する。止めたままにするときは、deploy の後に `systemctl --user stop <unit>` を実行する。
 - unit file に書く path と値に、ASCII の制御文字、空白、引用符、`\`、`$`、`%`、`;` を使えない（`unsupported_path`）。
 - SHIKI の tool に `grep`・`find`・`ls` は無い（bash で代用する）。model を設定しないときは Pi の設定の既定だけを使い、既存の SHIKI のように「認証のある最初の model」へは切り替えない。
 - 再開した会話（一時停止の後と、落ちた後）では、途中で止まった tool が一部だけ実行されていることがある。model が同じ操作をやり直し、外部への変更をくり返すことがある。evidence の `resumes` で、再開があったかどうかが分かる。
@@ -744,7 +759,7 @@ worker を撤去する PR で、旧名（`agentctl`）を次の箇所で `araya`
 - Task の終了の通知、自動の再実行
 - 実行枠の上限を 2 以上にすること（「並列数を上げるとき」）
 - 開発以外の Task。頼まれなくても自分で仕事を見つける動き（dots の proactive research）
-- Linux 以外と、systemd の user manager が無い環境での実行。linger の管理。`npm run deploy` での runner の入れ替え
+- Linux 以外と、systemd の user manager が無い環境での実行。linger の管理
 - worktree・branch・状態 directory・pi-durable の storage・log・台帳の古い記録の自動削除
 - SHIKI での subagent・codemode・tool-search・skill の利用（pi-durable は対応している。後の段階で検討する）
 - runner に渡す環境変数を設定で増やすこと
@@ -794,6 +809,9 @@ test は実際の Pi auth や model API を使わない。model は pi-ai の fa
 - [ ] build 済みの package（`dist`）の module で作った unit file の `ExecStart` の entrypoint は、`dist/bin/task-runner.js` の絶対 path で、その file は通常の file として存在する（撤去する `development-built.test.ts` の代わり。`npm test` は build してから実行する）。
 - [ ] 本物の systemd の test（`ARAYA_TEST_SYSTEMD=1`）: runner の main process を SIGKILL すると、`ExecStopPost` が試行の scope（`setsid` した process を含む）を止めてから、systemd が runner を起動し直し、試行が終わる。`systemctl --user stop` では起動し直さず、試行の scope も止まり、次の起動で続きから進む。restartLimit（test では小さくする）で止まるまで落ち続けても、systemd は起動し直すのをやめない。同じ unit 名で2つ目の runner は起動しない。`araya_create_worktree` の git の hook（`post-checkout`）が `setsid` で切り離して残した process は、試行の結果が記録された時点で止まっている。test の後に `araya-` で始まる unit と、test が作った process が残っていない。
 - [ ] `git grep -i agentctl -- ':!docs/spec/task-ledger-and-shiki-runner.md'` が `scripts/deploy.sh` の1行と README の1行だけを返す。worker を撤去する PR で満たす。
+- [ ] `npm run deploy`（`scripts/deploy.sh`）は、npm の install の後に、入れた `<prefix>/bin/araya` で `araya runner install` を実行する。そのときの `PATH` は、`npm run` が足した entry（入れ子の `npm run` で重ねて足したものを含む）を外したもので、元の `PATH` にあった `node_modules/.bin` は残る。`npm run` を通さないときは `PATH` を変えない（npm と araya を偽物にした test。本物の npm の `npm run deploy` でも確かめる）。`araya runner install` の stdout と stderr は deploy の出力に出る。
+- [ ] `araya runner install` が終了 code 69（`unsupported_platform` か `systemd_unavailable`）で終わったときは、deploy は注意を出して終了 code 0 で終わる（本物の araya の CLI で、user manager に接続できないときと、`PATH` に `systemctl` が無いときも確かめる。どちらも unit file を書かない）。それ以外の終了 code では、stderr に `<code>: ` で始まる行があっても、araya を入れたまま終了 code 1 で終わる（本物の araya の CLI で、未知の key に改行と `systemd_unavailable: ` を含む設定ファイルでも確かめる）。npm の install が失敗したときは、`araya runner install` を実行しない。
+- [ ] CLI は、`unsupported_platform` と `systemd_unavailable` では終了 code 69、ほかの誤りでは終了 code 1 で終わる（code の無い誤りは、message が `<code>: ` で始まっても 1）。
 - [ ] README とこの仕様が新しい動作を説明している。
 
 ## Assumptions（方針と調査から導いた判断）
@@ -829,10 +847,13 @@ test は実際の Pi auth や model API を使わない。model は pi-ai の fa
 - 再実行では前回の変更を自動で持ち込まない。前回の worktree は残し、場所を SHIKI に伝える。Issue #1 の「再試行時は未確認の副作用を慎重に扱う」に合わせるため。
 - pi-durable の storage は試行の後も残す。会話を後から確かめられるようにするため。古い記録の削除は worktree などと同じく後の段階で決める。
 - model を設定しないときは Pi の設定の既定だけを使う。既存の SHIKI が使う Pi の「最初の model を選ぶ」処理（`findInitialModel`）は package の外に公開されておらず、ほかの model へ黙って切り替えないため。
+- `npm run deploy` で runner を入れ直し、止めてある runner も起動する（利用者の選択）。1つのコマンドで、deploy した環境の runner が入れたコードで動いている状態にし、初めての deploy の後の手順を無くすため。止めてあった runner を起動しても、Task が無い間は model を呼ばない。前の版では、deploy の後に `araya runner install` を実行するまで、runner が前のコードで動き続けた。
+- `unsupported_platform` と `systemd_unavailable` では deploy を失敗にしない。runner を使えない環境でも、araya のほかのコマンド（旧経路と Pi の CLI）は使えるため。それ以外の失敗（`unsupported_path` など）は、runner を使う環境で値を直せば入れられるので、deploy を失敗にして知らせる。
+- deploy は、`araya runner install` の終了 code 69 で、この環境では runner を使えないことを見分ける。stderr の文で見分けると、誤りのメッセージに入る利用者の値（設定ファイルの key など）によっては `<code>: ` で始まる行ができ、ほかの失敗を成功の扱いにしてしまうことがあるため。69 は、Node.js が自分の誤りに使う終了 code（14 以下、124、128 より大きい値）と重ならない。前の版の CLI の終了 code（誤りの種類によらず 1）との互換は考えない（araya はまだ運用していない）。
 
 ## 技術調査結果
 
-pi-durable と Pi は 1.4.0、Node.js は v26.12.1、systemd は 259。model は pi-ai の faux provider だけを使い、実 API と実認証情報は使っていない。
+pi-durable と Pi は 1.4.0、Node.js は v26.12.1、systemd は 259、npm は 11.20.0。model は pi-ai の faux provider だけを使い、実 API と実認証情報は使っていない。
 
 ### pi-durable
 
@@ -879,6 +900,11 @@ pi-durable と Pi は 1.4.0、Node.js は v26.12.1、systemd は 259。model は
 - 当たる unit の無い glob の `systemctl --user stop '<glob>'` は、終了 code 0 だった。読み込まれていない unit を名前で `systemctl --user stop` すると、終了 code 5 で「Unit … not loaded.」になった。無い unit の `systemctl --user disable --now` は、終了 code 1 で「Unit … does not exist」になった。
 - service の環境には、user manager の環境（`HOME`、`XDG_RUNTIME_DIR`、デスクトップのセッションの変数など）と、service ごとの `INVOCATION_ID` があった。
 - man page（systemd 259）: `systemd-run` の `--expand-environment` と、`RestartSteps=`・`RestartMaxDelaySec=` は version 254 で入った。`StartLimitIntervalSec=0` は起動の回数の制限を無くす。unit file では `%` の specifier が展開される。
+
+### npm
+
+- `npm run` は、script の `PATH` の先頭に、package の directory（`package.json` のある directory。その下の directory から実行しても同じ）から `/` までの各 directory の `node_modules/.bin` を近い順に足し、続けて npm の `node_modules/@npmcli/run-script/lib/node-gyp-bin` を足した。元の `PATH` はその後に続いた。node の directory は足さなかった。
+- `npm run` の script の中で `npm run` を実行すると、同じまとまりを、もう1つ先頭に足した（2つ重なった）。
 
 ### 既存のコード
 

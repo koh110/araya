@@ -1,6 +1,6 @@
 # araya
 
-**実験用 MVP**。開発の課題は `araya task create` で Task の台帳に登録し、`araya runner install` で入れた runner（systemd の user service）が SHIKI（開発の agent）を動かします（仕様: [docs/spec/task-ledger-and-shiki-runner.md](docs/spec/task-ledger-and-shiki-runner.md)）。SHIKI は開発 root（既定 `~/dev`）の repository に課題用の worktree を作って実装し、Araya が SHIKI の登録した検証コマンドを実行して、結果を台帳に残します。Araya は commit・push・PR・merge・deploy を行いません。SHIKI にもしないよう指示しますが、強制はしません（「状態と安全境界」）。JSONL inbox に書いた `development` 課題は、inbox と `tick` / `run` の経路（旧経路）では実行せず、次のdue tickで `blocked` にします。自律的な課題発見、Goal / 探索対象の設定、外部ソース監視、read-only/external候補のexecutor、Native Broker、Discord/Hermes連携、Outbox配信、旧経路（`tick` / `run`）の常駐化は未実装です。`run`を起動しても、新しい課題を自律的に発見するわけではありません。引数なしの `araya` と `araya pi` は `@earendil-works/pi-coding-agent` のCLI entry pointを同じNode.jsプロセス内で実行し、その動作・権限・副作用はPi側の設定に従います。別途 `pi` CLIをインストールする必要はありません。
+**実験用 MVP**。開発の課題は `araya task create` で Task の台帳に登録し、runner（systemd の user service。`npm run deploy` か `araya runner install` で入れます）が SHIKI（開発の agent）を動かします（仕様: [docs/spec/task-ledger-and-shiki-runner.md](docs/spec/task-ledger-and-shiki-runner.md)）。SHIKI は開発 root（既定 `~/dev`）の repository に課題用の worktree を作って実装し、Araya が SHIKI の登録した検証コマンドを実行して、結果を台帳に残します。Araya は commit・push・PR・merge・deploy を行いません。SHIKI にもしないよう指示しますが、強制はしません（「状態と安全境界」）。JSONL inbox に書いた `development` 課題は、inbox と `tick` / `run` の経路（旧経路）では実行せず、次のdue tickで `blocked` にします。自律的な課題発見、Goal / 探索対象の設定、外部ソース監視、read-only/external候補のexecutor、Native Broker、Discord/Hermes連携、Outbox配信、旧経路（`tick` / `run`）の常駐化は未実装です。`run`を起動しても、新しい課題を自律的に発見するわけではありません。引数なしの `araya` と `araya pi` は `@earendil-works/pi-coding-agent` のCLI entry pointを同じNode.jsプロセス内で実行し、その動作・権限・副作用はPi側の設定に従います。別途 `pi` CLIをインストールする必要はありません。
 
 ## 必要環境
 
@@ -41,9 +41,11 @@ npm run araya -- status
 
 `araya task` と `araya runner` は、`npm run deploy` で入れた `araya` で実行します（「グローバルインストール」）。runner は、`araya runner install` を実行した araya のコードで動きます（unit file の `ExecStart` は Node.js を起動し、runner の entrypoint の絶対 path を引数に渡します。`npm run deploy` で入れた araya なら、entrypoint は install 先の `packages/araya/dist/bin/task-runner.js` です）。checkout で `npm run araya -- runner install` を実行すると、runner はその checkout の `packages/araya/bin/task-runner.ts` で動きます。その checkout の file を変えると runner の動作が変わり、checkout を移動・削除すると runner は起動できなくなります。
 
-`araya task` と `araya runner` は Linux と systemd（254 以降）の user manager が必要です。Linux 以外では何もせずに `unsupported_platform` で終わります。各コマンドは JSON 1件を stdout に出します。失敗したときは理由を stderr に出し、終了 code 1 で終わります。
+`araya task` と `araya runner` は Linux と systemd（254 以降）の user manager が必要です。Linux 以外では何もせずに `unsupported_platform` で終わります。各コマンドは JSON 1件を stdout に出します。失敗したときは理由を stderr に出し、終了 code 1 で終わります。ただし、Linux 以外（`unsupported_platform`）と、systemd の user manager に接続できないとき（`systemd_unavailable`）は、終了 code 69 で終わります。
 
 ### runner を入れる
+
+`npm run deploy` は、araya を入れた後に、入れた araya で `araya runner install` を実行します（「グローバルインストール」）。環境変数を変えたときは、`araya runner install` を実行します。checkout の araya で runner を動かすときは、checkout で `npm run araya -- runner install` を実行します。
 
 ```sh
 araya runner install
@@ -52,7 +54,7 @@ araya runner install
 - `~/.config/systemd/user/araya-runner-<hash>.service`（`XDG_CONFIG_HOME` が絶対 path ならその下）に unit file を書き、`systemctl --user daemon-reload`・`enable`・`restart` を実行します。`<hash>` は `<dataDir>` の実 path の SHA-256 の先頭12文字で、`<dataDir>` ごとに runner は1つです。
 - unit file の `Environment=` には、`araya runner install` を実行した環境の `PATH`・`LANG`・`LANGUAGE`・`TZ`・`LC_*`・`ARAYA_*`（`TOKEN`・`SECRET`・`PASSWORD`・`API_KEY`・`AUTH` などを名前に含む、秘密とみなす変数を除く）・`PI_CODING_AGENT_DIR` だけを書きます。`ARAYA_DATA_DIR` と `ARAYA_DEV_ROOT` は絶対 path にして書きます。ほかの変数（model の API key、proxy の設定など）は runner にも SHIKI にも渡りません。model の認証は Pi の `auth.json` から読みます。
 - `<dataDir>` などの path と環境変数の値に、空白・引用符・`\`・`$`・`%`・`;`・制御文字があると、unit file を書かずに `unsupported_path` で失敗します。
-- 環境変数を変えたときは、`araya runner install` をやり直してください。やり直すまで、unit file の `Environment=` は前の値のままで、runner は前の環境で動きます。`npm run deploy` で araya を入れ直したときも、`araya runner install` をやり直して、runner を新しいコードで起動し直してください。動いている runner は、起動したときに読み込んだコードで動き続けます。一方、`npm run deploy` は install 先の file を置き換えるので、やり直していなくても、runner が次に起動したとき（落ちて systemd が起動し直したとき、logout や再起動の後、`systemctl --user start` のとき）からは新しいコードで動きます。
+- 環境変数を変えたときは、`araya runner install` をやり直してください。やり直すまで、unit file の `Environment=` は前の値のままで、runner は前の環境で動きます。動いている runner は、起動したときに読み込んだコードで動き続けます。`npm run deploy` は、deploy を実行した環境の `ARAYA_DATA_DIR`（無ければ `~/.araya`）の runner を新しいコードで起動し直します。その runner については、deploy の後に `araya runner install` を実行する必要はありません。deploy が runner を入れなかったときと、ほかの `ARAYA_DATA_DIR` の runner については、「グローバルインストール」を見てください。
 - `ARAYA_DATA_DIR` を変えて `araya runner install` を実行すると、`<hash>` が変わるので別の unit（別の runner）ができ、前の runner は動き続けます。前の runner を残さないときは、先に前の `ARAYA_DATA_DIR` で `araya runner uninstall` を実行してください。
 - araya は linger を変えません。linger が無効だと、logout で runner が止まり（一時停止）、次に user manager が起動したときに続きから進みます。logout の後も動かすには、利用者が `loginctl enable-linger` を実行してください。`araya runner install` の出力の `linger` が `false` なら、stderr に注意を出します。
 - runner を止める（`systemctl --user stop araya-runner-<hash>.service`）のは一時停止です。動いていた試行は中止されず、次に起動（`systemctl --user start …`）したときに続きから進みます。runner が落ちたときは、systemd が間隔を空けて起動し直します。
@@ -213,6 +215,15 @@ araya runner uninstall
 ## グローバルインストール
 
 ルートで `npm run deploy` を実行すると、`araya`（version `0.0.1`）をbuildし、一時tarballからユーザーglobal prefix（既定: `$HOME/.local`）へinstallします。checkoutへのsymlinkではないため、以後のソース変更は再deployまで反映されず、araya の checkout を移動・削除しても、install済みコマンドは影響を受けません。npm registryへのpublishは行いません。指定prefix内に旧 `agentctl` package があれば先にuninstallし、`araya` のbin競合を解消してから置き換えます。
+
+続けて、入れた araya（`<prefix>/bin/araya`）で `araya runner install` を実行し、runner を新しいコードで起動し直します（「runner を入れる」）。初めての deploy では runner を入れ、止めてあった runner も起動します。動いていた試行は一時停止の扱いになり、新しいコードで続きから進みます（新しいコードで試行の進め方が変わったときは、`attempt_error` で失敗することがあります）。
+
+- 対象の runner は、`npm run deploy` を実行した環境の `ARAYA_DATA_DIR`（無ければ `~/.araya`）のものです。unit file の `Environment=` も、その環境の値で書き直します。`PATH` は、`npm run` が先頭に足した entry（checkout などの `node_modules/.bin` と、npm の `node-gyp-bin`）を除いた値にします。`~/.araya` 以外の `ARAYA_DATA_DIR` の runner を使っているときは、deploy を実行する環境の `ARAYA_DATA_DIR` にその値を設定してください。設定しないと、`~/.araya` の runner を入れます（使っている runner は、次に起動するまで前のコードのまま動き続けます）。
+- `ARAYA_INSTALL_PREFIX` で別の prefix に入れたときも、runner はその prefix に入れた araya で動きます。
+- runner を止めたままにするときは、deploy の後に `systemctl --user stop araya-runner-<hash>.service` を実行してください。
+- deploy は、runner が起動したことまでは確かめません。出力の `runner.state` が `running` でなければ、`<dataDir>/logs/runner.log` を確認してください。
+- Linux 以外の環境と、systemd の user manager に接続できない環境（`systemctl` が無い環境を含む）では、`araya runner install` が終了 code 69 で終わります。このとき deploy は、runner を入れずに注意を出し、成功で終わります。user manager に接続できない session（`su` で切り替えた session など）から deploy すると、動いている runner は、次に起動するまで前のコードのまま動き続けます。
+- それ以外の理由で `araya runner install` が失敗したときは（`PATH` に unit file に書けない文字がある、など）、deploy は araya を入れたまま、終了 code 1 で終わります。理由を直してから `araya runner install` を実行してください。
 
 ```sh
 npm run deploy

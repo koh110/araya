@@ -8,7 +8,7 @@ import { Readable } from 'node:stream'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 
-import { runCli } from '../src/cli.ts'
+import { exitCodeOf, runCli, UNSUPPORTED_ENVIRONMENT_EXIT_CODE } from '../src/cli.ts'
 import type { TaskCommandDependencies } from '../src/task-commands.ts'
 import { openTaskLedger, type AttemptResult, type AttemptSettings, type TaskLedger } from '../src/task-ledger.ts'
 
@@ -335,6 +335,38 @@ test('task: 設定ファイルが不正なら台帳を開かずに失敗する',
 
     await assert.rejects(runTask(taskEnv, ['list']), /invalid Araya config file/u)
     assert.deepEqual(await fs.readdir(taskEnv.dataDir), ['config.json'])
+  } finally {
+    await fs.rm(taskEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('CLI: この環境では使えない誤り（unsupported_platform・systemd_unavailable）は終了 code 69、ほかの誤りは終了 code 1 で終わる', async () => {
+  const taskEnv = await makeTaskEnv()
+
+  try {
+    assert.equal(UNSUPPORTED_ENVIRONMENT_EXIT_CODE, 69)
+    // Linux 以外で runCli が投げる誤り
+    const unsupported = await runCli(['runner', 'install'], startPiMustNotRun, taskEnv.env, { platform: 'darwin' }).then(() => null, (error: unknown) => error)
+    assert.equal(exitCodeOf(unsupported), 69)
+    // ほかの code の誤りと、code の無い誤りは 1（message が code の形でも、code が無ければ 1）
+    assert.equal(exitCodeOf(Object.assign(new Error('unsupported_path: test'), { code: 'unsupported_path' })), 1)
+    assert.equal(exitCodeOf(new Error('systemd_unavailable: test')), 1)
+    assert.equal(exitCodeOf('systemd_unavailable'), 1)
+
+    // process の終了 code。PATH に systemd-run・systemctl・bash が無ければ systemd_unavailable で 69
+    const emptyDir = path.join(taskEnv.root, 'empty-bin')
+    await fs.mkdir(emptyDir)
+    const unavailable = await spawnCli(['runner', 'install'], { ...taskEnv.env, PATH: emptyDir })
+    assert.deepEqual(unavailable.exit, { code: 69, signal: null })
+    assert.equal(unavailable.stdout, '')
+    assert.equal(unavailable.stderr, 'systemd_unavailable: PATH に systemd-run・systemctl・bash がありません\n')
+
+    // 設定ファイルの誤りは 1
+    await fs.mkdir(taskEnv.dataDir, { recursive: true })
+    await fs.writeFile(path.join(taskEnv.dataDir, 'config.json'), '{"unknown": true}', 'utf8')
+    const invalidConfig = await spawnCli(['runner', 'install'], { ...taskEnv.env, PATH: emptyDir })
+    assert.deepEqual(invalidConfig.exit, { code: 1, signal: null })
+    assert.match(invalidConfig.stderr, /^invalid Araya config file /u)
   } finally {
     await fs.rm(taskEnv.root, { recursive: true, force: true })
   }
