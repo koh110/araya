@@ -95,7 +95,7 @@ UTF-8 の JSON 1件を file で渡す（`--file <path>`。stdin から読むと�
 - `node:sqlite` の `DatabaseSync` を使う（既存の control plane と同じ。依存は増やさない）。
 - 接続ごとに `busy_timeout = 5000`、`journal_mode = WAL`、`foreign_keys = ON` をこの順に設定する（`busy_timeout` を先にして、ほかの process が書き込んでいる間に WAL への切り替えが `SQLITE_BUSY` で失敗しないようにする）。
 - 書き込みはすべて `BEGIN IMMEDIATE` の transaction で行う。transaction の中では、signal の送信、待機、process の起動（`systemctl` と `systemd-run` を含む）、pi-durable の呼び出しをしない。
-- `PRAGMA user_version` で schema の version を持つ。開いたときに、`BEGIN IMMEDIATE` の中で `user_version` と table の有無を確かめ、`user_version` が 0 で table が1つもなければ、同じ transaction で version 1 の schema を作って 1 にする。1 ならそのまま使う。それ以外（未知の version、または 0 なのに table がある）は、何も変更せずに失敗する。複数の process が同時に初めて開いても、schema を作るのは1つだけになる。
+- `PRAGMA user_version` で schema の version を持つ。開いたときに、`BEGIN IMMEDIATE` の中で `user_version` と table の有無を確かめ、`user_version` が 0 で table が1つもなければ、同じ transaction で version 1 の schema を作って 1 にする。1 ならそのまま使う。それ以外（未知の version、または 0 なのに table がある）は、何も変更せずに失敗する（schema、`user_version`、行を変えない。journal mode は、上の接続の設定で、確かめる前に WAL になる）。複数の process が同時に初めて開いても、schema を作るのは1つだけになる。
 - `<dataDir>` と `<dataDir>/logs` が無ければ mode 0700 で作る。
 - 台帳の file が無ければ、開く前に mode 0600 の空の file として作る（SQLite は WAL と共有メモリの file を、台帳の file と同じ mode で作る）。既にある file の mode は変えない。
 
@@ -400,7 +400,7 @@ pi-durable は、storage の誤り（`commit()` の失敗など）が起きる�
   - `TimeoutStopSec=10s` は、scope を止めるときに SIGTERM で止まらない process を 10 秒後に SIGKILL で止めるため。scope の既定は 90 秒で、下の「scope を止めるとき」の打ち切り（30 秒）を超える（「技術調査結果」）。
 - 検証のコマンド: 既存と同じ `runBoundedCommand`（timeout、出力の上限、process group の停止）で、`<systemd-run> --user --scope --quiet --collect --expand-environment=no --unit=araya-<h>-<taskKey>-verify-<n>.scope -p KillMode=control-group -p TimeoutStopSec=10s -- <登録された command の各要素>` を実行する。`<n>` は登録の順番（0 から）。phase の signal が中止されたら（Harness を閉じたとき、試行を中止したとき）、timeout と同じ手順でコマンドを止める。コマンドが終わったら、その scope を止める。止められなければ、その検証の `terminationConfirmed` を `false`（`reason` は `termination_unconfirmed`）にする。
 - git: `araya_create_worktree` と差分の収集は、git を `<systemd-run> --user --scope --quiet --collect --expand-environment=no --unit=araya-<h>-<taskKey>-git-<r>.scope -p KillMode=control-group -p TimeoutStopSec=10s -- <git> <引数>` で起動する。`<r>` は `a-z2-7` の 12 文字で、暗号学的乱数で選ぶ。git の path（既存と同じく、決まった候補から選んだ絶対 path）、引数、環境変数、timeout、出力の上限は既存と同じ（`araya_create_worktree` の git は hook を無効にせず、差分の収集の git は `core.hooksPath=/dev/null` を付ける）。git が終わって scope に process が残っていなければ、systemd が scope を消す（`--collect`）。hook などが process を残すと scope が残り、次にその試行の scope を止めるときに止まる。
-- scope を止めるときは、`systemctl --user stop '<pattern>'` を実行してから、`systemctl --user list-units --all --plain --no-legend '<pattern>'` で残っていないことを確かめる（それぞれ 30 秒で打ち切る）。どちらかが失敗するか、残っていれば、止められなかったとする。
+- scope を止めるときは、`systemctl --user stop '<pattern>'` を実行してから、`systemctl --user list-units --all --plain --no-legend '<pattern>'` で残っていないことを確かめる（それぞれ 30 秒で打ち切る）。どちらかが失敗するか、残っていれば、止められなかったとする。ただし、`stop` の失敗のうち、unit が読み込まれていないための失敗は除く。`<pattern>` が1つの scope の名前（検証のコマンドの scope）で、その scope が既に消えていると、`stop` はこの失敗になる（glob なら、当たる unit が無くても成功する。「技術調査結果」）。
 - 止める時期:
   - 試行の task の `evidence` の phase の始めと、`abort` の始め: その試行の scope（`araya-<h>-<taskKey>-*.scope`）。SHIKI の bash と `araya_create_worktree` の git が切り離した process が、差分の収集と検証の間に worktree を変えないようにするため。
   - 試行の結果を台帳に記録する前（「結果の判定と記録」）: その試行の scope。止められなければ結果を記録せず、枠も空かない。
@@ -418,7 +418,7 @@ phase は次のとおり。
 - `start`:
   1. 状態 directory `<dataDir>/development/<taskKey>/` を用意する。`attempt.json` は、同じ directory の一時 file に書いてから rename する。
      - 無ければ mode 0700 で作り、`attempt.json`（`{"taskKey": ..., "dataDir": ...}`）を書き、`BEGIN IMMEDIATE` の中で `runs.state_dir` に path を記録する。
-     - あれば、`attempt.json` が自分の taskKey と dataDir を持つことを確かめ、`runs.state_dir` が空なら記録する。`attempt.json` が無く directory が空なら（作った直後に落ちた）、`attempt.json` を書いて続ける。それ以外で `attempt.json` が無いか、読めないか、違えば、`failed`（`task_state_already_exists`。worktree だけの evidence）で終わる。
+     - あれば、`attempt.json` が自分の taskKey と dataDir を持つことを確かめ、`runs.state_dir` が空なら記録する。`attempt.json` が無く directory が空なら（作った直後に落ちた）、`attempt.json` を書いて続ける。それ以外で `attempt.json` が無いか、読めないか、違えば、`failed`（`task_state_already_exists`。worktree だけの evidence。ただし、その directory はこの試行のものと確かめられないので、状態 directory の path は `null`、worktree は空にする）で終わる。
   2. `settings_json.devRoot` が directory でなければ `failed`（`dev_root_missing`）、課題の本文が 80,000 文字を超えれば `failed`（`invalid_task`）で終わる。どちらも差分の収集と検証は行わない。
   3. model を決める（「SHIKI」の model）。決まらなければ、SHIKI の終わりを記録して（`agent` の手順 2 と同じ）、agent の失敗（`model_unavailable`）として `evidence` へ進む。
   4. 1つの commit の中で、試行の task が持つ会話（`ownership: task`）を作り、`configure` で model と thinking level、SHIKI の extension、tool、instructions、cwd（`settings_json.devRoot`）を設定し、session の document に会話の id と taskKey の対応を書き、会話の id を checkpoint に入れて `agent` へ進む（phase が途中で落ちてやり直しても、会話が2つできないようにするため）。
@@ -466,9 +466,10 @@ phase は次のとおり。
 ### model
 
 - `settings_json.model` があれば、その provider・id・thinking level を使う。
-- `null` なら、Pi の設定（`SettingsManager`。既存の SHIKI と同じく `agentDir` と状態 directory で作る）の既定の provider と model（`getDefaultProvider`・`getDefaultModel`）と thinking level（`getDefaultThinkingLevel`）を使う。
+- `null` なら、Pi の設定（`SettingsManager`。既存の SHIKI と同じく `agentDir` と状態 directory で作る）の既定の provider と model（`getDefaultProvider`・`getDefaultModel`）を使う。
+- thinking level は、`settings_json.model.thinkingLevel`（あれば）、Pi の設定の model ごとの値（`getModelThinkingLevel`）、Pi の設定の既定（`getDefaultThinkingLevel`）、`medium` の順で決め、model の対応範囲に丸める（pi-ai の `clampThinkingLevel`）。既存の SHIKI（Pi の SDK の session）と同じ決め方にするため（[開発 model の設定](development-model-config.md)）。pi-durable の既定（`off`）は使わない。
 - model が決まらないとき（`null` で Pi の既定も無い、`ModelRuntime` に無い、認証が無い）は `model_unavailable`。message は既存の SHIKI と同じ（「configured model … is not in the Pi model list」「… has no Pi authentication」など）。
-- 使った model は、evidence の `agent.model` と `runs.model_json` に、`source`（`araya-config` か `pi-settings`）付きで残す（既存と同じ）。
+- 使った model は、`runs.model_json` と、SHIKI の終わりが決まった試行の evidence の `agent.model`（「結果の判定と記録」）に、`source`（`araya-config` か `pi-settings`）付きで残す（既存と同じ）。`evidence` の phase の前に中止された試行（worktree だけの evidence）では、`runs.model_json` にだけ残る。runner が試行の task の結果を得られずに `attempt_error` にした試行（「結果の判定と記録」の手順 1）では、どちらにも残らない（`null`）。
 - 認証は Pi の `auth.json`（runner の `ModelRuntime`）から読む。環境変数の API key は runner に渡らない（「unit の名前と file」「既知の制限」）。
 
 ### tool
@@ -549,15 +550,15 @@ phase は次のとおり。
 - 試行の task は、outcome を記録する commit の前に `evidence.json` を書く（「秘密情報の扱い」）。
 - 試行の task が終わったら（`waitForTask` が返したら）、runner が次を行う。runner が止めている最中か、Harness が閉じ始めた後に `waitForTask` が返ったとき（`SessionFailed` で失敗したときを含む）は、何もしない（次の起動で待ち直す。「Harness が失敗で閉じたとき」）。
   1. outcome の result から試行の結果を取る。outcome が `completed` か `aborted` で result に試行の結果があるもの以外（`failed`・`orphaned`・`faulted`、result が無い、`waitForTask` が例外で終わった）は、`failed`（`attempt_error`。`failure_detail` に outcome の status と error の message（秘密を置き換えた先頭 2,000 文字））にする（worktree だけの evidence）。
-  2. その試行の scope を止める（「試行の scope」）。止められなければ、結果を記録せずに次の loop でやり直す。その間、枠は空かない。
+  2. その試行の scope を止める（「試行の scope」）。止められなければ、結果を記録せずに次の loop でやり直す。その間、枠は空かない。止め終えた後（手順 3 の transaction を始める前）に、runner が止めている最中か、Harness が閉じ始めていれば、結果を記録せずに次の起動に持ち越す（試行は `running` のままで、稼働時間は「止めるとき」の 4 か「Harness が失敗で閉じたとき」の 4 で精算する）。
   3. `BEGIN IMMEDIATE` の中で、試行がまだ `running` のときだけ、試行の稼働時間を精算し（「期限」）、`runs` の `status`・`finished_at`・`summary`（4,000 文字まで）・`model_json`・`decision_question`・`failure_reason`・`failure_detail`・`evidence_json` と、`tasks` の `status`・`updated_at` を更新し、`run.finished` event を追加する。同じ transaction で `cancel_requested_at` を読み、書かれていれば、次の「利用者の中止を優先する」に従う。
 - 利用者の中止を優先する: 手順 3 の transaction で、試行の `cancel_requested_at` が書かれていて、手順 1 の結果が `failed`（`cancelled`）でなければ、試行の task の結果にかかわらず（試行の task が中止の前に終わっていた場合や、ほかの理由で中止されていた場合を含む）、`failed`（`cancelled`）として記録する。
   - `failure_detail` は空にする。summary、model、質問、evidence（差分と検証の結果、`bodiesStored`、`bodiesSha256`）は、試行の task の結果のまま残す。
   - 台帳の evidence の `outcome` と `failureReason` を `failed` と `cancelled` にし、試行の task の結果を `resultBeforeCancel`（`{"status": ..., "failureReason": ..., "failureDetail": ...}`）として足す（`evidence.json` には入らない）。
   - CLI の中止（「中止」）と手順 3 は、どちらも `BEGIN IMMEDIATE` の中で試行が `running` かを確かめるので、順番が1つに決まる。中止が先なら結果は `failed`（`cancelled`）になり、記録が先なら CLI は `task_not_cancellable` を返す。`araya task cancel` が `requested` か `already_requested` を返した試行は、必ず `failed`（`cancelled`）で終わる。
   - pi-durable は、終わった試行の task への `abortTask` では何もしない（`terminal` を返し、`abort` は動かない。「技術調査結果」）。このため、中止の求めは、`abortTask` の結果ではなく、この transaction で確かめる。
-- evidence は既存の形（`taskKey`、`devRoot`、`outcome`、`agent`、`worktrees`（worktree ごとの差分と検証）、`failureReason` など）に、次を足したもの。台帳には、ここから本文を除いたものを入れる（「秘密情報の扱い」）。
-  - `agent`: 既存の形。失敗のときは、既存の `workerErrorName`・`workerErrorMessage` の代わりに、`error`（`model_unavailable`、submission の `reason` など）と `errorMessage`（model が決まらないときはその message、submission のときは `detail`（文字列でなければ JSON にしたもの）。秘密を置き換えた先頭 2,000 文字）を入れる。
+- evidence は既存の形（`taskKey`、`devRoot`、`outcome`、`summary`、`worktrees`（worktree ごとの差分と検証）、`failureReason` など）を、次のように変えたもの。台帳には、ここから本文を除いたものを入れる（「秘密情報の扱い」）。
+  - `agent`: SHIKI の終わり方（SHIKI の終わりが決まった試行だけ）。既存の evidence が top level に持つ `model`・`agentError`・`workerErrorName`・`workerErrorMessage` は、この object にまとめ、top level には置かない。`model` は使った model（決まらなかったときは無い）。失敗のときは、`error`（既存の `agentError` に当たるもの。`agent_timeout`、`model_unavailable`、submission の `reason` など）と `errorMessage`（model が決まらないときはその message、submission のときは `detail`（文字列でなければ JSON にしたもの）。秘密を置き換えた先頭 2,000 文字。無ければ省く）を入れる。
   - `timeoutMs` と `tools`（SHIKI に渡した tool の名前）: 実行環境を明示するため
   - `decisionQuestion`
   - `redactions`、`bodiesStored`、`bodiesSha256`（「秘密情報の扱い」）
@@ -573,6 +574,9 @@ Issue #1 の「Secrets を通常ログや Task 台帳に複製しない」のた
 - 台帳、`evidence.json`、log に文字列を書く前に、次を `[REDACTED]` に置き換える。
   - 秘密とみなす環境変数の値。runner と CLI が、起動時に自分の環境変数から集める。名前を大文字にしたときに `TOKEN`・`SECRET`・`PASSWORD`・`PASSWD`・`API_KEY`・`APIKEY`・`PRIVATE_KEY`・`CREDENTIAL`・`AUTH` のどれかを含み、値が 8 文字以上のもの（`SSH_AUTH_SOCK` は socket の path なので除く）。長い値から順に置き換える。
   - URL の userinfo（`<scheme>://<userinfo>@` の `<userinfo>`）。git の誤りの message などに、remote の URL に埋め込まれた token が含まれることがあるため。
+- 元の文字列の先頭か末尾だけを持つ文字列（上限で切って読んだ差分と検証の出力など）は、上の置き換えの前に、切った境界に接する部分も置き換える。秘密の値や URL の userinfo の一部が、境界をまたいで残らないようにするため。
+  - 末尾を切った文字列: 末尾が秘密の値の先頭の部分と一致すれば、その部分を置き換える。末尾が `<scheme>://` の後に空白・`/`・`@` の無い文字列で終わっていれば、`://` より後を置き換える。
+  - 先頭を切った文字列: 先頭が秘密の値の末尾の部分と一致すれば、その部分を置き換える。先頭から最初の `@` までに空白と `/` が無ければ、その `@` より前を置き換える。
 - 置き換える対象は、`runs` の `summary`・`decision_question`・`failure_detail`・`stop_detail`、evidence の中のすべての文字列（JSON にする前に置き換える）、`task_events.data_json` の中のすべての文字列、log のメッセージ、CLI が stderr に出す `systemctl` の誤り。置き換えた回数の合計を evidence の `redactions` に残す（値は残さない）。
 - 利用者が書いた Task の入力（`title`、`goal`、`constraints`、`targets`、`permissions`）と `note` は置き換えない。
 - runner の unit file に書く環境変数は「unit の名前と file」の一覧だけにする。systemd は値を unit の定義として持ち、`systemctl --user show` で表示する（「技術調査結果」）。unit file の mode は 0600 にする。
@@ -628,11 +632,11 @@ command:
   4. `systemctl --user daemon-reload` を実行し、`systemctl --user show --property=FragmentPath --value <unit>` が書いた file の path と同じことを確かめる。違えば `unit_not_loaded` で失敗する（user manager が別の directory を見ている）。
   5. `systemctl --user enable <unit>` と `systemctl --user restart <unit>` を実行する。restart は、動いている runner を一時停止してから、新しい unit file と、入れ直した araya のコードで起動し直す。
   6. 台帳の `runner` の行が新しい invocation の `running` になるのを 10 秒まで待つ（待てなければ、そのときの値を出す）。
-  7. `linger` を、`loginctl show-user <uid> --property=Linger --value` が `yes` なら `true`、`no` なら `false`、取れなければ `null` にする。`false` なら、stderr に「logout すると runner が止まります。loginctl enable-linger で有効にできます」と出す。araya は linger を変えない。
-  - `systemctl` と `loginctl` は、それぞれ 30 秒（restart は 90 秒）で打ち切る。失敗したら、その stderr の先頭 500 文字（秘密を置き換えたもの）を stderr に出して、終了 code 1 で終わる。
+  7. `linger` を、`loginctl show-user <uid> --property=Linger --value` が `yes` なら `true`、`no` なら `false`、取れなければ（`loginctl` が失敗したときを含む）`null` にする。`false` なら、stderr に「logout すると runner が止まります。logout の後も動かすには、loginctl enable-linger で linger を有効にしてください」と出す。araya は linger を変えない。
+  - `systemctl` と `loginctl` は、それぞれ 30 秒（restart は 90 秒）で打ち切る。`systemctl` が失敗したら、その stderr の先頭 500 文字（秘密を置き換えたもの）を stderr に出して、終了 code 1 で終わる（`loginctl` の失敗は、上の 7 のとおり `null` にして続ける）。
   - 出力: `{"unit": "...", "unitPath": "...", "linger": true | false | null, "runner": RunnerView}`
 - `araya runner uninstall`
-  - `systemctl --user disable --now <unit>`（90 秒で打ち切る。unit が無いための失敗は無視する）、unit file の削除、`systemctl --user daemon-reload` を行う。台帳は変えない。動いていた試行は `running` のまま残り、runner を入れ直すと続きから進む。
+  - `systemctl --user disable --now <unit>`（90 秒で打ち切る）、unit file の削除、`systemctl --user daemon-reload` を行う。`disable --now` の失敗のうち、unit が無いための失敗だけを無視する。そのときは、unit file が無くても unit が読み込まれたまま動いていることがある（unit file を消した後など）ので、続けて `systemctl --user stop <unit>`（90 秒で打ち切る）を行い、unit が読み込まれていないための失敗だけを無視する。それ以外の失敗は、`install` と同じく扱う（終了 code 1）。台帳は変えない。動いていた試行は `running` のまま残り、runner を入れ直すと続きから進む。
   - 出力: `{"unit": "...", "removed": boolean}`（`removed` は unit file を消したかどうか）
 
 出力の形:
@@ -763,7 +767,7 @@ test は実際の Pi auth や model API を使わない。model は pi-ai の fa
 - [ ] SHIKI が、runner が動いている時間で `timeoutMs` を過ぎても終わらないと、試行は `failed`（`agent_timeout`）になり、差分が集められ、登録された検証は `not_run` になる。実行中だった bash の process group は止まる。runner を `timeoutMs` より長く止めてから起動し直しても、それだけでは期限で中止されない。`active_ms` が `timeoutMs` 以上の試行がある状態で runner を起動すると、`resume()` の前に中止を始め、その試行の model は呼ばれない。
 - [ ] SHIKI の終わりの記録と期限による中止が重なったとき（test で順番を固定する）、先に台帳に書かれた方だけが効く。SHIKI の終わりが先なら検証まで進み、期限が先なら `agent_timeout` になる。どちらでも `run.finished` は1件。
 - [ ] 試行の稼働時間は、その試行を取り込んだ時点から数える（時計を差し替えた test）。heartbeat の 8 秒後に `timeoutMs` 5,000 の試行を取り込んでも、取り込んでから 5 秒たつまでは期限で中止されない。heartbeat の間に終わった試行の `activeMs` は、取り込みから記録までの時間になる。heartbeat の間隔（10 秒）より短い間隔で runner の一時停止と起動をくり返しても、稼働時間は足され続け、`timeoutMs` に達すると `agent_timeout` で中止される。
-- [ ] 試行の task が pi-durable の `restartLimit` で止められると（test では `restartLimit` を小さくする）、試行は `blocked`（`restart_limit`）になり、待っていた次の試行が取り込まれる。試行の task が想定外の outcome（phase が例外を投げた `failed` など）で終わったときは `failed`（`attempt_error`）になり、`failure_detail` に outcome の status が入る。
+- [ ] 試行の task が pi-durable の `restartLimit` で止められると（test では `restartLimit` を小さくする）、試行は `blocked`（`restart_limit`）になり、待っていた次の試行が取り込まれる。試行の task が想定外の outcome（phase が例外を投げた `faulted` など。pi-durable 1.4.0 では、phase の例外は `faulted` になる）で終わったときは `failed`（`attempt_error`）になり、`failure_detail` に outcome の status が入る。
 - [ ] pi-durable の storage の commit を1回だけ失敗させると（storage を包んだ test。試行の task の phase の commit と、取り込みの後の `createTask` の commit のそれぞれ）、runner は取り込みと結果の記録をやめ、scope を止めて、終了 code 1 で終わる。試行は `running` のままで、`attempt_error` にならない。同じ dataDir で起動し直すと、試行の task が続きから進み（`createTask` が失敗したときは、試行の task が1つだけ作られ）、試行は終わる。
 - [ ] `araya task cancel` は、`queued` の試行をその場で `failed`（`cancelled`）にし、その試行は取り込まれない。`running` の試行には中止を求め、runner は次の loop で中止を始め、試行は `failed`（`cancelled`）になる。実行中だった bash は止まり、差分の収集と検証は行われない。`completed`・`failed`・`blocked` の Task は `task_not_cancellable` で拒否する。
 - [ ] 試行の task が outcome を commit した後、台帳に結果を記録する前に `araya task cancel` を実行すると（test で順番を固定する）、CLI は `requested` を返し、runner の `abortTask` は `terminal` を返し、試行は `failed`（`cancelled`）になる。evidence には試行の task が集めた差分と検証の結果が残り、`resultBeforeCancel` に試行の task の結果が入る。runner の loop が中止の求めを確かめた後、結果を記録する前に中止を求めた場合も（test で順番を固定する）、`failed`（`cancelled`）になる。結果を記録した後の `araya task cancel` は `task_not_cancellable` で拒否される。どの場合も `run.finished` は1件。
@@ -872,6 +876,7 @@ pi-durable と Pi は 1.4.0、Node.js は v26.12.1、systemd は 259。model は
 - `-E`・`--setenv` で渡した環境変数の値は、transient unit の定義（`/run/user/<uid>/systemd/transient/<unit>.service`、mode 0644。`/run/user/<uid>` は 0700）と、`systemctl --user show -p Environment` と、process の `/proc/<pid>/environ` に出た。
 - `systemd-run` の command の引数では、`$$` が `$` になり、`${HOME}` は語の中でも展開された。`--expand-environment=no` を付けると、scope の中の bash に `$` を含む command がそのまま渡った。
 - scope の `TimeoutStopSec` の既定は 90 秒（`1min 30s`）だった。`-p TimeoutStopSec=3s` を付けた scope に、SIGTERM を無視する process と、`setsid` して SIGTERM を無視する子 process を置いて `systemctl --user stop` すると、約 3.3 秒で両方が止まり、unit は残らなかった。
+- 当たる unit の無い glob の `systemctl --user stop '<glob>'` は、終了 code 0 だった。読み込まれていない unit を名前で `systemctl --user stop` すると、終了 code 5 で「Unit … not loaded.」になった。無い unit の `systemctl --user disable --now` は、終了 code 1 で「Unit … does not exist」になった。
 - service の環境には、user manager の環境（`HOME`、`XDG_RUNTIME_DIR`、デスクトップのセッションの変数など）と、service ごとの `INVOCATION_ID` があった。
 - man page（systemd 259）: `systemd-run` の `--expand-environment` と、`RestartSteps=`・`RestartMaxDelaySec=` は version 254 で入った。`StartLimitIntervalSec=0` は起動の回数の制限を無くす。unit file では `%` の specifier が展開される。
 
