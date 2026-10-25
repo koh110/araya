@@ -112,6 +112,19 @@ function assertLongText(actual: unknown, expected: string, message: string) {
   assert.equal(text.length, expected.length, message)
 }
 
+// file の内容。file が無ければ空文字列
+async function readTextIfExists(file: string) {
+  try {
+    return await fs.readFile(file, 'utf8')
+  } catch (error) {
+    if (isRecord(error) && error.code === 'ENOENT') {
+      return ''
+    }
+
+    throw error
+  }
+}
+
 // worktree を作り、bash で編集し、検証を登録して、報告で終わる SHIKI
 function completingScript(options: { command?: readonly string[]; report?: string; bash?: (worktreePath: string) => string } = {}) {
   return (view: FauxView) => {
@@ -931,8 +944,10 @@ test('attempt: 中止された試行は台帳の stop_reason で結果を決め�
     for (const item of cases) {
       const started = await attempt.startAttempt(taskInput({ title: item.reason }), defaultSettings(fixture, models.model))
       const pattern = `araya-${fixture.hash}-${started.taskKey}-*.scope`
+      // bash が README.md に追記し（その後は sleep で動き続ける）、印の付いた process もある状態になるまで待ってから、試行を止める。
+      // 印は worktree を作る git にも付くので、印だけを待つと追記の前に止めることがある。そうなると、止める理由が agent_timeout の case で差分が空になる
       await waitUntil(async () => {
-        return (await findMarkedProcesses(pattern)).length > 0
+        return (await readTextIfExists(path.join(repo, '.worktree', `araya-${started.taskKey}`, 'README.md'))).includes('changed') && (await findMarkedProcesses(pattern)).length > 0
       }, `bash of ${item.reason}`)
       assert.equal(attempt.ledger.beginStop(started.taskKey, item.reason, item.detail), true)
       assert.equal(await attempt.harness.abortTask(started.taskId, ctx), 'marked')
