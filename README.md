@@ -4,7 +4,7 @@
 
 ## 必要環境
 
-- Node.js 24 以上
+- Node.js 26.8 以上
 - Pi coding-agent SDK 1.4.0 は依存関係として含まれます。引数なしの `araya` または `araya pi` に、グローバルな `pi` コマンドは不要です。
 
 ```sh
