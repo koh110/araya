@@ -69,8 +69,8 @@ function printHelp() {
     待ちの試行をその場で中止するか、動いている試行の中止を求める。
 
   araya runner install
-    runner（Task を動かす systemd の user service。araya-runner-<hash>.service）の unit file を書き、
-    有効にして起動し直す。linger は変えない（無効なら logout で runner が止まり、次に起動したときに続きから進む）。
+    runner（台帳の Task を取り込んで SHIKI を動かす常駐の process）を、systemd の user service（araya-runner-<hash>.service）として入れる。
+    unit file を書き、有効にして起動し直す。linger は変えない（無効なら logout で runner が止まり、次に起動したときに続きから進む）。
     unit file に書く環境変数は PATH・LANG・LANGUAGE・TZ・LC_*・ARAYA_*（秘密とみなす名前を除く）・PI_CODING_AGENT_DIR だけ。
     環境変数を変えたときは、やり直す（npm run deploy は、araya を入れた後にこれを実行する）。ARAYA_DATA_DIR を変えると別の runner になる
     （前の runner を残さないときは、先に前の ARAYA_DATA_DIR で araya runner uninstall を実行する）。

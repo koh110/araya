@@ -47,7 +47,7 @@ PR #7 で決めた方針:
 - **Task**: 利用者が依頼した仕事。目的・制約・作業対象の手がかり・許可を持つ。ID は台帳の中で増える整数。
 - **試行**: Task を SHIKI で1回実行すること。Task を作ると1回目の試行ができ、再実行のたびに次の試行ができる。Task ID と試行番号の組で識別する。
 - **taskKey**: 試行ごとの名前。Issue #1 の「実行ID」にあたる。状態 directory、worktree、branch、試行の scope の名前に使う。
-- **runner**: Task を動かす常駐の process。systemd の user service（「unit の名前と file」）として動き、pi-durable の storage を1つ持つ。
+- **runner**: 台帳の Task を取り込み、試行ごとに SHIKI を動かす常駐の process。SHIKI が終わった後の差分の収集、検証、結果の判定と記録も行う（「結果の判定と記録」）。systemd の user service（「unit の名前と file」）として動き、pi-durable の storage を1つ持つ。
 - **SHIKI**: runner の中の、試行ごとの pi-durable の会話（model と tool）。
 - **試行の task**: runner が試行ごとに pi-durable の Harness に作る task（`defineTask`）。SHIKI の会話、差分の収集と検証、中止を、phase に分けて持つ（「試行の task」）。
 - **試行の scope**: 新しい経路が試行のために起動する subprocess（SHIKI の bash、git、検証のコマンド）を入れる systemd の scope（「試行の scope」）。
@@ -850,6 +850,7 @@ test は実際の Pi auth や model API を使わない。model は pi-ai の fa
 - `npm run deploy` で runner を入れ直し、止めてある runner も起動する（利用者の選択）。1つのコマンドで、deploy した環境の runner が入れたコードで動いている状態にし、初めての deploy の後の手順を無くすため。止めてあった runner を起動しても、Task が無い間は model を呼ばない。前の版では、deploy の後に `araya runner install` を実行するまで、runner が前のコードで動き続けた。
 - `unsupported_platform` と `systemd_unavailable` では deploy を失敗にしない。runner を使えない環境でも、araya のほかのコマンド（旧経路と Pi の CLI）は使えるため。それ以外の失敗（`unsupported_path` など）は、runner を使う環境で値を直せば入れられるので、deploy を失敗にして知らせる。
 - deploy は、`araya runner install` の終了 code 69 で、この環境では runner を使えないことを見分ける。stderr の文で見分けると、誤りのメッセージに入る利用者の値（設定ファイルの key など）によっては `<code>: ` で始まる行ができ、ほかの失敗を成功の扱いにしてしまうことがあるため。69 は、Node.js が自分の誤りに使う終了 code（14 以下、124、128 より大きい値）と重ならない。前の版の CLI の終了 code（誤りの種類によらず 1）との互換は考えない（araya はまだ運用していない）。
+- runner のコマンド（`araya runner`）と unit の名前は `runner` のままにし、`shiki` にしない（利用者の選択）。runner は SHIKI を動かす常駐の process で、SHIKI は試行ごとの会話であるため（「用語」）。`shiki` にすると、常駐する SHIKI が1体いるように読め、Issue #1 の「Task ごとに動く SHIKI」と食い違ううえ、作業する SHIKI と、結果を判定して記録する runner の分担もぼやける。README と `araya --help` には、runner が SHIKI を動かす常駐の process であることを書く。
 
 ## 技術調査結果
 

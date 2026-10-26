@@ -37,7 +37,9 @@ npm run araya -- status
 
 ## 開発の Task（`araya task` と runner）
 
-開発の課題は Task として台帳（`<dataDir>/tasks.sqlite`）に登録します。常駐する runner が2秒ごとに台帳を見て、待ちの Task を古い順に取り込み、SHIKI を [Pi Durable](https://www.npmjs.com/package/@earendil-works/pi-durable) の会話として動かします。SHIKI が終わると、Araya が worktree ごとの差分を集め、SHIKI が登録した検証コマンドを実行し、結果を台帳に記録します。1つの runner（`<dataDir>`）で同時に動く SHIKI は1件までで、ほかの Task は `queued` で待ちます。
+開発の課題は Task として台帳（`<dataDir>/tasks.sqlite`）に登録します。常駐する runner が2秒ごとに台帳を見て、待ちの Task を古い順に取り込み、SHIKI を [Pi Durable](https://www.npmjs.com/package/@earendil-works/pi-durable) の会話として動かします。SHIKI が終わると、Araya が worktree ごとの差分を集め、SHIKI が登録した検証コマンドを実行し、結果を判定して台帳に記録します。1つの runner（`<dataDir>`）で同時に動く SHIKI は1件までで、ほかの Task は `queued` で待ちます。
+
+runner は SHIKI そのものではなく、SHIKI を動かすために常駐する Araya の process です。SHIKI は、試行ごとに runner の中で新しく作られる会話です（試行は Task を1回実行することで、再実行のたびに新しい試行になります）。Task が無い間も runner は動き続けますが、SHIKI は動かず、runner も model を呼びません。前の段落で Araya が行うと書いた、差分の収集、検証の実行、結果の判定と記録は、SHIKI ではなく runner が行います。
 
 `araya task` と `araya runner` は、`npm run deploy` で入れた `araya` で実行します（「グローバルインストール」）。runner は、`araya runner install` を実行した araya のコードで動きます（unit file の `ExecStart` は Node.js を起動し、runner の entrypoint の絶対 path を引数に渡します。`npm run deploy` で入れた araya なら、entrypoint は install 先の `packages/araya/dist/bin/task-runner.js` です）。checkout で `npm run araya -- runner install` を実行すると、runner はその checkout の `packages/araya/bin/task-runner.ts` で動きます。その checkout の file を変えると runner の動作が変わり、checkout を移動・削除すると runner は起動できなくなります。
 

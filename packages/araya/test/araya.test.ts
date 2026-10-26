@@ -255,7 +255,7 @@ test('CLI: help に task と runner の command がある', async () => {
   assert.doesNotMatch(help, /実装中|worker/u)
 })
 
-test('CLI: help の --note と SHIKI の説明、ARAYA_DATA_DIR を変えたときの runner の説明', async () => {
+test('CLI: help の --note と SHIKI の説明、runner と SHIKI の関係、ARAYA_DATA_DIR を変えたときの runner の説明', async () => {
   const lines: string[] = []
   const originalLog = console.log
   console.log = (...values: unknown[]) => {
@@ -275,6 +275,8 @@ test('CLI: help の --note と SHIKI の説明、ARAYA_DATA_DIR を変えたと�
   assert.match(help, /--note は追加の指示。SHIKI が判断を求めて blocked になった Task では、\s*質問（decisionQuestion）への答えを書く/u)
   assert.match(help, /SHIKI（開発の agent）/u)
   assert.doesNotMatch(help, /開発 agent/u)
+  // runner は SHIKI そのものではなく、SHIKI を動かす常駐の process
+  assert.match(help, /runner（台帳の Task を取り込んで SHIKI を動かす常駐の process）を、systemd の user service（araya-runner-<hash>\.service）として入れる/u)
   // ARAYA_DATA_DIR を変えると unit の名前が変わり、前の runner が残る
   assert.match(help, /ARAYA_DATA_DIR を変えると別の runner になる/u)
 })
