@@ -9,6 +9,7 @@
 ## 利用者の決定
 
 - model の指定は環境変数ではなく設定ファイルで行う。
+- runner install（`npm run deploy` を含む）で config がまだ無く、Pi の `defaultProvider` と `defaultModel` が両方設定されていれば、初回だけ model を保存する。`thinkingLevel` は書かず、Pi に任せる。既存 config は変更せず、default が無ければ warning を出して file を作らない。
 - 将来、limit に達したときに使う fallback model を設定できるようにしたい。今回は fallback を実装しない。
 
 ## 設定ファイル
@@ -16,7 +17,7 @@
 - 場所は `<dataDir>/config.json`（既定 `~/.araya/config.json`）。`dataDir` は `ARAYA_DATA_DIR` で変わる。設定ファイルの場所だけを変える環境変数は設けない。
 - 形式は UTF-8 の JSON object で、64 KiB まで。
 - 読むのは Araya の subcommand（`init`・`tick`・`status`・`run`・`approve`・`reject`）の起動時に1回だけ。`araya`（引数なし）、`araya pi`、`araya help`、`araya --help` は読まない。`araya run` の実行中に書き換えた内容は、再起動するまで反映しない。
-- path に何も存在しない（`lstat` が `ENOENT`）ときは、設定なしとして動く（従来どおり）。
+- path に何も存在しない（`lstat` が `ENOENT`）ときは、設定なしとして動く（従来どおり）。runner install 時に Pi の default model から初期設定されず、file も無いままなら、実行時の model は従来どおり Pi の設定で選ぶ。
 - path に何かが存在するのに使えないとき、つまり壊れた symlink、通常の file でない（directory など）、読めない、64 KiB を超える、UTF-8 でない、JSON として不正、下の schema に合わない場合は、subcommand を何も処理せずに失敗させる。message は `invalid Araya config file <path>: <理由>` で、CLI の exit code は 1。symlink の先が通常の file なら読む。
 
 例:
@@ -29,6 +30,15 @@
   }
 }
 ```
+
+### runner install 時の初期設定
+
+- `araya runner install`（`npm run deploy` からの実行を含む）は、unit file を書き換えて runner を起動する前に、`<dataDir>/config.json` が無いかを確かめる。
+- Araya config が無い場合に限り、Pi の agent directory にある `settings.json` から `defaultProvider` と `defaultModel` の両方を読み、両方が文字列で model reference として有効なら、`{"development":{"model":"<defaultProvider>/<defaultModel>"}}` を初期設定する。file は mode 0600 で作成する。
+- `thinkingLevel` は書かず、Pi の model 別・既定の thinking level に任せる。Pi の認証情報・ほかの settings はコピーせず、`auth.json` を読まず、model API も呼ばない。model の存在・利用可否や認証は検証しない。
+- 設定 file の作成は排他的・atomic に行う。並行した初期化で先に作成された file を上書きしない。既存 config は `{}` を含めて検証だけ行い、内容・mode を変更しない。不正な既存 config は通常どおりエラーにし、Pi default で置き換えない。
+- Pi `settings.json` が無い・読めない・不正、または両方の明示的な default が無い・不正なら、config file は作らず stderr に warning を出して runner install は続ける。`config.status` に `created`・`existing`・`skipped` の結果を含める。
+- 初期設定は一度だけ行う。後で Pi の default model を変更しても既存の Araya config は更新しない。Araya の model を変える場合は `<dataDir>/config.json` の `development.model` を利用者が更新する。
 
 ### schema
 
@@ -91,6 +101,10 @@
 
 ## Acceptance Criteria
 
+- [ ] `<dataDir>/config.json` が無く、Pi `settings.json` の有効な `defaultProvider` と `defaultModel` が両方ある場合、`runner install` は `development.model` だけを mode 0600 で一度だけ作成する。`thinkingLevel`・認証情報を含めず、Pi の認証・model APIを読まず、呼ばない。
+- [ ] 既存 config は `{}` を含めて内容を変えず、初期化を再実行しても Pi default で上書きしない。並行する初期化も排他的に作成し、既存値を保つ。
+- [ ] Pi settings が無い・読めない・不正、または明示的な default が不完全・不正なら config を作らず、warning を出して runner install は続ける。
+- [ ] 初期設定後に Pi の default model を変更しても Araya config は自動更新されない。
 - [ ] `<dataDir>/config.json` が無ければ、従来どおり Pi の設定で model を選び、evidence の `model.source` は `pi-settings`。
 - [ ] `development.model` と `thinkingLevel` を書くと、Pi session にその model と thinking level が渡り、evidence の `model` に provider・id・thinking level と `source: araya-config` が記録される。Pi の `settings.json` の既定 model より設定ファイルが優先される。
 - [ ] `thinkingLevel` を省略すると、Pi の設定の thinking level が使われ、その値が evidence に記録される。

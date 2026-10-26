@@ -25,9 +25,15 @@ async function makeInstallEnv() {
   const devRoot = path.join(root, 'dev')
   const home = path.join(root, 'home')
   const configHome = path.join(root, 'xdg')
+  const piAgentDir = path.join(root, 'pi-agent')
   const entrypoint = path.join(root, 'package', 'bin', 'task-runner.ts')
   await fs.mkdir(home)
+  await fs.mkdir(piAgentDir)
   await fs.mkdir(path.dirname(entrypoint), { recursive: true })
+  await fs.writeFile(path.join(piAgentDir, 'settings.json'), JSON.stringify({
+    defaultProvider: 'faux',
+    defaultModel: 'test-model'
+  }), 'utf8')
   await fs.writeFile(entrypoint, '', 'utf8')
   const env: NodeJS.ProcessEnv = {
     PATH: '/usr/bin:/bin',
@@ -35,7 +41,7 @@ async function makeInstallEnv() {
     XDG_CONFIG_HOME: configHome,
     ARAYA_DATA_DIR: dataDir,
     ARAYA_DEV_ROOT: devRoot,
-    PI_CODING_AGENT_DIR: path.join(root, 'pi-agent')
+    PI_CODING_AGENT_DIR: piAgentDir
   }
 
   return { root, dataDir, devRoot, home, configHome, entrypoint, env }
@@ -213,6 +219,116 @@ test('runner install: unit file を mode 0600 で書き、daemon-reload・enable
     ])
     // scope は作らない
     assert.deepEqual(fake.launches(), [])
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('runner install: Pi の明示的な default model があれば config.json を初回だけ作る', async () => {
+  const installEnv = await makeInstallEnv()
+  const settingsPath = path.join(installEnv.env.PI_CODING_AGENT_DIR ?? '', 'settings.json')
+  await fs.mkdir(path.dirname(settingsPath), { recursive: true })
+  await fs.writeFile(settingsPath, JSON.stringify({
+    defaultProvider: 'faux',
+    defaultModel: 'test-model',
+    defaultThinkingLevel: 'high'
+  }), 'utf8')
+  const fake = createFakeSystemd({
+    systemctl: defaultSystemctl(installEnv),
+    loginctl: async () => commandResult('yes\n')
+  })
+
+  try {
+    const { output, stderr } = await runRunner(installEnv, ['install'], fake)
+    const configPath = path.join(installEnv.dataDir, 'config.json')
+    const configText = await fs.readFile(configPath, 'utf8')
+
+    assert.deepEqual(JSON.parse(configText), { development: { model: 'faux/test-model' } })
+    assert.equal((await fs.stat(configPath)).mode & 0o777, 0o600)
+    assert.deepEqual(readField(output, 'config'), {
+      status: 'created',
+      configPath,
+      model: 'faux/test-model'
+    })
+    assert.equal(stderr, '')
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('runner install: PI_CODING_AGENT_DIR 未指定時は HOME/.pi/agent の settings.json を使う', async () => {
+  const installEnv = await makeInstallEnv()
+  const env = { ...installEnv.env }
+  delete env.PI_CODING_AGENT_DIR
+  const settingsPath = path.join(installEnv.home, '.pi', 'agent', 'settings.json')
+  await fs.mkdir(path.dirname(settingsPath), { recursive: true })
+  await fs.writeFile(settingsPath, JSON.stringify({ defaultProvider: 'faux', defaultModel: 'home-model' }), 'utf8')
+  const fake = createFakeSystemd({
+    systemctl: defaultSystemctl(installEnv),
+    loginctl: async () => commandResult('yes\n')
+  })
+
+  try {
+    const { output, stderr } = await runRunner({ ...installEnv, env }, ['install'], fake)
+    const configPath = path.join(installEnv.dataDir, 'config.json')
+
+    assert.deepEqual(JSON.parse(await fs.readFile(configPath, 'utf8')), {
+      development: { model: 'faux/home-model' }
+    })
+    assert.deepEqual(readField(output, 'config'), {
+      status: 'created',
+      configPath,
+      model: 'faux/home-model'
+    })
+    assert.equal(stderr, '')
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('runner install: 既存 config.json を変更せずそのまま使う', async () => {
+  const installEnv = await makeInstallEnv()
+  const configPath = path.join(installEnv.dataDir, 'config.json')
+  const original = '{"development":{"model":"faux/custom","thinkingLevel":"low"}}\n'
+  await fs.mkdir(installEnv.dataDir, { recursive: true })
+  await fs.writeFile(configPath, original, 'utf8')
+  const fake = createFakeSystemd({
+    systemctl: defaultSystemctl(installEnv),
+    loginctl: async () => commandResult('yes\n')
+  })
+
+  try {
+    const { output, stderr } = await runRunner(installEnv, ['install'], fake)
+
+    assert.equal(await fs.readFile(configPath, 'utf8'), original)
+    assert.deepEqual(readField(output, 'config'), { status: 'existing', configPath })
+    assert.equal(stderr, '')
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('runner install: Pi に明示的な default model がなければ config.json を作らず警告する', async () => {
+  const installEnv = await makeInstallEnv()
+  const settingsPath = path.join(installEnv.env.PI_CODING_AGENT_DIR ?? '', 'settings.json')
+  await fs.mkdir(path.dirname(settingsPath), { recursive: true })
+  await fs.writeFile(settingsPath, JSON.stringify({ defaultProvider: 'faux' }), 'utf8')
+  const fake = createFakeSystemd({
+    systemctl: defaultSystemctl(installEnv),
+    loginctl: async () => commandResult('yes\n')
+  })
+
+  try {
+    const { output, stderr } = await runRunner(installEnv, ['install'], fake)
+    const configPath = path.join(installEnv.dataDir, 'config.json')
+
+    await assert.rejects(fs.access(configPath), { code: 'ENOENT' })
+    assert.deepEqual(readField(output, 'config'), {
+      status: 'skipped',
+      configPath,
+      reason: 'pi_default_missing'
+    })
+    assert.match(stderr, /defaultProvider\/defaultModel が両方設定されていないため/u)
   } finally {
     await fs.rm(installEnv.root, { recursive: true, force: true })
   }

@@ -277,6 +277,8 @@ test('CLI: help の --note と SHIKI の説明、runner と SHIKI の関係、AR
   assert.doesNotMatch(help, /開発 agent/u)
   // runner は SHIKI そのものではなく、SHIKI を動かす常駐の process
   assert.match(help, /runner（台帳の Task を取り込んで SHIKI を動かす常駐の process）を、systemd の user service（araya-runner-<hash>\.service）として入れる/u)
+  assert.match(help, /Pi の settings\.json に defaultProvider と defaultModel が両方ある場合だけ model を初期設定する/u)
+  assert.match(help, /既存 config は変更せず/u)
   // ARAYA_DATA_DIR を変えると unit の名前が変わり、前の runner が残る
   assert.match(help, /ARAYA_DATA_DIR を変えると別の runner になる/u)
 })

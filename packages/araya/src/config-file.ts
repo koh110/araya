@@ -1,6 +1,8 @@
+import { randomBytes } from 'node:crypto'
 import { constants as fsConstants } from 'node:fs'
 import fs from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
+import path from 'node:path'
 import { TextDecoder } from 'node:util'
 
 import {
@@ -183,4 +185,166 @@ export async function loadConfigFile(configPath: string) {
   }
 
   return { developmentModel: parseDevelopmentModel(configPath, parsed) }
+}
+
+const MAX_PI_SETTINGS_BYTES = 1024 * 1024
+
+type PiDefaultModel =
+  | { model: string }
+  | { reason: 'pi_settings_missing' | 'pi_settings_unreadable' | 'pi_settings_invalid' | 'pi_default_missing' | 'pi_default_invalid' }
+
+export type DefaultConfigInitialization =
+  | { status: 'created'; configPath: string; model: string }
+  | { status: 'existing'; configPath: string }
+  | { status: 'skipped'; configPath: string; reason: Exclude<PiDefaultModel, { model: string }>['reason'] }
+
+// Pi の defaultProvider/defaultModel だけを読み、秘密情報など他の設定は持ち込まない
+async function readPiDefaultModel(settingsPath: string): Promise<PiDefaultModel> {
+  let linkStat
+
+  try {
+    linkStat = await fs.lstat(settingsPath)
+  } catch (error) {
+    return { reason: isErrno(error, 'ENOENT') ? 'pi_settings_missing' : 'pi_settings_unreadable' }
+  }
+
+  let fileHandle: FileHandle
+
+  try {
+    fileHandle = await fs.open(settingsPath, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK)
+  } catch {
+    return { reason: linkStat.isSymbolicLink() ? 'pi_settings_missing' : 'pi_settings_unreadable' }
+  }
+
+  let settings: unknown
+
+  try {
+    let isRegularFile: boolean
+
+    try {
+      isRegularFile = (await fileHandle.stat()).isFile()
+    } catch {
+      return { reason: 'pi_settings_unreadable' }
+    }
+
+    if (!isRegularFile) {
+      return { reason: 'pi_settings_invalid' }
+    }
+
+    let content: Buffer
+
+    try {
+      content = await readBounded(fileHandle, MAX_PI_SETTINGS_BYTES)
+    } catch {
+      return { reason: 'pi_settings_unreadable' }
+    }
+
+    if (content.byteLength > MAX_PI_SETTINGS_BYTES) {
+      return { reason: 'pi_settings_invalid' }
+    }
+
+    let text: string
+
+    try {
+      text = new TextDecoder('utf-8', { fatal: true }).decode(content)
+    } catch {
+      return { reason: 'pi_settings_invalid' }
+    }
+
+    try {
+      settings = JSON.parse(text)
+    } catch {
+      return { reason: 'pi_settings_invalid' }
+    }
+  } finally {
+    await fileHandle.close()
+  }
+
+  if (!isRecord(settings)) {
+    return { reason: 'pi_settings_invalid' }
+  }
+
+  if (!Object.hasOwn(settings, 'defaultProvider') || !Object.hasOwn(settings, 'defaultModel')) {
+    return { reason: 'pi_default_missing' }
+  }
+
+  if (typeof settings.defaultProvider !== 'string' || typeof settings.defaultModel !== 'string') {
+    return { reason: 'pi_default_invalid' }
+  }
+
+  const model = `${settings.defaultProvider}/${settings.defaultModel}`
+
+  if (parseModelReference(model) === undefined) {
+    return { reason: 'pi_default_invalid' }
+  }
+
+  return { model }
+}
+
+// deploy が runner を install するときに呼ぶ。既存 config は検証したうえで変更しない
+export async function initializeConfigFromPiSettings(configPath: string, settingsPath: string): Promise<DefaultConfigInitialization> {
+  try {
+    await fs.lstat(configPath)
+    await loadConfigFile(configPath)
+
+    return { status: 'existing', configPath }
+  } catch (error) {
+    if (!isErrno(error, 'ENOENT')) {
+      throw error
+    }
+  }
+
+  const piDefault = await readPiDefaultModel(settingsPath)
+
+  if (!('model' in piDefault)) {
+    return { status: 'skipped', configPath, reason: piDefault.reason }
+  }
+
+  await fs.mkdir(path.dirname(configPath), { recursive: true, mode: 0o700 })
+  const temporaryPath = path.join(path.dirname(configPath), `.config.json.${randomBytes(8).toString('hex')}.tmp`)
+  const content = `${JSON.stringify({ development: { model: piDefault.model } }, null, 2)}\n`
+  let temporaryCreated = false
+  let created = false
+  let existing = false
+
+  try {
+    const fileHandle = await fs.open(temporaryPath, 'wx', 0o600)
+    temporaryCreated = true
+
+    try {
+      await fileHandle.writeFile(content, 'utf8')
+      await fileHandle.sync()
+    } finally {
+      await fileHandle.close()
+    }
+
+    try {
+      await fs.link(temporaryPath, configPath)
+      created = true
+    } catch (error) {
+      if (!isErrno(error, 'EEXIST')) {
+        throw error
+      }
+
+      existing = true
+    }
+  } finally {
+    if (temporaryCreated) {
+      await fs.rm(temporaryPath, { force: true })
+    }
+  }
+
+  if (existing) {
+    await loadConfigFile(configPath)
+
+    return { status: 'existing', configPath }
+  }
+
+  if (!created) {
+    throw new Error(`could not initialize Araya config file ${configPath}`)
+  }
+
+  await loadConfigFile(configPath)
+
+  return { status: 'created', configPath, model: piDefault.model }
 }

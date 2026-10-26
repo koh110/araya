@@ -54,6 +54,7 @@ araya runner install
 ```
 
 - `~/.config/systemd/user/araya-runner-<hash>.service`（`XDG_CONFIG_HOME` が絶対 path ならその下）に unit file を書き、`systemctl --user daemon-reload`・`enable`・`restart` を実行します。`<hash>` は `<dataDir>` の実 path の SHA-256 の先頭12文字で、`<dataDir>` ごとに runner は1つです。
+- `<dataDir>/config.json` が無い場合、Pi の `settings.json` に有効な `defaultProvider` と `defaultModel` が両方あれば、`development.model` だけを mode 0600 で初期設定します。`thinkingLevel`・認証情報は写さず、APIも呼びません。設定が無い・読めない・不正なら config を作らず warning を出して runner install は続けます。既存 config（`{}` を含む）は変更しません。出力の `config.status` は `created`・`existing`・`skipped` のいずれかです。
 - unit file の `Environment=` には、`araya runner install` を実行した環境の `PATH`・`LANG`・`LANGUAGE`・`TZ`・`LC_*`・`ARAYA_*`（`TOKEN`・`SECRET`・`PASSWORD`・`API_KEY`・`AUTH` などを名前に含む、秘密とみなす変数を除く）・`PI_CODING_AGENT_DIR` だけを書きます。`ARAYA_DATA_DIR` と `ARAYA_DEV_ROOT` は絶対 path にして書きます。ほかの変数（model の API key、proxy の設定など）は runner にも SHIKI にも渡りません。model の認証は Pi の `auth.json` から読みます。
 - `<dataDir>` などの path と環境変数の値に、空白・引用符・`\`・`$`・`%`・`;`・制御文字があると、unit file を書かずに `unsupported_path` で失敗します。
 - 環境変数を変えたときは、`araya runner install` をやり直してください。やり直すまで、unit file の `Environment=` は前の値のままで、runner は前の環境で動きます。動いている runner は、起動したときに読み込んだコードで動き続けます。`npm run deploy` は、deploy を実行した環境の `ARAYA_DATA_DIR`（無ければ `~/.araya`）の runner を新しいコードで起動し直します。その runner については、deploy の後に `araya runner install` を実行する必要はありません。deploy が runner を入れなかったときと、ほかの `ARAYA_DATA_DIR` の runner については、「グローバルインストール」を見てください。
@@ -192,7 +193,7 @@ araya runner uninstall
 }
 ```
 
-- 形式は UTF-8 の JSON object で、64 KiB まで。top level の key は `development`（省略可）だけです。`{}` やファイルが無い場合は、Pi の `settings.json` の `defaultProvider`・`defaultModel` で決まる model を使います。使う model が決まらない、Pi の model の一覧に無い、認証が無いときは、別の model に切り替えず、試行を `failed`（`agent_failed`、evidence の `agent.error` は `model_unavailable`）にします。
+- 形式は UTF-8 の JSON object で、64 KiB まで。top level の key は `development`（省略可）だけです。`{}` やファイルが無い場合は、Pi の `settings.json` の `defaultProvider`・`defaultModel` で決まる model を使います。runner install（`npm run deploy` を含む）時に Araya の config が無く、両方の値が有効なら、`development.model` に `<defaultProvider>/<defaultModel>` を一度だけ保存します。既存 file は `{}` でも変更しません。Pi の設定に default が無い・読めない・不正なら file を作らず warning を出します。保存後は Pi の default model を変えても Araya の設定には追従しないため、切り替える場合は `config.json` の `development.model` を更新してください。使う model が決まらない、Pi の model の一覧に無い、認証が無いときは、別の model に切り替えず、試行を `failed`（`agent_failed`、evidence の `agent.error` は `model_unavailable`）にします。
 - `development.model`（必須）: `<provider>/<model id>`。最初の `/` で provider と model id に分けるため、model id には `/` を含められます（例: `openrouter/moonshotai/kimi-k2.6`）。provider と model id は空にできず、空白と制御文字を含めず、全体で200文字まで。
 - `development.thinkingLevel`（省略可）: `off`・`minimal`・`low`・`medium`・`high`・`xhigh`・`max` のいずれか。省略すると Pi の設定（`modelThinkingLevels["<provider>/<id>"]` → `defaultThinkingLevel` → `medium`）で決まります。Pi は model が対応しない thinking level を対応する値に丸めます。
 - 知らない key、型の違う値、`null` は拒否します。ファイルが存在するのに使えない場合（JSON の誤り、schema 違反、64 KiB 超、UTF-8 でない、通常の file でない、壊れた symlink、読めない）は、`init`・`tick`・`status`・`run`・`approve`・`reject`・`task`・`runner` が何も処理せずに `invalid Araya config file <path>: <理由>` で失敗します（終了 code 1）。引数なしの `araya`・`araya pi`・`araya --help` は設定ファイルを読みません。

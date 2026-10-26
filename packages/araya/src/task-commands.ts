@@ -6,6 +6,7 @@ import path from 'node:path'
 import { parseArgs, TextDecoder } from 'node:util'
 
 import { collectSecretValues, createRedactor, type Redactor } from './redaction.ts'
+import { initializeConfigFromPiSettings } from './config-file.ts'
 import {
   buildRunnerUnitFile,
   commandSucceeded,
@@ -521,6 +522,31 @@ async function installRunner(config: RunnerCommandConfig, deps: RunnerCommandDep
       piAgentDir: config.piAgentDir === undefined ? undefined : path.resolve(config.piAgentDir)
     })
   })
+  const piAgentDir = config.piAgentDir === undefined
+    ? path.join(deps.homeDir, '.pi', 'agent')
+    : path.resolve(config.piAgentDir)
+  const configInitialization = await initializeConfigFromPiSettings(
+    path.join(config.dataDir, 'config.json'),
+    path.join(piAgentDir, 'settings.json')
+  )
+
+  if (configInitialization.status === 'skipped') {
+    let reason: string
+
+    if (configInitialization.reason === 'pi_settings_missing') {
+      reason = 'Pi の settings.json がないため'
+    } else if (configInitialization.reason === 'pi_settings_unreadable') {
+      reason = 'Pi の settings.json を読み取れないため'
+    } else if (configInitialization.reason === 'pi_settings_invalid') {
+      reason = 'Pi の settings.json が有効な UTF-8 JSON file ではないため'
+    } else if (configInitialization.reason === 'pi_default_missing') {
+      reason = 'Pi の defaultProvider/defaultModel が両方設定されていないため'
+    } else {
+      reason = 'Pi の defaultProvider/defaultModel が有効でないため'
+    }
+
+    deps.stderr(`warning: ${reason}、Araya の config.json は作成しませんでした。`)
+  }
 
   // 3. unit file を書く
   await writeUnitFile(unitPath, content)
@@ -561,7 +587,7 @@ async function installRunner(config: RunnerCommandConfig, deps: RunnerCommandDep
     deps.stderr('logout すると runner が止まります。logout の後も動かすには、loginctl enable-linger で linger を有効にしてください')
   }
 
-  return { unit, unitPath, linger, runner }
+  return { unit, unitPath, linger, runner, config: configInitialization }
 }
 
 async function uninstallRunner(config: RunnerCommandConfig, deps: RunnerCommandDependencies, redactor: Redactor) {

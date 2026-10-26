@@ -655,7 +655,7 @@ command:
 
 ## `npm run deploy`
 
-`npm run deploy`（`scripts/deploy.sh`）は、araya を build して prefix に入れた後（README の「グローバルインストール」）、入れた araya（`<prefix>/bin/araya`）で `araya runner install` を実行する。初めての deploy では runner を入れ、動いている runner も止めてある runner も、書き直した unit file と入れたコードで起動し直す（restart）。動いていた試行は一時停止の扱いになり、続きから進む（「止めるとき（一時停止）」）。
+`npm run deploy`（`scripts/deploy.sh`）は、araya を build して prefix に入れた後（README の「グローバルインストール」）、入れた araya（`<prefix>/bin/araya`）で `araya runner install` を実行する。初めての deploy では runner を入れ、動いている runner も止めてある runner も、書き直した unit file と入れたコードで起動し直す（restart）。動いていた試行は一時停止の扱いになり、続きから進む（「止めるとき（一時停止）」）。runner install は runner を起動する前に Araya config が無い場合だけ Pi の明示的な `defaultProvider`・`defaultModel` から `development.model` を一度だけ初期設定する。既存 file は変更せず、Pi の認証や model API は使わない。詳細は「開発 model の設定」を参照する。
 
 - 対象の runner は、deploy を実行した環境の `ARAYA_DATA_DIR`（無ければ `~/.araya`）のもの。unit file の `Environment=` も、その環境の値で書き直す。
 - `PATH` は、`npm run` が先頭に足した entry を外して `araya runner install` に渡す（unit file の `PATH` になる）。`PATH` の先頭から、`/node_modules/.bin` か `/node-gyp-bin` で終わる entry が続く間を見て、その中の最後の `/node-gyp-bin` までを外す（「技術調査結果」の npm）。`/node-gyp-bin` が無ければ（`npm run` を通さずに実行したとき）、`PATH` を変えない。外さないと、checkout の `node_modules/.bin`（araya の開発用の道具）と npm の内部の directory が runner の `PATH` に入り、SHIKI の bash と検証のコマンドがそれを使う。checkout を移動・削除しても、入れた araya は影響を受けないという前提も崩れる。
@@ -799,6 +799,7 @@ test は実際の Pi auth や model API を使わない。model は pi-ai の fa
 - [ ] 秘密とみなす環境変数の値と userinfo 付きの URL を、検証コマンドが stdout と stderr に出し、SHIKI が報告にも書いても、台帳のどの table にも、`evidence.json` にも、log にもその値が現れず、`redactions` に置き換えた回数が残る。台帳の evidence には差分と検証の出力の本文が無く、`araya task show --full` のときだけ `evidence.json` から出る。
 - [ ] 試行の task が `evidence.json` を書いた後、outcome の commit の前に runner が落ちると（test で再現）、起動し直した runner で `evidence` の phase がやり直され、結果が1回だけ記録され（`run.finished` は1件）、`araya task show --full` は、記録された `bodiesSha256` と一致する `evidence.json` の本文（`worktrees`）を、台帳の evidence に入れて出す。`evidence.json` の中身を変えた試行では `digest_mismatch` を出す。
 - [ ] `araya runner install` は、「unit の名前と file」の内容（`ExecStart`、`ExecStopPost`、`Environment=` の一覧、property）で unit file を mode 0600 で書き、`daemon-reload`・`enable`・`restart` を実行する（`systemctl` を差し替えた test）。`ARAYA_DATA_DIR` と `ARAYA_DEV_ROOT` に相対 path を設定し、dataDir と違う cwd から実行しても、unit file の dataDir と `Environment=` は絶対 path になる。秘密とみなす名前の変数（`OPENAI_API_KEY`、`ARAYA_TEST_TOKEN` など）や一覧に無い変数は書かれない。dataDir に空白・`$`・`%` などがあれば、unit file を書かずに `unsupported_path` で失敗する。`FragmentPath` が書いた file と違えば `unit_not_loaded` で失敗する。
+- [ ] `araya runner install` は Araya config が無く、Pi の `settings.json` に有効な明示的 `defaultProvider` と `defaultModel` がある場合だけ、`development.model` を mode 0600 で初期設定する。`thinkingLevel` と認証情報は写さず、Pi auth/API は使わない。既存 config は変更せず、default が不足・不正なら warning を出して作成せず続ける。並行する初期化も既存 file を上書きしない。
 - [ ] `araya runner uninstall` は unit を止めて無効にし、unit file を消す。台帳の試行は変わらない。
 - [ ] `araya task` の出力の `runner.state` は、runner の行が無ければ `not_started`、`stopped` なら `stopped`、`heartbeat_at` が 60 秒より前なら `not_responding` になり、どれも stderr に注意が出る。
 - [ ] 台帳の接続で `busy_timeout` が 5000 になっている。複数の process から同時に書いても `SQLITE_BUSY` で失敗しない。

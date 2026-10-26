@@ -71,6 +71,8 @@ function printHelp() {
   araya runner install
     runner（台帳の Task を取り込んで SHIKI を動かす常駐の process）を、systemd の user service（araya-runner-<hash>.service）として入れる。
     unit file を書き、有効にして起動し直す。linger は変えない（無効なら logout で runner が止まり、次に起動したときに続きから進む）。
+    <dataDir>/config.json が無ければ、Pi の settings.json に defaultProvider と defaultModel が両方ある場合だけ model を初期設定する（thinkingLevel・認証情報は写さない）。
+    既存 config は変更せず、default が足りなければ warning を出して続ける。npm run deploy もこの処理を行う。
     unit file に書く環境変数は PATH・LANG・LANGUAGE・TZ・LC_*・ARAYA_*（秘密とみなす名前を除く）・PI_CODING_AGENT_DIR だけ。
     環境変数を変えたときは、やり直す（npm run deploy は、araya を入れた後にこれを実行する）。ARAYA_DATA_DIR を変えると別の runner になる
     （前の runner を残さないときは、先に前の ARAYA_DATA_DIR で araya runner uninstall を実行する）。

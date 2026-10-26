@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
-import { loadConfigFile } from '../src/config-file.ts'
+import { initializeConfigFromPiSettings, loadConfigFile } from '../src/config-file.ts'
 
 async function makeTempDir() {
   return fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'araya-config-file-test-')))
@@ -203,6 +203,72 @@ test('config file: 64 KiB を超える file、UTF-8 でない file、directory�
         return true
       }, sample.name)
     }
+  } finally {
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('config bootstrap: Pi の明示的な default model が無ければ config.json を作らない', async () => {
+  const root = await makeTempDir()
+  const configPath = path.join(root, 'config.json')
+  const settingsPath = path.join(root, 'settings.json')
+
+  try {
+    await fs.writeFile(settingsPath, JSON.stringify({ defaultProvider: 'faux' }), 'utf8')
+
+    assert.deepEqual(await initializeConfigFromPiSettings(configPath, settingsPath), {
+      status: 'skipped',
+      configPath,
+      reason: 'pi_default_missing'
+    })
+    await assert.rejects(fs.access(configPath), { code: 'ENOENT' })
+  } finally {
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('config bootstrap: 不正な Pi settings は config.json に反映しない', async () => {
+  const root = await makeTempDir()
+  const configPath = path.join(root, 'config.json')
+  const settingsPath = path.join(root, 'settings.json')
+
+  try {
+    await fs.writeFile(settingsPath, '{"defaultProvider":', 'utf8')
+
+    assert.deepEqual(await initializeConfigFromPiSettings(configPath, settingsPath), {
+      status: 'skipped',
+      configPath,
+      reason: 'pi_settings_invalid'
+    })
+    await assert.rejects(fs.access(configPath), { code: 'ENOENT' })
+  } finally {
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('config bootstrap: 同時初期化では config.json を一度だけ排他的に作る', async () => {
+  const root = await makeTempDir()
+  const configPath = path.join(root, 'config.json')
+  const settingsPath = path.join(root, 'settings.json')
+
+  try {
+    await fs.writeFile(settingsPath, JSON.stringify({ defaultProvider: 'faux', defaultModel: 'test-model' }), 'utf8')
+    const results = await Promise.all([
+      initializeConfigFromPiSettings(configPath, settingsPath),
+      initializeConfigFromPiSettings(configPath, settingsPath)
+    ])
+
+    assert.deepEqual(results.map((result) => {
+      return result.status
+    }).sort(), ['created', 'existing'])
+    assert.deepEqual(JSON.parse(await fs.readFile(configPath, 'utf8')), {
+      development: { model: 'faux/test-model' }
+    })
+    assert.equal((await fs.stat(configPath)).mode & 0o777, 0o600)
+    assert.deepEqual((await fs.readdir(root)).sort(), ['config.json', 'settings.json'])
+    assert.deepEqual(await loadConfigFile(configPath), {
+      developmentModel: { provider: 'faux', id: 'test-model', thinkingLevel: null }
+    })
   } finally {
     await fs.rm(root, { recursive: true, force: true })
   }
