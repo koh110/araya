@@ -10,7 +10,7 @@
 - Node.js 26.8 以上
 - git。作業対象の repository に worktree を作るときに使います。
 - 開発 root。Task で動かす repository は開発 root の中に必要です（既定 `~/dev`。`ARAYA_DEV_ROOT` で変えられます）。
-- Pi の使える model のアクセス。Pi coding-agent は araya の依存 package に含まれるので、別途 `pi` を入れる必要はありません。model の認証は Pi の `/login` で設定します（API key の環境変数は使いません）。
+- Pi で使える model へのアクセス。Pi coding-agent は araya の依存 package に含まれるので、別途 `pi` を入れる必要はありません。model の認証は Pi の `/login` で設定します（API key の環境変数は使いません）。
 
 ## インストール
 
@@ -67,7 +67,7 @@ araya task create --file task.json   # stdin から読むときは --file -
 ```
 
 - `title`（200 文字まで、改行なし）と `goal`（20,000 文字まで）は必須です。
-- `targets` は作業 repository を探してもらうための手がかりです（開発 root からの相対 path など）。worktree の対象を限定するものではなく、どの repository で作業するかは SHIKI が判断します。SHIKI が触れる file の制限にもなりません（「注意」を見てください）。SHIKI が開発 root の下に存在しない repository を指定したときは、worktree の作成が失敗し、理由（`repository_not_found`）が SHIKI に返されます。SHIKI は別の repository を選び直せます（tool の失敗だけでは試行は終わりません）。`constraints` と `permissions` は省略できます。`permissions` は SHIKI に渡すだけで、commit・push などの固定の禁止事項は解除しません。
+- `targets` は SHIKI に作業 repository を探してもらうための手がかりです（開発 root からの相対 path など）。worktree の対象を限定するものではなく、どの repository で作業するかは SHIKI が判断します。SHIKI が触れる file の制限にもなりません（「注意」を見てください）。SHIKI が開発 root の下に存在しない repository を指定したときは、worktree の作成が失敗し、理由（`repository_not_found`）が SHIKI に返されます。SHIKI は別の repository を選び直せます（tool の失敗だけでは試行は終わりません）。`constraints` と `permissions` は省略できます。`permissions` は SHIKI に渡すだけで、commit・push などの固定の禁止事項は解除しません。
 - `araya task` は runner も SHIKI も起動しません。動いている runner が数秒以内に台帳を見て、実行枠に空きがあれば取り込みます。runner が動いていないときは注意を出します（登録自体は成功します）。
 - 同じ `idempotencyKey` で同じ内容をもう一度登録すると、同じ Task を返します（`"created": false`）。入力の詳しい制限は仕様にあります。
 
@@ -96,7 +96,7 @@ SHIKI の変更は、試行ごとに作られた worktree `<repository>/.worktre
 
 ## 詰まったときは
 
-`blocked` は次のどちらかです。SHIKI が `araya_request_decision` で人の判断を求めた（質問は `decisionQuestion`）、または runner が落ち続けて試行が止められた（`restart_limit`）。どちら場合も、決めてから再実行します。
+`blocked` は次のどちらかです。SHIKI が `araya_request_decision` で人の判断を求めた（質問は `decisionQuestion`）、または runner が落ち続けて試行が止められた（`restart_limit`）。どちらの場合も、決めてから再実行します。
 
 ```sh
 araya task retry <taskId> --note "B 方案を使う"
@@ -106,7 +106,7 @@ araya task retry <taskId> --note "B 方案を使う"
 - 新しい試行は新しい taskKey を使い、worktree と branch も前回とは別になります。前回の worktree は残ります（前回の変更は持ち込みません）。
 - SHIKI が判断を求めたときは、質問への答えを `--note` に書きます（長い文字列は `--note-file`）。
 - 前回の試行が途中で止まっていたとき（中止、`agent_timeout`、`restart_limit` など）は、外部への変更をくり返すおそれがあるので、`--confirm-side-effects` を付けないと拒否されます。前回の worktree と外部の状態を確かめてから付けてください。
-- `araya task cancel <taskId>` は、待つの試行をその場で中止し、動いている試行には中止を求めます。自動の再実行はありません。
+- `araya task cancel <taskId>` は、待機中の試行をその場で中止し、動いている試行には中止を求めます。自動の再実行はありません。
 
 ## runner を管理する
 

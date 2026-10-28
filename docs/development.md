@@ -79,7 +79,7 @@ runner は、SHIKI を動かすために常駐する Araya の process です。
 ## Task の内部
 
 - 台帳 `<dataDir>/tasks.sqlite` が開発の Task と試行、途中経過、runner の状態を保持します。runner の Pi Durable の storage（SHIKI の会話）は `runner/durable.sqlite` です。
-- Task の入力: 知らない key、長さや件数の超過、256 KiB を超える入力、NUL、空白だけの値は拒否します。`title` は200文字まで（改行なし）、`goal` は20,000文字まで。`constraints`・`targets`・`permissions` は省略すると `[]` です。`targets` は SHIKI が作業 repository を探してもらうための手がかり（開発 root からの相対 path など）で、制限ではありません。どの repository で作業するかは SHIKI が判断します。repository の確かめ方は worktree の作成時で、選ばれた repository が開発 root の外なら `repository_outside_dev_root`、存在しないなら `repository_not_found` を tool error として SHIKI に返します。tool の失敗だけでは課題全体は止まらず、SHIKI は別の repository を選び直せます（「human-authored-development-loop」）。`targets` は SHIKI が触れる file の制限にもなりません（「状態と安全境界」）。`permissions` は SHIKI に渡すだけで、commit・push などの固定の禁止事項は解除しません。登録は `idempotencyKey` で idempotent です。同じ `idempotencyKey` で2回登録すると、同じ Task を `"created": false` で返します。`idempotencyKey` が同じでほかの項目の値が違う場合は、`idempotency_conflict` で拒否します。
+- Task の入力: 知らない key、長さや件数の超過、256 KiB を超える入力、NUL、空白だけの値は拒否します。`title` は200文字まで（改行なし）、`goal` は20,000文字まで。`constraints`・`targets`・`permissions` は省略すると `[]` です。`targets` は SHIKI に作業 repository を探してもらうための手がかり（開発 root からの相対 path など）で、制限ではありません。どの repository で作業するかは SHIKI が判断します。repository は worktree の作成時に確かめ、選ばれた repository が開発 root の外なら `repository_outside_dev_root`、存在しないなら `repository_not_found` を tool error として SHIKI に返します。tool の失敗だけでは課題全体は止まらず、SHIKI は別の repository を選び直せます（[docs/spec/human-authored-development-loop.md](spec/human-authored-development-loop.md)）。`targets` は SHIKI が触れる file の制限にもなりません（「状態と安全境界」）。`permissions` は SHIKI に渡すだけで、commit・push などの固定の禁止事項は解除しません。登録は `idempotencyKey` で idempotent です。同じ `idempotencyKey` で2回登録すると、同じ Task を `"created": false` で返します。`idempotencyKey` が同じでほかの項目の値が違う場合は、`idempotency_conflict` で拒否します。
 - CLI の引数:
 
 ```sh
@@ -94,7 +94,7 @@ araya runner uninstall
 
 - `task show` の出力の `attempts[].taskKey` で試行の taskKey が確かめられます。evidence には差分の統計、検証の結果、`activeMs` などが入ります。`--full` のときだけ、SHA-256 が台帳の記録と一致する `evidence.json` から本文を出します。
 - 前回の試行が、取り込まれた後に途中で止まったとき（中止、`agent_timeout`、`restart_limit`、model 以外の理由の `agent_failed` など）は、`--confirm-side-effects` を付けないと `side_effects_unconfirmed` で拒否されます。
-- `cancel` は、待つの試行をその場で `failed`（`cancelled`）にし、`running` の試行には中止を求めます（runner が動いていれば数秒以内に止め、`failed`（`cancelled`）になります。runner が止まっているときは、次に runner が起動したときに止めます）。`completed`・`failed`・`blocked` の Task は中止できません。
+- `cancel` は、待機中の試行をその場で `failed`（`cancelled`）にし、`running` の試行には中止を求めます（runner が動いていれば数秒以内に止め、`failed`（`cancelled`）になります。runner が止まっているときは、次に runner が起動したときに止めます）。`completed`・`failed`・`blocked` の Task は中止できません。
 - SHIKI 1回の期限は `ARAYA_DEVELOPMENT_TIMEOUT_MS`（既定 1200000 ms、範囲 1000〜3600000 ms。範囲外の値は範囲に丸め、数でない値は既定値にします）。過ぎると `failed`（`agent_timeout`）になります。検証コマンドは1件ごとに `ARAYA_VERIFICATION_TIMEOUT_MS`（既定 300000 ms、同じ範囲）で打ち切ります。どちらも runner が動いていた時間で数えます（一時停止の間は数えません）。
 - 秘密とみなす環境変数の値と URL の userinfo は、台帳・`evidence.json`・log に書く前に `[REDACTED]` に置き換えます。それ以外の秘密（file の中身など）を SHIKI が報告に書いたり、検証コマンドが出力したりすると残ります。
 - 台帳、Pi Durable の storage、試行の状態 directory、log、worktree と branch は自動では消しません。
