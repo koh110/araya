@@ -357,7 +357,7 @@ runner が試行を中止するときは、次を行う。
 
 pi-durable は、storage の誤り（`commit()` の失敗など）が起きると Harness を自分で閉じる。誤りに当たった呼び出しは元の誤りで失敗し、それ以後の呼び出しと待っている `waitForTask` は `SessionFailed` で失敗する。同じ Harness では回復せず、開き直す必要がある。開き直すと、commit 済みの状態から続きを進める（「技術調査結果」）。runner は終了して、systemd に起動し直させる。
 
-1. runner が `close()` を呼んでいないのに Harness が閉じ始めたら（「起動」の手順 5 の印）、loop をやめ、取り込み、中止、結果の記録を新しく始めない。Harness が閉じ始めた後に失敗した Harness の呼び出しと、`SessionFailed` で失敗した呼び出しは、その呼び出しの失敗として扱わない（取り込みの task の作成の失敗にも、試行の `attempt_error` にもしない）。誤りに当たった呼び出しは `SessionFailed` ではなく元の誤りで失敗するので、閉じ始めた印で見分ける（probe18 では、その呼び出しが失敗を返す前に listener が呼ばれた。待っている `waitForTask` は、README のとおり `SessionFailed` で失敗した。「技術調査結果」）。
+1. runner が `close()` を呼んでいないのに Harness が閉じ始めたら（「起動」の手順 5 の印）、loop をやめ、取り込み、中止、結果の記録を新しく始めない。Harness が閉じ始めた後に失敗した Harness の呼び出しと、`SessionFailed` で失敗した呼び出しは、その呼び出しの失敗として扱わない（取り込みの task の作成の失敗にも、試行の `attempt_error` にもしない）。誤りに当たった呼び出しは `SessionFailed` ではなく元の誤りで失敗するので、閉じ始めた印で見分ける（probe18 では、その呼び出しが失敗を返す前に listener が呼ばれた。待っている `waitForTask` は `SessionFailed` で失敗した。「技術調査結果」）。
 2. `harness.closed` が決まるのを 30 秒まで待つ。pi-durable は、動いている task に中止の signal を送り、task のコードが返るのを待ってから閉じる。30 秒で決まらなくても 3 へ進む（失敗した Harness は commit できないので、scope を止めても会話に記録されない）。
 3. dataDir の試行の scope をすべて止める（「試行の scope」）。
 4. `BEGIN IMMEDIATE` の中で、動かしていた試行すべての稼働時間を、Harness が閉じ始めた時点まで精算する（「期限」）。`runner` の行は変えない。
@@ -655,7 +655,7 @@ command:
 
 ## `npm run deploy`
 
-`npm run deploy`（`scripts/deploy.sh`）は、araya を build して prefix に入れた後（README の「グローバルインストール」）、入れた araya（`<prefix>/bin/araya`）で `araya runner install` を実行する。初めての deploy では runner を入れ、動いている runner も止めてある runner も、書き直した unit file と入れたコードで起動し直す（restart）。動いていた試行は一時停止の扱いになり、続きから進む（「止めるとき（一時停止）」）。runner install は runner を起動する前に Araya config が無い場合だけ Pi の明示的な `defaultProvider`・`defaultModel` から `development.model` を一度だけ初期設定する。既存 file は変更せず、Pi の認証や model API は使わない。詳細は「開発 model の設定」を参照する。
+`npm run deploy`（`scripts/deploy.sh`）は、araya を build して prefix に入れた後（docs/development.md の「deploy の仕組み」）、入れた araya（`<prefix>/bin/araya`）で `araya runner install` を実行する。初めての deploy では runner を入れ、動いている runner も止めてある runner も、書き直した unit file と入れたコードで起動し直す（restart）。動いていた試行は一時停止の扱いになり、続きから進む（「止めるとき（一時停止）」）。runner install は runner を起動する前に Araya config が無い場合だけ Pi の明示的な `defaultProvider`・`defaultModel` から `development.model` を一度だけ初期設定する。既存 file は変更せず、Pi の認証や model API は使わない。詳細は「開発 model の設定」を参照する。
 
 - 対象の runner は、deploy を実行した環境の `ARAYA_DATA_DIR`（無ければ `~/.araya`）のもの。unit file の `Environment=` も、その環境の値で書き直す。
 - `PATH` は、`npm run` が先頭に足した entry を外して `araya runner install` に渡す（unit file の `PATH` になる）。`PATH` の先頭から、`/node_modules/.bin` か `/node-gyp-bin` で終わる entry が続く間を見て、その中の最後の `/node-gyp-bin` までを外す（「技術調査結果」の npm）。`/node-gyp-bin` が無ければ（`npm run` を通さずに実行したとき）、`PATH` を変えない。外さないと、checkout の `node_modules/.bin`（araya の開発用の道具）と npm の内部の directory が runner の `PATH` に入り、SHIKI の bash と検証のコマンドがそれを使う。checkout を移動・削除しても、入れた araya は影響を受けないという前提も崩れる。
@@ -717,12 +717,12 @@ MVP の上限は 1。将来上げられるように、次のように作る。
 
 worker を撤去する PR で、旧名（`agentctl`）を次の箇所で `araya` に直す。
 
-- README の inbox の例（`payload.task` の文）
+- docs/development.md の inbox の例（`payload.task` の文）
 - `docs/spec/human-authored-development-loop.md` の `araya_create_worktree` と `araya_register_verification` の入力例
 - `araya_create_worktree` の `repository` の説明にある例（`development-agent.ts` の tool の定義。`shiki.ts` に移すもの）
 - test の入力値（`development-intake.test.ts`。`development-process.test.ts` の該当箇所は worker の入力の test で、撤去する）
 
-`scripts/deploy.sh` の旧 package の uninstall と、それを説明する README の文は残す。
+`scripts/deploy.sh` の旧 package の uninstall と、それを説明する docs/development.md の文は残す。
 
 ## 実装の置き場所（目安）
 
@@ -809,7 +809,7 @@ test は実際の Pi auth や model API を使わない。model は pi-ai の fa
 - [ ] `git grep -n -E 'development-worker|runPiWorker|parsePiWorkerResult|PiWorkerInput|runDevelopmentAgent|createAgentSession|createDevelopmentExecutor|DevelopmentTaskRunner|computeTaskKey|claimWorkspaceOpportunity' -- packages` が何も返さない。worker を撤去する PR で満たす。
 - [ ] build 済みの package（`dist`）の module で作った unit file の `ExecStart` の entrypoint は、`dist/bin/task-runner.js` の絶対 path で、その file は通常の file として存在する（撤去する `development-built.test.ts` の代わり。`npm test` は build してから実行する）。
 - [ ] 本物の systemd の test（`ARAYA_TEST_SYSTEMD=1`）: runner の main process を SIGKILL すると、`ExecStopPost` が試行の scope（`setsid` した process を含む）を止めてから、systemd が runner を起動し直し、試行が終わる。`systemctl --user stop` では起動し直さず、試行の scope も止まり、次の起動で続きから進む。restartLimit（test では小さくする）で止まるまで落ち続けても、systemd は起動し直すのをやめない。同じ unit 名で2つ目の runner は起動しない。`araya_create_worktree` の git の hook（`post-checkout`）が `setsid` で切り離して残した process は、試行の結果が記録された時点で止まっている。test の後に `araya-` で始まる unit と、test が作った process が残っていない。
-- [ ] `git grep -i agentctl -- ':!docs/spec/task-ledger-and-shiki-runner.md'` が `scripts/deploy.sh` の1行と README の1行だけを返す。worker を撤去する PR で満たす。
+- [ ] `git grep -i agentctl -- ':!docs/spec/task-ledger-and-shiki-runner.md'` が `scripts/deploy.sh` の1行と `docs/development.md` の1行だけを返す。worker を撤去する PR で満たす。
 - [ ] `npm run deploy`（`scripts/deploy.sh`）は、npm の install の後に、入れた `<prefix>/bin/araya` で `araya runner install` を実行する。そのときの `PATH` は、`npm run` が足した entry（入れ子の `npm run` で重ねて足したものを含む）を外したもので、元の `PATH` にあった `node_modules/.bin` は残る。`npm run` を通さないときは `PATH` を変えない（npm と araya を偽物にした test。本物の npm の `npm run deploy` でも確かめる）。`araya runner install` の stdout と stderr は deploy の出力に出る。
 - [ ] `araya runner install` が終了 code 69（`unsupported_platform` か `systemd_unavailable`）で終わったときは、deploy は注意を出して終了 code 0 で終わる（本物の araya の CLI で、user manager に接続できないときと、`PATH` に `systemctl` が無いときも確かめる。どちらも unit file を書かない）。それ以外の終了 code では、stderr に `<code>: ` で始まる行があっても、araya を入れたまま終了 code 1 で終わる（本物の araya の CLI で、未知の key に改行と `systemd_unavailable: ` を含む設定ファイルでも確かめる）。npm の install が失敗したときは、`araya runner install` を実行しない。
 - [ ] CLI は、`unsupported_platform` と `systemd_unavailable` では終了 code 69、ほかの誤りでは終了 code 1 で終わる（code の無い誤りは、message が `<code>: ` で始まっても 1）。
