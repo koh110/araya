@@ -39,7 +39,7 @@ npm run araya -- runner install
 
 root で `npm run deploy`（`scripts/deploy.sh`）を実行すると、次のことが起きます。
 
-1. root package に `npm pack` を実行し、一時 tarball からユーザーの global prefix（既定 `$HOME/.local`、`ARAYA_INSTALL_PREFIX` で変更可）へ araya を install します。checkout への symlink ではないため、以後のソース変更は再 deploy まで反映されず、araya の checkout を移動・削除しても、install 済みコマンドは影響を受けません。npm registry への publish は行いません。指定 prefix 内に旧 `agentctl` package があれば先に `npm uninstall --global` を実行し、`araya` の bin 競合を解消してから置き換えます。
+1. root package（version `0.0.1`）に `npm pack` を実行し、一時 tarball からユーザーの global prefix（既定 `$HOME/.local`、`ARAYA_INSTALL_PREFIX` で変更可）へ araya を install します。checkout への symlink ではないため、以後のソース変更は再 deploy まで反映されず、araya の checkout を移動・削除しても、install 済みコマンドは影響を受けません。npm registry への publish は行いません。指定 prefix 内に旧 `agentctl` package があれば先に `npm uninstall --global` を実行し、`araya` の bin 競合を解消してから置き換えます。
 2. 入れた araya（`<prefix>/bin/araya`）で `araya runner install` を実行し、deploy の環境の `ARAYA_DATA_DIR`（無ければ `~/.araya`）の data directory の runner を新しいコードで入れ直して起動します（「runner の仕組み」）。初めての deploy では runner を入れ、止めてあった runner も起動します。動いていた試行は一時停止の扱いで続きから進みます（新しいコードで試行の進め方が変わったときは、`attempt_error` で失敗することがあります）。
 3. unit file に書く `PATH` は、`npm run` が先頭に足した entry（checkout などの `node_modules/.bin` と、npm の `node-gyp-bin`）を除いた値になります。
 
@@ -73,11 +73,13 @@ runner は、SHIKI を動かすために常駐する Araya の process です。
 - runner の log は `<dataDir>/logs/runner.log`（1行1件の JSON、秘密を置き換えたもの）です。runner の stdout と stderr は捨てます。
 - SHIKI の bash はコマンドごとに、検証コマンドは1件ごとに、worktree の作成と差分の収集の git も実行ごとに、それぞれ別の transient な systemd の scope（名前は `araya-<hash>-<taskKey>-…`）の中で動きます。runner は、差分を集める前と結果を記録する前に、その試行の名前の scope をすべて止めるので、`setsid` などで切り離した process も残りません。
 - `araya task` と `araya runner` は Linux と systemd（254 以降）の user manager が必要です。Linux 以外では何もせずに `unsupported_platform` で終わります。各コマンドは JSON 1件を stdout に出します。失敗したときは理由を stderr に出し、終了 code 1 で終わります。ただし、Linux 以外（`unsupported_platform`）と、systemd の user manager に接続できないとき（`systemd_unavailable`）は、終了 code 69 で終わります。
+- `araya task` の各コマンドは、結果といっしょに台帳の `runner` と `queue` を出力に含めます。`runner.state` が `running` でないときは、出力とは別に stderr へ注意を出します（登録などの処理自体は成功します）。
+- `araya runner install` は linger を変えずに読むだけで、出力に `linger` を含めます。`linger` が `false` のときは stderr に注意を出します。
 
 ## Task の内部
 
 - 台帳 `<dataDir>/tasks.sqlite` が開発の Task と試行、途中経過、runner の状態を保持します。runner の Pi Durable の storage（SHIKI の会話）は `runner/durable.sqlite` です。
-- Task の入力: 知らない key、長さや件数の超過、256 KiB を超える入力、NUL、空白だけの値は拒否します。`title` は200文字まで（改行なし）、`goal` は20,000文字まで。`constraints`・`targets`・`permissions` は省略すると `[]` です。`targets` に列挙した repository だけが worktree の対象です（開発 root からの相対 path で解決し、開発 root の外は `repository_outside_dev_root`、存在しないものは `repository_not_found` で拒否）。`targets` は SHIKI が触れる file の制限にはなりません（「状態と安全境界」）。`permissions` は SHIKI に渡すだけで、commit・push などの固定の禁止事項は解除しません。登録は `idempotencyKey` で idempotent です。同じ `idempotencyKey` で2回登録すると、同じ Task を `"created": false` で返します。`idempotencyKey` が同じでほかの項目の値が違う場合は、`idempotency_conflict` で拒否します。
+- Task の入力: 知らない key、長さや件数の超過、256 KiB を超える入力、NUL、空白だけの値は拒否します。`title` は200文字まで（改行なし）、`goal` は20,000文字まで。`constraints`・`targets`・`permissions` は省略すると `[]` です。`targets` は SHIKI が作業 repository を探してもらうための手がかり（開発 root からの相対 path など）で、制限ではありません。どの repository で作業するかは SHIKI が判断します。repository の確かめ方は worktree の作成時で、選ばれた repository が開発 root の外なら `repository_outside_dev_root`、存在しないなら `repository_not_found` でその試行が失敗します。`targets` は SHIKI が触れる file の制限にもなりません（「状態と安全境界」）。`permissions` は SHIKI に渡すだけで、commit・push などの固定の禁止事項は解除しません。登録は `idempotencyKey` で idempotent です。同じ `idempotencyKey` で2回登録すると、同じ Task を `"created": false` で返します。`idempotencyKey` が同じでほかの項目の値が違う場合は、`idempotency_conflict` で拒否します。
 - CLI の引数:
 
 ```sh
@@ -170,7 +172,7 @@ npm run araya -- status
 - `approve <opportunityId>` 後: 次の処理で `blocked`（`no_external_executor`）
 - 承認通知用 outbox: `pending` のまま。送信処理はありません。
 
-`tick` の `due` は「処理時刻が来て tick を実行した」という意味で、候補が実行・完了した保証ではありません。`araya approve` は判断を記録するだけで、外部操作を開始しません。
+`tick` の `due` は「処理時刻が来て tick を実行した」という意味で、候補が実行・完了した保証ではありません。`araya approve <opportunityId> [note…]` と `araya reject <opportunityId> [note…]` は判断（note は省略可）を記録するだけで、外部操作を開始しません。
 
 ## 状態と安全境界
 
@@ -180,6 +182,7 @@ npm run araya -- status
 - これらの SQLite DB（`tasks.sqlite`・`runner/durable.sqlite`・`araya.sqlite`・`pi-durable.sqlite`）をまたぐ単一 transaction はありません。現在の PoC では、SQLite 間の障害注入・クラッシュ復旧の条件を満たしたとは主張しません。
 - `read-only` / `external` の実行 executor がない候補は `completed` と偽らず、`blocked` として残します。
 - Araya の通常 control-plane 処理は外部書き込みや通知送信をしません。`tick` / `run` は、Pi Durable の harness を開くときに Pi のモデル runtime を作りますが、モデルは呼び出しません。Pi の認証情報は `PI_CODING_AGENT_DIR`（未指定時は `~/.pi/agent`）から読み取り、Araya の設定や DB には複製しません。引数なしの `araya` と `araya pi` は明示的に Pi coding-agent SDK の CLI entry point を実行するため、その実行はこの節の対象外です。
+- 自律的な課題発見、Goal / 探索対象の設定、外部ソース監視、`read-only` / `external` 候補の executor、Native Broker、Discord / Hermes 連携、Outbox 配信、旧経路（`tick` / `run`）の常駐化は未実装です。`run` を起動しても、新しい課題を自律的に発見するわけではありません。
 - inbox の `development` 課題は実行せず `blocked` として残します（`development_executor_unavailable`）。
 - runner の SHIKI と検証コマンドは、利用者の権限で sandbox なしで動きます。開発 root の repository に限らず、利用者が書き込める file を変更できます。commit・push・PR の作成・merge・deploy・publish はしないよう SHIKI に指示しますが、強制はしません。
 - DB や inbox に利用者のデータを置く場合は、`ARAYA_DATA_DIR` とバックアップのアクセス権を利用者側で管理してください。

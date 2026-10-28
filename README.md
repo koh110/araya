@@ -67,7 +67,7 @@ araya task create --file task.json   # stdin から読むときは --file -
 ```
 
 - `title`（200 文字まで、改行なし）と `goal`（20,000 文字まで）は必須です。
-- `targets` は作業する repository の指定です（開発 root からの相対 path）。列挙した repository だけが worktree の対象になり、開発 root の外は拒否します。SHIKI が触れる file の制限にはなりません（「注意」を見てください）。`constraints` と `permissions` は省略できます。`permissions` は SHIKI に渡すだけで、commit・push などの固定の禁止事項は解除しません。
+- `targets` は作業 repository を探してもらうための手がかりです（開発 root からの相対 path など）。worktree の対象を限定するものではなく、どの repository で作業するかは SHIKI が判断します。SHIKI が触れる file の制限にもなりません（「注意」を見てください）。SHIKI が開発 root の下に存在しない repository を選んだときは、worktree の作成が失敗します（`repository_not_found`）。`constraints` と `permissions` は省略できます。`permissions` は SHIKI に渡すだけで、commit・push などの固定の禁止事項は解除しません。
 - `araya task` は runner も SHIKI も起動しません。動いている runner が数秒以内に台帳を見て、実行枠に空きがあれば取り込みます。runner が動いていないときは注意を出します（登録自体は成功します）。
 - 同じ `idempotencyKey` で同じ内容をもう一度登録すると、同じ Task を返します（`"created": false`）。入力の詳しい制限は仕様にあります。
 
