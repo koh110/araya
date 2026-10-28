@@ -79,7 +79,7 @@ runner は、SHIKI を動かすために常駐する Araya の process です。
 ## Task の内部
 
 - 台帳 `<dataDir>/tasks.sqlite` が開発の Task と試行、途中経過、runner の状態を保持します。runner の Pi Durable の storage（SHIKI の会話）は `runner/durable.sqlite` です。
-- Task の入力: 知らない key、長さや件数の超過、256 KiB を超える入力、NUL、空白だけの値は拒否します。`title` は200文字まで（改行なし）、`goal` は20,000文字まで。`constraints`・`targets`・`permissions` は省略すると `[]` です。`targets` は SHIKI が作業 repository を探してもらうための手がかり（開発 root からの相対 path など）で、制限ではありません。どの repository で作業するかは SHIKI が判断します。repository の確かめ方は worktree の作成時で、選ばれた repository が開発 root の外なら `repository_outside_dev_root`、存在しないなら `repository_not_found` でその試行が失敗します。`targets` は SHIKI が触れる file の制限にもなりません（「状態と安全境界」）。`permissions` は SHIKI に渡すだけで、commit・push などの固定の禁止事項は解除しません。登録は `idempotencyKey` で idempotent です。同じ `idempotencyKey` で2回登録すると、同じ Task を `"created": false` で返します。`idempotencyKey` が同じでほかの項目の値が違う場合は、`idempotency_conflict` で拒否します。
+- Task の入力: 知らない key、長さや件数の超過、256 KiB を超える入力、NUL、空白だけの値は拒否します。`title` は200文字まで（改行なし）、`goal` は20,000文字まで。`constraints`・`targets`・`permissions` は省略すると `[]` です。`targets` は SHIKI が作業 repository を探してもらうための手がかり（開発 root からの相対 path など）で、制限ではありません。どの repository で作業するかは SHIKI が判断します。repository の確かめ方は worktree の作成時で、選ばれた repository が開発 root の外なら `repository_outside_dev_root`、存在しないなら `repository_not_found` を tool error として SHIKI に返します。tool の失敗だけでは課題全体は止まらず、SHIKI は別の repository を選び直せます（「human-authored-development-loop」）。`targets` は SHIKI が触れる file の制限にもなりません（「状態と安全境界」）。`permissions` は SHIKI に渡すだけで、commit・push などの固定の禁止事項は解除しません。登録は `idempotencyKey` で idempotent です。同じ `idempotencyKey` で2回登録すると、同じ Task を `"created": false` で返します。`idempotencyKey` が同じでほかの項目の値が違う場合は、`idempotency_conflict` で拒否します。
 - CLI の引数:
 
 ```sh
