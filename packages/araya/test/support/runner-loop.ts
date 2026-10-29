@@ -94,6 +94,7 @@ export function startRunner(setup: RunnerSetup, overrides: Partial<RunnerDepende
       return setup.systemd.ops
     },
     pollMs: 20,
+    draftPrDelivery: overrides.draftPrDelivery ?? false,
     ...overrides
   })
 

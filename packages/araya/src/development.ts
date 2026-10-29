@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { constants as fsConstants } from 'node:fs'
 import fs from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
@@ -11,6 +12,8 @@ import {
   type VerificationCommandInput,
   type VerificationCommandResult
 } from './development-process.ts'
+import { deliverDraftPullRequests, type DraftPrSnapshotGuard, type DraftPrWorktreeEvidence, type DraftPrWorktreeInput } from './draft-pr-delivery.ts'
+import { hashGitDiffSnapshot, splitGitDiffSections } from './draft-pr-snapshot.ts'
 import {
   readDecision,
   readTaskState,
@@ -64,6 +67,8 @@ export type DevelopmentResult = {
 
 export type DevelopmentResultInput = {
   taskKey: string
+  title: string
+  draftPrDelivery: boolean
   // 開発 root の実 path（呼び出し側で解決済み）
   devRoot: string
   stateDir: string
@@ -81,6 +86,10 @@ export type DevelopmentResultInput = {
 export type DevelopmentResultDependencies = {
   // 差分の収集の git を起動する関数。runner は試行の scope の中で起動する関数を渡す
   runGit: GitCommandRunner
+  // commit・push の git を起動する関数。runner は試行の delivery scope の中で起動する関数を渡す
+  runDeliveryGit?: GitCommandRunner
+  // GitHub CLI を起動する関数。runner は試行の delivery scope の中で起動する関数を渡す
+  runGitHub?: GitCommandRunner
   // index は verifications.jsonl の中の登録の順番（0 から）。runner は検証の scope の名前に使う
   runVerification: (input: VerificationCommandInput & { index: number }) => Promise<VerificationCommandResult>
   // 差分の収集に使う git（test 用）。省略時は GIT_CANDIDATES から選ぶ
@@ -96,6 +105,7 @@ type FailureReason =
   | 'no_changes'
   | 'verification_missing'
   | 'verification_failed'
+  | 'draft_pr_failed'
 
 type GitContext = {
   executable: string
@@ -112,6 +122,8 @@ type DiffEvidence = {
   diff: string
   diffTruncated: boolean
   diffStat: { files: number; insertions: number; deletions: number; truncated: boolean }
+  snapshotSha256: string
+  snapshotDiffSha256: string
 }
 
 type VerificationEvidence = {
@@ -260,6 +272,7 @@ async function readBoundedFile(fileHandle: FileHandle, limit: number) {
 
 async function collectUntrackedDiff(worktreePath: string, untrackedFiles: readonly string[]) {
   const chunks: string[] = []
+  const entries: { path: string; diff: string }[] = []
   let bytes = 0
   let truncated = false
 
@@ -279,7 +292,9 @@ async function collectUntrackedDiff(worktreePath: string, untrackedFiles: readon
       if (isErrno(error, 'ELOOP')) {
         const note = `\n[untracked symlink omitted: ${displayedPath}]\n`
         chunks.push(note)
+        entries.push({ path: relativePath, diff: note })
         bytes += Buffer.byteLength(note)
+        truncated = true
         continue
       }
 
@@ -296,13 +311,16 @@ async function collectUntrackedDiff(worktreePath: string, untrackedFiles: readon
       if (!stat.isFile()) {
         const note = `\n[untracked non-regular file omitted: ${displayedPath}]\n`
         chunks.push(note)
+        entries.push({ path: relativePath, diff: note })
         bytes += Buffer.byteLength(note)
+        truncated = true
         continue
       }
 
+      const mode = (stat.mode & 0o111) === 0 ? '100644' : '100755'
       const header = [
         `diff --git a/${displayedPath} b/${displayedPath}`,
-        'new file mode 100644',
+        `new file mode ${mode}`,
         '--- /dev/null',
         `+++ b/${displayedPath}`
       ].join('\n')
@@ -312,6 +330,7 @@ async function collectUntrackedDiff(worktreePath: string, untrackedFiles: readon
       if (fileRead.truncated || stat.size > fileRead.content.byteLength) {
         const chunk = `${header}\n[untracked file content omitted or truncated: ${displayedPath}; bytes=${stat.size}]\n`
         chunks.push(chunk)
+        entries.push({ path: relativePath, diff: chunk })
         bytes += Buffer.byteLength(chunk)
         truncated = true
         continue
@@ -324,11 +343,13 @@ async function collectUntrackedDiff(worktreePath: string, untrackedFiles: readon
       } catch {
         const chunk = `${header}\n[binary untracked file omitted: ${displayedPath}; bytes=${stat.size}]\n`
         chunks.push(chunk)
+        entries.push({ path: relativePath, diff: chunk })
         bytes += Buffer.byteLength(chunk)
+        truncated = true
         continue
       }
 
-      const lines = text.split('\n')
+      const lines = text === '' ? [] : text.split('\n')
 
       if (text.endsWith('\n')) {
         lines.pop()
@@ -339,15 +360,16 @@ async function collectUntrackedDiff(worktreePath: string, untrackedFiles: readon
         : [`@@ -0,0 +1,${lines.length} @@`, ...lines.map((line) => {
             return `+${line}`
           })]
-      const chunk = `${header}\n${hunk.join('\n')}${hunk.length === 0 ? '' : '\n'}`
+      const chunk = `${header}\n${hunk.join('\n')}${hunk.length === 0 ? '' : '\n'}${text !== '' && !text.endsWith('\n') ? '\\ No newline at end of file\n' : ''}`
       chunks.push(chunk)
+      entries.push({ path: relativePath, diff: chunk })
       bytes += Buffer.byteLength(chunk)
     } finally {
       await fileHandle.close()
     }
   }
 
-  return { diff: chunks.join(''), truncated }
+  return { diff: chunks.join(''), entries, truncated }
 }
 
 function truncateUtf8(value: string, maxBytes: number) {
@@ -414,6 +436,15 @@ function summarizeDiff(diff: string, fileCount: number, truncated: boolean) {
   return { files: fileCount, insertions, deletions, truncated }
 }
 
+// snapshot の再確認では redaction count を増やさない。diff 本文は evidence へ返さず、hash 比較にだけ使う。
+function createSnapshotGitContext(git: GitContext): GitContext {
+  return {
+    ...git,
+    redact: (text) => text,
+    redactTruncated: (text) => text
+  }
+}
+
 // base SHA と作業 tree の差（commit 済み・未 commit・untracked）を集める
 async function collectWorktreeDiff(git: GitContext, record: WorktreeRecord, diffBudget: number) {
   const worktreeReal = await fs.realpath(record.worktreePath)
@@ -429,9 +460,15 @@ async function collectWorktreeDiff(git: GitContext, record: WorktreeRecord, diff
     throw new Error(`${record.worktreePath} is not the root of a git worktree`)
   }
 
+  const branch = (await runGitChecked(git, worktreeReal, ['rev-parse', '--abbrev-ref', 'HEAD'])).trim()
+
+  if (branch !== record.branch) {
+    throw new Error(`the worktree branch changed from ${record.branch} to ${branch}`)
+  }
+
   const headSha = (await runGitChecked(git, worktreeReal, ['rev-parse', '--verify', 'HEAD'])).trim()
   const trackedFiles = parseNulSeparatedPaths(await runGitChecked(git, worktreeReal, [
-    'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--name-only', '-z', record.baseSha, '--'
+    'diff', '--ignore-submodules=none', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--name-only', '-z', record.baseSha, '--'
   ]))
   const untrackedFiles = parseNulSeparatedPaths(await runGitChecked(git, worktreeReal, [
     'ls-files', '--others', '--exclude-standard', '-z'
@@ -447,7 +484,7 @@ async function collectWorktreeDiff(git: GitContext, record: WorktreeRecord, diff
   }
 
   const trackedDiff = await runGit(git, worktreeReal, [
-    'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--binary', '--unified=3', record.baseSha, '--'
+    'diff', '--ignore-submodules=none', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--binary', '--unified=3', record.baseSha, '--'
   ], diffBudget)
 
   if (trackedDiff.exitCode === null && trackedDiff.terminationReason !== 'output_overflow') {
@@ -463,18 +500,69 @@ async function collectWorktreeDiff(git: GitContext, record: WorktreeRecord, diff
   }
 
   const untracked = await collectUntrackedDiff(worktreeReal, untrackedFiles)
-  const diff = `${trackedDiff.stdout}${untracked.diff}`
+  const rawDiff = `${trackedDiff.stdout}${untracked.diff}`
   const trackedOverflowed = trackedDiff.terminationReason === 'output_overflow'
-  const limitedDiff = limitDiff(diff, diffBudget, trackedOverflowed, git.redactTruncated)
-  const diffTruncated = trackedOverflowed || untracked.truncated || limitedDiff !== diff
+  const diff = limitDiff(rawDiff, diffBudget, trackedOverflowed, git.redactTruncated)
+  const sectionsByPath = new Map<string, string>()
+  const trackedSections = splitGitDiffSections(trackedDiff.stdout)
+  let sectionsComplete = trackedSections !== null && trackedSections.length === trackedFiles.length
+
+  if (trackedSections !== null && trackedSections.length === trackedFiles.length) {
+    for (const [index, changedPath] of trackedFiles.entries()) {
+      const section = trackedSections[index]
+
+      if (section !== undefined) {
+        sectionsByPath.set(changedPath, section)
+      }
+    }
+  }
+
+  for (const entry of untracked.entries) {
+    const sections = splitGitDiffSections(entry.diff)
+
+    if (sections === null || sections.length !== 1) {
+      sectionsComplete = false
+      continue
+    }
+
+    sectionsByPath.set(entry.path, sections[0] ?? '')
+  }
+
+  const orderedSections = changedFiles.map((changedPath) => sectionsByPath.get(changedPath))
+  const completeSections: string[] = []
+
+  for (const section of orderedSections) {
+    if (section === undefined) {
+      continue
+    }
+
+    completeSections.push(section)
+  }
+
+  const normalizedSnapshotSha256 = completeSections.length === changedFiles.length
+    ? hashGitDiffSnapshot(changedFiles, completeSections)
+    : null
+  const snapshotDiffSha256 = normalizedSnapshotSha256 ?? createHash('sha256').update(rawDiff).digest('hex')
+  const diffTruncated = trackedOverflowed || untracked.truncated || diff !== rawDiff || !sectionsComplete || normalizedSnapshotSha256 === null
+  const snapshotSha256 = createHash('sha256')
+    .update(branch)
+    .update('\0')
+    .update(headSha)
+    .update('\0')
+    .update(changedFiles.join('\0'))
+    .update('\0')
+    .update(rawDiff)
+    .digest('hex')
 
   const evidence: DiffEvidence = {
     headSha,
     headMoved: headSha !== record.baseSha,
     changedFiles,
-    diff: limitedDiff,
+    diff,
     diffTruncated,
-    diffStat: summarizeDiff(limitedDiff, changedFiles.length, diffTruncated)
+    diffStat: summarizeDiff(diff, changedFiles.length, diffTruncated),
+    snapshotSha256,
+    snapshotDiffSha256
   }
 
   return evidence
@@ -633,18 +721,22 @@ export async function collectDevelopmentResult(
   const decisionRequested = agent.status === 'completed' && decision !== null
 
   const diffs: DiffEvidence[] = []
+  const diffBudgets: number[] = []
+  let git: GitContext | null = null
 
   try {
-    const git: GitContext = {
+    git = {
       executable: dependencies.gitExecutable ?? await findGitExecutable(),
       env: createGitEnv(input.env),
       run: dependencies.runGit,
       redact,
       redactTruncated
     }
+
     let diffBudget = MAX_DIFF_BYTES
 
     for (const record of state.worktrees) {
+      diffBudgets.push(diffBudget)
       const diff = await collectWorktreeDiff(git, record, diffBudget)
       diffBudget = Math.max(0, diffBudget - Buffer.byteLength(diff.diff))
       diffs.push(diff)
@@ -742,6 +834,37 @@ export async function collectDevelopmentResult(
     worktrees.push(toWorktreeEvidence(record, diff, verifications))
   }
 
+  if (agent.status === 'completed' && !decisionRequested && !verificationUnconfirmed) {
+    const snapshotGit = createSnapshotGitContext(git)
+    let worktreeChangedDuringVerification = false
+
+    try {
+      for (const [index, record] of state.worktrees.entries()) {
+        const verified = diffs[index]
+        const current = await collectWorktreeDiff(snapshotGit, record, diffBudgets[index] ?? 0)
+
+        if (verified === undefined || verified.snapshotSha256 !== current.snapshotSha256) {
+          worktreeChangedDuringVerification = true
+          break
+        }
+      }
+    } catch (error) {
+      return fail('evidence_collection_failed', true, {
+        ...agentEvidence(agent),
+        failureDetail: describeError(error, redact),
+        worktrees
+      })
+    }
+
+    if (worktreeChangedDuringVerification) {
+      return fail('verification_failed', true, {
+        ...agentEvidence(agent),
+        worktrees,
+        failureDetail: 'the worktree changed during verification or its final diff could not be captured completely; delivery was skipped'
+      })
+    }
+  }
+
   function decideFailureReason(): FailureReason | undefined {
     if (verificationUnconfirmed) {
       return 'termination_unconfirmed'
@@ -791,12 +914,158 @@ export async function collectDevelopmentResult(
     })
   }
 
-  const status = decisionRequested ? 'blocked' : 'completed'
   const decisionQuestion = decision?.question ?? null
+
+  if (decisionRequested) {
+    return {
+      status: 'blocked',
+      evidence: { taskKey, devRoot, outcome: 'blocked', ...agentEvidence(agent), worktrees, decisionQuestion },
+      decisionQuestion,
+      collected: true
+    }
+  }
+
+  if (!input.draftPrDelivery) {
+    return {
+      status: 'completed',
+      evidence: { taskKey, devRoot, outcome: 'completed', ...agentEvidence(agent), worktrees, decisionQuestion: null },
+      decisionQuestion: null,
+      collected: true
+    }
+  }
+
+  if (git === null || dependencies.runGitHub === undefined) {
+    return fail('draft_pr_failed', true, {
+      ...agentEvidence(agent),
+      worktrees,
+      failureDetail: 'Draft PR delivery command runners are not configured'
+    })
+  }
+
+  const snapshotGit = createSnapshotGitContext(git)
+
+  try {
+    for (const [index, record] of state.worktrees.entries()) {
+      const verified = diffs[index]
+      const current = await collectWorktreeDiff(snapshotGit, record, diffBudgets[index] ?? 0)
+
+      if (verified === undefined || verified.diffTruncated || current.diffTruncated || verified.snapshotSha256 !== current.snapshotSha256) {
+        return fail('verification_failed', true, {
+          ...agentEvidence(agent),
+          worktrees,
+          failureDetail: 'the worktree changed during verification or its final diff could not be captured completely; delivery was skipped'
+        })
+      }
+    }
+  } catch (error) {
+    return fail('evidence_collection_failed', true, {
+      ...agentEvidence(agent),
+      failureDetail: describeError(error, redact),
+      worktrees
+    })
+  }
+
+  const preflightSnapshotGuards: DraftPrSnapshotGuard[] = []
+
+  for (const [index, record] of state.worktrees.entries()) {
+    const diff = diffs[index]
+
+    if (diff === undefined) {
+      return fail('draft_pr_failed', true, {
+        ...agentEvidence(agent),
+        worktrees,
+        failureDetail: 'verified worktree snapshot is missing'
+      })
+    }
+
+    const diffBudget = diffBudgets[index] ?? 0
+    const readSnapshot = async () => {
+      const current = await collectWorktreeDiff(snapshotGit, record, diffBudget)
+
+      return { snapshotSha256: current.snapshotSha256, diffTruncated: current.diffTruncated }
+    }
+
+    preflightSnapshotGuards.push({ record, snapshotSha256: diff.snapshotSha256, readSnapshot })
+  }
+
+  const deliveryWorktrees: DraftPrWorktreeInput[] = []
+
+  for (const [index, record] of state.worktrees.entries()) {
+    if (changed[index] !== true) {
+      continue
+    }
+
+    const diff = diffs[index]
+    const evidence = worktrees[index]
+    const guard = preflightSnapshotGuards[index]
+
+    if (diff === undefined || evidence === undefined || guard === undefined) {
+      return fail('draft_pr_failed', true, {
+        ...agentEvidence(agent),
+        worktrees,
+        failureDetail: 'verified worktree evidence is missing'
+      })
+    }
+
+    deliveryWorktrees.push({
+      record,
+      headSha: diff.headSha,
+      verificationCount: evidence.verifications.filter((verification) => verification.status === 'passed').length,
+      snapshotSha256: diff.snapshotSha256,
+      snapshotDiffSha256: diff.snapshotDiffSha256,
+      snapshotChangedFiles: [...diff.changedFiles].sort(),
+      readSnapshot: guard.readSnapshot
+    })
+  }
+
+  const delivery = await deliverDraftPullRequests({
+    taskKey,
+    title: input.title,
+    worktrees: deliveryWorktrees,
+    preflightSnapshotGuards,
+    env: input.env,
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
+    redact
+  }, {
+    runGit: dependencies.runDeliveryGit ?? dependencies.runGit,
+    runGitHub: dependencies.runGitHub,
+    gitExecutable: git.executable
+  })
+  const deliveryByPath = new Map<string, DraftPrWorktreeEvidence>()
+
+  for (const item of delivery.worktrees) {
+    deliveryByPath.set(item.worktreePath, item)
+  }
+
+  const deliveredWorktrees = worktrees.map((worktree) => {
+    const item = deliveryByPath.get(worktree.worktreePath)
+
+    return item === undefined
+      ? { ...worktree, draftPrStatus: 'skipped' }
+      : { ...worktree, ...item }
+  })
+  const evidence: Record<string, unknown> = {
+    taskKey,
+    devRoot,
+    outcome: delivery.status,
+    ...agentEvidence(agent),
+    worktrees: deliveredWorktrees,
+    decisionQuestion: delivery.decisionQuestion,
+    draftPrDelivery: { status: delivery.status, worktrees: delivery.worktrees }
+  }
+
+  if (delivery.failureReason !== null) {
+    evidence.failureReason = delivery.failureReason
+  }
+
+  if (delivery.failureDetail !== null) {
+    evidence.failureDetail = redact(delivery.failureDetail).slice(0, MAX_FAILURE_DETAIL_CHARS)
+  }
+
   const developmentResult: DevelopmentResult = {
-    status,
-    evidence: { taskKey, devRoot, outcome: status, ...agentEvidence(agent), worktrees, decisionQuestion },
-    decisionQuestion,
+    status: delivery.status,
+    evidence,
+    decisionQuestion: delivery.decisionQuestion,
     collected: true
   }
 

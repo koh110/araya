@@ -105,6 +105,17 @@ export function gitScopeUnit(hash: string, taskKey: string, randomBytes: (size: 
   return `araya-${hash}-${taskKey}-git-${id}.scope`
 }
 
+// commit・push・Draft PR 作成を行う scope。<r> は a-z2-7 の 12 文字の乱数
+export function deliveryScopeUnit(hash: string, taskKey: string, randomBytes: (size: number) => Uint8Array = cryptoRandomBytes) {
+  let id = ''
+
+  for (const byte of randomBytes(GIT_SCOPE_ID_CHARS)) {
+    id += SCOPE_ID_ALPHABET[byte % SCOPE_ID_ALPHABET.length] ?? ''
+  }
+
+  return `araya-${hash}-${taskKey}-delivery-${id}.scope`
+}
+
 // 検証のコマンドの scope。<n> は verifications.jsonl の中の登録の順番（0 から）
 export function verifyScopeUnit(hash: string, taskKey: string, index: number) {
   return `araya-${hash}-${taskKey}-verify-${index}.scope`

@@ -85,6 +85,7 @@ function faultsOf(name: string | undefined) {
 const code = await runTaskRunner({
   dataDir,
   env: process.env,
+  draftPrDelivery: false,
   platform: process.platform,
   stopSignal: controller.signal,
   verifyUnit,

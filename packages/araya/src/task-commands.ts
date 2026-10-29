@@ -52,7 +52,7 @@ const UNIT_MISSING_PATTERN = /does not exist|not loaded|not found/iu
 // systemctl --user stop の、unit が読み込まれていないための失敗（systemd 259 では終了 code 5、stderr は Unit <unit> not loaded.）
 const UNIT_NOT_LOADED_PATTERN = /not loaded/iu
 
-const SIDE_EFFECTS_MESSAGE = '前回の試行は作業の途中で止まりました。外部への変更が済んでいる可能性があります。前回の worktree と外部の状態を確かめてから、--confirm-side-effects を付けて再実行してください'
+const SIDE_EFFECTS_MESSAGE = '前回の試行では外部の branch や Draft PR が作成・更新された可能性がある、または結果を確認できません。前回の worktree と GitHub の状態を確かめてから、--confirm-side-effects を付けて再実行してください'
 
 export type TaskCommandDependencies = {
   platform: NodeJS.Platform

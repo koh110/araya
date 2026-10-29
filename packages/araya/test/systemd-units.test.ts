@@ -16,6 +16,7 @@ import {
   createScopedVerificationRunner,
   createSystemdOps,
   dataDirHash,
+  deliveryScopeUnit,
   gitScopeUnit,
   isUnitFileValueSafe,
   resolveRunnerEntrypoint,
@@ -73,6 +74,9 @@ test('systemd-units: unit と scope の名前は dataDir の実 path の hash �
   )
   assert.match(gitScopeUnit(hash, TASK_KEY), new RegExp(`^araya-${hash}-${TASK_KEY}-git-[a-z2-7]{12}\\.scope$`, 'u'))
   assert.notEqual(gitScopeUnit(hash, TASK_KEY), gitScopeUnit(hash, TASK_KEY))
+  assert.ok(deliveryScopeUnit(hash, TASK_KEY).startsWith(`araya-${hash}-${TASK_KEY}-delivery-`))
+  assert.ok(deliveryScopeUnit(hash, TASK_KEY).endsWith('.scope'))
+  assert.notEqual(deliveryScopeUnit(hash, TASK_KEY), deliveryScopeUnit(hash, TASK_KEY))
 })
 
 test('systemd-units: shellQuote は単引用符で囲み、bash で元の文字列に戻る', () => {
@@ -496,6 +500,8 @@ test('scope: araya_create_worktree と差分の収集の git は git-<r>、検�
 
     const result = await collectDevelopmentResult({
       taskKey: TASK_KEY,
+      title: 'fixture Task',
+      draftPrDelivery: false,
       devRoot: fixture.devRoot,
       stateDir: fixture.stateDir,
       agent: { status: 'completed', summary: '報告', model: { provider: 'faux', id: 'faux-1', thinkingLevel: 'medium', source: 'araya-config' } },
@@ -596,6 +602,8 @@ test('scope: 検証の scope を止められなければ termination_unconfirmed
 
     const result = await collectDevelopmentResult({
       taskKey: TASK_KEY,
+      title: 'fixture Task',
+      draftPrDelivery: false,
       devRoot: fixture.devRoot,
       stateDir: fixture.stateDir,
       agent: { status: 'completed', summary: '報告', model: { provider: 'faux', id: 'faux-1', thinkingLevel: 'medium', source: 'araya-config' } },

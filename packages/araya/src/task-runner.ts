@@ -94,6 +94,8 @@ export type RunnerDependencies = {
   createModels?: (input: { agentDir: string; dataDir: string }) => Promise<ModelRuntime>
   createSystemdOps?: (env: Env) => Promise<SystemdOps>
   createPiSettings?: (stateDir: string, agentDir: string) => PiModelSettings
+  // test が runner 全体を検証するときに delivery を無効化できる。製品 runner の既定は有効
+  draftPrDelivery?: boolean
   // 実行枠の上限。既定は MAX_CONCURRENT_ATTEMPTS
   maxConcurrent?: number
   // pi-durable の restartLimit。省略すると pi-durable の既定（5）
@@ -420,6 +422,7 @@ async function runWithLedger(context: RunnerContext) {
       systemd,
       models,
       env: deps.env,
+      draftPrDelivery: deps.draftPrDelivery ?? true,
       secretValues,
       log,
       now,

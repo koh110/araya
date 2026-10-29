@@ -44,6 +44,7 @@ import {
 import {
   createScopedRunner,
   createScopedVerificationRunner,
+  deliveryScopeUnit,
   gitScopeUnit,
   scopePattern,
   verifyScopeUnit,
@@ -132,8 +133,9 @@ export type AttemptDependencies = {
   systemd: Pick<SystemdOps, 'launchInScope' | 'bashScopeCommand' | 'stopScopes'>
   // runner の ModelRuntime（Harness の models と同じもの）
   models: ModelLookup
-  // SHIKI の git と検証のコマンドに渡す環境変数
   env: Readonly<Record<string, string | undefined>>
+  // Task 作成時に指定された goal に対して、検証後の Draft PR delivery を有効にする
+  draftPrDelivery: boolean
   // 秘密とみなす環境変数の値（evidence と evidence.json に書く前に置き換える）
   secretValues: readonly string[]
   log(entry: Record<string, unknown>): void
@@ -623,6 +625,8 @@ export function createShikiExtension(deps: AttemptDependencies) {
   async function collect(input: AttemptInput, stateDir: string, agent: AgentOutcome, redactor: Redactor, signal: AbortSignal) {
     return collectDevelopmentResult({
       taskKey: input.taskKey,
+      title: input.title,
+      draftPrDelivery: deps.draftPrDelivery,
       devRoot: input.settings.devRoot,
       stateDir,
       agent,
@@ -634,6 +638,12 @@ export function createShikiExtension(deps: AttemptDependencies) {
     }, {
       runGit: createScopedRunner(deps.systemd, () => {
         return gitScopeUnit(deps.hash, input.taskKey)
+      }),
+      runDeliveryGit: createScopedRunner(deps.systemd, () => {
+        return deliveryScopeUnit(deps.hash, input.taskKey)
+      }),
+      runGitHub: createScopedRunner(deps.systemd, () => {
+        return deliveryScopeUnit(deps.hash, input.taskKey)
       }),
       runVerification: createScopedVerificationRunner(deps.systemd, (index) => {
         return verifyScopeUnit(deps.hash, input.taskKey, index)

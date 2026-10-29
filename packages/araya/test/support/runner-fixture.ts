@@ -145,6 +145,7 @@ export type AttemptHarnessOptions = {
   systemd: Pick<SystemdOps, 'launchInScope' | 'bashScopeCommand' | 'stopScopes'>
   faults?: AttemptFaults
   createPiSettings?: (stateDir: string, agentDir: string) => PiModelSettings
+  draftPrDelivery?: boolean
 }
 
 // 試行の task を動かす Harness を開く。runner と同じく、storage は <dataDir>/runner/durable.sqlite
@@ -160,6 +161,7 @@ export async function openAttemptHarness(fixture: RunnerFixture, options: Attemp
     systemd: options.systemd,
     models: options.models,
     env: fixture.env,
+    draftPrDelivery: options.draftPrDelivery ?? false,
     secretValues,
     log: (entry) => {
       logs.push(entry)

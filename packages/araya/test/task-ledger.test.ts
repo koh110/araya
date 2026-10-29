@@ -594,14 +594,24 @@ test('ledger: failed と blocked だけ再実行でき、新しい taskKey の q
   }
 })
 
-test('ledger: 途中で止まった試行の再実行は side_effects_unconfirmed で、--confirm-side-effects で confirmedSideEffects true', async () => {
+test('ledger: 中断された試行または外部変更の可能性がある試行の再実行は確認が必要で、--confirm-side-effects で confirmedSideEffects true', async () => {
   const interruptedResults: AttemptResult[] = [
     result({ status: 'failed', failureReason: 'cancelled' }),
     result({ status: 'blocked', failureReason: 'restart_limit' }),
     result({ status: 'failed', failureReason: 'attempt_error', failureDetail: 'failed' }),
     result({ status: 'failed', failureReason: 'termination_unconfirmed' }),
     result({ status: 'failed', failureReason: 'agent_timeout' }),
-    result({ status: 'failed', failureReason: 'agent_failed', evidence: { agent: { error: 'model_error' }, worktrees: [] } })
+    result({ status: 'failed', failureReason: 'agent_failed', evidence: { agent: { error: 'model_error' }, worktrees: [] } }),
+    result({
+      status: 'failed',
+      failureReason: 'draft_pr_failed',
+      evidence: { draftPrDelivery: { worktrees: [{ draftPrStatus: 'pushed' }] }, worktrees: [] }
+    }),
+    result({
+      status: 'failed',
+      failureReason: 'draft_pr_failed',
+      evidence: { draftPrDelivery: { worktrees: [{ draftPrStatus: 'failed', remoteSideEffectsUnconfirmed: true }] }, worktrees: [] }
+    })
   ]
 
   for (const interrupted of interruptedResults) {

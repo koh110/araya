@@ -523,7 +523,7 @@ test('task cancel: queued はその場で failed（cancelled）、completed・fa
   }
 })
 
-test('task retry: 途中で止まった試行は --confirm-side-effects が無ければ前回の worktree を出して拒否し、付けると再実行する', async () => {
+test('task retry: 外部変更の可能性がある試行は --confirm-side-effects が無ければ前回の worktree を出して拒否し、付けると再実行する', async () => {
   const taskEnv = await makeTaskEnv()
 
   try {
@@ -544,7 +544,7 @@ test('task retry: 途中で止まった試行は --confirm-side-effects が無�
     await assert.rejects(runTask(taskEnv, ['retry', '1']), (error: unknown) => {
       assert.ok(error instanceof Error)
       assert.equal(error.message, [
-        'side_effects_unconfirmed: 前回の試行は作業の途中で止まりました。外部への変更が済んでいる可能性があります。前回の worktree と外部の状態を確かめてから、--confirm-side-effects を付けて再実行してください',
+        'side_effects_unconfirmed: 前回の試行では外部の branch や Draft PR が作成・更新された可能性がある、または結果を確認できません。前回の worktree と GitHub の状態を確かめてから、--confirm-side-effects を付けて再実行してください',
         '前回の worktree:',
         '  - /home/u/dev/repo/.worktree/araya-task-1-1-aaaaaa（branch araya/task-1-1-aaaaaa）'
       ].join('\n'))

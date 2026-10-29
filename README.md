@@ -1,6 +1,6 @@
 # araya
 
-開発課題を AI agent に依頼するための CLI です。目指す姿は、検証済みの変更を draft PR まで届け、merge は人が判断することです。現行MVPでは、常駐 runner が SHIKI（Pi で作る開発の agent）を対象 repository の worktree で動かし、差分と検証結果を Task の台帳に記録しますが、変更は未 commit のままで、commit・push・PR 作成はしません。
+開発課題を AI agent に依頼するための CLI です。検証済みの変更を draft PR まで届け、merge は人が判断します。常駐 runner が SHIKI（Pi で作る開発 agent）を対象 repository の worktree で動かし、登録検証がすべて通った変更を Araya が commit・GitHub.com へ push し、Draft PR を作成します。Araya は merge・deploy・publish を行いません。
 
 実験用 MVP です。この文書では `araya` を入れてから結果を受け取るまでの手順を説明します。内部の仕組みと開発の手順は [docs/development.md](docs/development.md)、動作の詳しい定義は仕様 [docs/spec/task-ledger-and-shiki-runner.md](docs/spec/task-ledger-and-shiki-runner.md) にあります。
 
@@ -9,6 +9,7 @@
 - Linux と systemd（254 以降）の user manager に到達する host。それ以外の host では `araya task` と `araya runner` は使えません。
 - Node.js 26.8 以上
 - git。作業対象の repository に worktree を作るときに使います。
+- GitHub.com の repository へ Draft PR を届けるときは GitHub CLI `gh` が必要です。runner と同じ OS user で `gh auth login` を済ませてください。GitHub Enterprise は対象外です。
 - 開発 root。Task で動かす repository は開発 root の中に必要です（既定 `~/dev`。`ARAYA_DEV_ROOT` で変えられます）。
 - Pi で使える model へのアクセス。Pi coding-agent は araya の依存 package に含まれるので、別途 `pi` を入れる必要はありません。model の認証は Pi の `/login` で設定します（API key の環境変数は使いません）。
 
@@ -67,7 +68,7 @@ araya task create --file task.json   # stdin から読むときは --file -
 ```
 
 - `title`（200 文字まで、改行なし）と `goal`（20,000 文字まで）は必須です。
-- `targets` は SHIKI に作業 repository を探してもらうための手がかりです（開発 root からの相対 path など）。worktree の対象を限定するものではなく、どの repository で作業するかは SHIKI が判断します。SHIKI が触れる file の制限にもなりません（「注意」を見てください）。SHIKI が開発 root の下に存在しない repository を指定したときは、worktree の作成が失敗し、理由（`repository_not_found`）が SHIKI に返されます。SHIKI は別の repository を選び直せます（tool の失敗だけでは試行は終わりません）。`constraints` と `permissions` は省略できます。`permissions` は SHIKI に渡すだけで、commit・push などの固定の禁止事項は解除しません。
+- `targets` は SHIKI に作業 repository を探してもらうための手がかりです（開発 root からの相対 path など）。worktree の対象を限定するものではなく、どの repository で作業するかは SHIKI が判断します。SHIKI が触れる file の制限にもなりません（「注意」を見てください）。SHIKI が開発 root の下に存在しない repository を指定したときは、worktree の作成が失敗し、理由（`repository_not_found`）が SHIKI に返されます。SHIKI は別の repository を選び直せます（tool の失敗だけでは試行は終わりません）。`constraints` と `permissions` は省略できます。`permissions` は SHIKI に渡す制約情報で、Araya が検証後に行う commit・push・Draft PR の前提を解除したり、merge・deploy を許可したりしません。
 - `araya task` は runner も SHIKI も起動しません。動いている runner が数秒以内に台帳を見て、実行枠に空きがあれば取り込みます。runner が動いていないときは注意を出します（登録自体は成功します）。
 - 同じ `idempotencyKey` で同じ内容をもう一度登録すると、同じ Task を返します（`"created": false`）。入力の詳しい制限は仕様にあります。
 
@@ -82,9 +83,9 @@ Task の状態は次のとおりです。
 
 - `queued`: 待ち
 - `running`: runner が動かしている（runner が止まっている間もこの状態）
-- `completed`: SHIKI が成功し、差分のある worktree すべてで検証が通った
-- `failed`: 失敗した、または中止された（理由は `failureReason`）
-- `blocked`: 人の判断を待っている（「詰まったときは」を見てください）
+- `completed`: SHIKI が成功し、差分のある全 worktree で登録検証が通り、GitHub.com の Draft PR まで届けた（差分なしは `no_changes` で失敗）。
+- `failed`: agent・検証・commit・push・PR 作成のいずれかが失敗、または中止された（理由は `failureReason`）。
+- `blocked`: 人の判断、GitHub CLI 認証、GitHub repository の確認などが必要（「詰まったときは」を見てください）。
 
 `task list` には runner の状態（`runner.state`: `running`・`stopped`・`not_responding`・`not_started`）も出ます。1つの runner で同時に動く SHIKI は1件までで、ほかの Task は `queued` で待ちます。
 
@@ -92,7 +93,7 @@ Task の状態は次のとおりです。
 
 ## 結果を受け取る
 
-現行MVPでは、SHIKI の変更は試行ごとの worktree `<repository>/.worktree/araya-<taskKey>`（branch `araya/<taskKey>`）に未 commit のまま残ります。Araya は commit・push・PR 作成・merge・deploy・publish を行わず、SHIKI にもしないよう指示しますが、強制はしません。`araya task show <taskId> --full` の出力か worktree の差分で変更を確かめ、取り込むかどうかは自分で判断してください。目指す形では、検証済みの変更から draft PR を作り、merge は人が判断します。現行MVPと今後の設計方針の違いは [Draft PR まで届ける設計方針](docs/spec/draft-pr-delivery.md) を見てください。worktree・branch・log・台帳は自動では消えません。
+SHIKI の変更は試行ごとの worktree `<repository>/.worktree/araya-<taskKey>`（branch `araya/<taskKey>`）に作られます。差分のある各 repository で全検証が通ると、Araya が変更を commit し、GitHub.com の `origin` に fast-forward push して Draft PR を作成します。PR URL は `task show` の evidence に残ります。`gh` 不在・未認証、GitHub 以外の remote、Git identity 不足などでは success にせず、設定が必要な場合は `blocked` にします。Araya は merge・deploy・publish を行いません。worktree・branch・log・台帳は自動では消えません。詳しくは [Draft PR delivery 仕様](docs/spec/draft-pr-delivery.md) を見てください。
 
 ## 詰まったときは
 
@@ -105,7 +106,7 @@ araya task retry <taskId> --note "B 方案を使う"
 - 再実行できるのは `failed` と `blocked` の Task だけです。
 - 新しい試行は新しい taskKey を使い、worktree と branch も前回とは別になります。前回の worktree は残ります（前回の変更は持ち込みません）。
 - SHIKI が判断を求めたときは、質問への答えを `--note` に書きます（長い文字列は `--note-file`）。
-- 前回の試行が途中で止まっていたとき（中止、`agent_timeout`、`restart_limit` など）は、外部への変更をくり返すおそれがあるので、`--confirm-side-effects` を付けないと拒否されます。前回の worktree と外部の状態を確かめてから付けてください。
+- 前回の試行が中断された場合、または Draft PR 配送で remote branch / PR が作成・更新されたか確認できない場合は、`--confirm-side-effects` が必要です。前回の worktree と GitHub の状態を確かめてから付けてください。
 - `araya task cancel <taskId>` は、待機中の試行をその場で中止し、動いている試行には中止を求めます。自動の再実行はありません。
 
 ## runner を管理する
@@ -133,6 +134,7 @@ npm run deploy
 ## 注意
 
 - SHIKI と検証コマンドは sandbox 無しで、利用者の権限で動きます。開発 root の repository だけでなく、利用者が書き込める file を変更できます。
+- SHIKI には main checkout を編集せず、commit・push・PR 作成をしないよう指示しますが、sandbox・network制限はなく、prompt は強制されません。SHIKI が直接 remote を変更する可能性があります。Araya の組み込み delivery が commit・push・PR を行うのは全検証後です。Task と agent の権限を確認してから登録してください。
 - Araya は秘密とみなす値と URL の userinfo を、台帳・evidence・log に書く前に `[REDACTED]` に置き換えます。ただし完全ではありません。SHIKI の会話は Pi Durable の storage にそのまま残ります。Task の文字列に何を書いたかは確認してください。
 - データは `~/.araya`（`ARAYA_DATA_DIR` で変わります）に置かれます。アクセス権とバックアップは利用者側で管理してください。
 - SHIKI の tool は `read`・`edit`・`write`・`bash` と Araya の tool です。`grep`・`find`・`ls` はありません（bash で代用します）。

@@ -89,7 +89,7 @@ export const SHIKI_TOOL_NAMES = [
 ] as const
 
 const MAX_TASK_BODY_SUMMARY_CHARS = 4000
-const INTERRUPTED_NOTICE = '- 注意: 前回の試行は作業の途中で止まりました。外部への変更が済んでいる可能性があります。同じ操作をくり返す前に、前回の worktree と外部の状態を確かめてください。'
+const INTERRUPTED_NOTICE = '- 注意: 前回の試行では外部の branch や Draft PR が作成・更新された可能性がある、または結果を確認できません。同じ操作をくり返す前に、前回の worktree と GitHub の状態を確かめてください。'
 
 export function getWorktreePattern(input: { taskKey: string }) {
   return `<repository>/.worktree/araya-${input.taskKey}`

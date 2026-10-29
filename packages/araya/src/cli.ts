@@ -63,7 +63,7 @@ function printHelp() {
   araya task retry <taskId> [--note <text> | --note-file <path|->] [--confirm-side-effects]
     failed と blocked の Task を再実行する。--note は追加の指示。SHIKI が判断を求めて blocked になった Task では、
     質問（decisionQuestion）への答えを書く。
-    途中で止まった試行の後は --confirm-side-effects が必要。
+    外部 branch や Draft PR が作成・更新された可能性がある試行の後は --confirm-side-effects が必要。
 
   araya task cancel <taskId>
     待ちの試行をその場で中止するか、動いている試行の中止を求める。

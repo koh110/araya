@@ -10,7 +10,7 @@ Task は、常駐する runner（systemd の user service）が動かす。runne
 
 この手順で、旧経路の worker（JSONL inbox の development の課題を、Pi の SDK の session で動かす process）も撤去する。撤去は runner より先に行い、SHIKI を動かすのは runner だけになる（利用者の選択。「旧経路との関係」）。
 
-この仕様が定義するのは現行MVPの動作であり、PR 作成は含まない。製品の目標は、検証済みの開発変更を draft PR まで届け、merge は人が判断すること。この目標と現行MVPの範囲を区別し、今後の設計課題を [Draft PR まで届ける設計方針](draft-pr-delivery.md) に記録する。
+この仕様は Task runner と SHIKI 委任の動作を定義する。検証済みの変更は、実装仕様 [Draft PR delivery](draft-pr-delivery.md) に従い commit・push・Draft PR まで届ける。CI の完了待ち、merge、deploy は行わない。
 
 ## 概要
 
@@ -506,7 +506,7 @@ phase は次のとおり。
 作業対象の手がかり（必要な repository は自分で判断してよい）:
 - <targets の各要素>
 
-この Task で許可されていること（現行MVPでは commit、push、PR の作成、merge、deploy、publish は、ここに書かれていても行わない）:
+この Task で SHIKI に許可されていること（SHIKI 自身は commit・push・PR 作成・merge・deploy・publish をしない。Araya は全検証成功後に commit・push・Draft PR を行い、merge・deploy・publish は行わない）:
 - <permissions の各要素>
 
 前回の試行（<試行番号>回目）の結果:
@@ -590,10 +590,10 @@ Issue #1 の「Secrets を通常ログや Task 台帳に複製しない」のた
 ## 再実行
 
 - `araya task retry <taskId>`。対象は `failed` と `blocked` の Task だけ。ほかは `task_not_retryable` で拒否する。
-- 「途中で止まった試行」とは、runner が取り込んだ（`started_at` がある）試行のうち、失敗の理由が `cancelled`・`restart_limit`・`attempt_error`・`termination_unconfirmed`・`agent_timeout`・`agent_failed`（evidence の `agent.error` が `model_unavailable` のものを除く）のどれかの試行をいう。SHIKI か検証のコマンドが終わる前に止まったため、network 経由の操作などの外部への変更が済んだかどうかが分からない。利用者の中止を優先して `cancelled` にした試行（「結果の判定と記録」）も、試行の task が終わっていたかどうかにかかわらず、これに含める。`model_unavailable` は SHIKI が動く前の失敗なので含めない。取り込まれる前に中止した試行（`started_at` が無い）も、動いていないので含めない。
-  - 最新の試行がこれに当たるときは、`--confirm-side-effects` が無ければ `side_effects_unconfirmed` で拒否し、試行を作らない。stderr には「前回の試行は作業の途中で止まりました。外部への変更が済んでいる可能性があります。前回の worktree と外部の状態を確かめてから、--confirm-side-effects を付けて再実行してください」と、前回の worktree の path を出す。
+- 「確認が必要な試行」とは、取り込まれた試行のうち、(a) runner や agent が途中で止まったため外部への変更が済んだか分からないもの、または (b) Draft PR 配送 evidence が remote branch/PR の作成・更新済み、もしくは push 結果未確認を示すものをいう。中断理由と `model_unavailable` の例外は従来どおりである。
+  - 最新の試行がこれに当たるときは、`--confirm-side-effects` が無ければ `side_effects_unconfirmed` で拒否し、試行を作らない。stderr には「前回の試行では外部の branch や Draft PR が作成・更新された可能性がある、または結果を確認できません。前回の worktree と GitHub の状態を確かめてから、--confirm-side-effects を付けて再実行してください」と、前回の worktree の path を出す。
   - `--confirm-side-effects` を付けたときは、`task.retried` event の `confirmedSideEffects` を `true` にする。
-  - 課題の本文の「前回の試行」に、次の1行を足す: 「- 注意: 前回の試行は作業の途中で止まりました。外部への変更が済んでいる可能性があります。同じ操作をくり返す前に、前回の worktree と外部の状態を確かめてください。」
+  - 課題の本文の「前回の試行」に、確認が必要なときは次の注意を足す: 「- 注意: 前回の試行では外部の branch や Draft PR が作成・更新された可能性がある、または結果を確認できません。同じ操作をくり返す前に、前回の worktree と GitHub の状態を確かめてください。」
 - `BEGIN IMMEDIATE` の中で Task の状態を確かめ、次の試行（`current_attempt + 1`、`queued`、新しい taskKey、追加の指示）を作り、`tasks.current_attempt` と `tasks.status` を更新し、`task.retried` event を追加する。runner が次の loop で取り込む。
 - 新しい試行は、新しい taskKey・状態 directory・試行の task と会話・worktree・branch を使う。前回の worktree と branch は残し、課題の本文と evidence で場所を示す。前回の変更を自動で持ち込まない。
 - 自動の再実行はしない。
@@ -843,10 +843,10 @@ test は実際の Pi auth や model API を使わない。model は pi-ai の fa
 - runner の環境変数を一覧に限る。systemd は unit の環境変数を `systemctl --user show` で表示するので、秘密を渡すと、その出力（agent の作業記録など）に写るおそれがあるため。model の認証は、今と同じく Pi の `auth.json` から読む。
 - runner は 2 秒ごとに台帳を読む。CLI と Extension から runner を起こす仕組みを作らずに、登録から数秒で始めるため。読むだけで model は呼ばない。heartbeat の書き込みは 10 秒ごとにする。
 - 途中経過は、pi-durable の hook から台帳へ直接書く。SHIKI と runner が同じ process なので、file を介して渡す必要が無いため。
-- 途中で止まった試行の再実行には、利用者の明示的な確認（`--confirm-side-effects`）を求める。Issue #1 の「再試行時は未確認の副作用を慎重に扱う」に合わせ、外部への変更をくり返さないため。
+- 中断した試行と、Draft PR 配送で外部 branch/PR の変更があったか確認できない試行の再実行には、利用者の明示的な確認（`--confirm-side-effects`）を求める。Issue #1 の「再試行時は未確認の副作用を慎重に扱う」に合わせ、外部への変更をくり返さないため。
 - 差分の本文と検証の出力は、台帳ではなく状態 directory の `evidence.json` に残す。秘密情報が混ざりやすい本文を台帳に複製せず、別のセッションからは利用者が `--full` を付けたときだけ読めるようにするため。`evidence.json` と台帳の結果の対応は、SHA-256 で確かめる。file の書き込みと台帳の commit を1つの操作にできないため。
 - `targets` は SHIKI への手がかりで、制限ではない。どの repository を変更するかは SHIKI が判断するという既存の決定に合わせるため。
-- 現行MVPでは `permissions` は記録して SHIKI に渡すだけで、固定の禁止事項（commit、push、PR の作成、merge、deploy、publish）は解除しない。Issue #1 は権限の自動拡大を当面実装しないものとし、Issue から CI 成功 PR までの自動化をこのMVPの必須にしていないため。これは現行仕様の範囲であり、製品の目標である draft PR 作成の認可・認証・失敗時の扱いは [Draft PR まで届ける設計方針](draft-pr-delivery.md) で別途定義する。
+- Issue #1 の初期MVPでは `permissions` を記録して SHIKI に渡すだけとし、Issue から CI 成功 PR までの自動化を必須要件にしていなかった。Issue #1 の説明では、初期目的を Software Factory から Pi Extension としての Araya の継続性・SHIKI 委任へ絞り、Issue→PR→CI 修復は将来の workflow としている。この当初のスコープが、従来のMVPが PR 作成前に止まっていた理由である。現在の Draft PR delivery は [Draft PR delivery](draft-pr-delivery.md) で定義する。
 - 再実行では前回の変更を自動で持ち込まない。前回の worktree は残し、場所を SHIKI に伝える。Issue #1 の「再試行時は未確認の副作用を慎重に扱う」に合わせるため。
 - pi-durable の storage は試行の後も残す。会話を後から確かめられるようにするため。古い記録の削除は worktree などと同じく後の段階で決める。
 - model を設定しないときは Pi の設定の既定だけを使う。既存の SHIKI が使う Pi の「最初の model を選ぶ」処理（`findInitialModel`）は package の外に公開されておらず、ほかの model へ黙って切り替えないため。

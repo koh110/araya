@@ -1,6 +1,7 @@
 import { randomBytes as cryptoRandomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { performance } from 'node:perf_hooks'
 import { DatabaseSync } from 'node:sqlite'
 import { TextDecoder } from 'node:util'
 
@@ -455,10 +456,37 @@ export function createTaskKey(taskId: number, attempt: number, randomBytes: (siz
   return `task-${taskId}-${attempt}-${suffix}`
 }
 
-// 途中で止まった試行かどうか。取り込まれた後（started_at がある）で、決まった理由で終わったもの
+// 途中で止まった試行、または外部 repository の更新が済んだ可能性がある試行は、再実行前に確認を求める。
 // agent_failed のうち model が決まらなかった（SHIKI が動く前の）ものは含めない
+function hasDraftPrSideEffects(evidence: Record<string, unknown> | null) {
+  const delivery = evidence?.draftPrDelivery
+
+  if (!isRecord(delivery) || !Array.isArray(delivery.worktrees)) {
+    return false
+  }
+
+  return delivery.worktrees.some((worktree) => {
+    if (!isRecord(worktree)) {
+      return false
+    }
+
+    return worktree.remoteSideEffectsUnconfirmed === true ||
+      worktree.draftPrStatus === 'pushed' ||
+      worktree.draftPrStatus === 'created' ||
+      worktree.draftPrStatus === 'reused'
+  })
+}
+
 export function isInterruptedAttempt(row: { startedAt: string | null; failureReason: string | null; evidence: Record<string, unknown> | null }) {
-  if (row.startedAt === null || row.failureReason === null || !INTERRUPTED_FAILURE_REASONS.includes(row.failureReason)) {
+  if (row.startedAt === null || row.failureReason === null) {
+    return false
+  }
+
+  if (hasDraftPrSideEffects(row.evidence)) {
+    return true
+  }
+
+  if (!INTERRUPTED_FAILURE_REASONS.includes(row.failureReason)) {
     return false
   }
 
@@ -844,6 +872,63 @@ const TASK_WITH_LATEST_RUN = `
   FROM tasks t JOIN runs r ON r.task_id = t.id AND r.attempt = t.current_attempt
 `
 
+function isSqliteBusy(error: unknown): boolean {
+  return typeof error === 'object'
+    && error !== null
+    && 'errcode' in error
+    && typeof error.errcode === 'number'
+    && (error.errcode & 0xff) === 5
+}
+
+function enableWalMode(db: DatabaseSync) {
+  const timeoutMs = 5000
+  const deadline = performance.now() + timeoutMs
+  const waitCell = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT))
+  let lastBusyError: unknown
+
+  while (true) {
+    const remainingMs = deadline - performance.now()
+
+    if (remainingMs <= 0) {
+      if (lastBusyError !== undefined) {
+        throw lastBusyError
+      }
+
+      throw new Error('SQLite WAL initialization timed out')
+    }
+
+    // Keep each SQLite busy wait short; the JS deadline is checked before every attempt.
+    db.exec(`PRAGMA busy_timeout = ${Math.min(25, Math.max(0, Math.floor(remainingMs - 1)))}`)
+
+    if (deadline - performance.now() <= 0) {
+      if (lastBusyError !== undefined) {
+        throw lastBusyError
+      }
+
+      throw new Error('SQLite WAL initialization timed out')
+    }
+
+    try {
+      db.exec('PRAGMA journal_mode = WAL')
+      db.exec(`PRAGMA busy_timeout = ${timeoutMs}`)
+      return
+    } catch (error) {
+      if (!isSqliteBusy(error)) {
+        throw error
+      }
+
+      lastBusyError = error
+      const retryMs = deadline - performance.now()
+
+      if (retryMs <= 0) {
+        throw error
+      }
+
+      Atomics.wait(waitCell, 0, 0, Math.min(25, retryMs))
+    }
+  }
+}
+
 export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {}) {
   const now = options.now ?? (() => new Date())
   const randomBytes = options.randomBytes ?? cryptoRandomBytes
@@ -854,7 +939,7 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
   try {
     // busy_timeout を先にして、ほかの process が書き込んでいる間に WAL への切り替えが SQLITE_BUSY で失敗しないようにする
     db.exec('PRAGMA busy_timeout = 5000')
-    db.exec('PRAGMA journal_mode = WAL')
+    enableWalMode(db)
     db.exec('PRAGMA foreign_keys = ON')
     ensureSchema(db)
   } catch (error) {
@@ -1069,7 +1154,7 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
         if (isInterruptedAttempt(latest) && !options.confirmSideEffects) {
           throw ledgerError(
             'side_effects_unconfirmed',
-            `the previous attempt of Task ${taskId} stopped in the middle of its work`,
+            `the previous attempt may have changed an external branch or pull request; confirm the previous worktree and remote state before retrying`,
             { previousWorktrees: worktreesFromEvidence(latest.evidence) }
           )
         }

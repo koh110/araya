@@ -8,9 +8,12 @@ import test from 'node:test'
 import { DatabaseSync } from 'node:sqlite'
 
 import { DIFF_TRUNCATION_MARKER, MAX_DIFF_BYTES } from '../src/development.ts'
-import { VERIFICATION_OUTPUT_BYTES } from '../src/development-process.ts'
+import { runBoundedCommand, VERIFICATION_OUTPUT_BYTES, type GitCommandRunner } from '../src/development-process.ts'
+import { deliverDraftPullRequests } from '../src/draft-pr-delivery.ts'
+import { hashGitDiffSnapshot, splitGitDiffSections } from '../src/draft-pr-snapshot.ts'
+import { readTaskState } from '../src/development-worktrees.ts'
 import { SHIKI_TOOL_NAMES } from '../src/shiki.ts'
-import { bashScopeUnit, verifyScopeUnit } from '../src/systemd-units.ts'
+import { bashScopeUnit, deliveryScopeUnit, verifyScopeUnit } from '../src/systemd-units.ts'
 import { AttemptsDoc, buildAttemptInput, resolveShikiModel, type PiModelSettings } from '../src/task-attempt.ts'
 import { openTaskLedger } from '../src/task-ledger.ts'
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from '@earendil-works/pi-ai'
@@ -1037,7 +1040,7 @@ test('attempt: 再実行の試行の input には、追加の指示・前回の�
         '- 前回の worktree（編集しない。必要なら読んでよい）:',
         `  - ${worktree.worktreePath}（branch ${worktree.branch}）`,
         ...(item.interrupted
-          ? ['- 注意: 前回の試行は作業の途中で止まりました。外部への変更が済んでいる可能性があります。同じ操作をくり返す前に、前回の worktree と外部の状態を確かめてください。']
+          ? ['- 注意: 前回の試行では外部の branch や Draft PR が作成・更新された可能性がある、または結果を確認できません。同じ操作をくり返す前に、前回の worktree と GitHub の状態を確かめてください。']
           : []),
         '',
         '追加の指示:',
@@ -1050,5 +1053,377 @@ test('attempt: 再実行の試行の input には、追加の指示・前回の�
   } finally {
     ledger.close()
     await removeRunnerFixture(fixture)
+  }
+})
+
+test('attempt: 検証成功後に変更をcommit・pushし、Draft PR URLをevidenceに残す', async () => {
+  const value = await setup()
+  const { fixture, models, systemd } = value
+  const fakeBin = path.join(fixture.root, 'fake-bin')
+  const fakeGhLog = path.join(fixture.root, 'fake-gh.jsonl')
+  const fakePrState = path.join(fixture.root, 'fake-pr.json')
+  const pushCalls: string[][] = []
+  const pushSourceShas: string[] = []
+  const pushMovedHeads: string[] = []
+  const deliveryDiffCalls: string[][] = []
+  const deliveryUnits: string[] = []
+  await fs.mkdir(fakeBin)
+  const fakeGh = path.join(fakeBin, 'gh')
+  await fs.writeFile(fakeGh, [
+    '#!/usr/bin/env node',
+    "const fs = require('node:fs')",
+    "const input = fs.readFileSync(0, 'utf8')",
+    'const args = process.argv.slice(2)',
+    'fs.appendFileSync(process.env.ARAYA_FAKE_GH_LOG, JSON.stringify({ args, input }) + String.fromCharCode(10))',
+    "if (args[0] === 'auth' && args[1] === 'status') process.exit(0)",
+    "if (args[0] === 'repo' && args[1] === 'view') { if (args.includes('--repo') || args[2] !== 'github.com/example/repo' || args[3] !== '--json' || args[4] !== 'defaultBranchRef') process.exit(2); process.stdout.write(JSON.stringify({ defaultBranchRef: { name: 'main' } })); process.exit(0) }",
+    "if (args[0] === 'pr' && args[1] === 'list') { const headAt = args.indexOf('--head'); if (headAt < 0 || typeof args[headAt + 1] !== 'string' || args[headAt + 1].includes(':')) process.exit(2); try { process.stdout.write(fs.readFileSync(process.env.ARAYA_FAKE_PR_STATE, 'utf8')) } catch { process.stdout.write('[]') } process.exit(0) }",
+    "if (args[0] === 'pr' && args[1] === 'create') { const at = (flag) => args.indexOf(flag) + 1; const head = args[at('--head')]; const base = args[at('--base')]; const url = 'https://github.com/example/repo/pull/123'; fs.writeFileSync(process.env.ARAYA_FAKE_PR_STATE, JSON.stringify([{ url, isDraft: true, state: 'OPEN', headRefName: head, baseRefName: base, headRepository: { nameWithOwner: 'example/repo' } }])); process.stdout.write(url); process.exit(0) }",
+    'process.exit(2)'
+  ].join('\n'), 'utf8')
+  await fs.chmod(fakeGh, 0o700)
+  fixture.env.PATH = `${fakeBin}:${fixture.env.PATH ?? ''}`
+  fixture.env.ARAYA_FAKE_GH_LOG = fakeGhLog
+  fixture.env.ARAYA_FAKE_PR_STATE = fakePrState
+  const attempt = await openAttemptHarness(fixture, {
+    models: models.runtime,
+    systemd: {
+      ...systemd.ops,
+      launchInScope: async (unit, command, args, options) => {
+        if (path.basename(command) === 'git' && args.includes('diff')) {
+          deliveryDiffCalls.push([...args])
+        }
+
+        if (path.basename(command) === 'gh' || (path.basename(command) === 'git' && args.some((argument) => {
+          return argument === 'commit' || argument === 'push'
+        }))) {
+          deliveryUnits.push(unit)
+        }
+
+        if (path.basename(command) === 'git' && args.includes('push')) {
+          const worktreePath = args[args.indexOf('-C') + 1]
+          assert.ok(worktreePath)
+          const verifiedHead = git(fixture, worktreePath, 'rev-parse', 'HEAD')
+          git(fixture, worktreePath, 'commit', '--allow-empty', '-m', 'unverified change during push')
+          const sourceRefspec = args.at(-1)
+          const sourceRef = sourceRefspec?.split(':')[0]
+          assert.ok(sourceRef)
+          pushMovedHeads.push(git(fixture, worktreePath, 'rev-parse', 'HEAD'))
+          pushSourceShas.push(git(fixture, worktreePath, 'rev-parse', '--verify', sourceRef))
+          pushCalls.push([...args])
+          git(fixture, worktreePath, 'reset', '--hard', verifiedHead)
+          return {
+            exitCode: 0,
+            signal: null,
+            stdout: '',
+            stderr: '',
+            stdoutBytes: 0,
+            stderrBytes: 0,
+            terminationReason: undefined,
+            terminationConfirmed: true
+          }
+        }
+
+        return systemd.ops.launchInScope(unit, command, args, options)
+      }
+    },
+    draftPrDelivery: true
+  })
+
+  try {
+    const repo = await createRepository(fixture, 'repo')
+    git(fixture, repo, 'config', '--local', 'user.name', 'Araya Test')
+    git(fixture, repo, 'config', '--local', 'user.email', 'araya-test@example.invalid')
+    git(fixture, repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git')
+    git(fixture, repo, 'config', '--local', 'push.recurseSubmodules', 'only')
+    git(fixture, repo, 'config', '--local', 'submodule.recurse', 'true')
+    models.script(completingScript({
+      bash: (worktreePath) => {
+        return `printf 'changed\\n' >> ${worktreePath}/README.md && printf 'new-file' > ${worktreePath}/added.txt && printf '' > ${worktreePath}/empty.txt`
+      }
+    }))
+
+    const done = await attempt.runAttempt(taskInput({ title: 'Draft PR feature task' }), defaultSettings(fixture, models.model))
+    const run = attempt.ledger.showTask(done.ledgerTaskId, { events: 0 }).attempts[0]
+    const worktree = records(run?.evidence?.worktrees)[0]
+
+    assert.equal(done.outcome.status, 'completed')
+    assert.equal(run?.status, 'completed')
+    assert.equal(worktree?.draftPrUrl, 'https://github.com/example/repo/pull/123')
+    const state = await readTaskState({
+      devRoot: fixture.devRoot,
+      stateDir: path.join(fixture.dataDir, 'development', done.taskKey),
+      taskKey: done.taskKey
+    })
+    const record = state.worktrees[0]
+    assert.ok(record)
+    assert.equal(typeof worktree?.commitSha, 'string')
+    assert.equal(git(fixture, String(worktree?.worktreePath), 'cat-file', '-s', `${String(worktree?.commitSha)}:empty.txt`), '0')
+    const retryPushCalls: string[][] = []
+    const retryGit: GitCommandRunner = (command, args, options) => {
+      if (path.basename(command) === 'git' && args.includes('push')) {
+        retryPushCalls.push([...args])
+        return Promise.resolve({
+          exitCode: 0,
+          signal: null,
+          stdout: '',
+          stderr: '',
+          stdoutBytes: 0,
+          stderrBytes: 0,
+          terminationReason: undefined,
+          terminationConfirmed: true
+        })
+      }
+
+      return systemd.ops.launchInScope(deliveryScopeUnit(fixture.hash, done.taskKey), command, args, options)
+    }
+    const retrySnapshotDiff = git(fixture, record.worktreePath, 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--binary', '--unified=3', record.baseSha, '--')
+    const retrySnapshotPaths = git(fixture, record.worktreePath, 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--name-only', '-z', record.baseSha, '--').split('\0').filter((value) => value !== '').sort()
+    const retrySnapshotSections = splitGitDiffSections(retrySnapshotDiff)
+    const retrySnapshotDiffSha256 = retrySnapshotSections === null
+      ? null
+      : hashGitDiffSnapshot(retrySnapshotPaths, retrySnapshotSections)
+
+    assert.ok(retrySnapshotDiffSha256)
+
+    const retryInput = {
+      taskKey: done.taskKey,
+      title: 'Draft PR feature task',
+      worktrees: [{
+        record,
+        headSha: String(worktree?.commitSha),
+        verificationCount: 1,
+        snapshotSha256: 'b'.repeat(64),
+        snapshotDiffSha256: retrySnapshotDiffSha256,
+        snapshotChangedFiles: retrySnapshotPaths,
+        readSnapshot: async () => ({ snapshotSha256: 'b'.repeat(64), diffTruncated: false })
+      }],
+      preflightSnapshotGuards: [],
+      env: fixture.env,
+      redact(text: string) {
+        return text
+      }
+    }
+    const retryDependencies = {
+      runGit: retryGit,
+      runGitHub: runBoundedCommand,
+      ghExecutable: fakeGh
+    }
+    await fs.writeFile(fakePrState, JSON.stringify([{
+      url: 'https://github.com/example/repo/pull/123',
+      isDraft: true,
+      state: 'OPEN',
+      headRefName: `araya/${done.taskKey}`,
+      baseRefName: 'main',
+      headRepository: { nameWithOwner: 'example/fork' }
+    }]))
+
+    const forkRetry = await deliverDraftPullRequests(retryInput, retryDependencies)
+
+    assert.equal(forkRetry.status, 'blocked')
+    assert.equal(forkRetry.failureReason, 'draft_pr_conflict')
+    assert.equal(retryPushCalls.length, 0)
+    await fs.writeFile(fakePrState, JSON.stringify([{
+      url: 'https://github.com/example/repo/pull/123',
+      isDraft: true,
+      state: 'OPEN',
+      headRefName: `araya/${done.taskKey}`,
+      baseRefName: 'main',
+      headRepository: { nameWithOwner: 'example/repo' }
+    }]))
+
+    const retry = await deliverDraftPullRequests(retryInput, retryDependencies)
+
+    assert.equal(retry.status, 'completed')
+    assert.equal(retry.worktrees[0]?.draftPrStatus, 'reused')
+    assert.equal(retry.worktrees[0]?.draftPrUrl, 'https://github.com/example/repo/pull/123')
+    assert.equal(retry.worktrees[0]?.commitSha, worktree?.commitSha)
+    assert.equal(retryPushCalls.length, 1)
+    assert.equal(git(fixture, String(worktree?.worktreePath), 'rev-list', '--count', `${record.baseSha}..HEAD`), '1')
+    const calls: { args: string[]; input: string }[] = []
+
+    for (const line of (await fs.readFile(fakeGhLog, 'utf8')).split(String.fromCharCode(10))) {
+      if (line.trim() === '') {
+        continue
+      }
+
+      const call: unknown = JSON.parse(line)
+
+      if (!isRecord(call) || !Array.isArray(call.args) || typeof call.input !== 'string') {
+        throw new Error('fake gh call has an invalid shape')
+      }
+
+      const args = call.args.filter((argument): argument is string => typeof argument === 'string')
+
+      if (args.length !== call.args.length) {
+        throw new Error('fake gh args contain a non-string')
+      }
+
+      calls.push({ args, input: call.input })
+    }
+    assert.match(String(worktree?.commitSha), /^[0-9a-f]{40}$/u)
+    assert.equal(git(fixture, repo, 'rev-parse', `refs/heads/araya/${done.taskKey}`), worktree?.commitSha)
+    assert.deepEqual(git(fixture, String(worktree?.worktreePath), 'status', '--porcelain'), '')
+    assert.equal(pushCalls.length, 1)
+    assert.notEqual(pushMovedHeads[0], worktree?.commitSha)
+    assert.equal(pushSourceShas[0], worktree?.commitSha)
+    assert.ok(pushCalls[0]?.includes('https://github.com/example/repo.git'))
+    assert.ok(pushCalls[0]?.includes('--recurse-submodules=no'))
+    assert.equal(pushCalls[0]?.at(-1), `${String(worktree?.commitSha)}:refs/heads/araya/${done.taskKey}`)
+    assert.ok(deliveryDiffCalls.length >= 4)
+    assert.ok(deliveryDiffCalls.every((args) => args.includes('--ignore-submodules=none')))
+    assert.ok(deliveryUnits.length > 0)
+    assert.ok(deliveryUnits.every((unit) => {
+      return unit.startsWith(`araya-${fixture.hash}-${done.taskKey}-delivery-`) && unit.endsWith('.scope')
+    }), JSON.stringify(deliveryUnits))
+    const create = calls.find((call) => call.args[0] === 'pr' && call.args[1] === 'create')
+    assert.ok(create)
+    assert.equal(calls.filter((call) => call.args[0] === 'pr' && call.args[1] === 'create').length, 1)
+    assert.ok(create.args.includes('--draft'))
+    assert.ok(create.args.includes('--repo'))
+    assert.ok(create.args.includes('github.com/example/repo'))
+    assert.ok(create.args.includes('--head'))
+    assert.ok(create.args.includes(`araya/${done.taskKey}`))
+    assert.ok(create.args.includes('--title'))
+    assert.ok(create.args.includes('Draft PR feature task'))
+    assert.ok(create.args.includes('--body-file'))
+    assert.ok(create.input.includes(done.taskKey))
+    assert.ok(create.input.includes('verification'))
+    assert.equal(create.input.includes('README に1行足し'), false)
+    assert.equal(calls.some((call) => call.args.includes('--dry-run')), false)
+  } finally {
+    await teardown(value, attempt)
+  }
+})
+
+test('attempt: 検証失敗時は Draft PR 用の commit・push・GitHub CLI を実行しない', async () => {
+  const value = await setup()
+  const { fixture, models, systemd } = value
+  const fakeBin = path.join(fixture.root, 'fake-bin')
+  const fakeGhLog = path.join(fixture.root, 'fake-gh-called')
+  const pushCalls: string[][] = []
+  await fs.mkdir(fakeBin)
+  const fakeGh = path.join(fakeBin, 'gh')
+  await fs.writeFile(fakeGh, [
+    '#!/usr/bin/env node',
+    "require('node:fs').appendFileSync(process.env.ARAYA_FAKE_GH_LOG, 'called' + String.fromCharCode(10))",
+    'process.exit(0)'
+  ].join(String.fromCharCode(10)), 'utf8')
+  await fs.chmod(fakeGh, 0o700)
+  fixture.env.PATH = `${fakeBin}:${fixture.env.PATH ?? ''}`
+  fixture.env.ARAYA_FAKE_GH_LOG = fakeGhLog
+  const attempt = await openAttemptHarness(fixture, {
+    models: models.runtime,
+    systemd: {
+      ...systemd.ops,
+      launchInScope: async (unit, command, args, options) => {
+        if (path.basename(command) === 'git' && args.includes('push')) {
+          pushCalls.push([...args])
+          return {
+            exitCode: 0,
+            signal: null,
+            stdout: '',
+            stderr: '',
+            stdoutBytes: 0,
+            stderrBytes: 0,
+            terminationReason: undefined,
+            terminationConfirmed: true
+          }
+        }
+
+        return systemd.ops.launchInScope(unit, command, args, options)
+      }
+    },
+    draftPrDelivery: true
+  })
+
+  try {
+    const repo = await createRepository(fixture, 'repo')
+    git(fixture, repo, 'config', '--local', 'user.name', 'Araya Test')
+    git(fixture, repo, 'config', '--local', 'user.email', 'araya-test@example.invalid')
+    git(fixture, repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git')
+    models.script(completingScript({ command: [process.execPath, '-e', "console.error('broken'); process.exit(1)"] }))
+
+    const done = await attempt.runAttempt(taskInput({ title: 'Failed verification task' }), defaultSettings(fixture, models.model))
+    const run = attempt.ledger.showTask(done.ledgerTaskId, { events: 0 }).attempts[0]
+    const worktree = records(run?.evidence?.worktrees)[0]
+
+    assert.equal(run?.status, 'failed')
+    assert.equal(run?.failureReason, 'verification_failed')
+    assert.equal(records(worktree?.verifications)[0]?.status, 'failed')
+    assert.equal(await readTextIfExists(fakeGhLog), '')
+    assert.equal(pushCalls.length, 0)
+    assert.equal(git(fixture, repo, 'rev-parse', `refs/heads/araya/${done.taskKey}`), worktree?.baseSha)
+  } finally {
+    await teardown(value, attempt)
+  }
+})
+
+test('attempt: GitHub CLI 認証不能なら blocked で、commit・push しない', async () => {
+  const value = await setup()
+  const { fixture, models, systemd } = value
+  const fakeBin = path.join(fixture.root, 'fake-bin')
+  const fakeGhLog = path.join(fixture.root, 'fake-gh.jsonl')
+  const remoteWrites: string[][] = []
+  await fs.mkdir(fakeBin)
+  const fakeGh = path.join(fakeBin, 'gh')
+  await fs.writeFile(fakeGh, [
+    '#!/usr/bin/env node',
+    "const fs = require('node:fs')",
+    'const args = process.argv.slice(2)',
+    'fs.appendFileSync(process.env.ARAYA_FAKE_GH_LOG, JSON.stringify(args) + String.fromCharCode(10))',
+    "if (args[0] === 'auth' && args[1] === 'status') process.exit(1)",
+    'process.exit(2)'
+  ].join(String.fromCharCode(10)), 'utf8')
+  await fs.chmod(fakeGh, 0o700)
+  fixture.env.PATH = `${fakeBin}:${fixture.env.PATH ?? ''}`
+  fixture.env.ARAYA_FAKE_GH_LOG = fakeGhLog
+  const attempt = await openAttemptHarness(fixture, {
+    models: models.runtime,
+    systemd: {
+      ...systemd.ops,
+      launchInScope: async (unit, command, args, options) => {
+        if (path.basename(command) === 'git' && (args.includes('commit') || args.includes('push'))) {
+          remoteWrites.push([...args])
+          return {
+            exitCode: 0,
+            signal: null,
+            stdout: '',
+            stderr: '',
+            stdoutBytes: 0,
+            stderrBytes: 0,
+            terminationReason: undefined,
+            terminationConfirmed: true
+          }
+        }
+
+        return systemd.ops.launchInScope(unit, command, args, options)
+      }
+    },
+    draftPrDelivery: true
+  })
+
+  try {
+    const repo = await createRepository(fixture, 'repo')
+    git(fixture, repo, 'config', '--local', 'user.name', 'Araya Test')
+    git(fixture, repo, 'config', '--local', 'user.email', 'araya-test@example.invalid')
+    git(fixture, repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git')
+    models.script(completingScript())
+
+    const done = await attempt.runAttempt(taskInput({ title: 'Auth blocked task' }), defaultSettings(fixture, models.model))
+    const run = attempt.ledger.showTask(done.ledgerTaskId, { events: 0 }).attempts[0]
+    const worktree = records(run?.evidence?.worktrees)[0]
+    const ghCalls = (await fs.readFile(fakeGhLog, 'utf8')).trim().split(String.fromCharCode(10)).map((line): unknown => {
+      return JSON.parse(line)
+    })
+
+    assert.equal(run?.status, 'blocked')
+    assert.equal(run?.failureReason, 'github_auth_unavailable')
+    assert.equal(remoteWrites.length, 0)
+    assert.equal(ghCalls.length, 1)
+    assert.deepEqual(ghCalls[0], ['auth', 'status', '--hostname', 'github.com'])
+    assert.equal(git(fixture, repo, 'rev-parse', `refs/heads/araya/${done.taskKey}`), worktree?.baseSha)
+  } finally {
+    await teardown(value, attempt)
   }
 })

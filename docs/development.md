@@ -71,7 +71,8 @@ runner は、SHIKI を動かすために常駐する Araya の process です。
 - `systemctl --user stop` は一時停止です。動いていた試行は中止されず、次に起動したときに続きから進みます。runner が落ちたときは、systemd が間隔を空けて起動し直します。
 - `araya runner uninstall` は unit を止めて無効にし、unit file を消します。台帳は変えないので、動いていた試行は `running` のまま残り、入れ直すと続きから進みます。
 - runner の log は `<dataDir>/logs/runner.log`（1行1件の JSON、秘密を置き換えたもの）です。runner の stdout と stderr は捨てます。
-- SHIKI の bash はコマンドごとに、検証コマンドは1件ごとに、worktree の作成と差分の収集の git も実行ごとに、それぞれ別の transient な systemd の scope（名前は `araya-<hash>-<taskKey>-…`）の中で動きます。runner は、差分を集める前と結果を記録する前に、その試行の名前の scope をすべて止めるので、`setsid` などで切り離した process も残りません。
+- GitHub.com の Draft PR delivery は、runner が利用する `gh` CLI と、その OS user の保存済み `gh auth` 状態を使います。GitHub token を agent・evidence・log・command arguments に渡したり記録したりしません。`gh` が無い・認証できない場合や GitHub Enterprise / 他 host の remote は、success にせず `blocked` にします。
+- SHIKI の bash は command ごとに、検証 command は1件ごとに、worktree 作成と差分収集の git も実行ごとに、さらに delivery の commit/push と GitHub CLI も各 command ごとに、それぞれ別の transient な systemd scope（名前は `araya-<hash>-<taskKey>-…`）の中で動きます。runner は、差分を集める前と結果を記録する前に、その試行の名前の scope をすべて止めるので、`setsid` などで切り離した process も残りません。
 - `araya task` と `araya runner` は Linux と systemd（254 以降）の user manager が必要です。Linux 以外では何もせずに `unsupported_platform` で終わります。各コマンドは JSON 1件を stdout に出します。失敗したときは理由を stderr に出し、終了 code 1 で終わります。ただし、Linux 以外（`unsupported_platform`）と、systemd の user manager に接続できないとき（`systemd_unavailable`）は、終了 code 69 で終わります。
 - `araya task` の各コマンドは、結果といっしょに台帳の `runner` と `queue` を出力に含めます。`runner.state` が `running` でないときは、出力とは別に stderr へ注意を出します（登録などの処理自体は成功します）。
 - `araya runner install` は linger を変えずに読むだけで、出力に `linger` を含めます。`linger` が `false` のときは stderr に注意を出します。
@@ -79,7 +80,7 @@ runner は、SHIKI を動かすために常駐する Araya の process です。
 ## Task の内部
 
 - 台帳 `<dataDir>/tasks.sqlite` が開発の Task と試行、途中経過、runner の状態を保持します。runner の Pi Durable の storage（SHIKI の会話）は `runner/durable.sqlite` です。
-- Task の入力: 知らない key、長さや件数の超過、256 KiB を超える入力、NUL、空白だけの値は拒否します。`title` は200文字まで（改行なし）、`goal` は20,000文字まで。`constraints`・`targets`・`permissions` は省略すると `[]` です。`targets` は SHIKI に作業 repository を探してもらうための手がかり（開発 root からの相対 path など）で、制限ではありません。どの repository で作業するかは SHIKI が判断します。repository は worktree の作成時に確かめ、選ばれた repository が開発 root の外なら `repository_outside_dev_root`、存在しないなら `repository_not_found` を tool error として SHIKI に返します。tool の失敗だけでは課題全体は止まらず、SHIKI は別の repository を選び直せます（[docs/spec/human-authored-development-loop.md](spec/human-authored-development-loop.md)）。`targets` は SHIKI が触れる file の制限にもなりません（「状態と安全境界」）。`permissions` は SHIKI に渡すだけで、commit・push などの固定の禁止事項は解除しません。登録は `idempotencyKey` で idempotent です。同じ `idempotencyKey` で2回登録すると、同じ Task を `"created": false` で返します。`idempotencyKey` が同じでほかの項目の値が違う場合は、`idempotency_conflict` で拒否します。
+- Task の入力: 知らない key、長さや件数の超過、256 KiB を超える入力、NUL、空白だけの値は拒否します。`title` は200文字まで（改行なし）、`goal` は20,000文字まで。`constraints`・`targets`・`permissions` は省略すると `[]` です。`targets` は SHIKI に作業 repository を探してもらうための手がかり（開発 root からの相対 path など）で、制限ではありません。どの repository で作業するかは SHIKI が判断します。repository は worktree の作成時に確かめ、選ばれた repository が開発 root の外なら `repository_outside_dev_root`、存在しないなら `repository_not_found` を tool error として SHIKI に返します。tool の失敗だけでは課題全体は止まらず、SHIKI は別の repository を選び直せます（[docs/spec/human-authored-development-loop.md](spec/human-authored-development-loop.md)）。`targets` は SHIKI が触れる file の制限にもなりません（「状態と安全境界」）。`permissions` は SHIKI へ渡す制約情報で、SHIKI の固定指示（commit・push・PR 作成・merge・deploy・publish をしない）を解除しません。Araya は全検証成功後に commit・push・Draft PR 作成を行います。merge・deploy・publish は行いません。登録は `idempotencyKey` で idempotent です。同じ `idempotencyKey` で2回登録すると、同じ Task を `"created": false` で返します。`idempotencyKey` が同じでほかの項目の値が違う場合は、`idempotency_conflict` で拒否します。
 - CLI の引数:
 
 ```sh
@@ -93,7 +94,7 @@ araya runner uninstall
 ```
 
 - `task show` の出力の `attempts[].taskKey` で試行の taskKey が確かめられます。evidence には差分の統計、検証の結果、`activeMs` などが入ります。`--full` のときだけ、SHA-256 が台帳の記録と一致する `evidence.json` から本文を出します。
-- 前回の試行が、取り込まれた後に途中で止まったとき（中止、`agent_timeout`、`restart_limit`、model 以外の理由の `agent_failed` など）は、`--confirm-side-effects` を付けないと `side_effects_unconfirmed` で拒否されます。
+- 前回の試行が中断された、または Draft PR 配送で remote branch/PR が更新されたか確認できない場合は、`--confirm-side-effects` を付けないと `side_effects_unconfirmed` で拒否されます。
 - `cancel` は、待機中の試行をその場で `failed`（`cancelled`）にし、`running` の試行には中止を求めます（runner が動いていれば数秒以内に止め、`failed`（`cancelled`）になります。runner が止まっているときは、次に runner が起動したときに止めます）。`completed`・`failed`・`blocked` の Task は中止できません。
 - SHIKI 1回の期限は `ARAYA_DEVELOPMENT_TIMEOUT_MS`（既定 1200000 ms、範囲 1000〜3600000 ms。範囲外の値は範囲に丸め、数でない値は既定値にします）。過ぎると `failed`（`agent_timeout`）になります。検証コマンドは1件ごとに `ARAYA_VERIFICATION_TIMEOUT_MS`（既定 300000 ms、同じ範囲）で打ち切ります。どちらも runner が動いていた時間で数えます（一時停止の間は数えません）。
 - 秘密とみなす環境変数の値と URL の userinfo は、台帳・`evidence.json`・log に書く前に `[REDACTED]` に置き換えます。それ以外の秘密（file の中身など）を SHIKI が報告に書いたり、検証コマンドが出力したりすると残ります。
@@ -184,5 +185,5 @@ npm run araya -- status
 - Araya の通常 control-plane 処理は外部書き込みや通知送信をしません。`tick` / `run` は、Pi Durable の harness を開くときに Pi のモデル runtime を作りますが、モデルは呼び出しません。Pi の認証情報は `PI_CODING_AGENT_DIR`（未指定時は `~/.pi/agent`）から読み取り、Araya の設定や DB には複製しません。引数なしの `araya` と `araya pi` は明示的に Pi coding-agent SDK の CLI entry point を実行するため、その実行はこの節の対象外です。
 - 自律的な課題発見、Goal / 探索対象の設定、外部ソース監視、`read-only` / `external` 候補の executor、Native Broker、Discord / Hermes 連携、Outbox 配信、旧経路（`tick` / `run`）の常駐化は未実装です。`run` を起動しても、新しい課題を自律的に発見するわけではありません。
 - inbox の `development` 課題は実行せず `blocked` として残します（`development_executor_unavailable`）。
-- 現行MVPの runner の SHIKI と検証コマンドは、利用者の権限で sandbox なしで動きます。開発 root の repository に限らず、利用者が書き込める file を変更できます。commit・push・PR の作成・merge・deploy・publish はしないよう SHIKI に指示しますが、強制はしません。検証済みの変更を draft PR まで届けることは今後の目標で、現行MVPには未実装です（[Draft PR まで届ける設計方針](spec/draft-pr-delivery.md)）。
+- runner の SHIKI と検証コマンドは利用者の権限で sandbox なしに動き、開発 root 以外の書き込み可能 file にも触れます。SHIKI には自分で commit・push・PR 作成・merge・deploy・publish をしないよう指示しますが、network 制限や sandbox はなく、直接 remote を変更する可能性があります。Araya の built-in delivery は全検証成功後に commit・push・GitHub.com Draft PR 作成を行い、merge・deploy・publish はしません。詳しくは [Draft PR delivery 仕様](spec/draft-pr-delivery.md) を見てください。
 - DB や inbox に利用者のデータを置く場合は、`ARAYA_DATA_DIR` とバックアップのアクセス権を利用者側で管理してください。

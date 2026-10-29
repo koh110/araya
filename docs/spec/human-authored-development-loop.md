@@ -1,10 +1,10 @@
 # 人が投入する開発課題を処理する自動ループ
 
-> 注記: この文書のうち、worker（Pi の SDK の session）で課題を動かす部分は、worker を撤去する手順で撤去し、[Task の台帳と SHIKI の実行](task-ledger-and-shiki-runner.md)の仕様（Task の台帳と常駐する runner）に置き換えた。SHIKI の作業と完了の判定（worktree、検証の登録と実行、結果の判定）は、この文書を基準のままにする。inbox の development の課題は実行されずに `blocked` になる。開発の課題は `araya task create` で Task の台帳に登録し、`araya runner install` で入れた runner（systemd の user service）が SHIKI を動かす。
+> 注記: この文書は旧 worker / inbox 経路の設計記録です。worker の実行と Task 台帳は [Task の台帳と SHIKI の実行](task-ledger-and-shiki-runner.md) に置き換え、検証後の commit・push・Draft PR 作成は [Draft PR delivery](draft-pr-delivery.md) が定義します。以下の worktree・検証の詳細は参考ですが、終了後の処理・完了条件・安全境界のうち current Task runner の説明と矛盾する箇所は新しい仕様が優先します。
 
 ## 概要
 
-Araya の利用者が JSONL inbox に開発課題を書くことが、実行開始の承認になる。別の approve 操作は不要。Araya は due tick で課題を1件選び、Pi coding agent を開発 root（既定 `~/dev`）で動かす。agent は課題に必要な repository を自分で判断し（複数でもよい）、変更する repository ごとに、その repository の `.worktree/` 配下へ課題用の worktree を作って実装する。agent の終了後、Araya は agent が登録した検証コマンドを最終状態の worktree で実行し、worktree ごとの差分と検証結果を記録して止まる。
+Araya の利用者が `araya task create` で登録した開発課題が実行開始の依頼になる。runner は対象 repository ごとに worktree を用意し、SHIKI に実装と検証登録を委ねる。SHIKI 終了後、Araya は差分と全検証結果を記録し、差分がある全 repository の検証が成功した場合は Araya が commit・fast-forward push・Draft PR 作成まで行う。merge は人が判断する。旧 JSONL inbox 経路は実行せず `blocked` にする。
 
 Araya は sandbox による隔離を行わない。agent と検証コマンドは、Araya を起動した利用者の権限・環境変数・network で動く。
 
@@ -93,8 +93,8 @@ Araya は sandbox による隔離を行わない。agent と検証コマンド�
 4. agent が成功し、差分のある worktree が1つ以上あるとき、差分のある worktree ごとに、登録された検証コマンドを登録順に実行する。検証が登録されていない worktree があっても、ほかの worktree の検証は実行する。cwd は worktree root（`cwd` 指定時はその下）。sandbox は使わず、環境変数は Araya の process から引き継ぐ。1件ごとに timeout を設ける。出力が多くても検証を止めず、stdout と stderr それぞれの末尾 8 KiB を残す。不正な UTF-8 は置換文字にする。cwd が存在しない場合、その検証は失敗とする。cwd の realpath が worktree の外にある場合（symlink など）は、その検証を実行せずに失敗とする（理由 `cwd_outside_worktree`）。検証コマンドの終了を確認できなかった場合は、残りの検証を実行しない。
 5. 実行しなかった検証は `not_run` とし、理由を記録する（差分なしは `no_changes`、agent の失敗は `agent_failed`、agent の timeout は `agent_timeout`、先行する検証の終了が確認できないときは `previous_termination_unconfirmed`）。
 6. 結果の判定:
-   - `completed`: agent が成功し、差分のある worktree が1つ以上あり、そのすべてに検証の登録があり、実行した検証がすべて exit 0。
-   - `failed`: それ以外。`failureReason` は次のうち、上にあるものを優先して1つ選ぶ。
+   - `completed`: agent が成功し、差分のある worktree が1つ以上あり、そのすべてに検証の登録があり、実行した検証がすべて exit 0 で、その後の Draft PR delivery が成功。
+   - `failed`: agent・検証または Draft PR delivery が失敗した。`failureReason` は「Task 台帳と SHIKI の実行」「Draft PR delivery」の仕様に従う。
      - `invalid_task`: 課題の入力が不正
      - `dev_root_missing`: 開発 root が無い
      - `task_state_already_exists`: 状態 directory が既にある
@@ -106,7 +106,7 @@ Araya は sandbox による隔離を行わない。agent と検証コマンド�
      - `no_changes`: 差分のある worktree が1つもない
      - `verification_missing`: 差分があるのに検証が登録されていない worktree がある
      - `verification_failed`: 実行した検証に exit 0 以外・timeout・起動失敗がある
-7. worktree と branch は、成功・失敗にかかわらず残す。Araya は commit、push、PR、merge、deploy をしない。自動 retry もしない。
+7. worktree と branch は成功・失敗にかかわらず残す。SHIKI 自身は commit/push/PR 作成をしない。Araya は全検証後に commit・fast-forward push・Draft PR 作成を行い、merge・deploy・publish は行わない。retry は自動で行わない。
 8. 各 tick で実行する workspace task は最大1件。複数の task を並列に実行しない。
 
 ## 証拠（opportunity evidence）
@@ -151,11 +151,13 @@ Araya は sandbox による隔離を行わない。agent と検証コマンド�
 - [ ] `araya_create_worktree` は `<repository>/.worktree/araya-<taskKey>` と branch `araya/<taskKey>` を指定した base から作る。`.worktree` が ignore されていない repository では `info/exclude` に `/.worktree/` を追記し、`.gitignore`・`info/exclude`・global excludes のいずれかで ignore 済みの repository では exclude を変更しない。
 - [ ] `araya_create_worktree` は、絶対 path、`..`、開発 root の外、repository root ではない path、linked worktree、`.worktree` を含む path、`.worktree` 配下の tracked file、`-` で始まる base、解決できない base、記録外の既存 path や branch を拒否し、同じ repository への再呼び出しには記録済みの worktree を返す。
 - [ ] 2つの repository にまたがる課題で、両方の worktree の差分と検証結果が evidence に記録される。
-- [ ] 検証は agent の終了後に Araya が最終状態で実行し、差分のある worktree すべてで登録済みの検証が exit 0 のときだけ `completed` になる。
+- [ ] 検証は agent の終了後に Araya が最終状態で実行し、差分のある worktree すべてで登録済みの検証が exit 0 のときだけ Draft PR delivery に進む。全 repository の delivery が成功したときだけ Task は `completed` になる。
 - [ ] 差分なし、検証の未登録、検証の失敗、agent の失敗、timeout、不正な状態記録が、それぞれ定義した `failureReason` で `failed` になり、worktree と branch は残る。
 - [ ] Pi session の tool 集合が9種類の allowlist と一致しなければ agent を実行しない。
 - [ ] worker は sandbox なしで起動でき、build 済み package からも起動できる。timeout 時は SIGTERM で session を abort して終了する。
 - [ ] 外部の Pi auth や model API を使わずに unit・integration test が通る。
+- [ ] faux `git`・`gh` で検証後の commit/push/Draft PR 作成、既存 Draft PR の再利用、URL の evidence 記録を検証する。検証失敗と GitHub 認証失敗では commit・push・PR 作成をしない。
+- [ ] 外部 side effect が既知または不確実な失敗からの retry は `--confirm-side-effects` を要求する。
 - [ ] README とこの仕様が新しい動作を説明している。
 
 ## Assumptions（利用者の決定から導いた判断）

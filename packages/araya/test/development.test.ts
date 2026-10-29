@@ -10,6 +10,7 @@ import {
   runBoundedCommand,
   runVerificationCommand,
   VERIFICATION_OUTPUT_BYTES,
+  type GitCommandRunner,
   type VerificationCommandInput,
   type VerificationCommandResult
 } from '../src/development-process.ts'
@@ -95,6 +96,9 @@ async function runTask(
     gitExecutable?: string
     signal?: AbortSignal
     redactor?: Pick<Redactor, 'redact' | 'redactTruncated'>
+    draftPrDelivery?: boolean
+    runDeliveryGit?: GitCommandRunner
+    runGitHub?: GitCommandRunner
   } = {}
 ) {
   const stateDir = await createTaskState(fixture.dataDir, TASK_KEY)
@@ -102,6 +106,8 @@ async function runTask(
 
   return collectDevelopmentResult({
     taskKey: TASK_KEY,
+    title: 'fixture Task',
+    draftPrDelivery: options.draftPrDelivery ?? false,
     devRoot: fixture.devRoot,
     stateDir,
     agent,
@@ -113,7 +119,9 @@ async function runTask(
   }, {
     runGit: runBoundedCommand,
     runVerification: options.runVerification ?? runVerificationCommand,
-    ...(options.gitExecutable === undefined ? {} : { gitExecutable: options.gitExecutable })
+    ...(options.gitExecutable === undefined ? {} : { gitExecutable: options.gitExecutable }),
+    ...(options.runDeliveryGit === undefined ? {} : { runDeliveryGit: options.runDeliveryGit }),
+    ...(options.runGitHub === undefined ? {} : { runGitHub: options.runGitHub })
   })
 }
 
@@ -208,6 +216,284 @@ async function changeRepository(input: WorkInput, repository: string, options: {
 
   return record
 }
+
+test('collectDevelopmentResult: 検証が作業 tree を変えた場合は delivery を止める', async () => {
+  const fixture = await createFixture()
+  await createRepository(fixture, 'repo-a')
+  let deliveryCalls = 0
+
+  try {
+    const result = await runTask(fixture, async (input) => {
+      await changeRepository(input, 'repo-a', { command: PASS_COMMAND })
+
+      return completed('変更しました。')
+    }, {
+      draftPrDelivery: true,
+      runVerification: async ({ cwd }) => {
+        await fs.appendFile(path.join(cwd, 'README.md'), 'verification mutation\n', 'utf8')
+
+        return {
+          status: 'passed',
+          exitCode: 0,
+          signal: null,
+          stdout: '',
+          stderr: '',
+          stdoutBytes: 0,
+          stderrBytes: 0,
+          terminationConfirmed: true
+        }
+      },
+      runGitHub: async () => {
+        deliveryCalls += 1
+        throw new Error('delivery must not start')
+      }
+    })
+
+    assert.equal(result.status, 'failed')
+    assert.equal(result.evidence.failureReason, 'verification_failed')
+    assert.equal(result.evidence.failureDetail, 'the worktree changed during verification or its final diff could not be captured completely; delivery was skipped')
+    assert.equal(deliveryCalls, 0)
+  } finally {
+    await removeFixture(fixture)
+  }
+})
+
+test('collectDevelopmentResult: 検証が当初 clean な別 repository を変更した場合は delivery を止める', async () => {
+  const fixture = await createFixture()
+  await createRepository(fixture, 'repo-a')
+  await createRepository(fixture, 'repo-b')
+  let cleanWorktreePath = ''
+  let deliveryCalls = 0
+
+  try {
+    const result = await runTask(fixture, async (input) => {
+      await changeRepository(input, 'repo-a', { command: PASS_COMMAND })
+      const clean = await serviceFor(input).createWorktree({ repository: 'repo-b' })
+      cleanWorktreePath = clean.worktreePath
+
+      return completed('repo-a を変更しました。')
+    }, {
+      draftPrDelivery: true,
+      runVerification: async () => {
+        await fs.writeFile(path.join(cleanWorktreePath, 'verification-output.txt'), 'unverified change\n', 'utf8')
+
+        return {
+          status: 'passed',
+          exitCode: 0,
+          signal: null,
+          stdout: '',
+          stderr: '',
+          stdoutBytes: 0,
+          stderrBytes: 0,
+          terminationConfirmed: true
+        }
+      },
+      runGitHub: async () => {
+        deliveryCalls += 1
+        throw new Error('delivery must not start')
+      }
+    })
+
+    assert.equal(result.status, 'failed')
+    assert.equal(result.evidence.failureReason, 'verification_failed')
+    assert.equal(result.evidence.failureDetail, 'the worktree changed during verification or its final diff could not be captured completely; delivery was skipped')
+    assert.deepEqual(findWorktree(result.evidence, 'repo-b').changedFiles, [])
+    assert.equal(await fs.readFile(path.join(cleanWorktreePath, 'verification-output.txt'), 'utf8'), 'unverified change\n')
+    assert.equal(deliveryCalls, 0)
+  } finally {
+    await removeFixture(fixture)
+  }
+})
+
+test('collectDevelopmentResult: GitHub preflight 中に clean worktree が変わった場合は delivery を止める', async () => {
+  const fixture = await createFixture()
+  const repoA = await createRepository(fixture, 'repo-a')
+  await createRepository(fixture, 'repo-b')
+  const cleanWorktreePath = worktreePathOf(path.join(fixture.devRoot, 'repo-b'))
+  const deliveryWrites: string[][] = []
+  let preflightMutationCount = 0
+  const response = (stdout = '') => ({
+    exitCode: 0,
+    signal: null,
+    stdout,
+    stderr: '',
+    stdoutBytes: Buffer.byteLength(stdout),
+    stderrBytes: 0,
+    terminationReason: undefined,
+    terminationConfirmed: true
+  })
+
+  git(fixture, repoA, 'config', '--local', 'user.name', 'Araya Test')
+  git(fixture, repoA, 'config', '--local', 'user.email', 'araya-test@example.invalid')
+  git(fixture, repoA, 'remote', 'add', 'origin', 'https://github.com/example/repo.git')
+
+  try {
+    const result = await runTask(fixture, async (input) => {
+      await changeRepository(input, 'repo-a', { command: PASS_COMMAND })
+      const clean = await serviceFor(input).createWorktree({ repository: 'repo-b' })
+      assert.equal(clean.worktreePath, cleanWorktreePath)
+      return completed('repo-a を変更しました。')
+    }, {
+      draftPrDelivery: true,
+      runGitHub: async (_command, args) => {
+        if (args[0] === 'auth' && args[1] === 'status') {
+          await fs.writeFile(path.join(cleanWorktreePath, 'preflight-output.txt'), 'unverified change\n', 'utf8')
+          preflightMutationCount += 1
+          return response()
+        }
+
+        if (args[0] === 'repo' && args[1] === 'view') {
+          return response(JSON.stringify({ defaultBranchRef: { name: 'main' } }))
+        }
+
+        if (args[0] === 'pr' && args[1] === 'list') {
+          return response('[]')
+        }
+
+        return response()
+      },
+      runDeliveryGit: async (command, args, options) => {
+        if (args.includes('commit') || args.includes('push')) {
+          deliveryWrites.push([...args])
+          return response()
+        }
+
+        return runBoundedCommand(command, args, options)
+      }
+    })
+
+    assert.equal(preflightMutationCount, 1)
+    assert.equal(result.status, 'failed')
+    assert.equal(await fs.readFile(path.join(cleanWorktreePath, 'preflight-output.txt'), 'utf8'), 'unverified change\n')
+    assert.equal(deliveryWrites.length, 0)
+  } finally {
+    await removeFixture(fixture)
+  }
+})
+
+test('collectDevelopmentResult: another clean worktree changes during commit preparation, so no push starts', async () => {
+  const fixture = await createFixture()
+  const repoA = await createRepository(fixture, 'repo-a')
+  await createRepository(fixture, 'repo-b')
+  const cleanWorktreePath = worktreePathOf(path.join(fixture.devRoot, 'repo-b'))
+  const deliveryWrites: string[][] = []
+  let commitMutationCount = 0
+  const response = (stdout = '') => ({
+    exitCode: 0,
+    signal: null,
+    stdout,
+    stderr: '',
+    stdoutBytes: Buffer.byteLength(stdout),
+    stderrBytes: 0,
+    terminationReason: undefined,
+    terminationConfirmed: true
+  })
+
+  git(fixture, repoA, 'config', '--local', 'user.name', 'Araya Test')
+  git(fixture, repoA, 'config', '--local', 'user.email', 'araya-test@example.invalid')
+  git(fixture, repoA, 'remote', 'add', 'origin', 'https://github.com/example/repo.git')
+
+  try {
+    const result = await runTask(fixture, async (input) => {
+      await changeRepository(input, 'repo-a', { command: PASS_COMMAND })
+      const clean = await serviceFor(input).createWorktree({ repository: 'repo-b' })
+      assert.equal(clean.worktreePath, cleanWorktreePath)
+      return completed('repo-a を変更しました。')
+    }, {
+      draftPrDelivery: true,
+      runGitHub: async (_command, args) => {
+        if (args[0] === 'repo' && args[1] === 'view') {
+          return response(JSON.stringify({ defaultBranchRef: { name: 'main' } }))
+        }
+
+        if (args[0] === 'pr' && args[1] === 'list') {
+          return response('[]')
+        }
+
+        return response()
+      },
+      runDeliveryGit: async (command, args, options) => {
+        if (args.includes('commit')) {
+          await fs.writeFile(path.join(cleanWorktreePath, 'commit-output.txt'), 'unverified change\n', 'utf8')
+          commitMutationCount += 1
+        }
+
+        if (args.includes('push')) {
+          deliveryWrites.push([...args])
+          return response()
+        }
+
+        return runBoundedCommand(command, args, options)
+      }
+    })
+
+    assert.equal(commitMutationCount, 1)
+    assert.equal(result.status, 'failed')
+    assert.equal(await fs.readFile(path.join(cleanWorktreePath, 'commit-output.txt'), 'utf8'), 'unverified change\n')
+    assert.equal(deliveryWrites.length, 0)
+  } finally {
+    await removeFixture(fixture)
+  }
+})
+
+test('collectDevelopmentResult: diff.ignoreSubmodules=all の verifier が gitlink を変えても見落とさない', async () => {
+  const fixture = await createFixture()
+  const repository = await createRepository(fixture, 'repo-a')
+  const submoduleRepository = path.join(fixture.root, 'submodule-source')
+  await fs.mkdir(submoduleRepository)
+  git(fixture, submoduleRepository, 'init', '-q', '-b', 'main')
+  await fs.writeFile(path.join(submoduleRepository, 'README.md'), 'submodule base\n', 'utf8')
+  git(fixture, submoduleRepository, 'add', '--all')
+  git(fixture, submoduleRepository, 'commit', '-q', '-m', 'submodule base')
+  const initialSubmoduleSha = git(fixture, submoduleRepository, 'rev-parse', 'HEAD')
+  await fs.appendFile(path.join(submoduleRepository, 'README.md'), 'submodule later\n', 'utf8')
+  git(fixture, submoduleRepository, 'add', '--all')
+  git(fixture, submoduleRepository, 'commit', '-q', '-m', 'submodule later')
+  git(fixture, repository, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', submoduleRepository, 'vendor')
+  git(fixture, repository, 'add', '--all')
+  git(fixture, repository, 'commit', '-q', '-m', 'add submodule fixture')
+  git(fixture, repository, 'config', '--local', 'diff.ignoreSubmodules', 'all')
+  let deliveryCalls = 0
+  let stagedSubmoduleHidden = false
+
+  try {
+    const result = await runTask(fixture, async (input) => {
+      await changeRepository(input, 'repo-a', { command: PASS_COMMAND })
+      return completed('通常 file と submodule を変更しました。')
+    }, {
+      draftPrDelivery: true,
+      runVerification: async ({ cwd }) => {
+        git(fixture, cwd, '-c', 'protocol.file.allow=always', 'submodule', 'update', '--init', '--quiet', 'vendor')
+        git(fixture, path.join(cwd, 'vendor'), 'checkout', initialSubmoduleSha)
+        git(fixture, cwd, 'add', 'vendor')
+        stagedSubmoduleHidden = git(fixture, cwd, 'diff', '--cached', '--name-only').length === 0
+
+        return {
+          status: 'passed',
+          exitCode: 0,
+          signal: null,
+          stdout: '',
+          stderr: '',
+          stdoutBytes: 0,
+          stderrBytes: 0,
+          terminationConfirmed: true
+        }
+      },
+      runGitHub: async () => {
+        deliveryCalls += 1
+        throw new Error('delivery must not start')
+      }
+    })
+
+    assert.equal(stagedSubmoduleHidden, true)
+    assert.equal(result.status, 'failed')
+    assert.equal(result.evidence.failureReason, 'verification_failed')
+    assert.equal(result.evidence.failureDetail, 'the worktree changed during verification or its final diff could not be captured completely; delivery was skipped')
+    assert.equal(deliveryCalls, 0)
+  } finally {
+    await removeFixture(fixture)
+  }
+})
 
 test('collectDevelopmentResult: 2つの repository にまたがる課題が completed になり、差分と検証結果を残す', async () => {
   const fixture = await createFixture()
