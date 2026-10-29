@@ -19,6 +19,19 @@ npm run typecheck
 ARAYA_TEST_SYSTEMD=1 node --test packages/araya/test/task-runner-systemd.test.ts
 ```
 
+## source の配置と import
+
+`packages/araya/src/` は機能ごとに分けています。
+
+- `cli/`: 引数解析と CLI command の実行
+- `config/`: 環境変数、設定ファイル、model 設定
+- `control-plane/`: store、観測、操作、runtime と task graph
+- `development/`: SHIKI、worktree、開発結果の収集。`draft-pr/` は Draft PR delivery と snapshot
+- `runner/`: 試行、台帳、runner loop
+- `infrastructure/`: subprocess、秘密の置換、systemd
+
+import は相対 path と `.ts` 拡張子を使い、必要な module を直接参照します。build 時に `.js` へ変換します。
+
 ## CI
 
 `.github/workflows/ci.yml` は pull_request と main への push で動きます。ubuntu-26.04（Node 26）の job が2つで、`test`（typecheck と `npm test`）と `systemd`（`ARAYA_TEST_SYSTEMD=1` で task-runner-systemd.test.ts を実行。linger を有効にして user manager を起動）です。

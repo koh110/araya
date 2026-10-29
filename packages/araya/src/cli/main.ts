@@ -1,8 +1,8 @@
 import os from 'node:os'
 
 import { parseCliArguments } from './arguments.ts'
-import { loadConfig } from './config.ts'
-import { loadConfigFile } from './config-file.ts'
+import { loadConfig } from '../config/environment.ts'
+import { loadConfigFile } from '../config/file.ts'
 import {
   approveOpportunity,
   initAraya,
@@ -10,8 +10,8 @@ import {
   runAraya,
   statusAraya,
   tickAraya
-} from './operations.ts'
-import { createSystemdOps, resolveRunnerEntrypoint } from './systemd-units.ts'
+} from '../control-plane/operations.ts'
+import { createSystemdOps, resolveRunnerEntrypoint } from '../infrastructure/systemd.ts'
 import {
   assertSupportedPlatform,
   runRunnerCommand,

@@ -28,10 +28,10 @@ import {
   type AgentModelEvidence,
   type AgentOutcome,
   type DevelopmentResult
-} from './development.ts'
-import type { ThinkingLevel } from './development-model.ts'
-import { readDecision } from './development-worktrees.ts'
-import { createRedactor, type Redactor } from './redaction.ts'
+} from '../development/result.ts'
+import type { ThinkingLevel } from '../config/model.ts'
+import { readDecision } from '../development/worktrees.ts'
+import { createRedactor, type Redactor } from '../infrastructure/redaction.ts'
 import {
   buildShikiInstructions,
   buildTaskBody,
@@ -40,7 +40,7 @@ import {
   describeModelUnavailable,
   getStateDir,
   SHIKI_TOOL_NAMES
-} from './shiki.ts'
+} from '../development/shiki.ts'
 import {
   createScopedRunner,
   createScopedVerificationRunner,
@@ -49,8 +49,8 @@ import {
   scopePattern,
   verifyScopeUnit,
   type SystemdOps
-} from './systemd-units.ts'
-import type { AttemptResult, AttemptSettings, ClaimedAttempt, TaskLedger, ToolEventType, WorktreeLocation } from './task-ledger.ts'
+} from '../infrastructure/systemd.ts'
+import type { AttemptResult, AttemptSettings, ClaimedAttempt, TaskLedger, ToolEventType, WorktreeLocation } from './ledger.ts'
 
 // 試行の task（pi-durable の defineTask）、session の document（araya.attempts）、SHIKI の extension（tool と途中経過の hook）。
 // runner の loop は知らない。台帳には AttemptLedgerPort の操作だけで触る

@@ -1,9 +1,9 @@
 import path from 'node:path'
 import { parseArgs } from 'node:util'
 
-import { collectSecretValues } from '../../src/redaction.ts'
-import type { AttemptFaults } from '../../src/task-attempt.ts'
-import { createRunnerLog, installRunnerProcessHandlers, runTaskRunner, type RunnerFaults } from '../../src/task-runner.ts'
+import { collectSecretValues } from '../../src/infrastructure/redaction.ts'
+import type { AttemptFaults } from '../../src/runner/attempt.ts'
+import { createRunnerLog, installRunnerProcessHandlers, runTaskRunner, type RunnerFaults } from '../../src/runner/runner.ts'
 import { createFakeSystemd } from './fake-systemd.ts'
 import { createFauxModels } from './faux-shiki.ts'
 import { isProcessFault, processStep, recordFilePath } from './runner-process.ts'

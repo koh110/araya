@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { hashGitDiffSnapshot, splitGitDiffSections } from '../src/draft-pr-snapshot.ts'
+import { hashGitDiffSnapshot, splitGitDiffSections } from '../src/development/draft-pr/snapshot.ts'
 
 test('snapshot digest ignores Git patch metadata but includes file identity, modes and content', () => {
   const evidenceDiff = [

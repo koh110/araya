@@ -8,9 +8,9 @@ import { Readable } from 'node:stream'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 
-import { exitCodeOf, runCli, UNSUPPORTED_ENVIRONMENT_EXIT_CODE } from '../src/cli.ts'
-import type { TaskCommandDependencies } from '../src/task-commands.ts'
-import { openTaskLedger, type AttemptResult, type AttemptSettings, type TaskLedger } from '../src/task-ledger.ts'
+import { exitCodeOf, runCli, UNSUPPORTED_ENVIRONMENT_EXIT_CODE } from '../src/cli/main.ts'
+import type { TaskCommandDependencies } from '../src/cli/task-commands.ts'
+import { openTaskLedger, type AttemptResult, type AttemptSettings, type TaskLedger } from '../src/runner/ledger.ts'
 
 const CLI_PATH = fileURLToPath(new URL('../bin/cli.ts', import.meta.url))
 

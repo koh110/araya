@@ -5,15 +5,15 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
-import { runBoundedCommand } from '../src/development-process.ts'
+import { runBoundedCommand } from '../src/infrastructure/process.ts'
 import {
   MAX_VERIFICATIONS_PER_TASK,
   MAX_WORKTREES_PER_TASK,
   createTaskState,
   createWorktreeService,
   readTaskState
-} from '../src/development-worktrees.ts'
-import type { VerificationRecord, WorktreeRecord } from '../src/development-worktrees.ts'
+} from '../src/development/worktrees.ts'
+import type { VerificationRecord, WorktreeRecord } from '../src/development/worktrees.ts'
 
 const FIXED_NOW = new Date('2026-10-23T00:00:00.000Z')
 

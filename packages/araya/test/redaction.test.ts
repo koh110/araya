@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { collectSecretValues, createRedactor, isSecretEnvName, REDACTED } from '../src/redaction.ts'
+import { collectSecretValues, createRedactor, isSecretEnvName, REDACTED } from '../src/infrastructure/redaction.ts'
 
 test('redaction: 名前を大文字にして決まった語を含む環境変数を秘密とみなし、SSH_AUTH_SOCK は除く', () => {
   for (const name of [

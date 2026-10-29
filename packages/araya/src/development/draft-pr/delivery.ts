@@ -1,10 +1,10 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
-import type { GitCommandRunner } from './development-process.ts'
-import type { WorktreeRecord } from './development-worktrees.ts'
-import { hashGitDiffSnapshot, splitGitDiffSections } from './draft-pr-snapshot.ts'
-import { isSecretEnvName } from './redaction.ts'
+import type { GitCommandRunner } from '../../infrastructure/process.ts'
+import type { WorktreeRecord } from '../worktrees.ts'
+import { hashGitDiffSnapshot, splitGitDiffSections } from './snapshot.ts'
+import { isSecretEnvName } from '../../infrastructure/redaction.ts'
 
 const GITHUB_HOST = 'github.com'
 const GH_TIMEOUT_MS = 120_000

@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import type { BoundedProcessResult, GitCommandRunner } from '../src/development-process.ts'
-import { deliverDraftPullRequests } from '../src/draft-pr-delivery.ts'
-import type { WorktreeRecord } from '../src/development-worktrees.ts'
+import type { BoundedProcessResult, GitCommandRunner } from '../src/infrastructure/process.ts'
+import { deliverDraftPullRequests } from '../src/development/draft-pr/delivery.ts'
+import type { WorktreeRecord } from '../src/development/worktrees.ts'
 
 function result(stdout = '', exitCode = 0): BoundedProcessResult {
   return {

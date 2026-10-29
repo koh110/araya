@@ -5,7 +5,7 @@ import test from 'node:test'
 
 import { DatabaseSync } from 'node:sqlite'
 
-import { scopePattern } from '../src/systemd-units.ts'
+import { scopePattern } from '../src/infrastructure/systemd.ts'
 import { answer, toolCall, worktreePathFrom, type FauxView } from './support/faux-shiki.ts'
 import { findMarkedProcesses } from './support/fake-systemd.ts'
 import { taskInput, waitUntil, type RunnerFixture } from './support/runner-fixture.ts'

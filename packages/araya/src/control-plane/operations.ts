@@ -4,9 +4,9 @@ import path from 'node:path'
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
 import type { SettledTask } from '@earendil-works/pi-durable'
 
-import { loadConfig } from './config.ts'
-import { openControlPlane, type OpportunitySummary } from './control-plane.ts'
-import { formatModel } from './development-model.ts'
+import { loadConfig } from '../config/environment.ts'
+import { openControlPlane, type OpportunitySummary } from './store.ts'
+import { formatModel } from '../config/model.ts'
 import { ensureScoutTask, openArayaRuntime, MAIN_GOAL_ID, readTaskGraph } from './runtime.ts'
 import { TASK_NAMES, type ScoutResult } from './tasks.ts'
 

@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
-import type { BoundedProcessResult, GitCommandRunner } from './development-process.ts'
+import type { BoundedProcessResult, GitCommandRunner } from '../infrastructure/process.ts'
 
 export const MAX_WORKTREES_PER_TASK = 16
 export const MAX_VERIFICATIONS_PER_TASK = 32

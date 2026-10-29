@@ -5,23 +5,23 @@ import type { FileHandle } from 'node:fs/promises'
 import path from 'node:path'
 import { TextDecoder } from 'node:util'
 
-import type { SessionModel } from './development-model.ts'
+import type { SessionModel } from '../config/model.ts'
 import {
   VERIFICATION_OUTPUT_BYTES,
   type GitCommandRunner,
   type VerificationCommandInput,
   type VerificationCommandResult
-} from './development-process.ts'
-import { deliverDraftPullRequests, type DraftPrSnapshotGuard, type DraftPrWorktreeEvidence, type DraftPrWorktreeInput } from './draft-pr-delivery.ts'
-import { hashGitDiffSnapshot, splitGitDiffSections } from './draft-pr-snapshot.ts'
+} from '../infrastructure/process.ts'
+import { deliverDraftPullRequests, type DraftPrSnapshotGuard, type DraftPrWorktreeEvidence, type DraftPrWorktreeInput } from './draft-pr/delivery.ts'
+import { hashGitDiffSnapshot, splitGitDiffSections } from './draft-pr/snapshot.ts'
 import {
   readDecision,
   readTaskState,
   type DecisionRecord,
   type VerificationRecord,
   type WorktreeRecord
-} from './development-worktrees.ts'
-import type { CutSide } from './redaction.ts'
+} from './worktrees.ts'
+import type { CutSide } from '../infrastructure/redaction.ts'
 
 const MAX_TASK_TIMEOUT_MS = 60 * 60 * 1000
 const MAX_SUMMARY_CHARS = 4000

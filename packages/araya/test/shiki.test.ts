@@ -8,7 +8,7 @@ import {
   describeModelUnavailable,
   getWorktreePattern,
   REGISTER_VERIFICATION_TOOL_TEXT
-} from '../src/shiki.ts'
+} from '../src/development/shiki.ts'
 
 const DEV_ROOT = '/home/araya/dev'
 const TASK_KEY = 'task-12-1-k3m7qz'

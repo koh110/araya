@@ -61,8 +61,8 @@
 
 ## 責務の分担
 
-- `src/config.ts` の `loadConfig(env)` は、従来どおり環境変数だけを読む。返す値に `configPath`（`<dataDir>/config.json`）を加える。
-- 設定ファイルの読み込みと検証は、新しい module（例: `src/config-file.ts`）に置く。CLI は subcommand を処理する前に1回だけ呼び、結果の `developmentModel` を config に入れて各処理へ渡す。
+- `src/config/environment.ts` の `loadConfig(env)` は、従来どおり環境変数だけを読む。返す値に `configPath`（`<dataDir>/config.json`）を加える。
+- 設定ファイルの読み込みと検証は、新しい module（例: `src/config/file.ts`）に置く。CLI は subcommand を処理する前に1回だけ呼び、結果の `developmentModel` を config に入れて各処理へ渡す。
 - `developmentModel` の型は `{ provider: string, id: string, thinkingLevel: ThinkingLevel | null } | null`。`null` は設定ファイルで model を指定していないことを表す。
 - development executor は `developmentModel` を worker の入力へそのまま渡す。worker は設定ファイルを読まない。
 - 設定ファイルの値を受け取らずに config を作る経路（test など）では `developmentModel` を `null` とする。

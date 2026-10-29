@@ -5,9 +5,9 @@ import { Type } from '@earendil-works/pi-ai'
 import { defineTool, type DocumentReader, type ToolExecutionResult } from '@earendil-works/pi-durable'
 import { createBashTool, createEditTool, createReadTool, createWriteTool } from '@earendil-works/pi-durable/tools'
 
-import { formatModel } from './development-model.ts'
-import { createWorktreeService, recordDecision } from './development-worktrees.ts'
-import { bashScopeUnit, createScopedRunner, gitScopeUnit, type SystemdOps } from './systemd-units.ts'
+import { formatModel } from '../config/model.ts'
+import { createWorktreeService, recordDecision } from './worktrees.ts'
+import { bashScopeUnit, createScopedRunner, gitScopeUnit, type SystemdOps } from '../infrastructure/systemd.ts'
 
 // SHIKI に渡す文（system prompt、課題の prompt、課題の本文、model が使えないときの message、tool の説明）と、
 // pi-durable の会話で SHIKI が使う tool

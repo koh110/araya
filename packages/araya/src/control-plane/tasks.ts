@@ -1,7 +1,7 @@
 import type { Context } from '@earendil-works/chord'
 import { defineTask, type TaskId } from '@earendil-works/pi-durable'
 
-import type { ControlPlane } from './control-plane.ts'
+import type { ControlPlane } from './store.ts'
 import { readObservationSource } from './observations.ts'
 
 export const TASK_NAMES = {

@@ -12,7 +12,7 @@ import {
   type GitCommandRunner,
   type VerificationCommandInput,
   type VerificationCommandResult
-} from './development-process.ts'
+} from './process.ts'
 import { collectSecretValues, createRedactor, isSecretEnvName, type CutSide } from './redaction.ts'
 
 // runner の unit file、試行の scope、systemd の操作（systemctl・systemd-run・loginctl の呼び出し）。test では SystemdOps を差し替える
@@ -242,7 +242,7 @@ export function buildRunnerUnitFile(input: RunnerUnitFileInput) {
 // build 前は .ts、build 後は .js の runner の entrypoint を、この module と同じ package の bin/ から探す
 export async function resolveRunnerEntrypoint(moduleUrl: string = import.meta.url) {
   const modulePath = fileURLToPath(moduleUrl)
-  const packageRoot = path.dirname(path.dirname(modulePath))
+  const packageRoot = path.dirname(path.dirname(path.dirname(modulePath)))
   const entrypoint = path.join(packageRoot, 'bin', `task-runner${path.extname(modulePath)}`)
   let stat
 

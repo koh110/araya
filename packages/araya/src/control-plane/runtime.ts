@@ -12,7 +12,7 @@ import {
   type TaskId
 } from '@earendil-works/pi-durable'
 
-import { openControlPlane, type ControlPlane } from './control-plane.ts'
+import { openControlPlane, type ControlPlane } from './store.ts'
 import { createArayaTasks, TASK_NAMES, type ArayaTasks, type ScoutInput, type ScoutResult } from './tasks.ts'
 
 export const MAIN_GOAL_ID = 'araya:goal:main'

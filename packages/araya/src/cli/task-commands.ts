@@ -5,8 +5,8 @@ import type { FileHandle } from 'node:fs/promises'
 import path from 'node:path'
 import { parseArgs, TextDecoder } from 'node:util'
 
-import { collectSecretValues, createRedactor, type Redactor } from './redaction.ts'
-import { initializeConfigFromPiSettings } from './config-file.ts'
+import { collectSecretValues, createRedactor, type Redactor } from '../infrastructure/redaction.ts'
+import { initializeConfigFromPiSettings } from '../config/file.ts'
 import {
   buildRunnerUnitFile,
   commandSucceeded,
@@ -16,7 +16,7 @@ import {
   unitFilePath,
   type CommandResult,
   type SystemdOps
-} from './systemd-units.ts'
+} from '../infrastructure/systemd.ts'
 import {
   isLedgerError,
   MAX_CONCURRENT_ATTEMPTS,
@@ -29,7 +29,7 @@ import {
   type AttemptView,
   type RunnerView,
   type TaskLedger
-} from './task-ledger.ts'
+} from '../runner/ledger.ts'
 
 // araya task の command。台帳だけを読み書きし、runner を起動しない
 

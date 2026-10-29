@@ -2,8 +2,8 @@
 import path from 'node:path'
 import { parseArgs } from 'node:util'
 
-import { collectSecretValues } from '../src/redaction.ts'
-import { createRunnerLog, installRunnerProcessHandlers, runTaskRunner } from '../src/task-runner.ts'
+import { collectSecretValues } from '../src/infrastructure/redaction.ts'
+import { createRunnerLog, installRunnerProcessHandlers, runTaskRunner } from '../src/runner/runner.ts'
 
 // runner の entrypoint。systemd の user service（araya runner install が書く unit）の ExecStart から起動する
 const { values } = parseArgs({

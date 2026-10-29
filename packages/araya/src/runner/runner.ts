@@ -17,16 +17,16 @@ import {
 import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node'
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node'
 
-import { loadConfig } from './config.ts'
-import { loadConfigFile } from './config-file.ts'
-import { collectSecretValues, createRedactor } from './redaction.ts'
+import { loadConfig } from '../config/environment.ts'
+import { loadConfigFile } from '../config/file.ts'
+import { collectSecretValues, createRedactor } from '../infrastructure/redaction.ts'
 import {
   createSystemdOps,
   dataDirHash,
   runnerUnitName,
   scopePattern,
   type SystemdOps
-} from './systemd-units.ts'
+} from '../infrastructure/systemd.ts'
 import {
   AttemptsDoc,
   buildAttemptErrorResult,
@@ -35,7 +35,7 @@ import {
   isAttemptResult,
   type AttemptFaults,
   type PiModelSettings
-} from './task-attempt.ts'
+} from './attempt.ts'
 import {
   MAX_CONCURRENT_ATTEMPTS,
   openTaskLedger,
@@ -46,7 +46,7 @@ import {
   type Settlement,
   type StopReason,
   type TaskLedger
-} from './task-ledger.ts'
+} from './ledger.ts'
 
 // runner の本体（起動、開き直したときの確認、loop、取り込み、中止、結果の記録、止めるとき、Harness が失敗で閉じたとき、log）。
 // systemd の user service の中で1つだけ動き、pi-durable の storage を1つ持つ。試行は Task ごとの試行の task として動かす

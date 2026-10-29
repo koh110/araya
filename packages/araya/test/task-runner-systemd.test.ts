@@ -11,7 +11,7 @@ import {
   runnerUnitSections,
   scopePattern,
   selectUnitEnvironment
-} from '../src/systemd-units.ts'
+} from '../src/infrastructure/systemd.ts'
 import { taskInput, waitUntil } from './support/runner-fixture.ts'
 import { openLedger, parseLogLines, readRunnerLog, waitForTaskStatus, type RunnerSetup } from './support/runner-loop.ts'
 import { processFiles, scriptGoal, type ProcessFault, type ProcessScript } from './support/runner-process.ts'

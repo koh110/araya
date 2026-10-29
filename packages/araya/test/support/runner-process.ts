@@ -4,7 +4,7 @@ import path from 'node:path'
 import type { TestContext } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
-import { shellQuote } from '../../src/systemd-units.ts'
+import { shellQuote } from '../../src/infrastructure/systemd.ts'
 import { answer, toolCall, worktreePathFrom, type FauxView } from './faux-shiki.ts'
 import { readRunnerLog, teardownRunner, withTimeout, type RunnerSetup } from './runner-loop.ts'
 import { completingStep, isRecord, PASS_COMMAND } from './runner-scenarios.ts'

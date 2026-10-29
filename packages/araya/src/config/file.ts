@@ -11,7 +11,7 @@ import {
   parseModelReference,
   THINKING_LEVEL_RULE,
   type DevelopmentModel
-} from './development-model.ts'
+} from './model.ts'
 
 const MAX_CONFIG_FILE_BYTES = 64 * 1024
 const TOP_LEVEL_KEYS = ['development'] as const

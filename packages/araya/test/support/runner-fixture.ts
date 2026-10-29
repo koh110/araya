@@ -9,9 +9,9 @@ import { createRegistry, Harness, type SettledTask } from '@earendil-works/pi-du
 import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node'
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node'
 
-import type { DevelopmentModel } from '../../src/development-model.ts'
-import { collectSecretValues } from '../../src/redaction.ts'
-import { dataDirHash, scopePattern, type SystemdOps } from '../../src/systemd-units.ts'
+import type { DevelopmentModel } from '../../src/config/model.ts'
+import { collectSecretValues } from '../../src/infrastructure/redaction.ts'
+import { dataDirHash, scopePattern, type SystemdOps } from '../../src/infrastructure/systemd.ts'
 import {
   AttemptsDoc,
   buildAttemptInput,
@@ -19,8 +19,8 @@ import {
   type AttemptFaults,
   type AttemptInput,
   type PiModelSettings
-} from '../../src/task-attempt.ts'
-import { openTaskLedger, type AttemptResult, type AttemptSettings, type TaskInput } from '../../src/task-ledger.ts'
+} from '../../src/runner/attempt.ts'
+import { openTaskLedger, type AttemptResult, type AttemptSettings, type TaskInput } from '../../src/runner/ledger.ts'
 
 // 試行の task の test の fixture（一時 dataDir、開発 root と git の repository、Pi の agentDir）と、
 // runner の loop の代わりに試行を1件ずつ動かす小さな driver（台帳で取り込み → root の commit で task と document → 終わりを待つ）

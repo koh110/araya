@@ -10,14 +10,14 @@ import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
 import { createModels } from '@earendil-works/pi-ai/models'
 import { createRegistry, defineExtension, Harness } from '@earendil-works/pi-durable'
 
-import { loadConfig } from '../src/config.ts'
-import { parseCliArguments } from '../src/arguments.ts'
-import { runCli } from '../src/cli.ts'
-import { openControlPlane } from '../src/control-plane.ts'
-import { approveOpportunity, initAraya, tickAraya, statusAraya } from '../src/operations.ts'
-import { readObservationSource } from '../src/observations.ts'
-import { createArayaModelRuntime, MAIN_GOAL_ID } from '../src/runtime.ts'
-import { createArayaTasks, TASK_NAMES } from '../src/tasks.ts'
+import { loadConfig } from '../src/config/environment.ts'
+import { parseCliArguments } from '../src/cli/arguments.ts'
+import { runCli } from '../src/cli/main.ts'
+import { openControlPlane } from '../src/control-plane/store.ts'
+import { approveOpportunity, initAraya, tickAraya, statusAraya } from '../src/control-plane/operations.ts'
+import { readObservationSource } from '../src/control-plane/observations.ts'
+import { createArayaModelRuntime, MAIN_GOAL_ID } from '../src/control-plane/runtime.ts'
+import { createArayaTasks, TASK_NAMES } from '../src/control-plane/tasks.ts'
 
 async function makeConfig(): Promise<{ dir: string; config: ReturnType<typeof loadConfig> }> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-test-'))

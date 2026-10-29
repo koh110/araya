@@ -1,8 +1,8 @@
 import { appendFileSync } from 'node:fs'
 import fs from 'node:fs/promises'
 
-import { runBoundedCommand } from '../../src/development-process.ts'
-import { shellQuote, type CommandResult, type ScopeStopResult, type SystemdOps } from '../../src/systemd-units.ts'
+import { runBoundedCommand } from '../../src/infrastructure/process.ts'
+import { shellQuote, type CommandResult, type ScopeStopResult, type SystemdOps } from '../../src/infrastructure/systemd.ts'
 
 // 偽物の systemd。scope を作らずに command を直接実行し、process の環境変数 ARAYA_FAKE_SCOPE に scope の名前の印を付ける。
 // 印は setsid した子孫にも引き継がれるので、scope と同じく切り離した process も止められる。

@@ -1,7 +1,7 @@
 import os from 'node:os'
 import path from 'node:path'
 
-import type { DevelopmentModel } from './development-model.ts'
+import type { DevelopmentModel } from './model.ts'
 
 // 設定ファイルの値は CLI が loadConfigFile で読んで置き換える。読まない経路（test など）では model を指定しない
 const NO_DEVELOPMENT_MODEL: DevelopmentModel | null = null

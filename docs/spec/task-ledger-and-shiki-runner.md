@@ -601,7 +601,7 @@ Issue #1 の「Secrets を通常ログや Task 台帳に複製しない」のた
 ## 試行の入力
 
 - taskKey: `task-<Task ID>-<試行番号>-<suffix>`。suffix は `a-z2-7` の6文字で、暗号学的乱数で選ぶ（例: `task-12-1-k3m7qz`）。台帳を作り直して Task ID が 1 から始まっても、残っている worktree・branch・scope と名前が重ならないように乱数を付ける。試行を `queued` で作るときに決めて `runs.task_key` に入れる。
-- worktree と branch: 既存と同じ規則で `<repository root>/.worktree/araya-<taskKey>` と `araya/<taskKey>`。taskKey を検証する箇所（`development-worktrees.ts` など）は、この形式だけを受け付ける。旧形式（`development-` と16進20桁）の taskKey は旧経路の executor だけが作り（`computeTaskKey`）、この手順で撤去する。
+- worktree と branch: 既存と同じ規則で `<repository root>/.worktree/araya-<taskKey>` と `araya/<taskKey>`。taskKey を検証する箇所（`development/worktrees.ts` など）は、この形式だけを受け付ける。旧形式（`development-` と16進20桁）の taskKey は旧経路の executor だけが作り（`computeTaskKey`）、この手順で撤去する。
 - title: Task の title。
 - 課題の本文: Task から組み立てる（「課題の本文」）。
 
@@ -677,7 +677,7 @@ command:
 - worker を起動して応答を読む処理（`development-process.ts` の `runPiWorker`・`parsePiWorkerResult`・`PiWorkerInput` と、worker の path の解決、応答の検証、worker 用の上限の定数）
 - Pi の SDK の session（`createAgentSession`）で SHIKI を動かす処理（`development-agent.ts` の `runDevelopmentAgent`、Pi の SDK 用の tool の定義（tool の説明の文は `shiki.ts` に移す）、`DEVELOPMENT_TOOL_NAMES`・`hasUsableModel`・`findAssistantFailure`）
 - 旧経路の development executor（`development.ts` の `createDevelopmentExecutor`・`DevelopmentExecution`・`DevelopmentTaskRunner`・`DevelopmentExecutorOptions`）のうち、SHIKI が終わる前の部分（opportunity から課題を作る、開発 root を確かめる、状態 directory を作る、worker を起動する）。SHIKI が終わった後の部分は、新しい経路に移す（下）。
-- 旧形式の taskKey を作る `computeTaskKey`（`development-worktrees.ts`）
+- 旧形式の taskKey を作る `computeTaskKey`（`development/worktrees.ts`）
 - executor を渡す引数（`openArayaRuntime`・`tickAraya`・`createArayaTasks`・`createWorkTask`）、`runtime.ts` での executor の作成、WorkTask の executor の呼び出しと、そのための `claimWorkspaceOpportunity`（`control-plane.ts`）
 - 撤去したものだけを確かめる test（`development-built.test.ts`、`development-agent.test.ts`、`development-process.test.ts` の `runPiWorker`・`parsePiWorkerResult`・development worker の test、`development.test.ts` のうち SHIKI が終わる前の部分（課題の検証、開発 root、状態 directory の作成）と、worker に渡す model、worker が報告した model と誤りの記録だけを確かめるもの、`development-worktrees.test.ts` の `computeTaskKey` の test）。新しい経路の同じ確かめは、「Acceptance Criteria」の test で行う。残す test で taskKey を作るのに `computeTaskKey` を使っている箇所は、新しい形式の taskKey に置き換える。`araya.test.ts` の、`tickAraya` に executor を渡して development の課題を実行する test は、「撤去した後の旧経路」の動作を確かめる test に直す。
 
@@ -687,7 +687,7 @@ worker を撤去する PR で残し（関数への切り出しと file の移動
 
 - executor の、SHIKI が終わった後の部分（状態 directory の記録を読み、差分を集め、検証を実行し、結果を決める）。関数に切り出し、試行の task の `evidence` の phase で使う（「実装の置き場所」）。`development.test.ts` のうち、この部分を確かめるもの（差分、検証、失敗の理由、状態 directory の記録の検証、symlink の扱い、diff の上限など）は、切り出した関数を直接呼ぶ test に直して残す。
 - 検証のコマンドの実行（`development-process.ts` の `runBoundedCommand`・`runVerificationCommand`）と、その test
-- `araya_create_worktree`・`araya_register_verification` の処理（`development-worktrees.ts`）と、その test
+- `araya_create_worktree`・`araya_register_verification` の処理（`development/worktrees.ts`）と、その test
 - 課題の prompt、system prompt、model が使えないときの message、tool の説明の文（`development-agent.ts` から `shiki.ts` へ）
 - 設定ファイルと model の指定（`config-file.ts`・`development-model.ts`）と、その test
 
@@ -728,15 +728,15 @@ worker を撤去する PR で、旧名（`agentctl`）を次の箇所で `araya`
 
 ## 実装の置き場所（目安）
 
-- 台帳: `packages/araya/src/task-ledger.ts`
-- runner の本体（起動、開き直したときの確認、loop、取り込み、中止、結果の記録、止めるとき）: `packages/araya/src/task-runner.ts`
-- 試行の task と SHIKI の extension（hook と session の document）: `packages/araya/src/task-attempt.ts`
-- SHIKI の tool（pi-durable 版）と instructions: `packages/araya/src/shiki.ts`。`araya_create_worktree` は、`createWorktreeService`（`development-worktrees.ts`）に git を起動する関数を渡して使う（必須の引数にし、`execFile` で直接起動する経路は残さない）
-- systemd の操作（`systemctl`・`systemd-run`・`loginctl` の呼び出し、scope の command、unit file の内容。test で差し替える）: `packages/araya/src/systemd-units.ts`
-- 差分の収集、検証、判定: executor の、SHIKI が終わった後の部分を `development.ts` の中で関数に切り出す（executor のほかの部分は撤去する。「旧経路との関係」）。git と検証のコマンドを起動する関数を必須の引数で受け取り、runner は scope の中で起動する関数を渡す。検証のコマンドの実行（`runBoundedCommand`）に、中止の signal を受け取る引数を足す
+- 台帳: `packages/araya/src/runner/ledger.ts`
+- runner の本体（起動、開き直したときの確認、loop、取り込み、中止、結果の記録、止めるとき）: `packages/araya/src/runner/runner.ts`
+- 試行の task と SHIKI の extension（hook と session の document）: `packages/araya/src/runner/attempt.ts`
+- SHIKI の tool（pi-durable 版）と instructions: `packages/araya/src/development/shiki.ts`。`araya_create_worktree` は、`createWorktreeService`（`development/worktrees.ts`）に git を起動する関数を渡して使う（必須の引数にし、`execFile` で直接起動する経路は残さない）
+- systemd の操作（`systemctl`・`systemd-run`・`loginctl` の呼び出し、scope の command、unit file の内容。test で差し替える）: `packages/araya/src/infrastructure/systemd.ts`
+- 差分の収集、検証、判定: executor の、SHIKI が終わった後の部分を `development/result.ts` の中で関数に切り出す（executor のほかの部分は撤去する。「旧経路との関係」）。git と検証のコマンドを起動する関数を必須の引数で受け取り、runner は scope の中で起動する関数を渡す。検証のコマンドの実行（`runBoundedCommand`）に、中止の signal を受け取る引数を足す
 - 旧経路の worker の撤去（worker を撤去する PR。runner より先）: 「旧経路との関係」の「撤去するもの」と「新しい経路に移して使うもの」
 - runner の entrypoint: `packages/araya/bin/task-runner.ts`
-- CLI: `packages/araya/src/cli.ts` に `task` と `runner` を加える。誤りの終了 code は `exitCodeOf`（`packages/araya/bin/cli.ts` が使う）
+- CLI: `packages/araya/src/cli/main.ts` に `task` と `runner` を加える。誤りの終了 code は `exitCodeOf`（`packages/araya/bin/cli.ts` が使う）
 - deploy: `scripts/deploy.sh`（test は `packages/araya/test/deploy.test.ts`。npm と、npm が入れる araya を偽物にする）
 
 ## 既知の制限
@@ -912,10 +912,10 @@ pi-durable と Pi は 1.4.0、Node.js は v26.12.1、systemd は 259、npm は 1
 
 ### 既存のコード
 
-- 既存の `loadConfig`（`config.ts`）は、`ARAYA_DATA_DIR`・`ARAYA_DEV_ROOT` などを `path.resolve` で絶対 path にするため、相対 path は process の cwd を基準に解決される。Pi の agent directory は `PI_CODING_AGENT_DIR` から読む（無ければ Pi の既定）。
+- 既存の `loadConfig`（`config/environment.ts`）は、`ARAYA_DATA_DIR`・`ARAYA_DEV_ROOT` などを `path.resolve` で絶対 path にするため、相対 path は process の cwd を基準に解決される。Pi の agent directory は `PI_CODING_AGENT_DIR` から読む（無ければ Pi の既定）。
 - 既存の development executor（`development.ts`）は、worker を `runPiWorker` で起動し、その後に状態 directory の記録を読み、git で差分を集め、検証のコマンドを `runBoundedCommand`（`development-process.ts`）で実行して、失敗の理由（`invalid_task`・`dev_root_missing`・`task_state_already_exists`・`termination_unconfirmed`・`task_state_invalid`・`evidence_collection_failed`・`agent_timeout`・`agent_failed`・`no_changes`・`verification_missing`・`verification_failed`）を決める。
 - `runBoundedCommand` は、コマンドを独立した process group（`detached`）で起動し、timeout と出力の上限で process group を止め、終わったことを確かめる。中止の signal は受け取らない。
-- `araya_create_worktree`（`development-worktrees.ts`）は、git を `execFile` で起動し（決まった候補から選んだ絶対 path。timeout は 60 秒、`git worktree add` は 10 分、出力は 2 MiB まで、timeout のときは SIGKILL）、hook を無効にしない。差分の収集（`development.ts`）の git は `runBoundedCommand` で起動し、`core.hooksPath=/dev/null` を付ける。`araya_register_verification` は subprocess を起動しない（path の確認と file の追記だけ）。
+- `araya_create_worktree`（`development/worktrees.ts`）は、git を `execFile` で起動し（決まった候補から選んだ絶対 path。timeout は 60 秒、`git worktree add` は 10 分、出力は 2 MiB まで、timeout のときは SIGKILL）、hook を無効にしない。差分の収集（`development.ts`）の git は `runBoundedCommand` で起動し、`core.hooksPath=/dev/null` を付ける。`araya_register_verification` は subprocess を起動しない（path の確認と file の追記だけ）。
 - 既存の SHIKI（`development-agent.ts`）は、model が設定されていなければ Pi の SDK（`createAgentSession`）に model を選ばせ、設定されていれば `ModelRuntime` に無いときと認証が無いときに `model_unavailable` の誤りにする。
 - 既存の development worker の entrypoint は、`development-process.ts` の module の1つ上の directory を package root とし、その `bin/` から、module と同じ拡張子で探す（build 前は `.ts`、build 後は `.js`）。通常の file でなければ起動しない。build 済みの package でこれを確かめる test（`development-built.test.ts`）がある。
 - 既存の WorkTask は、executor が渡されていないとき、kind と risk の組が正しく `discovered` の development の課題を `blocked`（evidence は `{"type": "development_executor_unavailable", "opportunityId": ...}`）にし、`no_executor` で終わる。この経路の test は無い。

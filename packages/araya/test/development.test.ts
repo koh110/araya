@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
-import { buildWorktreeOnlyEvidence, collectDevelopmentResult, type AgentOutcome } from '../src/development.ts'
+import { buildWorktreeOnlyEvidence, collectDevelopmentResult, type AgentOutcome } from '../src/development/result.ts'
 import {
   runBoundedCommand,
   runVerificationCommand,
@@ -13,9 +13,9 @@ import {
   type GitCommandRunner,
   type VerificationCommandInput,
   type VerificationCommandResult
-} from '../src/development-process.ts'
-import { createTaskState, createWorktreeService, recordDecision } from '../src/development-worktrees.ts'
-import { createRedactor, type Redactor } from '../src/redaction.ts'
+} from '../src/infrastructure/process.ts'
+import { createTaskState, createWorktreeService, recordDecision } from '../src/development/worktrees.ts'
+import { createRedactor, type Redactor } from '../src/infrastructure/redaction.ts'
 
 const TASK_KEY = 'task-1-1-abcdef'
 const PASS_COMMAND = [process.execPath, '-e', "console.log('verified')"]

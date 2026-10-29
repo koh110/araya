@@ -5,8 +5,8 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
-import { openControlPlane } from '../src/control-plane.ts'
-import { readObservationSource } from '../src/observations.ts'
+import { openControlPlane } from '../src/control-plane/store.ts'
+import { readObservationSource } from '../src/control-plane/observations.ts'
 
 async function makeTempDir() {
   return fs.mkdtemp(path.join(os.tmpdir(), 'araya-development-intake-test-'))

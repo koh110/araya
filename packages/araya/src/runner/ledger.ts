@@ -5,8 +5,8 @@ import { performance } from 'node:perf_hooks'
 import { DatabaseSync } from 'node:sqlite'
 import { TextDecoder } from 'node:util'
 
-import { isThinkingLevel, type DevelopmentModel } from './development-model.ts'
-import { createRedactor } from './redaction.ts'
+import { isThinkingLevel, type DevelopmentModel } from '../config/model.ts'
+import { createRedactor } from '../infrastructure/redaction.ts'
 
 // Task の台帳（<dataDir>/tasks.sqlite）。CLI と runner の両方が開く。pi-durable と systemd は import しない
 // 書き込みはすべて同期の BEGIN IMMEDIATE の transaction で行い、transaction の中で待機や process の起動をしない

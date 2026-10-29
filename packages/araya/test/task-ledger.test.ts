@@ -6,7 +6,7 @@ import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 
-import { REDACTED } from '../src/redaction.ts'
+import { REDACTED } from '../src/infrastructure/redaction.ts'
 import {
   createTaskKey,
   isLedgerError,
@@ -19,9 +19,9 @@ import {
   type LedgerErrorCode,
   type TaskInput,
   type TaskLedger
-} from '../src/task-ledger.ts'
+} from '../src/runner/ledger.ts'
 
-const TASK_LEDGER_MODULE = new URL('../src/task-ledger.ts', import.meta.url).href
+const TASK_LEDGER_MODULE = new URL('../src/runner/ledger.ts', import.meta.url).href
 
 async function makeDataDir() {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'araya-task-ledger-test-')))

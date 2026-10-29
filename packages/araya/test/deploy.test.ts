@@ -6,7 +6,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 
-import { shellQuote } from '../src/systemd-units.ts'
+import { shellQuote } from '../src/infrastructure/systemd.ts'
 
 // scripts/deploy.sh（npm run deploy）の test。npm と、npm が入れる araya を偽物にする。本物の npm を使う test と、
 // 本物の araya の CLI を使う test もある。どの test も、利用者の prefix・dataDir・systemd には触れない

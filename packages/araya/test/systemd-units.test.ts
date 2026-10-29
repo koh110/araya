@@ -5,10 +5,10 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
-import { collectDevelopmentResult } from '../src/development.ts'
-import { createTaskState, createWorktreeService } from '../src/development-worktrees.ts'
+import { collectDevelopmentResult } from '../src/development/result.ts'
+import { createTaskState, createWorktreeService } from '../src/development/worktrees.ts'
 import {
   bashScopeUnit,
   buildRunnerUnitFile,
@@ -26,7 +26,7 @@ import {
   shellQuote,
   unitFilePath,
   verifyScopeUnit
-} from '../src/systemd-units.ts'
+} from '../src/infrastructure/systemd.ts'
 import { createFakeSystemd, findMarkedProcesses } from './support/fake-systemd.ts'
 
 const TASK_KEY = 'task-7-2-abcdef'
@@ -192,10 +192,10 @@ test('systemd-units: runner の entrypoint は package root の bin/ から、mo
   const root = await makeRoot('araya-entrypoint-test-')
 
   try {
-    await fs.mkdir(path.join(root, 'src'))
+    await fs.mkdir(path.join(root, 'src', 'infrastructure'), { recursive: true })
     await fs.mkdir(path.join(root, 'bin'))
-    const tsModule = pathToFileURL(path.join(root, 'src', 'systemd-units.ts')).href
-    const jsModule = pathToFileURL(path.join(root, 'src', 'systemd-units.js')).href
+    const tsModule = pathToFileURL(path.join(root, 'src', 'infrastructure', 'systemd.ts')).href
+    const jsModule = pathToFileURL(path.join(root, 'src', 'infrastructure', 'systemd.js')).href
 
     await assert.rejects(resolveRunnerEntrypoint(tsModule), errorWithCode('runner_entrypoint_unavailable'))
 
@@ -212,6 +212,13 @@ test('systemd-units: runner の entrypoint は package root の bin/ から、mo
   } finally {
     await fs.rm(root, { recursive: true, force: true })
   }
+})
+
+test('systemd-units: source の default entrypoint は同じ package の bin/task-runner.ts', async () => {
+  const expected = fileURLToPath(new URL('../bin/task-runner.ts', import.meta.url))
+
+  assert.equal(await resolveRunnerEntrypoint(), expected)
+  assert.equal((await fs.lstat(expected)).isFile(), true)
 })
 
 test('systemd-units: unit file の path は XDG_CONFIG_HOME が絶対 path のときだけ使い、それ以外は ~/.config', () => {

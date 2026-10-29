@@ -12,7 +12,7 @@ import {
   buildTaskBody,
   createShikiTools,
   SHIKI_TOOL_NAMES
-} from '../src/shiki.ts'
+} from '../src/development/shiki.ts'
 import { createFakeSystemd } from './support/fake-systemd.ts'
 import { answer, createFauxModels, toolCall } from './support/faux-shiki.ts'
 import { createRepository, createRunnerFixture, ctx, removeRunnerFixture } from './support/runner-fixture.ts'

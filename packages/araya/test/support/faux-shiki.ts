@@ -9,7 +9,7 @@ import {
 } from '@earendil-works/pi-ai'
 import { ModelRuntime } from '@earendil-works/pi-coding-agent'
 
-import type { DevelopmentModel } from '../../src/development-model.ts'
+import type { DevelopmentModel } from '../../src/config/model.ts'
 
 // faux provider の model と応答。応答は、会話の中の課題の識別子と tool の結果だけで決め、process の memory に状態を持たない
 // （process をまたぐ test でも同じ応答の関数を使えるように）
