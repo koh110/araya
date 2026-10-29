@@ -1,6 +1,6 @@
 # araya
 
-開発の課題を AI agent にたのむための CLI。開発の課題を JSON で書き、常駐する runner が SHIKI（Pi で作る開発の agent）を対象 repository の worktree の中で動かします。Araya は差分と検証の結果を集めて Task の台帳に記録します。Araya は commit・push・PR・merge・deploy を行いません。
+開発課題を AI agent に依頼するための CLI です。目指す姿は、検証済みの変更を draft PR まで届け、merge は人が判断することです。現行MVPでは、常駐 runner が SHIKI（Pi で作る開発の agent）を対象 repository の worktree で動かし、差分と検証結果を Task の台帳に記録しますが、変更は未 commit のままで、commit・push・PR 作成はしません。
 
 実験用 MVP です。この文書では `araya` を入れてから結果を受け取るまでの手順を説明します。内部の仕組みと開発の手順は [docs/development.md](docs/development.md)、動作の詳しい定義は仕様 [docs/spec/task-ledger-and-shiki-runner.md](docs/spec/task-ledger-and-shiki-runner.md) にあります。
 
@@ -92,7 +92,7 @@ Task の状態は次のとおりです。
 
 ## 結果を受け取る
 
-SHIKI の変更は、試行ごとに作られた worktree `<repository>/.worktree/araya-<taskKey>`（branch `araya/<taskKey>`）に、未 commit のまま置かれます。Araya は commit・push・PR の作成・merge・deploy・publish を行いません。SHIKI にもしないよう指示しますが、強制はしません。`araya task show <taskId> --full` の出力か worktree の差分で変更を確かめ、マージする・直す・捨てるを自分で決めてください。worktree・branch・log・台帳は自動では消えません。
+現行MVPでは、SHIKI の変更は試行ごとの worktree `<repository>/.worktree/araya-<taskKey>`（branch `araya/<taskKey>`）に未 commit のまま残ります。Araya は commit・push・PR 作成・merge・deploy・publish を行わず、SHIKI にもしないよう指示しますが、強制はしません。`araya task show <taskId> --full` の出力か worktree の差分で変更を確かめ、取り込むかどうかは自分で判断してください。目指す形では、検証済みの変更から draft PR を作り、merge は人が判断します。現行MVPと今後の設計方針の違いは [Draft PR まで届ける設計方針](docs/spec/draft-pr-delivery.md) を見てください。worktree・branch・log・台帳は自動では消えません。
 
 ## 詰まったときは
 

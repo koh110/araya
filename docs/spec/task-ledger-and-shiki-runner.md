@@ -10,6 +10,8 @@ Task は、常駐する runner（systemd の user service）が動かす。runne
 
 この手順で、旧経路の worker（JSONL inbox の development の課題を、Pi の SDK の session で動かす process）も撤去する。撤去は runner より先に行い、SHIKI を動かすのは runner だけになる（利用者の選択。「旧経路との関係」）。
 
+この仕様が定義するのは現行MVPの動作であり、PR 作成は含まない。製品の目標は、検証済みの開発変更を draft PR まで届け、merge は人が判断すること。この目標と現行MVPの範囲を区別し、今後の設計課題を [Draft PR まで届ける設計方針](draft-pr-delivery.md) に記録する。
+
 ## 概要
 
 - 利用者が Task を登録すると、台帳（`<dataDir>/tasks.sqlite`）に `queued` で記録される。登録した process は runner を起動せず、試行の終了も待たない。
@@ -504,7 +506,7 @@ phase は次のとおり。
 作業対象の手がかり（必要な repository は自分で判断してよい）:
 - <targets の各要素>
 
-この Task で許可されていること（commit、push、PR の作成、merge、deploy、publish は、ここに書かれていても行わない）:
+この Task で許可されていること（現行MVPでは commit、push、PR の作成、merge、deploy、publish は、ここに書かれていても行わない）:
 - <permissions の各要素>
 
 前回の試行（<試行番号>回目）の結果:
@@ -844,7 +846,7 @@ test は実際の Pi auth や model API を使わない。model は pi-ai の fa
 - 途中で止まった試行の再実行には、利用者の明示的な確認（`--confirm-side-effects`）を求める。Issue #1 の「再試行時は未確認の副作用を慎重に扱う」に合わせ、外部への変更をくり返さないため。
 - 差分の本文と検証の出力は、台帳ではなく状態 directory の `evidence.json` に残す。秘密情報が混ざりやすい本文を台帳に複製せず、別のセッションからは利用者が `--full` を付けたときだけ読めるようにするため。`evidence.json` と台帳の結果の対応は、SHA-256 で確かめる。file の書き込みと台帳の commit を1つの操作にできないため。
 - `targets` は SHIKI への手がかりで、制限ではない。どの repository を変更するかは SHIKI が判断するという既存の決定に合わせるため。
-- `permissions` は記録して SHIKI に渡すだけで、固定の禁止事項（commit、push、PR の作成、merge、deploy、publish）は解除しない。Issue #1 は権限の自動拡大を当面実装しないものとし、Issue から CI 成功 PR までの自動化を MVP の必須にしていないため。
+- 現行MVPでは `permissions` は記録して SHIKI に渡すだけで、固定の禁止事項（commit、push、PR の作成、merge、deploy、publish）は解除しない。Issue #1 は権限の自動拡大を当面実装しないものとし、Issue から CI 成功 PR までの自動化をこのMVPの必須にしていないため。これは現行仕様の範囲であり、製品の目標である draft PR 作成の認可・認証・失敗時の扱いは [Draft PR まで届ける設計方針](draft-pr-delivery.md) で別途定義する。
 - 再実行では前回の変更を自動で持ち込まない。前回の worktree は残し、場所を SHIKI に伝える。Issue #1 の「再試行時は未確認の副作用を慎重に扱う」に合わせるため。
 - pi-durable の storage は試行の後も残す。会話を後から確かめられるようにするため。古い記録の削除は worktree などと同じく後の段階で決める。
 - model を設定しないときは Pi の設定の既定だけを使う。既存の SHIKI が使う Pi の「最初の model を選ぶ」処理（`findInitialModel`）は package の外に公開されておらず、ほかの model へ黙って切り替えないため。

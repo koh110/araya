@@ -184,5 +184,5 @@ npm run araya -- status
 - Araya の通常 control-plane 処理は外部書き込みや通知送信をしません。`tick` / `run` は、Pi Durable の harness を開くときに Pi のモデル runtime を作りますが、モデルは呼び出しません。Pi の認証情報は `PI_CODING_AGENT_DIR`（未指定時は `~/.pi/agent`）から読み取り、Araya の設定や DB には複製しません。引数なしの `araya` と `araya pi` は明示的に Pi coding-agent SDK の CLI entry point を実行するため、その実行はこの節の対象外です。
 - 自律的な課題発見、Goal / 探索対象の設定、外部ソース監視、`read-only` / `external` 候補の executor、Native Broker、Discord / Hermes 連携、Outbox 配信、旧経路（`tick` / `run`）の常駐化は未実装です。`run` を起動しても、新しい課題を自律的に発見するわけではありません。
 - inbox の `development` 課題は実行せず `blocked` として残します（`development_executor_unavailable`）。
-- runner の SHIKI と検証コマンドは、利用者の権限で sandbox なしで動きます。開発 root の repository に限らず、利用者が書き込める file を変更できます。commit・push・PR の作成・merge・deploy・publish はしないよう SHIKI に指示しますが、強制はしません。
+- 現行MVPの runner の SHIKI と検証コマンドは、利用者の権限で sandbox なしで動きます。開発 root の repository に限らず、利用者が書き込める file を変更できます。commit・push・PR の作成・merge・deploy・publish はしないよう SHIKI に指示しますが、強制はしません。検証済みの変更を draft PR まで届けることは今後の目標で、現行MVPには未実装です（[Draft PR まで届ける設計方針](spec/draft-pr-delivery.md)）。
 - DB や inbox に利用者のデータを置く場合は、`ARAYA_DATA_DIR` とバックアップのアクセス権を利用者側で管理してください。
