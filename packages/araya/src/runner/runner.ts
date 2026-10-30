@@ -1,11 +1,10 @@
 import { randomUUID } from 'node:crypto'
 import { appendFileSync } from 'node:fs'
 import fs from 'node:fs/promises'
-import os from 'node:os'
 import path from 'node:path'
 
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
-import { ModelRuntime } from '@earendil-works/pi-coding-agent'
+import type { ModelRuntime } from '@earendil-works/pi-coding-agent'
 import {
   createRegistry,
   Harness,
@@ -17,7 +16,7 @@ import {
 import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node'
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node'
 
-import { loadConfig } from '../config/environment.ts'
+import { loadConfig, loadPiSdk } from '../config/environment.ts'
 import { loadConfigFile } from '../config/file.ts'
 import { collectSecretValues, createRedactor } from '../infrastructure/redaction.ts'
 import {
@@ -64,6 +63,8 @@ type Env = Readonly<Record<string, string | undefined>>
 
 // test で順番を固定するための注入点。本物の runner では渡さない
 export type RunnerFaults = {
+  // 試行の task を作る直前。throw すると作成失敗の経路を test する
+  beforeAttemptTaskCreate?(taskKey: string): void | Promise<void>
   // 取り込みの transaction の commit の後、試行の task を作る前
   afterClaimCommit?(taskKey: string): void | Promise<void>
   // loop の中止の求めの確認（手順 3）の後
@@ -93,7 +94,7 @@ export type RunnerDependencies = {
   openStorage?: (storagePath: string) => Promise<Storage>
   createModels?: (input: { agentDir: string; dataDir: string }) => Promise<ModelRuntime>
   createSystemdOps?: (env: Env) => Promise<SystemdOps>
-  createPiSettings?: (stateDir: string, agentDir: string) => PiModelSettings
+  createPiSettings?: (stateDir: string, agentDir: string) => PiModelSettings | Promise<PiModelSettings>
   // test が runner 全体を検証するときに delivery を無効化できる。製品 runner の既定は有効
   draftPrDelivery?: boolean
   // 実行枠の上限。既定は MAX_CONCURRENT_ATTEMPTS
@@ -185,6 +186,7 @@ export function createRunnerLog(dataDir: string, secretValues: readonly string[]
 
 // runner の ModelRuntime（既存の SHIKI と同じ options）。auth は Pi の auth.json から読み、network は使わない
 export async function createRunnerModelRuntime(input: { agentDir: string; dataDir: string }) {
+  const { ModelRuntime } = await loadPiSdk(input.agentDir)
   const runtime = await ModelRuntime.create({
     authPath: path.join(input.agentDir, 'auth.json'),
     modelsPath: path.join(input.agentDir, 'models.json'),
@@ -396,7 +398,7 @@ async function runWithLedger(context: RunnerContext) {
     let systemd: SystemdOps
 
     try {
-      systemd = await (deps.createSystemdOps ?? createSystemdOps)(deps.env)
+      systemd = await (deps.createSystemdOps ?? createSystemdOps)(config.env)
     } catch (error) {
       log({ type: 'systemd_unavailable', message: describeError(error) })
       return 1
@@ -410,7 +412,7 @@ async function runWithLedger(context: RunnerContext) {
       return 1
     }
 
-    const agentDir = path.resolve(config.piAgentDir ?? path.join(os.homedir(), '.pi', 'agent'))
+    const agentDir = config.piAgentDir
     const storageDir = path.join(dataDir, STORAGE_DIR)
     await fs.mkdir(storageDir, { recursive: true, mode: 0o700 })
     await fs.chmod(storageDir, 0o700)
@@ -421,7 +423,7 @@ async function runWithLedger(context: RunnerContext) {
       ledger,
       systemd,
       models,
-      env: deps.env,
+      env: config.env,
       draftPrDelivery: deps.draftPrDelivery ?? true,
       secretValues,
       log,
@@ -439,7 +441,7 @@ async function runWithLedger(context: RunnerContext) {
       registry,
       ...(restartLimit === undefined ? {} : { settings: { restartLimit } }),
       env: ({ cwd }) => {
-        return new NodeExecutionEnv({ cwd: cwd ?? config.devRoot, shellEnv: { ...deps.env } })
+        return new NodeExecutionEnv({ cwd: cwd ?? config.devRoot, shellEnv: config.env })
       },
       onReport: (error, info) => {
         // 切り詰めで秘密の一部や URL の @ が境界の外に出ないように、置き換えてから切り詰める
@@ -473,6 +475,7 @@ async function runWithLedger(context: RunnerContext) {
     // 記録の前に scope を止められず、次の loop で記録し直す結果
     const pendingResults = new Map<string, AttemptResult>()
     let abortFailed = false
+    let reconciliationDeferred = false
     let reportedConfigError: string | null = null
 
     function shouldExit() {
@@ -520,6 +523,7 @@ async function runWithLedger(context: RunnerContext) {
     // 試行の task を作り、session の document に taskKey と task の id を書く（1つの commit）。document に id があれば作らない
     async function createAttemptTask(claimed: ClaimedAttempt) {
       try {
+        await faults.beforeAttemptTaskCreate?.(claimed.taskKey)
         const root = await harness.root(ctx)
         const id = await root.commit(async (tx) => {
           const attempts = await tx.doc(AttemptsDoc)
@@ -608,9 +612,18 @@ async function runWithLedger(context: RunnerContext) {
 
         // 台帳で取り込んだ後、task を作る前に落ちた
         const claimed = ledger.readClaimedAttempt(attempt.taskKey)
+        const createdTask = claimed !== null && await createAttemptTask(claimed)
 
-        if (claimed !== null && await createAttemptTask(claimed)) {
+        if (createdTask) {
           created.push(attempt.taskKey)
+        } else if (attempt.settings?.agentDir !== agentDir || attempt.stopReason !== null) {
+          if (attempt.settings?.agentDir !== agentDir && attempt.stopReason === null) {
+            await beginAttemptStop(attempt.taskKey, 'attempt_error', 'Pi directory changed. Run araya pi and /login and /model, then create a new retry. Saved attempt settings were not changed.')
+          }
+
+          if (!harnessFailed()) {
+            reconciliationDeferred = true
+          }
         }
 
         if (harnessFailed()) {
@@ -670,7 +683,9 @@ async function runWithLedger(context: RunnerContext) {
           continue
         }
 
-        if (attempt.stopReason !== null) {
+        if (attempt.settings?.agentDir !== agentDir && attempt.stopReason === null) {
+          await beginAttemptStop(attempt.taskKey, 'attempt_error', 'Pi directory changed. Run araya pi and /login and /model, then create a new retry. Saved attempt settings were not changed.')
+        } else if (attempt.stopReason !== null) {
           // 前の process が中止を始めた後に落ちた
           await abortAttemptTask(attempt.taskKey)
         } else if (attempt.cancelRequestedAt !== null) {
@@ -998,6 +1013,10 @@ async function runWithLedger(context: RunnerContext) {
 
     try {
       await reconcile()
+
+      if (reconciliationDeferred && !shouldExit()) {
+        return finishStop()
+      }
 
       if (!shouldExit()) {
         harness.resume()

@@ -25,9 +25,10 @@ async function makeInstallEnv() {
   const devRoot = path.join(root, 'dev')
   const home = path.join(root, 'home')
   const configHome = path.join(root, 'xdg')
-  const piAgentDir = path.join(root, 'pi-agent')
+  const piAgentDir = path.join(dataDir, 'pi')
   const entrypoint = path.join(root, 'package', 'bin', 'task-runner.ts')
   await fs.mkdir(home)
+  await fs.mkdir(dataDir, { mode: 0o700 })
   await fs.mkdir(piAgentDir)
   await fs.mkdir(path.dirname(entrypoint), { recursive: true })
   await fs.writeFile(path.join(piAgentDir, 'settings.json'), JSON.stringify({
@@ -196,7 +197,7 @@ test('runner install: unit file を mode 0600 で書き、daemon-reload・enable
         ['ARAYA_DATA_DIR', installEnv.dataDir],
         ['ARAYA_DEV_ROOT', installEnv.devRoot],
         ['PATH', '/usr/bin:/bin'],
-        ['PI_CODING_AGENT_DIR', path.join(installEnv.root, 'pi-agent')]
+        ['PI_CODING_AGENT_DIR', path.join(installEnv.dataDir, 'pi')]
       ]
     }))
     assert.equal((await fs.stat(unitPath)).mode & 0o777, 0o600)
@@ -226,7 +227,7 @@ test('runner install: unit file を mode 0600 で書き、daemon-reload・enable
 
 test('runner install: Pi の明示的な default model があれば config.json を初回だけ作る', async () => {
   const installEnv = await makeInstallEnv()
-  const settingsPath = path.join(installEnv.env.PI_CODING_AGENT_DIR ?? '', 'settings.json')
+  const settingsPath = path.join(installEnv.dataDir, 'pi', 'settings.json')
   await fs.mkdir(path.dirname(settingsPath), { recursive: true })
   await fs.writeFile(settingsPath, JSON.stringify({
     defaultProvider: 'faux',
@@ -256,7 +257,7 @@ test('runner install: Pi の明示的な default model があれば config.json 
   }
 })
 
-test('runner install: PI_CODING_AGENT_DIR 未指定時は HOME/.pi/agent の settings.json を使う', async () => {
+test('runner install: PI_CODING_AGENT_DIR 未指定時も Araya 専用 settings.json を使う', async () => {
   const installEnv = await makeInstallEnv()
   const env = { ...installEnv.env }
   delete env.PI_CODING_AGENT_DIR
@@ -273,12 +274,12 @@ test('runner install: PI_CODING_AGENT_DIR 未指定時は HOME/.pi/agent の set
     const configPath = path.join(installEnv.dataDir, 'config.json')
 
     assert.deepEqual(JSON.parse(await fs.readFile(configPath, 'utf8')), {
-      development: { model: 'faux/home-model' }
+      development: { model: 'faux/test-model' }
     })
     assert.deepEqual(readField(output, 'config'), {
       status: 'created',
       configPath,
-      model: 'faux/home-model'
+      model: 'faux/test-model'
     })
     assert.equal(stderr, '')
   } finally {
@@ -308,9 +309,29 @@ test('runner install: 既存 config.json を変更せずそのまま使う', asy
   }
 })
 
+test('runner install: host の指定を無視して専用 settings から初期化し、host file は変えない', async () => {
+  const installEnv = await makeInstallEnv()
+  const hostPi = path.join(installEnv.root, 'standalone-pi')
+  await fs.mkdir(hostPi)
+  const hostSettings = Buffer.from('{"defaultProvider":"host-only","defaultModel":"host-only"}\n')
+  await fs.writeFile(path.join(hostPi, 'settings.json'), hostSettings)
+  const fake = createFakeSystemd({ systemctl: defaultSystemctl(installEnv), loginctl: async () => commandResult('yes\n') })
+  try {
+    await runRunner({ ...installEnv, env: { ...installEnv.env, PI_CODING_AGENT_DIR: hostPi, PI_CODING_AGENT_SESSION_DIR: path.join(hostPi, 'sessions') } }, ['install'], fake)
+    assert.deepEqual(JSON.parse(await fs.readFile(path.join(installEnv.dataDir, 'config.json'), 'utf8')), { development: { model: 'faux/test-model' } })
+    const unit = await fs.readFile(unitPathOf(installEnv, unitOf(await fs.realpath(installEnv.dataDir))), 'utf8')
+    assert.ok(unit.includes(`Environment=PI_CODING_AGENT_DIR=${path.join(installEnv.dataDir, 'pi')}`))
+    assert.equal(unit.includes(hostPi), false)
+    assert.equal(unit.includes('PI_CODING_AGENT_SESSION_DIR'), false)
+    assert.deepEqual(await fs.readFile(path.join(hostPi, 'settings.json')), hostSettings)
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
 test('runner install: Pi に明示的な default model がなければ config.json を作らず警告する', async () => {
   const installEnv = await makeInstallEnv()
-  const settingsPath = path.join(installEnv.env.PI_CODING_AGENT_DIR ?? '', 'settings.json')
+  const settingsPath = path.join(installEnv.dataDir, 'pi', 'settings.json')
   await fs.mkdir(path.dirname(settingsPath), { recursive: true })
   await fs.writeFile(settingsPath, JSON.stringify({ defaultProvider: 'faux' }), 'utf8')
   const fake = createFakeSystemd({
@@ -357,7 +378,7 @@ test('runner install: 相対 path の ARAYA_DATA_DIR・ARAYA_DEV_ROOT・PI_CODIN
       `Environment=ARAYA_DATA_DIR=${installEnv.dataDir}`,
       `Environment=ARAYA_DEV_ROOT=${installEnv.devRoot}`,
       'Environment=PATH=/usr/bin:/bin',
-      `Environment=PI_CODING_AGENT_DIR=${path.join(installEnv.root, 'pi-agent')}`
+      `Environment=PI_CODING_AGENT_DIR=${path.join(installEnv.dataDir, 'pi')}`
     ])
   } finally {
     process.chdir(previousCwd)
@@ -394,7 +415,7 @@ test('runner install: 秘密とみなす名前の変数と一覧に無い変数�
       'Environment=LANG=ja_JP.UTF-8',
       'Environment=LC_ALL=C.UTF-8',
       'Environment=PATH=/usr/bin:/bin',
-      `Environment=PI_CODING_AGENT_DIR=${path.join(installEnv.root, 'pi-agent')}`,
+      `Environment=PI_CODING_AGENT_DIR=${path.join(installEnv.dataDir, 'pi')}`,
       'Environment=TZ=Asia/Tokyo'
     ])
 
@@ -467,7 +488,7 @@ test('runner install: user manager に接続できなければ systemd_unavailab
 
     try {
       await assert.rejects(runRunner(installEnv, ['install'], fake), errorWithCode('systemd_unavailable'))
-      assert.equal(await exists(installEnv.dataDir), false)
+      assert.deepEqual(await fs.readdir(installEnv.dataDir), ['pi'])
       assert.equal(await exists(path.join(installEnv.configHome, 'systemd')), false)
     } finally {
       await fs.rm(installEnv.root, { recursive: true, force: true })
@@ -731,7 +752,7 @@ test('runner: Linux 以外では unsupported_platform で何もしない', async
 
     assert.equal(opened, 0)
     assert.deepEqual(fake.records(), [])
-    assert.equal(await exists(installEnv.dataDir), false)
+    assert.deepEqual(await fs.readdir(installEnv.dataDir), ['pi'])
     assert.equal(await exists(installEnv.configHome), false)
   } finally {
     await fs.rm(installEnv.root, { recursive: true, force: true })

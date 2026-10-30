@@ -80,7 +80,7 @@ export type RunnerCommandDependencies = TaskCommandDependencies & {
 export type RunnerCommandConfig = {
   dataDir: string
   devRoot: string
-  piAgentDir: string | undefined
+  piAgentDir: string
 }
 
 export type FullEvidenceError = 'not_stored' | 'missing' | 'unreadable' | 'digest_mismatch'
@@ -519,15 +519,12 @@ async function installRunner(config: RunnerCommandConfig, deps: RunnerCommandDep
     environment: selectUnitEnvironment(deps.env, {
       dataDir: config.dataDir,
       devRoot: config.devRoot,
-      piAgentDir: config.piAgentDir === undefined ? undefined : path.resolve(config.piAgentDir)
+      piAgentDir: config.piAgentDir
     })
   })
-  const piAgentDir = config.piAgentDir === undefined
-    ? path.join(deps.homeDir, '.pi', 'agent')
-    : path.resolve(config.piAgentDir)
   const configInitialization = await initializeConfigFromPiSettings(
     path.join(config.dataDir, 'config.json'),
-    path.join(piAgentDir, 'settings.json')
+    path.join(config.piAgentDir, 'settings.json')
   )
 
   if (configInitialization.status === 'skipped') {

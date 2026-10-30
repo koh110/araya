@@ -12,6 +12,7 @@ import {
   type TaskId
 } from '@earendil-works/pi-durable'
 
+import { loadPiSdk } from '../config/environment.ts'
 import { openControlPlane, type ControlPlane } from './store.ts'
 import { createArayaTasks, TASK_NAMES, type ArayaTasks, type ScoutInput, type ScoutResult } from './tasks.ts'
 
@@ -29,16 +30,15 @@ async function ensureParentDir(filePath: string): Promise<void> {
   await fs.mkdir(path.dirname(filePath), { recursive: true })
 }
 
-export async function createArayaModelRuntime(agentDir?: string) {
-  const { ModelRuntime } = await import('@earendil-works/pi-coding-agent')
-  const options = agentDir === undefined
-    ? {}
-    : {
-        authPath: path.join(agentDir, 'auth.json'),
-        modelsPath: path.join(agentDir, 'models.json')
-      }
-
-  return ModelRuntime.create({ refreshOnCreate: false, ...options })
+export async function createArayaModelRuntime(agentDir: string) {
+  const { ModelRuntime } = await loadPiSdk(agentDir)
+  return ModelRuntime.create({
+    authPath: path.join(agentDir, 'auth.json'),
+    modelsPath: path.join(agentDir, 'models.json'),
+    modelsStorePath: path.join(agentDir, 'models-store.json'),
+    allowModelNetwork: false,
+    refreshOnCreate: false
+  })
 }
 
 export async function openArayaRuntime(
@@ -47,7 +47,7 @@ export async function openArayaRuntime(
     inboxDir: string
     piDurablePath: string
     intervalMs: number
-    piAgentDir?: string
+    piAgentDir: string
   },
   options: { resumeTasks?: boolean } = {}
 ): Promise<ArayaRuntime> {

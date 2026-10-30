@@ -31,7 +31,7 @@ Araya は sandbox による隔離を行わない。agent と検証コマンド�
 - `ARAYA_DEV_ROOT`: 開発 root。既定は `<home>/dev`。課題の開始時に `realpath` で解決し、実体が directory でなければ `dev_root_missing` で失敗する。symlink の root は解決先を使う。
 - `ARAYA_DEVELOPMENT_TIMEOUT_MS`: agent 1回の上限。既定 20分、範囲 1秒〜60分。
 - `ARAYA_VERIFICATION_TIMEOUT_MS`: 検証コマンド1件ごとの上限。既定 5分、範囲 1秒〜60分。
-- `PI_CODING_AGENT_DIR`: Pi の agent directory。既定は `<home>/.pi/agent`。
+- 内蔵 Pi の agent directory は `<ARAYA_DATA_DIR>/pi`（既定 `<home>/.araya/pi`）。継承した `PI_CODING_AGENT_DIR`・`PI_CODING_AGENT_SESSION_DIR` は保存先として採用しない。
 - `ARAYA_PROJECT_DIR` と `ARAYA_WORKTREE_DIR` は廃止する。環境変数は既存どおり `config/environment.ts` だけで読む。
 - 開発 agent の model と thinking level は、設定ファイル `<dataDir>/config.json` で指定する。仕様は [設定ファイルによる開発 agent の model 指定](development-model-config.md) を参照する。
 

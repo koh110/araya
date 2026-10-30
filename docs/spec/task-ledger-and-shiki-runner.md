@@ -1,5 +1,7 @@
 # Task の台帳と SHIKI の実行
 
+内蔵 Pi の設定・認証・session は `<dataDir>/pi`（既定 `~/.araya/pi`）に隔離します。`settings.json`・`auth.json`・`models.json`・`models-store.json`・`sessions/`・Pi SDK が管理する `bin/` はここに置き、runner の model cache は既存の `<dataDir>/runner/models-store.json` を維持します。host Pi からの fallback・copy・migration・symlink は追加しません。Araya 側の TUI（`araya` または `araya pi`）で `/login` と `/model` を設定し直してください。Araya 自身の `config.json`・台帳・runner storage の配置、既存 config の model は変更しません。旧 host agentDir を保存した running 試行は、再開前に host 設定を読まず既存の `attempt_error` で失敗させます。保存済み入力は書き換えず、再設定後の新規 retry を必要とします。DB schema 変更・rewrite・migration は行いません。
+
 ## 位置づけ
 
 PR #7 に書いた進め方の手順1。Issue #1 のチェックリストのうち、C（Task ごとに SHIKI を起動し、結果と失敗を台帳に回収できる）と D（重複起動・孤児実行・再実行を安全に扱える）を満たし、B（Pi セッションを越えて Task の一覧と状態を取得できる）の土台を作る。
@@ -250,7 +252,7 @@ WantedBy=default.target
 - `Environment=` は1変数に1行。`araya runner install` を実行した process の環境変数のうち、次だけを書く。値は unit file と `systemctl --user show` に出るため、秘密を書かない（「秘密情報の扱い」）。
   - `PATH`、`LANG`、`LANGUAGE`、`TZ`、名前が `LC_` で始まるもの
   - 名前が `ARAYA_` で始まり、秘密とみなす名前（「秘密情報の扱い」）に当たらないもの。ただし `ARAYA_DATA_DIR` と `ARAYA_DEV_ROOT` は、`loadConfig` で解決した絶対 path にして書く（環境変数に無くても書く）。`loadConfig` は相対 path を process の cwd を基準に解決するため、そのまま書くと、cwd の違う runner が別の台帳や開発 root を使ってしまう。
-  - `PI_CODING_AGENT_DIR`（あれば、絶対 path にして）
+  - `PI_CODING_AGENT_DIR`（常に `<dataDir>/pi` の絶対 path に正規化し、host の指定は継承しない）
   - これ以外（`HOME`、`XDG_RUNTIME_DIR` など）は、systemd の user manager の環境になる。
 - unit file では、`%` が specifier として、`ExecStart` などの `$` が変数として展開され、空白や引用符にも意味がある。escape の処理を作らないため、unit file に書く値（node の実行ファイル、entrypoint、dataDir、systemctl の path、`Environment=` の値）のどれかが、ASCII の制御文字、空白、`"`、`'`、`\`、`$`、`%`、`;` を含むときは、unit file を書かずに `unsupported_path` で失敗する（stderr にどの値かを出す）。環境変数は、名前が `^[A-Za-z_][A-Za-z0-9_]*$` に当たるものだけを書く。
 - `StartLimitIntervalSec=0` で、systemd は起動し直す回数を制限しない。`RestartSteps` と `RestartMaxDelaySec` で、起動し直すまでの間隔を 1 秒から 1 分まで伸ばす。くり返し落ちる試行は、systemd ではなく pi-durable の restartLimit で止める（「落ちたとき」）。
@@ -265,7 +267,7 @@ runner は次の順に進む。起動してすぐ、SIGTERM と SIGINT の handl
 3. 台帳を開く（無ければ作る。「file と接続」）。開けなければ終了 code 1 で終わる。`BEGIN IMMEDIATE` の中で `runner` の行を、`state` を `running`、`unit`・`invocation_id`（`INVOCATION_ID`）・`pid`・`started_at`・`heartbeat_at` を自分のものに、`stopped_at` を空にして書く。
 4. dataDir の試行の scope（`araya-<h>-*.scope`）をすべて止める（「試行の scope」）。止められなければ、Harness を開かずに終了 code 1 で終わる（systemd が間隔を空けて起動し直す）。前の process が残した scope の中の process が、再開した会話や次の試行と重ならないようにするため。
 5. pi-durable の storage（`<dataDir>/runner/durable.sqlite`。directory は mode 0700）を開き、Harness を開く。
-   - `models`: Pi の `ModelRuntime`。既存の SHIKI と同じく、`authPath` を `<agentDir>/auth.json`、`modelsPath` を `<agentDir>/models.json`、`modelsStorePath` を `<dataDir>/runner/models-store.json`、`allowModelNetwork` と `refreshOnCreate` を `false` にして作り、`refresh({ allowNetwork: false })` する。`agentDir` は Pi の agent directory（`PI_CODING_AGENT_DIR`。無ければ Pi の既定の `~/.pi/agent`）。
+   - `models`: Pi の `ModelRuntime`。既存の SHIKI と同じく、`authPath` を `<agentDir>/auth.json`、`modelsPath` を `<agentDir>/models.json`、`modelsStorePath` を `<dataDir>/runner/models-store.json`、`allowModelNetwork` と `refreshOnCreate` を `false` にして作り、`refresh({ allowNetwork: false })` する。`agentDir` は Araya 専用の `<dataDir>/pi`。host の Pi directory に fallback しない。
    - `registry`: SHIKI の extension（tool と途中経過の hook。「SHIKI」「途中経過」）と、試行の task を入れる。
    - `env`: pi-durable の `NodeExecutionEnv`（cwd は会話の cwd）。
    - `settings.restartLimit` は既定（5）のまま。
@@ -316,7 +318,7 @@ runner は、止めるように求められるまで、次を 2 秒ごとに（�
 ```json
 {
   "devRoot": "/home/user/dev",
-  "agentDir": "/home/user/.pi/agent",
+  "agentDir": "/home/user/.araya/pi",
   "model": { "provider": "anthropic", "id": "example-model", "thinkingLevel": "high" },
   "timeoutMs": 1200000,
   "verificationTimeoutMs": 300000
@@ -912,7 +914,7 @@ pi-durable と Pi は 1.4.0、Node.js は v26.12.1、systemd は 259、npm は 1
 
 ### 既存のコード
 
-- 既存の `loadConfig`（`config/environment.ts`）は、`ARAYA_DATA_DIR`・`ARAYA_DEV_ROOT` などを `path.resolve` で絶対 path にするため、相対 path は process の cwd を基準に解決される。Pi の agent directory は `PI_CODING_AGENT_DIR` から読む（無ければ Pi の既定）。
+- 既存の `loadConfig`（`config/environment.ts`）は、`ARAYA_DATA_DIR`・`ARAYA_DEV_ROOT` などを `path.resolve` で絶対 path にするため、相対 path は process の cwd を基準に解決される。内蔵 Pi の agent directory は `<dataDir>/pi` の絶対 path に固定し、継承した `PI_CODING_AGENT_DIR`・`PI_CODING_AGENT_SESSION_DIR` は保存先として採用しない。
 - 既存の development executor（`development.ts`）は、worker を `runPiWorker` で起動し、その後に状態 directory の記録を読み、git で差分を集め、検証のコマンドを `runBoundedCommand`（`development-process.ts`）で実行して、失敗の理由（`invalid_task`・`dev_root_missing`・`task_state_already_exists`・`termination_unconfirmed`・`task_state_invalid`・`evidence_collection_failed`・`agent_timeout`・`agent_failed`・`no_changes`・`verification_missing`・`verification_failed`）を決める。
 - `runBoundedCommand` は、コマンドを独立した process group（`detached`）で起動し、timeout と出力の上限で process group を止め、終わったことを確かめる。中止の signal は受け取らない。
 - `araya_create_worktree`（`development/worktrees.ts`）は、git を `execFile` で起動し（決まった候補から選んだ絶対 path。timeout は 60 秒、`git worktree add` は 10 分、出力は 2 MiB まで、timeout のときは SIGKILL）、hook を無効にしない。差分の収集（`development.ts`）の git は `runBoundedCommand` で起動し、`core.hooksPath=/dev/null` を付ける。`araya_register_verification` は subprocess を起動しない（path の確認と file の追記だけ）。

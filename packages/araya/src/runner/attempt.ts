@@ -4,7 +4,7 @@ import path from 'node:path'
 
 import type { Context } from '@earendil-works/chord'
 import { clampThinkingLevel } from '@earendil-works/pi-ai'
-import { SettingsManager, type ModelRuntime } from '@earendil-works/pi-coding-agent'
+import type { ModelRuntime } from '@earendil-works/pi-coding-agent'
 import {
   configure,
   defineDoc,
@@ -21,6 +21,7 @@ import {
   type ToolHookCall
 } from '@earendil-works/pi-durable'
 
+import { loadPiSdk } from '../config/environment.ts'
 import {
   agentEvidence,
   buildWorktreeOnlyEvidence,
@@ -140,7 +141,7 @@ export type AttemptDependencies = {
   secretValues: readonly string[]
   log(entry: Record<string, unknown>): void
   // 省略時は Pi の SettingsManager（agentDir と状態 directory で作る）
-  createPiSettings?: (stateDir: string, agentDir: string) => PiModelSettings
+  createPiSettings?: (stateDir: string, agentDir: string) => PiModelSettings | Promise<PiModelSettings>
   now?: () => Date
   faults?: AttemptFaults
 }
@@ -257,10 +258,10 @@ export function resolveShikiModel(models: ModelLookup, settings: AttemptSettings
   return { ok: true as const, model }
 }
 
-function createDefaultPiSettings(stateDir: string, agentDir: string) {
-  const settings: PiModelSettings = SettingsManager.create(stateDir, agentDir, { projectTrusted: false })
+async function createDefaultPiSettings(stateDir: string, agentDir: string) {
+  const { SettingsManager } = await loadPiSdk(agentDir)
 
-  return settings
+  return SettingsManager.create(stateDir, agentDir, { projectTrusted: false })
 }
 
 // evidence.json を一時 file に書いてから rename する。書いた byte 列の SHA-256 を返す。書けなければ stored: false
@@ -750,7 +751,7 @@ export function createShikiExtension(deps: AttemptDependencies) {
           return
         }
 
-        const piSettings = (deps.createPiSettings ?? createDefaultPiSettings)(stateDir, settings.agentDir)
+        const piSettings = await (deps.createPiSettings ?? createDefaultPiSettings)(stateDir, settings.agentDir)
         const resolved = resolveShikiModel(deps.models, settings, piSettings)
 
         if (!resolved.ok) {

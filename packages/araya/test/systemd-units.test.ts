@@ -126,9 +126,10 @@ test('systemd-units: Environment= には一覧の変数だけを選び、秘密�
     ['PI_CODING_AGENT_DIR', '/abs/agent'],
     ['TZ', 'Asia/Tokyo']
   ])
-  assert.deepEqual(selectUnitEnvironment({}, { dataDir: '/d', devRoot: '/v', piAgentDir: undefined }), [
+  assert.deepEqual(selectUnitEnvironment({}, { dataDir: '/d', devRoot: '/v', piAgentDir: '/d/pi' }), [
     ['ARAYA_DATA_DIR', '/d'],
-    ['ARAYA_DEV_ROOT', '/v']
+    ['ARAYA_DEV_ROOT', '/v'],
+    ['PI_CODING_AGENT_DIR', '/d/pi']
   ])
 })
 

@@ -1,7 +1,7 @@
 import os from 'node:os'
 
 import { parseCliArguments } from './arguments.ts'
-import { loadConfig } from '../config/environment.ts'
+import { loadConfig, loadPiSdk, withPiEnvironment } from '../config/environment.ts'
 import { loadConfigFile } from '../config/file.ts'
 import {
   approveOpportunity,
@@ -19,9 +19,11 @@ import {
   type RunnerCommandDependencies
 } from './task-commands.ts'
 
-async function launchPi(args: string[]) {
-  const { main } = await import('@earendil-works/pi-coding-agent')
-  await main(args)
+async function launchPi(args: string[], agentDir: string) {
+  const { main } = await loadPiSdk(agentDir)
+  await withPiEnvironment(agentDir, async () => {
+    await main(args)
+  })
 }
 
 function printHelp() {
@@ -71,7 +73,7 @@ function printHelp() {
   araya runner install
     runner（台帳の Task を取り込んで SHIKI を動かす常駐の process）を、systemd の user service（araya-runner-<hash>.service）として入れる。
     unit file を書き、有効にして起動し直す。linger は変えない（無効なら logout で runner が止まり、次に起動したときに続きから進む）。
-    <dataDir>/config.json が無ければ、Pi の settings.json に defaultProvider と defaultModel が両方ある場合だけ model を初期設定する（thinkingLevel・認証情報は写さない）。
+    <dataDir>/config.json が無ければ、<dataDir>/pi/settings.json に defaultProvider と defaultModel が両方ある場合だけ model を初期設定する（thinkingLevel・認証情報は写さない）。
     既存 config は変更せず、default が足りなければ warning を出して続ける。npm run deploy もこの処理を行う。
     unit file に書く環境変数は PATH・LANG・LANGUAGE・TZ・LC_*・ARAYA_*（秘密とみなす名前を除く）・PI_CODING_AGENT_DIR だけ。
     環境変数を変えたときは、やり直す（npm run deploy は、araya を入れた後にこれを実行する）。ARAYA_DATA_DIR を変えると別の runner になる
@@ -93,6 +95,12 @@ function printHelp() {
     runner の SHIKI（開発の agent）の model と thinking level を指定する。subcommand は起動時に1回だけ読み、
     runner は試行を取り込むたびに読む。
 
+内蔵 Pi の設定:
+  <ARAYA_DATA_DIR>/pi（既定: ~/.araya/pi）に settings.json・auth.json・models.json・models-store.json・sessions/・Pi SDK が管理する bin/ を置く。
+  継承した PI_CODING_AGENT_DIR・PI_CODING_AGENT_SESSION_DIR は保存先として使わない。
+  standalone Pi の認証は自動移行しない。araya 側で /login と /model を設定する。
+  旧 directory を記録した running 試行は attempt_error で失敗する。設定後、新規 retry が必要。
+
 環境変数:
   ARAYA_DATA_DIR
   ARAYA_INBOX_DIR
@@ -104,7 +112,6 @@ function printHelp() {
   ARAYA_DEV_ROOT
   ARAYA_DEVELOPMENT_TIMEOUT_MS
   ARAYA_VERIFICATION_TIMEOUT_MS
-  PI_CODING_AGENT_DIR
 `)
 }
 
@@ -166,12 +173,12 @@ export async function runCli(
   taskDependencies: Partial<RunnerCommandDependencies> = {}
 ) {
   if (args.length === 0) {
-    await startPi([])
+    await startPi([], loadConfig(env).piAgentDir)
     return
   }
 
   if (args[0] === 'pi') {
-    await startPi(args.slice(1))
+    await startPi(args.slice(1), loadConfig(env).piAgentDir)
     return
   }
 

@@ -1,5 +1,7 @@
 # 設定ファイルによる開発 agent の model 指定
 
+内蔵 Pi の設定・認証・session は `<dataDir>/pi`（既定 `~/.araya/pi`）に隔離します。`settings.json`・`auth.json`・`models.json`・`models-store.json`・`sessions/`・Pi SDK が管理する `bin/` はここに置き、runner の model cache は既存の `<dataDir>/runner/models-store.json` を維持します。host Pi からの fallback・copy・migration・symlink は追加しません。Araya 側の TUI（`araya` または `araya pi`）で `/login` と `/model` を設定し直してください。Araya 自身の `config.json`・台帳・runner storage の配置、既存 config の model は変更しません。旧 host agentDir を保存した running 試行は、再開前に host 設定を読まず既存の `attempt_error` で失敗させます。保存済み入力は書き換えず、再設定後の新規 retry を必要とします。DB schema 変更・rewrite・migration は行いません。
+
 > 注記: この文書のうち、worker の入力と出力で model を受け渡す部分は、worker を撤去する手順で撤去し、[Task の台帳と SHIKI の実行](task-ledger-and-shiki-runner.md)の仕様に置き換えた。設定ファイルの形と検証は、この文書を基準のままにする。runner は、この文書の subcommand とは別に、試行を取り込むたびに設定ファイルを読む（同じ仕様の「取り込み」）。
 
 ## 概要
@@ -34,7 +36,7 @@
 ### runner install 時の初期設定
 
 - `araya runner install`（`npm run deploy` からの実行を含む）は、unit file を書き換えて runner を起動する前に、`<dataDir>/config.json` が無いかを確かめる。
-- Araya config が無い場合に限り、Pi の agent directory にある `settings.json` から `defaultProvider` と `defaultModel` の両方を読み、両方が文字列で model reference として有効なら、`{"development":{"model":"<defaultProvider>/<defaultModel>"}}` を初期設定する。file は mode 0600 で作成する。
+- Araya config が無い場合に限り、Araya 専用の `<dataDir>/pi/settings.json` から `defaultProvider` と `defaultModel` の両方を読み、両方が文字列で model reference として有効なら、`{"development":{"model":"<defaultProvider>/<defaultModel>"}}` を初期設定する。file は mode 0600 で作成する。
 - `thinkingLevel` は書かず、Pi の model 別・既定の thinking level に任せる。Pi の認証情報・ほかの settings はコピーせず、`auth.json` を読まず、model API も呼ばない。model の存在・利用可否や認証は検証しない。
 - 設定 file の作成は排他的・atomic に行う。並行した初期化で先に作成された file を上書きしない。既存 config は `{}` を含めて検証だけ行い、内容・mode を変更しない。不正な既存 config は通常どおりエラーにし、Pi default で置き換えない。
 - Pi `settings.json` が無い・読めない・不正、または両方の明示的な default が無い・不正なら、config file は作らず stderr に warning を出して runner install は続ける。`config.status` に `created`・`existing`・`skipped` の結果を含める。
@@ -128,7 +130,7 @@
 ## Assumptions
 
 - 形式は JSON にする。Node.js の標準機能で読めて依存を増やさず、Pi の `settings.json` と同じ形式だから。
-- 場所は data directory にする。Pi が `~/.pi/agent` に設定と状態を置くのと同じ考え方で、`ARAYA_DATA_DIR` で状態と一緒に切り替えられるようにする。
+- Araya config の場所は data directory にする。内蔵 Pi の設定と状態は `<dataDir>/pi` に隔離し、`ARAYA_DATA_DIR` で状態と一緒に切り替えられるようにする。
 - 設定ファイルが不正なときは、`status` も含めて失敗させる。不正な設定のまま開発課題を処理しないため。
 - `thinkingLevel` を省略したときは Pi の設定に従う。model だけを固定する使い方を簡単にするため。使った値は evidence に残る。
 - model が使えないときの `failureReason` は既存の `agent_failed` とし、新しい値は足さない。原因は `workerErrorName` で区別できる。

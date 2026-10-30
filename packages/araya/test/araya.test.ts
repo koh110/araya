@@ -117,11 +117,11 @@ test('runtime: Pi auth.json credentials are available to durable model calls', a
   }
 })
 
-test('config: Pi agent directory is taken from the shared environment variable', () => {
+test('config: Pi agent directory is isolated from the host environment variable', () => {
   const agentDir = path.join(os.tmpdir(), 'araya-shared-pi-agent')
   const config = loadConfig({ PI_CODING_AGENT_DIR: agentDir })
 
-  assert.equal(config.piAgentDir, agentDir)
+  assert.equal(config.piAgentDir, path.join(config.dataDir, 'pi'))
 })
 
 test('config: 開発 root と timeout の範囲を設定から読む', () => {
@@ -156,7 +156,7 @@ test('config: 子 process に引き継ぐ環境変数を copy として持つ', 
   const env = { ARAYA_DATA_DIR: '/tmp/araya-config-test', PATH: '/usr/bin', CUSTOM_TOKEN_NAME: 'value' }
   const config = loadConfig(env)
 
-  assert.deepEqual(config.env, env)
+  assert.deepEqual(config.env, { ...env, PI_CODING_AGENT_DIR: path.join(config.dataDir, 'pi'), PI_CODING_AGENT_SESSION_DIR: undefined })
   assert.notEqual(config.env, env)
 })
 
@@ -277,7 +277,7 @@ test('CLI: help の --note と SHIKI の説明、runner と SHIKI の関係、AR
   assert.doesNotMatch(help, /開発 agent/u)
   // runner は SHIKI そのものではなく、SHIKI を動かす常駐の process
   assert.match(help, /runner（台帳の Task を取り込んで SHIKI を動かす常駐の process）を、systemd の user service（araya-runner-<hash>\.service）として入れる/u)
-  assert.match(help, /Pi の settings\.json に defaultProvider と defaultModel が両方ある場合だけ model を初期設定する/u)
+  assert.match(help, /<dataDir>\/pi\/settings\.json に defaultProvider と defaultModel が両方ある場合だけ model を初期設定する/u)
   assert.match(help, /既存 config は変更せず/u)
   // ARAYA_DATA_DIR を変えると unit の名前が変わり、前の runner が残る
   assert.match(help, /ARAYA_DATA_DIR を変えると別の runner になる/u)

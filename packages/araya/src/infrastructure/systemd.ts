@@ -135,7 +135,7 @@ export function isUnitFileValueSafe(value: string) {
 // ARAYA_DATA_DIR・ARAYA_DEV_ROOT・PI_CODING_AGENT_DIR は、呼び出し側が解決した絶対 path を書く
 export function selectUnitEnvironment(
   env: Readonly<Record<string, string | undefined>>,
-  resolved: { dataDir: string; devRoot: string; piAgentDir: string | undefined }
+  resolved: { dataDir: string; devRoot: string; piAgentDir: string }
 ) {
   const selected = new Map<string, string>()
 
@@ -152,11 +152,7 @@ export function selectUnitEnvironment(
   selected.set('ARAYA_DATA_DIR', resolved.dataDir)
   selected.set('ARAYA_DEV_ROOT', resolved.devRoot)
 
-  if (resolved.piAgentDir === undefined) {
-    selected.delete('PI_CODING_AGENT_DIR')
-  } else {
-    selected.set('PI_CODING_AGENT_DIR', resolved.piAgentDir)
-  }
+  selected.set('PI_CODING_AGENT_DIR', resolved.piAgentDir)
 
   const environment: UnitEnvironment = [...selected.entries()].sort(([left], [right]) => {
     return left < right ? -1 : left > right ? 1 : 0
