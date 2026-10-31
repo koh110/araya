@@ -107,7 +107,6 @@ test('systemd-units: Environment= には一覧の変数だけを選び、秘密�
     XDG_RUNTIME_DIR: '/run/user/1000',
     OPENAI_API_KEY: 'sk-not-written',
     ARAYA_TEST_TOKEN: 'not-written-token',
-    ARAYA_INTERVAL_MS: '60000',
     ARAYA_DATA_DIR: 'relative-data',
     ARAYA_DEV_ROOT: 'relative-dev',
     PI_CODING_AGENT_DIR: 'relative-agent',
@@ -118,7 +117,6 @@ test('systemd-units: Environment= には一覧の変数だけを選び、秘密�
   assert.deepEqual(environment, [
     ['ARAYA_DATA_DIR', '/abs/data'],
     ['ARAYA_DEV_ROOT', '/abs/dev'],
-    ['ARAYA_INTERVAL_MS', '60000'],
     ['LANG', 'ja_JP.UTF-8'],
     ['LANGUAGE', 'ja'],
     ['LC_ALL', 'C.UTF-8'],

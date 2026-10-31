@@ -7,7 +7,7 @@ import test from 'node:test'
 import { runBoundedCommand, runVerificationCommand } from '../src/infrastructure/process.ts'
 
 async function makeTempDir() {
-  return fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'araya-development-process-test-')))
+  return fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'araya-infrastructure-process-test-')))
 }
 
 async function exists(target: string) {

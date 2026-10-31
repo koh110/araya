@@ -1,12 +1,8 @@
 # Draft PR まで届ける仕様
 
-## 状態
+## 位置づけ
 
-これは Task runner に組み込まれた Draft PR delivery の動作仕様です。登録検証が全て成功した変更は Araya が commit・fast-forward push・Draft PR 作成まで行い、人が差分を review して merge を判断します。CI 完了待ち、merge、deploy、publish は行いません。
-
-## 目的
-
-Araya の開発 Task は、実装と登録済み検証が成功した変更を draft PR まで届けます。人が差分を review し、必要なら修正して merge を判断します。Araya は merge・deploy・publish を行いません。
+この文書は Task runner に組み込まれた Draft PR delivery の現行仕様です。検証に成功し変更がある場合、Araya が commit・fast-forward push・Draft PR 作成まで行い、人が差分を review して merge を判断します。CI 完了待ち、merge、deploy、publish は行いません。
 
 ## 実行条件と認可
 

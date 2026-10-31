@@ -83,12 +83,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     configPath: path.join(dataDir, 'config.json'),
     devRoot: path.resolve(env.ARAYA_DEV_ROOT || path.join(os.homedir(), 'dev')),
     piAgentDir: path.join(dataDir, 'pi'),
-    inboxDir: path.resolve(env.ARAYA_INBOX_DIR ?? path.join(dataDir, 'inbox')),
-    statusFile: path.resolve(env.ARAYA_STATUS_FILE ?? path.join(dataDir, 'status.json')),
-    controlPlanePath: path.resolve(env.ARAYA_CONTROL_PLANE_PATH ?? path.join(dataDir, 'araya.sqlite')),
-    piDurablePath: path.resolve(env.ARAYA_PI_DURABLE_PATH ?? path.join(dataDir, 'pi-durable.sqlite')),
-    intervalMs: numberFromEnv(env.ARAYA_INTERVAL_MS, 15 * 60 * 1000, { minimum: 0 }),
-    maxActions: numberFromEnv(env.ARAYA_MAX_ACTIONS, 3, { minimum: 1 }),
     developmentTimeoutMs: numberFromEnv(env.ARAYA_DEVELOPMENT_TIMEOUT_MS, 20 * 60 * 1000, {
       minimum: 1000,
       maximum: 60 * 60 * 1000

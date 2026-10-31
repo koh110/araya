@@ -400,7 +400,6 @@ test('runner install: 秘密とみなす名前の変数と一覧に無い変数�
         LANG: 'ja_JP.UTF-8',
         LC_ALL: 'C.UTF-8',
         TZ: 'Asia/Tokyo',
-        ARAYA_INTERVAL_MS: '60000',
         XDG_RUNTIME_DIR: '/run/user/1000',
         DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus',
         GITHUB_SECRET_PATH: '/not/written'
@@ -411,7 +410,6 @@ test('runner install: 秘密とみなす名前の変数と一覧に無い変数�
     assert.deepEqual(environmentLines(unitFile), [
       `Environment=ARAYA_DATA_DIR=${installEnv.dataDir}`,
       `Environment=ARAYA_DEV_ROOT=${installEnv.devRoot}`,
-      'Environment=ARAYA_INTERVAL_MS=60000',
       'Environment=LANG=ja_JP.UTF-8',
       'Environment=LC_ALL=C.UTF-8',
       'Environment=PATH=/usr/bin:/bin',

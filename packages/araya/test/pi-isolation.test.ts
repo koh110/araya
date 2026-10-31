@@ -14,7 +14,6 @@ import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite
 
 import { loadConfig, withPiEnvironment } from '../src/config/environment.ts'
 import { runCli } from '../src/cli/main.ts'
-import { createArayaModelRuntime } from '../src/control-plane/runtime.ts'
 import { createRunnerModelRuntime } from '../src/runner/runner.ts'
 import { AttemptsDoc, buildAttemptInput, createShikiExtension } from '../src/runner/attempt.ts'
 import { answer } from './support/faux-shiki.ts'
@@ -112,7 +111,7 @@ test('Pi isolation: injected TUI receives directory without changing process env
   assert.deepEqual([process.env.PI_CODING_AGENT_DIR, process.env.PI_CODING_AGENT_SESSION_DIR], before)
 })
 
-test('Pi isolation: control-plane uses explicit auth, models and cache with network disabled', async (t) => {
+test('Pi isolation: runner uses explicit auth, models and cache with network disabled', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-pi-isolation-'))
   const hostPi = path.join(root, 'host-pi')
   const arayaPi = path.join(root, 'data', 'pi')
@@ -142,12 +141,9 @@ test('Pi isolation: control-plane uses explicit auth, models and cache with netw
   })
   try {
     const config = loadConfig({ ARAYA_DATA_DIR: path.dirname(arayaPi), PI_CODING_AGENT_DIR: hostPi })
-    const runtime = await createArayaModelRuntime(config.piAgentDir)
-    assert.equal((await runtime.getAuth('openai'))?.auth.apiKey, 'araya-only')
-    assert.deepEqual(calls, [{ authPath: path.join(arayaPi, 'auth.json'), modelsPath: path.join(arayaPi, 'models.json'), modelsStorePath: path.join(arayaPi, 'models-store.json'), allowModelNetwork: false, refreshOnCreate: false }])
     const runner = await createRunnerModelRuntime({ agentDir: config.piAgentDir, dataDir: config.dataDir })
     assert.equal((await runner.getAuth('openai'))?.auth.apiKey, 'araya-only')
-    assert.deepEqual(calls[1], { authPath: path.join(arayaPi, 'auth.json'), modelsPath: path.join(arayaPi, 'models.json'), modelsStorePath: path.join(config.dataDir, 'runner', 'models-store.json'), allowModelNetwork: false, refreshOnCreate: false })
+    assert.deepEqual(calls, [{ authPath: path.join(arayaPi, 'auth.json'), modelsPath: path.join(arayaPi, 'models.json'), modelsStorePath: path.join(config.dataDir, 'runner', 'models-store.json'), allowModelNetwork: false, refreshOnCreate: false }])
     for (const [file, bytes] of snapshots) {
       assert.deepEqual(await fs.readFile(file), bytes)
     }
@@ -262,13 +258,8 @@ test('Pi isolation: runner records dedicated agentDir and normalizes child envir
   }
 })
 
-for (const kind of ['control-plane', 'runner'] as const) {
-  const modulePaths = kind === 'control-plane'
-    ? ['../src/control-plane/runtime.ts', '../dist/src/control-plane/runtime.js']
-    : ['../src/runner/runner.ts', '../dist/src/runner/runner.js']
-
-  for (const module of modulePaths) {
-    test(`Pi isolation: ${kind} SDK first import uses Araya bin despite inherited host paths (${module})`, async () => {
+for (const module of ['../src/runner/runner.ts', '../dist/src/runner/runner.js']) {
+    test(`Pi isolation: runner SDK first import uses Araya bin despite inherited host paths (${module})`, async () => {
       const root = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-sdk-entry-isolation-'))
       const hostAgentDir = path.join(root, 'host-pi')
       const dataDir = path.join(root, 'data')
@@ -290,11 +281,7 @@ for (const kind of ['control-plane', 'runner'] as const) {
           const app = await import(${JSON.stringify(modulePath)})
           const agentDir = ${JSON.stringify(arayaAgentDir)}
           const dataDir = ${JSON.stringify(dataDir)}
-          if (${JSON.stringify(kind)} === 'control-plane') {
-            await app.createArayaModelRuntime(agentDir)
-          } else {
-            await app.createRunnerModelRuntime({ agentDir, dataDir })
-          }
+          await app.createRunnerModelRuntime({ agentDir, dataDir })
           const { getToolPath } = await import(new URL('./utils/tools-manager.js', ${JSON.stringify(sdkEntry)}))
           process.stdout.write(JSON.stringify({
             toolPath: getToolPath('rg'),
@@ -325,8 +312,7 @@ for (const kind of ['control-plane', 'runner'] as const) {
       } finally {
         await fs.rm(root, { recursive: true, force: true })
       }
-    })
-  }
+  })
 }
 
 test('Pi isolation: SHIKI native SettingsManager selects Araya settings and leaves host files unchanged', async () => {

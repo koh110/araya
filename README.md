@@ -147,6 +147,5 @@ npm run deploy
 
 ## その他のコマンド
 
-- 引数なしの `araya` は Pi coding agent の TUI を起動します（Araya の `tick` は自動では実行しません）。`araya pi ...` は引数を Pi にそのまま渡します。`araya --help` はヘルプです。
-- 旧経路（`init`・`tick`・`status`・`run`・`approve`・`reject`）は開発の課題を動かすために使いません。JSONL inbox に書いた `development` の課題は実行されず `blocked` になります。開発の課題は `araya task create` で登録してください。旧経路については docs/development.md を見てください。
-- 未実装: 自律的な課題発見、Goal / 探索対象の設定、外部ソース監視、Outbox 配信、旧経路（`tick` / `run`）の常駐化。`run` を起動しても、新しい課題を自律的に発見するわけではありません。
+- 引数なしの `araya` は Pi coding agent の TUI を起動します。`araya pi ...` は引数を Pi にそのまま渡し、`araya --help` はヘルプを表示します。
+- 未実装: 自律的な課題発見、外部ソース監視、通知連携。

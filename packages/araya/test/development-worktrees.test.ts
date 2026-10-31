@@ -649,8 +649,8 @@ test('createTaskState creates a private directory and refuses to reuse an existi
     await assert.rejects(createTaskState(dataDir, linkKey), errorCode('task_state_already_exists'))
     assert.equal(await exists(path.join(root, 'missing')), false)
 
+    await assert.rejects(createTaskState(dataDir, 'not-a-task-key'), errorCode('task_key_invalid'))
     await assert.rejects(createTaskState(dataDir, '../escape'), errorCode('task_key_invalid'))
-    await assert.rejects(createTaskState(dataDir, 'development-0123456789abcdef0123'), errorCode('task_key_invalid'))
   } finally {
     await fs.rm(root, { recursive: true, force: true })
   }

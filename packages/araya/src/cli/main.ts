@@ -3,14 +3,6 @@ import os from 'node:os'
 import { parseCliArguments } from './arguments.ts'
 import { loadConfig, loadPiSdk, withPiEnvironment } from '../config/environment.ts'
 import { loadConfigFile } from '../config/file.ts'
-import {
-  approveOpportunity,
-  initAraya,
-  rejectOpportunity,
-  runAraya,
-  statusAraya,
-  tickAraya
-} from '../control-plane/operations.ts'
 import { createSystemdOps, resolveRunnerEntrypoint } from '../infrastructure/systemd.ts'
 import {
   assertSupportedPlatform,
@@ -31,25 +23,13 @@ function printHelp() {
 
 使い方:
   araya
-    引数なし: Pi の interactive TUI を同じプロセス内で起動する。tick は自動では実行しない。
+    引数なし: Pi の interactive TUI を同じプロセス内で起動する。
 
   araya pi [arguments...]
     Pi に指定した引数を渡して起動する。
 
   araya --help
     このヘルプを表示する。
-
-  araya init
-    状態領域と seed inbox を作成し、初期状態を status.json へ書き出す。
-
-  araya tick
-    1回だけ due goal を処理する。inbox の開発課題は実行せずに blocked にする（開発の課題は araya task create で登録する）。
-
-  araya status
-    control plane と live task graph を読み、status.json へ書き出す。
-
-  araya run
-    ARAYA_INTERVAL_MS ごとに tick を繰り返す。Ctrl+C で停止する。
 
   araya task create --file <path|->
     開発の Task を台帳（<ARAYA_DATA_DIR>/tasks.sqlite）に登録する。入力は UTF-8 の JSON 1件（- は stdin）。
@@ -82,17 +62,11 @@ function printHelp() {
   araya runner uninstall
     runner の unit を止めて無効にし、unit file を消す。台帳は変えない（動いていた試行は、入れ直すと続きから進む）。
 
-  araya approve <opportunityId> [note...]
-    承認待ち候補を承認する。外部実行はまだ行わない。
-
-  araya reject <opportunityId> [note...]
-    候補を却下する。
-
   araya task と araya runner は Linux と systemd（254 以降）の user manager が必要。
 
 設定ファイル:
   <ARAYA_DATA_DIR>/config.json（既定: ~/.araya/config.json）
-    runner の SHIKI（開発の agent）の model と thinking level を指定する。subcommand は起動時に1回だけ読み、
+    runner の SHIKI（開発の agent）の model と thinking level を指定する。task・runner command は起動時に1回だけ読み、
     runner は試行を取り込むたびに読む。
 
 内蔵 Pi の設定:
@@ -103,20 +77,10 @@ function printHelp() {
 
 環境変数:
   ARAYA_DATA_DIR
-  ARAYA_INBOX_DIR
-  ARAYA_STATUS_FILE
-  ARAYA_CONTROL_PLANE_PATH
-  ARAYA_PI_DURABLE_PATH
-  ARAYA_INTERVAL_MS
-  ARAYA_MAX_ACTIONS
   ARAYA_DEV_ROOT
   ARAYA_DEVELOPMENT_TIMEOUT_MS
   ARAYA_VERIFICATION_TIMEOUT_MS
 `)
-}
-
-function printJson(value: unknown) {
-  console.log(JSON.stringify(value, null, 2))
 }
 
 // この環境では araya task と araya runner を使えないことを表す誤りの code
@@ -134,10 +98,8 @@ export function exitCodeOf(error: unknown) {
   return 1
 }
 
-const SUBCOMMANDS = ['init', 'tick', 'status', 'run', 'approve', 'reject']
-
 async function loadCliConfig(env: NodeJS.ProcessEnv | undefined) {
-  // 設定ファイルは subcommand を処理する前に1回だけ読む。実行中に書き換えても再起動するまで反映しない
+  // task・runner command の開始時に一度だけ読み込む
   const baseConfig = loadConfig(env)
   const { developmentModel } = await loadConfigFile(baseConfig.configPath)
 
@@ -205,45 +167,6 @@ export async function runCli(
     return
   }
 
-  if (!SUBCOMMANDS.includes(command)) {
-    printHelp()
-    throw new Error(`不明な command: ${command}`)
-  }
-
-  const config = await loadCliConfig(env)
-
-  if (command === 'init') {
-    printJson(await initAraya(config))
-    return
-  }
-
-  if (command === 'tick') {
-    printJson(await tickAraya(config))
-    return
-  }
-
-  if (command === 'status') {
-    printJson(await statusAraya(config))
-    return
-  }
-
-  if (command === 'run') {
-    await runAraya(config)
-    return
-  }
-
-  if (command === 'approve' || command === 'reject') {
-    const opportunityId = positionals[1]
-
-    if (opportunityId === undefined || opportunityId === '') {
-      throw new Error(`${command} には opportunityId が必要です`)
-    }
-
-    const note = positionals.slice(2).join(' ')
-    const result = command === 'approve'
-      ? approveOpportunity(config, opportunityId, note)
-      : rejectOpportunity(config, opportunityId, note)
-
-    printJson(result)
-  }
+  printHelp()
+  throw new Error(`不明な command: ${command}`)
 }
