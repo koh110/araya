@@ -1,20 +1,19 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { createHash } from 'node:crypto'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
+import { runBoundedCommand } from '../src/infrastructure/process.ts'
 import {
   MAX_VERIFICATIONS_PER_TASK,
   MAX_WORKTREES_PER_TASK,
-  computeTaskKey,
   createTaskState,
   createWorktreeService,
   readTaskState
-} from '../src/development-worktrees.ts'
-import type { VerificationRecord, WorktreeRecord } from '../src/development-worktrees.ts'
+} from '../src/development/worktrees.ts'
+import type { VerificationRecord, WorktreeRecord } from '../src/development/worktrees.ts'
 
 const FIXED_NOW = new Date('2026-10-23T00:00:00.000Z')
 
@@ -25,7 +24,7 @@ async function createFixture() {
   const home = path.join(root, 'home')
   const gitConfig = path.join(home, 'gitconfig')
   const devRoot = path.join(root, 'dev')
-  const taskKey = computeTaskKey('development:worktrees-test')
+  const taskKey = 'task-1-1-abcdef'
   await fs.mkdir(home)
   await fs.mkdir(devRoot)
   await fs.writeFile(gitConfig, '', 'utf8')
@@ -81,6 +80,7 @@ function createService(fixture: Fixture, overrides: { taskKey?: string; stateDir
     stateDir: overrides.stateDir ?? fixture.stateDir,
     taskKey: overrides.taskKey ?? fixture.taskKey,
     env: fixture.env,
+    runGit: runBoundedCommand,
     now: () => {
       return FIXED_NOW
     }
@@ -229,8 +229,8 @@ test('createWorktree resolves base from HEAD by default and from branch names or
       { label: 'revision', base: 'HEAD~1', expectedBase: 'HEAD~1', expectedSha: first }
     ]
 
-    for (const testCase of cases) {
-      const taskKey = computeTaskKey(`development:base-${testCase.label}`)
+    for (const [index, testCase] of cases.entries()) {
+      const taskKey = `task-2-${index + 1}-abcdef`
       const stateDir = await createTaskState(path.join(fixture.root, 'data'), taskKey)
       const service = createService(fixture, { taskKey, stateDir })
       const record = await service.createWorktree(testCase.base === undefined
@@ -633,33 +633,25 @@ test('createTaskState creates a private directory and refuses to reuse an existi
 
   try {
     const dataDir = path.join(root, 'data')
-    const taskKey = computeTaskKey('development:state')
+    const taskKey = 'task-1-1-abcdef'
     const stateDir = await createTaskState(dataDir, taskKey)
 
     assert.equal(stateDir, path.join(dataDir, 'development', taskKey))
     assert.equal((await fs.stat(stateDir)).mode & 0o777, 0o700)
     await assert.rejects(createTaskState(dataDir, taskKey), errorCode('task_state_already_exists'))
 
-    const fileKey = computeTaskKey('development:file')
+    const fileKey = 'task-2-1-abcdef'
     await fs.writeFile(path.join(dataDir, 'development', fileKey), '', 'utf8')
     await assert.rejects(createTaskState(dataDir, fileKey), errorCode('task_state_already_exists'))
 
-    const linkKey = computeTaskKey('development:link')
+    const linkKey = 'task-3-1-abcdef'
     await fs.symlink(path.join(root, 'missing'), path.join(dataDir, 'development', linkKey))
     await assert.rejects(createTaskState(dataDir, linkKey), errorCode('task_state_already_exists'))
     assert.equal(await exists(path.join(root, 'missing')), false)
 
+    await assert.rejects(createTaskState(dataDir, 'not-a-task-key'), errorCode('task_key_invalid'))
     await assert.rejects(createTaskState(dataDir, '../escape'), errorCode('task_key_invalid'))
   } finally {
     await fs.rm(root, { recursive: true, force: true })
   }
-})
-
-test('computeTaskKey derives a stable development key from the opportunity id', () => {
-  const taskKey = computeTaskKey('development:example')
-
-  assert.match(taskKey, /^development-[0-9a-f]{20}$/u)
-  assert.equal(taskKey, `development-${createHash('sha256').update('development:example').digest('hex').slice(0, 20)}`)
-  assert.equal(computeTaskKey('development:example'), taskKey)
-  assert.notEqual(computeTaskKey('development:other'), taskKey)
 })

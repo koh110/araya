@@ -13,10 +13,11 @@
     "packages/araya"
   ],
   "engines": {
-    "node": ">=24.0.0"
+    "node": ">=26.8.0"
   },
   "scripts": {
     "araya": "node packages/araya/bin/cli.ts",
+    "prebuild": "node scripts/clean-build-output.mjs",
     "build": "tsc -p tsconfig.build.json",
     "postbuild": "node scripts/copy-package-metadata.mjs",
     "deploy": "sh scripts/deploy.sh",

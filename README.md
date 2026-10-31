@@ -1,157 +1,151 @@
 # araya
 
-**実験用 MVP**。利用者がJSONL inboxに書いた `development` 課題を、Araya は due tick で1件選び、Pi coding-agent SDKのagentを開発root（既定: `~/dev`）でsandboxなしに動かします。agentは課題に必要なrepositoryを自分で判断し（複数でもよい）、変更するrepositoryごとに `<repository>/.worktree/` 配下へ課題用のworktreeを作って実装し、最終状態で通るべき検証コマンドを登録します。agentの終了後、Arayaは登録された検証コマンドを各worktreeで実行し、worktreeごとのbase SHA、branch、差分、検証結果を保存して停止します。Araya自身はcommit・push・PR・merge・deployを行いません。自律的な課題発見、Goal / 探索対象の設定、外部ソース監視、read-only/external候補のexecutor、Native Broker、Discord/Hermes連携、Outbox配信、systemd常駐化は未実装です。`run`を起動しても、新しい課題を自律的に発見するわけではありません。引数なしの `araya` と `araya pi` は `@earendil-works/pi-coding-agent` のCLI entry pointを同じNode.jsプロセス内で実行し、その動作・権限・副作用はPi側の設定に従います。別途 `pi` CLIをインストールする必要はありません。
+開発課題を AI agent に依頼するための CLI です。検証済みの変更を draft PR まで届け、merge は人が判断します。常駐 runner が SHIKI（Pi で作る開発 agent）を対象 repository の worktree で動かし、登録検証がすべて通った変更を Araya が commit・GitHub.com へ push し、Draft PR を作成します。Araya は merge・deploy・publish を行いません。
 
-## 必要環境
+実験用 MVP です。この文書では `araya` を入れてから結果を受け取るまでの手順を説明します。内部の仕組みと開発の手順は [docs/development.md](docs/development.md)、動作の詳しい定義は仕様 [docs/spec/task-ledger-and-shiki-runner.md](docs/spec/task-ledger-and-shiki-runner.md) にあります。
 
-- Node.js 24 以上
-- Git。`development` 課題で worktree の作成と差分の収集に使います（`/usr/bin/git`、`/bin/git`、`/usr/local/bin/git` のいずれか）。
-- Windows 以外の OS。agent と検証コマンドを process group 単位で止めるためです。
-- Pi coding-agent SDK 1.4.0 は依存関係として含まれます。引数なしの `araya` または `araya pi` に、グローバルな `pi` コマンドは不要です。
+## 必要な環境
+
+- Linux と systemd（254 以降）の user manager に到達する host。それ以外の host では `araya task` と `araya runner` は使えません。
+- Node.js 26.8 以上
+- git。作業対象の repository に worktree を作るときに使います。
+- GitHub.com の repository へ Draft PR を届けるときは GitHub CLI `gh` が必要です。runner と同じ OS user で `gh auth login` を済ませてください。GitHub Enterprise は対象外です。
+- 開発 root。Task で動かす repository は開発 root の中に必要です（既定 `~/dev`。`ARAYA_DEV_ROOT` で変えられます）。
+- Pi で使える model へのアクセス。Pi coding-agent は araya の依存 package に含まれるので、別途 `pi` を入れる必要はありません。model の認証は Pi の `/login` で設定します（API key の環境変数は使いません）。
+
+## インストール
 
 ```sh
+git clone https://github.com/koh110/araya
+cd araya
 npm ci
-npm test
-npm run typecheck
+npm run deploy
 ```
 
-## 試す
+`npm run deploy` は、`araya` コマンドをユーザーの global prefix（既定 `~/.local`）に入れ、runner を systemd の user service として入れます。`~/.local/bin` を PATH に足してください。
 
 ```sh
-export ARAYA_DATA_DIR="$HOME/.local/state/araya-demo"
-npm run araya -- init
-npm run araya -- tick
-npm run araya -- status
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-`init` は初期状態と `inbox/seed.jsonl` を作ります。seed が既にあれば上書きしません。`tick` は due goal を一度処理し、`status` は保留中の durable task を再開せずに control plane と Pi Durable の状態を表示します。データは既定で `~/.araya` に置かれます。
+これで `araya` が使えます。入れ先を変えるときは `ARAYA_INSTALL_PREFIX` を設定して deploy を実行します。deploy の内部の動作と失敗の扱いは docs/development.md を見てください。
 
-継続起動を手動で試す場合は `npm run araya -- run` を使い、ARAYA_INTERVAL_MS ごとに tick が回り、Ctrl+C で止めます。引数なしの `araya` は Pi の interactive TUI を同じ Node.js プロセス内で起動しますが、Araya の `tick` は自動実行しません。制御 plane を明示的に起動する場合は `araya tick`、ヘルプ表示は `araya --help` を使います。`araya pi [arguments...]` は指定した引数を Pi coding-agent SDK の CLI entry point に渡します。`run` は前景プロセスの loop であり、OS 起動時の自動起動・監視・再起動を設定しません。次回起床時刻は control plane DB に保存されますが、長期停止後の復旧・重複実行を含む採用条件はまだ検証完了していません。
+## model を選ぶ
 
-初期 seed を処理したときの状態遷移は次のとおりです。
+Araya 内蔵 Pi は `<ARAYA_DATA_DIR>/pi`（既定 `~/.araya/pi`）を使います。`settings.json`・`auth.json`・`models.json`・`models-store.json`・`sessions/` と Pi SDK が管理する `bin/` はこの専用 directory に置きます。standalone Pi の設定・認証は自動移行しません。継承した `PI_CODING_AGENT_DIR`・`PI_CODING_AGENT_SESSION_DIR` は内蔵 Pi の保存先に使いません。
 
-- executor がない `read-only` 候補: `blocked` (`no_read_only_executor`)
-- `external` 候補: `approval_requested`
-- `approve <opportunityId>` 後: 次の処理で `blocked` (`no_external_executor`)
-- 承認通知用 outbox: `pending` のまま。送信処理はありません。
+Task を動かす前に、Araya 側で SHIKI が使う model と認証を設定し直します。checkout で `araya` を引数なしで動かすと（`npm run araya`）Pi の TUI が立ちます。
 
-`tick` の `due` は「処理時刻が来て tick を実行した」という意味で、候補が実行・完了した保証ではありません。
+1. `/login` で provider に接続する
+2. `/model` で model を選び、既定として保存する
 
-## inbox 形式
+旧 host directory を記録した既存の running 試行は、再開時に host 設定を読まず `failed`（`attempt_error`）になります。Araya 側で `/login` と `/model` を設定してから新規 retry してください。保存済みの試行入力・DB schema は変更しません。Araya 自身の `config.json`・台帳・runner storage の場所も変わりません。
 
-`ARAYA_INBOX_DIR` 配下の `.jsonl` ファイルを読みます。各行は JSON object です。通常候補の例:
+この状態で `npm run deploy`（または `araya runner install`）を実行すると、araya はその既定 model を設定ファイル `<dataDir>/config.json`（既定 `~/.araya/config.json`）に保存します。保存するのは設定ファイルが無いときだけです。認証情報は写さず、API は呼ばず、既存の設定ファイルは変更しません。
 
-```json
-{"id":"candidate:example","kind":"investigate","title":"対象の状態を確認する","risk":"read-only","payload":{"source":"local-note"}}
-```
-
-開発課題の例:
-
-```json
-{"id":"development:example","kind":"development","title":"入力検証を追加する","risk":"workspace","payload":{"task":"agentctl の入力で空の値を拒否し、既存のテストに回帰ケースを追加する"}}
-```
-
-`development` 行をinboxへ置くことが実行開始の承認です。別のapprove操作は不要です。`payload` は `task` だけを持ちます（空白以外の文字を含む20,000文字以内、NULなし）。`task` 以外のkeyを持つ課題はintakeで拒否します。課題ごとの検証コマンドは指定できません。
-
-次のdue tickでArayaは次のように処理します。
-
-1. 課題ごとの状態directory `<dataDir>/development/<taskKey>/` を作り、Pi agentを開発rootで起動します。`taskKey` は `development-` と opportunity id の SHA-256 の先頭20桁です。状態directoryが既にある課題は実行せず、以前のworktreeやbranchを再利用しません。
-2. agentは課題に必要なrepositoryを判断し、変更するrepositoryごとに `araya_create_worktree` で `<repository>/.worktree/araya-<taskKey>` にworktreeとbranch `araya/<taskKey>` を作って、その中だけを編集します。`.worktree` がignoreされていないrepositoryでは、`.git/info/exclude` に `/.worktree/` を1行追記します。
-3. agentは終了前に、変更したworktreeごとに最終状態で通るべき検証コマンドを `araya_register_verification` で登録します。
-4. agentの終了後、Arayaは差分のあるworktreeごとに、登録された検証コマンドをshellなしのargvとして登録順に実行します。差分のあるworktreeすべてに検証が登録され、すべてexit 0のときだけ `completed` とします。それ以外は理由（`no_changes`、`verification_missing`、`verification_failed`、`agent_failed`、`agent_timeout` など）を付けて `failed` とします。
-
-完了・失敗いずれでもworktreeとbranchを保持し、worktreeごとの差分（base SHAとの差。commit済み・未commit・untrackedを含む、全worktree合計で256 KiBまで）と、検証ごとのstdout/stderrの末尾8 KiBを証拠として保存します。
-
-`risk` は `read-only`、`workspace`、`external` のいずれかです。`workspace` は `kind: "development"` 専用です。`id` は省略可能ですが、再投入時の重複防止には安定した ID を指定してください。不正行・重複 ID・読み取りエラーは `inbox.read_errors` event に記録します。不正な行は候補に含めず、同じ読み込みで有効だった行は処理対象になることがあります。そのため `tick` の `due` は入力全件が正常だった保証ではありません。inboxの内容はデータとして扱いますが、`development` の `payload.task` はPiへの指示として実行されます。人が内容を確認してから書き込んでください。
-
-## CLI
-
-```sh
-araya                                # Pi の interactive TUI を同一プロセス内で起動（tick は自動では実行しない）
-araya pi [arguments...]              # 指定した引数を Pi coding-agent SDK に転送
-araya --help                         # ヘルプ表示
-npm run araya -- init
-npm run araya -- tick
-npm run araya -- status
-npm run araya -- run
-npm run araya -- pi [arguments...]
-npm run araya -- approve <opportunityId> [note...]
-npm run araya -- reject <opportunityId> [note...]
-```
-
-承認コマンドは判断を記録するだけで、外部操作を開始しません。
-
-## 設定
-
-- `ARAYA_DATA_DIR` — 状態ディレクトリ（既定: `~/.araya`）
-- `ARAYA_INBOX_DIR` — JSONL inbox（既定: `<dataDir>/inbox`）
-- `ARAYA_STATUS_FILE` — 状態スナップショット（既定: `<dataDir>/status.json`）
-- `ARAYA_CONTROL_PLANE_PATH` — Goal / Opportunity / decision / event / outbox DB
-- `ARAYA_PI_DURABLE_PATH` — Pi Durable task graph DB
-- `ARAYA_INTERVAL_MS` — 次回起床間隔（既定: 900000 ms）
-- `ARAYA_MAX_ACTIONS` — 1 tick あたりの処理候補数上限（既定: 3）
-- `ARAYA_DEV_ROOT` — 開発root（既定: `~/dev`）。agentはここをcwdとして動き、配下のrepositoryのcloneを使います。課題の開始時にrealpathで解決し、directoryでなければ課題は `dev_root_missing` で失敗します。
-- `ARAYA_DEVELOPMENT_TIMEOUT_MS` — agent 1回のtimeout（既定: 1200000 ms、範囲: 1000〜3600000 ms）。timeoutではworkerにSIGTERMを送ってPi sessionをabortさせ、10秒で終わらなければSIGKILLを送ります。
-- `ARAYA_VERIFICATION_TIMEOUT_MS` — 検証command 1件ごとのtimeout（既定: 300000 ms、範囲: 1000〜3600000 ms）
-- `PI_CODING_AGENT_DIR` — Pi の agent directory。Pi と Araya の両方で同じ値を使うと、`tick` / `run` のモデルruntimeと開発agentが同じ `auth.json` と `models.json` を参照します。未指定時は `~/.pi/agent` を使用します。
-
-### 設定ファイル
-
-開発課題を実行する Pi agent の model と thinking level は、設定ファイル `<dataDir>/config.json`（既定: `~/.araya/config.json`）で指定します。場所は `ARAYA_DATA_DIR` に従い、設定ファイルの場所だけを変える環境変数はありません。
+設定ファイルは自分で書くこともできます。
 
 ```json
 {
   "development": {
-    "model": "openai/gpt-5.5",
-    "thinkingLevel": "high"
+    "model": "openai/gpt-5.5"
   }
 }
 ```
 
-- 形式は UTF-8 の JSON object で、64 KiB まで。top level の key は `development`（省略可）だけで、`{}` やファイルが無い場合は従来どおり Pi の設定（`settings.json` の `defaultProvider`・`defaultModel` など）で model を選びます。
-- `development.model`（必須）: `<provider>/<model id>`。最初の `/` で provider と model id に分けるため、model id には `/` を含められます（例: `openrouter/moonshotai/kimi-k2.6`）。provider と model id は空にできず、空白と制御文字を含めず、全体で200文字まで。
-- `development.thinkingLevel`（省略可）: `off`・`minimal`・`low`・`medium`・`high`・`xhigh`・`max` のいずれか。省略すると Pi の設定（`modelThinkingLevels["<provider>/<id>"]` → `defaultThinkingLevel` → `medium`）で決まります。Pi は model が対応しない thinking level を対応する値に丸めます。
-- 知らない key、型の違う値、`null` は拒否します。ファイルが存在するのに使えない場合（JSON の誤り、schema 違反、64 KiB 超、UTF-8 でない、通常の file でない、壊れた symlink、読めない）は、`init`・`tick`・`status`・`run`・`approve`・`reject` が何も処理せずに `invalid Araya config file <path>: <理由>` で失敗します（exit code 1）。引数なしの `araya`・`araya pi`・`araya --help` は設定ファイルを読みません。
-- 設定ファイルは subcommand の起動時に1回だけ読みます。`araya run` の実行中に書き換えた内容は、再起動するまで反映されません。
-- 指定した model が Pi の model 一覧に無い、または Pi の認証（`auth.json` など）が無いときは、別の model に切り替えず、agent を動かさずに課題を失敗にします。`failureReason` は `agent_failed`、evidence の `workerErrorName` は `ModelUnavailableError` です。課題は自動で再実行しないため、設定を直したら別の id で課題を入れ直してください。
-- 使った model は課題の evidence の `model`（`provider`・`id`・丸めた後の `thinkingLevel`・`source`）に記録します。`source` は設定ファイルで指定したとき `araya-config`、Pi の設定で選んだとき `pi-settings` です。
-- `araya status` の出力と `status.json` の `config` に、`configPath` と `developmentModel`（`{ "model": "<provider>/<id>", "thinkingLevel": ... }`、未指定なら `null`）が入ります。status は Pi の認証を読まないため、model が実際に使えるかは表示しません。
-- 利用上限に達したときの fallback model と自動 retry は未対応です。`fallbackModels` などの key は知らない key として拒否します。
+`model` は `<provider>/<model id>` です。`thinkingLevel` は省略できます（省略すると Pi の設定で決まります）。API key は設定ファイルに書かないでください（読みません）。設定ファイルが無いときは、model は Pi の設定で選ばれます。runner は試行を取り込むたびに設定ファイルを読むので、インストールした後に作っても反映されます。
 
-詳細は [docs/spec/development-model-config.md](docs/spec/development-model-config.md) を参照してください。
+注意: 保存した後は Pi の既定 model を変えても Araya の設定には追従しません。model を切り替えるときは設定ファイルの `development.model` を更新してください。使う model が決まらない、Pi の model の一覧に無い、認証が無いときは、別の model に切り替えずに試行を `failed`（`agent_failed`、`model_unavailable`）で終わらせます。設定ファイルの詳しい規則は [docs/spec/development-model-config.md](docs/spec/development-model-config.md) を見てください。
 
-## 状態と安全境界
+## Task を登録する
 
-- `araya.sqlite` が Goal、Opportunity、承認、Event、Outbox を保持します。
-- `pi-durable.sqlite` が Pi Durable の Task Graph と Checkpoint を保持します。Pi Durable 1.4.0 で既存DBを開くと schema v2 へ自動移行されます。移行後は同じDBを Pi Durable 1.3.0 以下で開けないため、初回利用前にDBをバックアップしてください。
-- 2つの SQLite DB をまたぐ単一 transaction はありません。現在の PoC では、SQLite 間の障害注入・クラッシュ復旧の条件を満たしたとは主張しません。
-- `read-only` / `external` の実行executorがない候補は `completed` と偽らず、`blocked` として残します。
-- Arayaの通常control-plane処理は外部書き込みや通知送信をしません。`tick` / `run` は `development` taskを実行するときだけPiのモデルruntimeを呼び出します。Piの認証情報は `PI_CODING_AGENT_DIR`（未指定時は `~/.pi/agent`）から読み取り、Arayaの設定やDBには複製しません。通常のscout処理やread-only/external候補はモデルを呼び出しません。引数なしの `araya` と `araya pi` は明示的にPi coding-agent SDKのCLI entry pointを実行するため、その実行はこの節の対象外です。
-- `development` 課題のagentと検証commandはsandboxなしで動きます。Arayaを起動した利用者の権限・環境変数・networkをそのまま使い、開発root配下に限らずfilesystemを読み書きできます。agentのtoolはPi標準の `read`・`bash`・`edit`・`write`・`grep`・`find`・`ls` と、Arayaの `araya_create_worktree`・`araya_register_verification` の9種類で、sessionのtool集合がこれと一致しなければagentを動かしません。MCP、Pi extension、skill、prompt template、context fileは読み込まず、会話履歴はPiのsession directoryに保存しません。
-- main checkoutを編集しない、commit・push・PR作成・merge・deploy・publishをしない、認証情報を読み出さない、といった制約はpromptでの指示だけで、Arayaは強制も検知もしません。課題の内容とagentの権限を理解したうえで課題を書いてください。
-- 既知の制限: agentが `setsid` や `nohup` などで切り離したprocessは、timeout後も残ることがあります。検証commandはagentが登録するため、課題の作者が指定する方法はありません。worktreeとbranchは自動では削除しません。
-- DB や inbox に利用者のデータを置く場合は、`ARAYA_DATA_DIR` とバックアップのアクセス権を利用者側で管理してください。
-
-## グローバルインストール
-
-ルートで `npm run deploy` を実行すると、`araya`（version `0.0.1`）をbuildし、一時tarballからユーザーglobal prefix（既定: `$HOME/.local`）へinstallします。checkoutへのsymlinkではないため、以後のソース変更は再deployまで反映されず、worktreeを移動・削除してもinstall済みコマンドは影響を受けません。npm registryへのpublishは行いません。指定prefix内に旧 `agentctl` package があれば先にuninstallし、`araya` のbin競合を解消してから置き換えます。
+```json
+{
+  "title": "README の誤字を直す",
+  "goal": "README.md の誤字を直し、ファイルを検索して置換を確認する検証コマンドを登録する",
+  "targets": ["my-app"]
+}
+```
 
 ```sh
+araya task create --file task.json   # stdin から読むときは --file -
+```
+
+- `title`（200 文字まで、改行なし）と `goal`（20,000 文字まで）は必須です。
+- `targets` は SHIKI に作業 repository を探してもらうための手がかりです（開発 root からの相対 path など）。worktree の対象を限定するものではなく、どの repository で作業するかは SHIKI が判断します。SHIKI が触れる file の制限にもなりません（「注意」を見てください）。SHIKI が開発 root の下に存在しない repository を指定したときは、worktree の作成が失敗し、理由（`repository_not_found`）が SHIKI に返されます。SHIKI は別の repository を選び直せます（tool の失敗だけでは試行は終わりません）。`constraints` と `permissions` は省略できます。`permissions` は SHIKI に渡す制約情報で、Araya が検証後に行う commit・push・Draft PR の前提を解除したり、merge・deploy を許可したりしません。
+- `araya task` は runner も SHIKI も起動しません。動いている runner が数秒以内に台帳を見て、実行枠に空きがあれば取り込みます。runner が動いていないときは注意を出します（登録自体は成功します）。
+- 同じ `idempotencyKey` で同じ内容をもう一度登録すると、同じ Task を返します（`"created": false`）。入力の詳しい制限は仕様にあります。
+
+## 進捗を見る
+
+```sh
+araya task list
+araya task show <taskId>
+```
+
+Task の状態は次のとおりです。
+
+- `queued`: 待ち
+- `running`: runner が動かしている（runner が止まっている間もこの状態）
+- `completed`: SHIKI が成功し、差分のある全 worktree で登録検証が通り、GitHub.com の Draft PR まで届けた（差分なしは `no_changes` で失敗）。
+- `failed`: agent・検証・commit・push・PR 作成のいずれかが失敗、または中止された（理由は `failureReason`）。
+- `blocked`: 人の判断、GitHub CLI 認証、GitHub repository の確認などが必要（「詰まったときは」を見てください）。
+
+`task list` には runner の状態（`runner.state`: `running`・`stopped`・`not_responding`・`not_started`）も出ます。1つの runner で同時に動く SHIKI は1件までで、ほかの Task は `queued` で待ちます。
+
+`task show` は試行ごとの報告（`summary`）、使った model、evidence、途中経過を出します。試行ごとに名前（`taskKey`）があり、`taskId` とは別です。差分と検証の出力の本文は台帳に入れず、試行の状態 directory（`<dataDir>/development/<taskKey>/evidence.json`）に置き、`--full` を付けたときだけ表示します。
+
+## 結果を受け取る
+
+SHIKI の変更は試行ごとの worktree `<repository>/.worktree/araya-<taskKey>`（branch `araya/<taskKey>`）に作られます。差分のある各 repository で全検証が通ると、Araya が変更を commit し、GitHub.com の `origin` に fast-forward push して Draft PR を作成します。PR URL は `task show` の evidence に残ります。`gh` 不在・未認証、GitHub 以外の remote、Git identity 不足などでは success にせず、設定が必要な場合は `blocked` にします。Araya は merge・deploy・publish を行いません。worktree・branch・log・台帳は自動では消えません。詳しくは [Draft PR delivery 仕様](docs/spec/draft-pr-delivery.md) を見てください。
+
+## 詰まったときは
+
+`blocked` は次のどちらかです。SHIKI が `araya_request_decision` で人の判断を求めた（質問は `decisionQuestion`）、または runner が落ち続けて試行が止められた（`restart_limit`）。どちらの場合も、決めてから再実行します。
+
+```sh
+araya task retry <taskId> --note "B 方案を使う"
+```
+
+- 再実行できるのは `failed` と `blocked` の Task だけです。
+- 新しい試行は新しい taskKey を使い、worktree と branch も前回とは別になります。前回の worktree は残ります（前回の変更は持ち込みません）。
+- SHIKI が判断を求めたときは、質問への答えを `--note` に書きます（長い文字列は `--note-file`）。
+- 前回の試行が中断された場合、または Draft PR 配送で remote branch / PR が作成・更新されたか確認できない場合は、`--confirm-side-effects` が必要です。前回の worktree と GitHub の状態を確かめてから付けてください。
+- `araya task cancel <taskId>` は、待機中の試行をその場で中止し、動いている試行には中止を求めます。自動の再実行はありません。
+
+## runner を管理する
+
+runner は systemd の user service です。`npm run deploy` で入ります。unit の名前は `araya-runner-<hash>.service`（`<hash>` は data directory から決まります。`araya runner install` の出力に載ります）。
+
+- 止める: `systemctl --user stop araya-runner-<hash>.service`。これは一時停止で、動いていた試行は次に起動したときに続きから進みます。
+- 起動・再開: `systemctl --user start araya-runner-<hash>.service`。
+- 環境変数を変えたとき: `araya runner install` をやり直します。やり直すまで、runner は前の環境で動き続けます。
+- 取り除く: `araya runner uninstall`。unit を止めて消すだけで、台帳は変えません。入れ直すと続きから進みます。
+- 動作記録: `<dataDir>/logs/runner.log`（1行1件の JSON、秘密を置き換えたもの）。
+
+araya は linger を変えません。linger が無効だと、logout で runner は止まり（一時停止）、次に user manager が起動したときに続きから進みます。logout の後も動かしたいときは `loginctl enable-linger` を実行してください。runner が落ちたときは、systemd が間隔を空けて起動し直します。
+
+## araya を更新する
+
+```sh
+git pull
+npm ci
 npm run deploy
-araya --help
 ```
 
-別のprefixを使う場合は `ARAYA_INSTALL_PREFIX` で上書きできます。prefixの `bin` directoryが `PATH` に含まれていることを確認してください。
+`npm run deploy` は、その環境の data directory の runner を新しいコードで入れ直して起動します。動いていた試行は一時停止の扱いで続きから進みます。
 
-```sh
-ARAYA_INSTALL_PREFIX="$HOME/.npm-global" npm run deploy
-```
+## 注意
 
-## 開発
+- SHIKI と検証コマンドは sandbox 無しで、利用者の権限で動きます。開発 root の repository だけでなく、利用者が書き込める file を変更できます。
+- SHIKI には main checkout を編集せず、commit・push・PR 作成をしないよう指示しますが、sandbox・network制限はなく、prompt は強制されません。SHIKI が直接 remote を変更する可能性があります。Araya の組み込み delivery が commit・push・PR を行うのは全検証後です。Task と agent の権限を確認してから登録してください。
+- Araya は秘密とみなす値と URL の userinfo を、台帳・evidence・log に書く前に `[REDACTED]` に置き換えます。ただし完全ではありません。SHIKI の会話は Pi Durable の storage にそのまま残ります。Task の文字列に何を書いたかは確認してください。
+- データは `~/.araya`（`ARAYA_DATA_DIR` で変わります）に置かれます。アクセス権とバックアップは利用者側で管理してください。
+- SHIKI の tool は `read`・`edit`・`write`・`bash` と Araya の tool です。`grep`・`find`・`ls` はありません（bash で代用します）。
+- 試行と検証の期限は、runner が動いていた時間で数えます（一時停止の間は数えません）。`ARAYA_DEVELOPMENT_TIMEOUT_MS` と `ARAYA_VERIFICATION_TIMEOUT_MS` で変えられます。
+- 環境変数・設定ファイルの完全な一覧と、内部の仕組みは docs/development.md にあります。
 
-```sh
-npm test
-npm run typecheck
-```
+## その他のコマンド
 
-テストは一時ディレクトリを使い、実際の SQLite と Pi Durable storage を通して状態遷移を検証します。
+- 引数なしの `araya` は Pi coding agent の TUI を起動します。`araya pi ...` は引数を Pi にそのまま渡し、`araya --help` はヘルプを表示します。
+- 未実装: 自律的な課題発見、外部ソース監視、通知連携。
