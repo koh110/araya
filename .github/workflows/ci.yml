@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # ARAYA の runner を常駐させる host に合わせて、Ubuntu 26.04 と Node.js 26 で動かす
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      # npm test は build してから test を実行する。本物の systemd を使う test は ARAYA_TEST_SYSTEMD=1 のときだけ動くので、ここでは skip される
+      - run: npm test
+
+  systemd:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          cache: npm
+      - run: npm ci
+      # job の user には login session が無いので、linger を有効にして user manager を起動する。
+      # 後の step の systemctl --user と systemd-run --user が user manager に接続できるよう、XDG_RUNTIME_DIR を渡す
+      - name: systemd の user manager を起動する
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export XDG_RUNTIME_DIR
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          state=''
+          for _ in $(seq 1 60); do
+            state=$(systemctl --user is-system-running --wait 2> /dev/null || true)
+            if [ "$state" = running ] || [ "$state" = degraded ]; then
+              break
+            fi
+            sleep 1
+          done
+          echo "user manager: ${state:-unreachable}"
+          if [ "$state" = degraded ]; then
+            systemctl --user --failed --no-pager
+          elif [ "$state" != running ]; then
+            exit 1
+          fi
+      - name: 本物の systemd を使う test を実行する
+        run: node --test packages/araya/test/task-runner-systemd.test.ts
+        env:
+          ARAYA_TEST_SYSTEMD: '1'

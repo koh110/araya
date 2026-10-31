@@ -7,7 +7,7 @@
     "araya": "./bin/cli.ts"
   },
   "engines": {
-    "node": ">=24.0.0"
+    "node": ">=26.8.0"
   },
   "dependencies": {
     "@earendil-works/chord": "1.4.0",
