@@ -1,4 +1,4 @@
-import { randomBytes as cryptoRandomBytes } from 'node:crypto'
+import { createHash, randomBytes as cryptoRandomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { performance } from 'node:perf_hooks'
@@ -13,12 +13,17 @@ import { createRedactor } from '../infrastructure/redaction.ts'
 
 // 同時に running にできる試行の数。runner の取り込みと CLI の queue.limit がこの値を使う
 export const MAX_CONCURRENT_ATTEMPTS = 1
-export const LEDGER_SCHEMA_VERSION = 1
+export const LEDGER_SCHEMA_VERSION = 2
 export const LEDGER_FILE_NAME = 'tasks.sqlite'
 
 export const TASK_STATUSES = ['queued', 'running', 'completed', 'failed', 'blocked'] as const
 export type TaskStatus = (typeof TASK_STATUSES)[number]
-export const STOP_REASONS = ['agent_timeout', 'cancelled', 'restart_limit', 'attempt_error'] as const
+export const STOP_REASONS = [
+  'agent_timeout',
+  'cancelled',
+  'restart_limit',
+  'attempt_error',
+] as const
 export type StopReason = (typeof STOP_REASONS)[number]
 
 export const MAX_TASK_INPUT_BYTES = 256 * 1024
@@ -32,7 +37,16 @@ const MAX_TARGET_CHARS = 200
 const MAX_PERMISSIONS = 16
 const MAX_PERMISSIONS_TOTAL_CHARS = 5_000
 const MAX_IDEMPOTENCY_KEY_CHARS = 200
-const TASK_INPUT_KEYS = ['title', 'goal', 'constraints', 'targets', 'permissions', 'idempotencyKey'] as const
+const CANCEL_RESULTS = ['cancelled', 'requested', 'already_requested'] as const
+type MutationOperation = 'cancel' | 'retry'
+const TASK_INPUT_KEYS = [
+  'title',
+  'goal',
+  'constraints',
+  'targets',
+  'permissions',
+  'idempotencyKey',
+] as const
 
 const MAX_SUMMARY_CHARS = 4_000
 const MAX_STOP_DETAIL_CHARS = 2_000
@@ -50,7 +64,7 @@ const INTERRUPTED_FAILURE_REASONS = [
   'attempt_error',
   'termination_unconfirmed',
   'agent_timeout',
-  'agent_failed'
+  'agent_failed',
 ]
 
 const SCHEMA_V1 = `
@@ -119,6 +133,16 @@ CREATE TABLE runner (
 );
 `
 
+const SCHEMA_V2 = `
+CREATE TABLE mutation_receipts (
+  idempotency_key TEXT PRIMARY KEY,
+  operation TEXT NOT NULL CHECK (operation IN ('cancel', 'retry')),
+  task_id INTEGER NOT NULL REFERENCES tasks (id),
+  request_hash TEXT NOT NULL,
+  result TEXT NOT NULL
+);
+`
+
 export type LedgerErrorCode =
   | 'invalid_task_input'
   | 'invalid_note'
@@ -137,25 +161,31 @@ const LEDGER_ERROR_CODES: readonly LedgerErrorCode[] = [
   'task_not_cancellable',
   'task_not_retryable',
   'side_effects_unconfirmed',
-  'ledger_unsupported_version'
+  'ledger_unsupported_version',
 ]
 
 export type WorktreeLocation = { worktreePath: string; branch: string }
 
 export type LedgerError = Error & { code: LedgerErrorCode; previousWorktrees?: WorktreeLocation[] }
 
-export function ledgerError(code: LedgerErrorCode, message: string, extra: { previousWorktrees?: WorktreeLocation[] } = {}) {
+export function ledgerError(
+  code: LedgerErrorCode,
+  message: string,
+  extra: { previousWorktrees?: WorktreeLocation[] } = {},
+) {
   const error: LedgerError = Object.assign(new Error(`${code}: ${message}`), { code }, extra)
 
   return error
 }
 
 export function isLedgerError(error: unknown): error is LedgerError {
-  return error instanceof Error &&
+  return (
+    error instanceof Error &&
     'code' in error &&
     LEDGER_ERROR_CODES.some((code) => {
       return code === error.code
     })
+  )
 }
 
 export type TaskInput = {
@@ -238,6 +268,9 @@ export type EventView = {
   type: string
   data: Record<string, unknown>
 }
+
+// 通知 loop 用: event に task title を添えた形（Discord の通知文に task 名を載せるため）
+export type NotificationEvent = EventView & { taskId: number; taskTitle: string }
 
 export type RunnerState = 'running' | 'stopped' | 'not_responding' | 'not_started'
 
@@ -327,7 +360,7 @@ function parseRequiredText(value: unknown, key: string, maxChars: number) {
 function parseTextList(
   value: unknown,
   key: string,
-  limits: { maxItems: number; maxItemChars?: number; maxTotalChars?: number }
+  limits: { maxItems: number; maxItemChars?: number; maxTotalChars?: number },
 ) {
   if (value === undefined) {
     return []
@@ -342,7 +375,11 @@ function parseTextList(
   }
 
   const items = value.map((item: unknown, index) => {
-    return parseRequiredText(item, `${key}[${index}]`, limits.maxItemChars ?? Number.MAX_SAFE_INTEGER)
+    return parseRequiredText(
+      item,
+      `${key}[${index}]`,
+      limits.maxItemChars ?? Number.MAX_SAFE_INTEGER,
+    )
   })
   const totalChars = items.reduce((sum, item) => {
     return sum + item.length
@@ -401,8 +438,14 @@ export function parseTaskInput(raw: Uint8Array) {
   let parsedKey: string | null = null
 
   if (idempotencyKey !== undefined) {
-    if (typeof idempotencyKey !== 'string' || idempotencyKey.length < 1 || idempotencyKey.length > MAX_IDEMPOTENCY_KEY_CHARS) {
-      throw invalidInput(`idempotencyKey must be a string of 1 to ${MAX_IDEMPOTENCY_KEY_CHARS} characters`)
+    if (
+      typeof idempotencyKey !== 'string' ||
+      idempotencyKey.length < 1 ||
+      idempotencyKey.length > MAX_IDEMPOTENCY_KEY_CHARS
+    ) {
+      throw invalidInput(
+        `idempotencyKey must be a string of 1 to ${MAX_IDEMPOTENCY_KEY_CHARS} characters`,
+      )
     }
 
     if (idempotencyKey.includes('\0')) {
@@ -417,14 +460,17 @@ export function parseTaskInput(raw: Uint8Array) {
     goal: parseRequiredText(parsed.goal, 'goal', MAX_GOAL_CHARS),
     constraints: parseTextList(parsed.constraints, 'constraints', {
       maxItems: MAX_CONSTRAINTS,
-      maxTotalChars: MAX_CONSTRAINTS_TOTAL_CHARS
+      maxTotalChars: MAX_CONSTRAINTS_TOTAL_CHARS,
     }),
-    targets: parseTextList(parsed.targets, 'targets', { maxItems: MAX_TARGETS, maxItemChars: MAX_TARGET_CHARS }),
+    targets: parseTextList(parsed.targets, 'targets', {
+      maxItems: MAX_TARGETS,
+      maxItemChars: MAX_TARGET_CHARS,
+    }),
     permissions: parseTextList(parsed.permissions, 'permissions', {
       maxItems: MAX_PERMISSIONS,
-      maxTotalChars: MAX_PERMISSIONS_TOTAL_CHARS
+      maxTotalChars: MAX_PERMISSIONS_TOTAL_CHARS,
     }),
-    idempotencyKey: parsedKey
+    idempotencyKey: parsedKey,
   }
 
   return input
@@ -444,7 +490,11 @@ export function parseRetryNote(note: string) {
 }
 
 // task-<Task ID>-<試行番号>-<a-z2-7 の6文字>。台帳を作り直しても worktree・branch・scope の名前が重ならないように乱数を付ける
-export function createTaskKey(taskId: number, attempt: number, randomBytes: (size: number) => Uint8Array = cryptoRandomBytes) {
+export function createTaskKey(
+  taskId: number,
+  attempt: number,
+  randomBytes: (size: number) => Uint8Array = cryptoRandomBytes,
+) {
   const bytes = randomBytes(TASK_KEY_SUFFIX_CHARS)
   let suffix = ''
 
@@ -470,14 +520,20 @@ function hasDraftPrSideEffects(evidence: Record<string, unknown> | null) {
       return false
     }
 
-    return worktree.remoteSideEffectsUnconfirmed === true ||
+    return (
+      worktree.remoteSideEffectsUnconfirmed === true ||
       worktree.draftPrStatus === 'pushed' ||
       worktree.draftPrStatus === 'created' ||
       worktree.draftPrStatus === 'reused'
+    )
   })
 }
 
-export function isInterruptedAttempt(row: { startedAt: string | null; failureReason: string | null; evidence: Record<string, unknown> | null }) {
+export function isInterruptedAttempt(row: {
+  startedAt: string | null
+  failureReason: string | null
+  evidence: Record<string, unknown> | null
+}) {
   if (row.startedAt === null || row.failureReason === null) {
     return false
   }
@@ -509,7 +565,11 @@ export function worktreesFromEvidence(evidence: Record<string, unknown> | null) 
   const locations: WorktreeLocation[] = []
 
   for (const worktree of worktrees) {
-    if (isRecord(worktree) && typeof worktree.worktreePath === 'string' && typeof worktree.branch === 'string') {
+    if (
+      isRecord(worktree) &&
+      typeof worktree.worktreePath === 'string' &&
+      typeof worktree.branch === 'string'
+    ) {
       locations.push({ worktreePath: worktree.worktreePath, branch: worktree.branch })
     }
   }
@@ -619,9 +679,10 @@ function parseSettings(value: unknown) {
     settingsModel = {
       provider: asText(model.provider),
       id: asText(model.id),
-      thinkingLevel: thinkingLevel === null || thinkingLevel === undefined
-        ? null
-        : parseThinkingLevel(thinkingLevel)
+      thinkingLevel:
+        thinkingLevel === null || thinkingLevel === undefined
+          ? null
+          : parseThinkingLevel(thinkingLevel),
     }
   }
 
@@ -630,7 +691,7 @@ function parseSettings(value: unknown) {
     agentDir: asText(parsed.agentDir),
     model: settingsModel,
     timeoutMs: asNumber(parsed.timeoutMs),
-    verificationTimeoutMs: asNumber(parsed.verificationTimeoutMs)
+    verificationTimeoutMs: asNumber(parsed.verificationTimeoutMs),
   }
 
   return settings
@@ -677,7 +738,7 @@ function fitEventData(data: Record<string, unknown>) {
   return fitted
 }
 
-function transaction<T>(db: DatabaseSync, fn: () => T): T {
+function transaction<T>(db: DatabaseSync, fn: () => T) {
   db.exec('BEGIN IMMEDIATE')
 
   try {
@@ -717,7 +778,11 @@ function ensureSchema(db: DatabaseSync) {
   transaction(db, () => {
     const version = asNumber(db.prepare('PRAGMA user_version').get()?.user_version)
     const tableCount = asNumber(
-      db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").get()?.count
+      db
+        .prepare(
+          "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )
+        .get()?.count,
     )
 
     if (version === LEDGER_SCHEMA_VERSION) {
@@ -726,6 +791,14 @@ function ensureSchema(db: DatabaseSync) {
 
     if (version === 0 && tableCount === 0) {
       db.exec(SCHEMA_V1)
+      db.exec(SCHEMA_V2)
+      db.exec(`PRAGMA user_version = ${LEDGER_SCHEMA_VERSION}`)
+
+      return
+    }
+
+    if (version === 1) {
+      db.exec(SCHEMA_V2)
       db.exec(`PRAGMA user_version = ${LEDGER_SCHEMA_VERSION}`)
 
       return
@@ -735,7 +808,7 @@ function ensureSchema(db: DatabaseSync) {
       'ledger_unsupported_version',
       version === 0
         ? 'the task ledger has tables but no schema version'
-        : `the task ledger has an unsupported schema version ${version}`
+        : `the task ledger has an unsupported schema version ${version}`,
     )
   })
 }
@@ -797,7 +870,7 @@ function toRunRow(row: Record<string, unknown>) {
     decisionQuestion: asNullableText(row.decision_question),
     failureReason: asNullableText(row.failure_reason),
     failureDetail: asNullableText(row.failure_detail),
-    evidence: parseNullableObject(row.evidence_json)
+    evidence: parseNullableObject(row.evidence_json),
   }
 
   return run
@@ -822,7 +895,7 @@ function toAttemptView(run: RunRow) {
     failureReason: run.failureReason,
     failureDetail: run.failureDetail,
     stateDir: run.stateDir,
-    evidence: run.evidence
+    evidence: run.evidence,
   }
 
   return view
@@ -845,7 +918,7 @@ function toTaskView(row: Record<string, unknown>) {
     targets: parseStringArray(row.targets_json),
     permissions: parseStringArray(row.permissions_json),
     summary: asNullableText(row.r_summary),
-    cancelRequested: status === 'running' && asNullableText(row.r_cancel_requested_at) !== null
+    cancelRequested: status === 'running' && asNullableText(row.r_cancel_requested_at) !== null,
   }
 
   return view
@@ -860,7 +933,7 @@ function toTaskSummary(view: TaskView) {
     failureReason: view.failureReason,
     decisionQuestion: view.decisionQuestion,
     createdAt: view.createdAt,
-    updatedAt: view.updatedAt
+    updatedAt: view.updatedAt,
   }
 
   return summary
@@ -872,12 +945,14 @@ const TASK_WITH_LATEST_RUN = `
   FROM tasks t JOIN runs r ON r.task_id = t.id AND r.attempt = t.current_attempt
 `
 
-function isSqliteBusy(error: unknown): boolean {
-  return typeof error === 'object'
-    && error !== null
-    && 'errcode' in error
-    && typeof error.errcode === 'number'
-    && (error.errcode & 0xff) === 5
+function isSqliteBusy(error: unknown) {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'errcode' in error &&
+    typeof error.errcode === 'number' &&
+    (error.errcode & 0xff) === 5
+  )
 }
 
 function enableWalMode(db: DatabaseSync) {
@@ -930,7 +1005,11 @@ function enableWalMode(db: DatabaseSync) {
 }
 
 export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {}) {
-  const now = options.now ?? (() => new Date())
+  const now =
+    options.now ??
+    (() => {
+      return new Date()
+    })
   const randomBytes = options.randomBytes ?? cryptoRandomBytes
   const redactor = createRedactor(options.secretValues ?? [])
   const ledgerPath = prepareLedgerFiles(dataDir)
@@ -961,9 +1040,79 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
     return maxChars === undefined ? redacted : truncateChars(redacted, maxChars)
   }
 
-  function appendEvent(taskId: number, attempt: number | null, type: string, data: Record<string, unknown>, at = nowIso()) {
-    db.prepare('INSERT INTO task_events (task_id, attempt, at, type, data_json) VALUES (?, ?, ?, ?, ?)')
-      .run(taskId, attempt, at, type, JSON.stringify(data))
+  function appendEvent(
+    taskId: number,
+    attempt: number | null,
+    type: string,
+    data: Record<string, unknown>,
+    at = nowIso(),
+  ) {
+    db.prepare(
+      'INSERT INTO task_events (task_id, attempt, at, type, data_json) VALUES (?, ?, ?, ?, ?)',
+    ).run(taskId, attempt, at, type, JSON.stringify(data))
+  }
+
+  function mutationRequestHash(input: Record<string, unknown>) {
+    return createHash('sha256').update(JSON.stringify(input)).digest('hex')
+  }
+
+  function readMutationReceipt(
+    idempotencyKey: string | undefined,
+    operation: MutationOperation,
+    taskId: number,
+    requestHash: string,
+  ) {
+    if (idempotencyKey === undefined) {
+      return null
+    }
+
+    if (
+      idempotencyKey.length < 1 ||
+      idempotencyKey.length > MAX_IDEMPOTENCY_KEY_CHARS ||
+      idempotencyKey.includes(String.fromCharCode(0))
+    ) {
+      throw ledgerError('invalid_task_input', 'the mutation idempotency key is invalid')
+    }
+
+    const row = db
+      .prepare(
+        'SELECT operation, task_id, request_hash, result FROM mutation_receipts WHERE idempotency_key = ?',
+      )
+      .get(idempotencyKey)
+
+    if (row === undefined) {
+      return null
+    }
+
+    const matches =
+      row.operation === operation &&
+      asNumber(row.task_id) === taskId &&
+      row.request_hash === requestHash
+
+    if (!matches) {
+      throw ledgerError(
+        'idempotency_conflict',
+        'a mutation with the same idempotency key has different values',
+      )
+    }
+
+    return asText(row.result)
+  }
+
+  function writeMutationReceipt(
+    idempotencyKey: string | undefined,
+    operation: MutationOperation,
+    taskId: number,
+    requestHash: string,
+    result: string,
+  ) {
+    if (idempotencyKey === undefined) {
+      return
+    }
+
+    db.prepare(
+      'INSERT INTO mutation_receipts (idempotency_key, operation, task_id, request_hash, result) VALUES (?, ?, ?, ?, ?)',
+    ).run(idempotencyKey, operation, taskId, requestHash, result)
   }
 
   function readTaskView(taskId: number) {
@@ -977,7 +1126,9 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
   }
 
   function readRun(taskId: number, attempt: number) {
-    const row = db.prepare('SELECT * FROM runs WHERE task_id = ? AND attempt = ?').get(taskId, attempt)
+    const row = db
+      .prepare('SELECT * FROM runs WHERE task_id = ? AND attempt = ?')
+      .get(taskId, attempt)
 
     return row === undefined ? undefined : toRunRow(row)
   }
@@ -990,14 +1141,17 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
 
   function insertRun(taskId: number, attempt: number, note: string | null, at: string) {
     const taskKey = createTaskKey(taskId, attempt, randomBytes)
-    db.prepare('INSERT INTO runs (task_id, attempt, task_key, status, note, queued_at) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(taskId, attempt, taskKey, 'queued', note, at)
+    db.prepare(
+      'INSERT INTO runs (task_id, attempt, task_key, status, note, queued_at) VALUES (?, ?, ?, ?, ?, ?)',
+    ).run(taskId, attempt, taskKey, 'queued', note, at)
 
     return taskKey
   }
 
   function settle(settlements: readonly Settlement[]) {
-    const statement = db.prepare("UPDATE runs SET active_ms = active_ms + ? WHERE task_key = ? AND status = 'running'")
+    const statement = db.prepare(
+      "UPDATE runs SET active_ms = active_ms + ? WHERE task_key = ? AND status = 'running'",
+    )
 
     for (const settlement of settlements) {
       if (settlement.addMs > 0) {
@@ -1007,7 +1161,9 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
   }
 
   function countRuns(status: TaskStatus) {
-    return asNumber(db.prepare('SELECT COUNT(*) AS count FROM runs WHERE status = ?').get(status)?.count)
+    return asNumber(
+      db.prepare('SELECT COUNT(*) AS count FROM runs WHERE status = ?').get(status)?.count,
+    )
   }
 
   function toPreviousAttempt(run: RunRow) {
@@ -1018,7 +1174,7 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
       summary: run.summary,
       decisionQuestion: run.decisionQuestion,
       worktrees: worktreesFromEvidence(run.evidence),
-      interrupted: isInterruptedAttempt(run)
+      interrupted: isInterruptedAttempt(run),
     }
 
     return previous
@@ -1038,10 +1194,25 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
       permissions: task.permissions,
       note: run.note,
       settings,
-      previous: previousRun === undefined ? null : toPreviousAttempt(previousRun)
+      previous: previousRun === undefined ? null : toPreviousAttempt(previousRun),
     }
 
     return claimed
+  }
+
+  // task_events と tasks を join した row を通知 event に変換する
+  function toNotificationEventRow(row: Record<string, unknown>) {
+    const event: NotificationEvent = {
+      seq: asNumber(row.seq),
+      taskId: asNumber(row.task_id),
+      taskTitle: asText(row.title),
+      attempt: asNullableNumber(row.attempt),
+      at: asText(row.at),
+      type: asText(row.type),
+      data: parseNullableObject(row.data_json) ?? {},
+    }
+
+    return event
   }
 
   return {
@@ -1056,7 +1227,7 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
       return {
         busyTimeout: asNumber(db.prepare('PRAGMA busy_timeout').get()?.timeout),
         journalMode: asText(db.prepare('PRAGMA journal_mode').get()?.journal_mode),
-        foreignKeys: asNumber(db.prepare('PRAGMA foreign_keys').get()?.foreign_keys)
+        foreignKeys: asNumber(db.prepare('PRAGMA foreign_keys').get()?.foreign_keys),
       }
     },
 
@@ -1069,17 +1240,23 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
         const permissionsJson = JSON.stringify(input.permissions)
 
         if (input.idempotencyKey !== null) {
-          const existing = db.prepare('SELECT * FROM tasks WHERE idempotency_key = ?').get(input.idempotencyKey)
+          const existing = db
+            .prepare('SELECT * FROM tasks WHERE idempotency_key = ?')
+            .get(input.idempotencyKey)
 
           if (existing !== undefined) {
-            const same = existing.title === input.title &&
+            const same =
+              existing.title === input.title &&
               existing.goal === input.goal &&
               existing.constraints_json === constraintsJson &&
               existing.targets_json === targetsJson &&
               existing.permissions_json === permissionsJson
 
             if (!same) {
-              throw ledgerError('idempotency_conflict', 'a Task with the same idempotencyKey has different values')
+              throw ledgerError(
+                'idempotency_conflict',
+                'a Task with the same idempotencyKey has different values',
+              )
             }
 
             return { created: false, task: readTaskView(asNumber(existing.id)) }
@@ -1087,11 +1264,22 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
         }
 
         const at = nowIso()
-        const inserted = db.prepare(`
+        const inserted = db
+          .prepare(`
           INSERT INTO tasks (kind, title, goal, constraints_json, targets_json, permissions_json, idempotency_key,
             status, current_attempt, created_at, updated_at)
           VALUES ('development', ?, ?, ?, ?, ?, ?, 'queued', 1, ?, ?)
-        `).run(input.title, input.goal, constraintsJson, targetsJson, permissionsJson, input.idempotencyKey, at, at)
+        `)
+          .run(
+            input.title,
+            input.goal,
+            constraintsJson,
+            targetsJson,
+            permissionsJson,
+            input.idempotencyKey,
+            at,
+            at,
+          )
         const taskId = asNumber(inserted.lastInsertRowid)
         insertRun(taskId, 1, null, at)
         appendEvent(taskId, 1, 'task.created', {}, at)
@@ -1101,9 +1289,12 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
     },
 
     listTasks(filter: { status?: TaskStatus; limit: number }) {
-      const rows = filter.status === undefined
-        ? db.prepare(`${TASK_WITH_LATEST_RUN} ORDER BY t.id DESC LIMIT ?`).all(filter.limit)
-        : db.prepare(`${TASK_WITH_LATEST_RUN} WHERE t.status = ? ORDER BY t.id DESC LIMIT ?`).all(filter.status, filter.limit)
+      const rows =
+        filter.status === undefined
+          ? db.prepare(`${TASK_WITH_LATEST_RUN} ORDER BY t.id DESC LIMIT ?`).all(filter.limit)
+          : db
+              .prepare(`${TASK_WITH_LATEST_RUN} WHERE t.status = ? ORDER BY t.id DESC LIMIT ?`)
+              .all(filter.status, filter.limit)
 
       return rows.map((row) => {
         return toTaskSummary(toTaskView(row))
@@ -1116,10 +1307,14 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
 
     showTask(taskId: number, options: { events: number }) {
       const task = readTaskView(taskId)
-      const attempts = db.prepare('SELECT * FROM runs WHERE task_id = ? ORDER BY attempt ASC').all(taskId).map((row) => {
-        return toAttemptView(toRunRow(row))
-      })
-      const events = db.prepare('SELECT * FROM task_events WHERE task_id = ? ORDER BY seq DESC LIMIT ?')
+      const attempts = db
+        .prepare('SELECT * FROM runs WHERE task_id = ? ORDER BY attempt ASC')
+        .all(taskId)
+        .map((row) => {
+          return toAttemptView(toRunRow(row))
+        })
+      const events = db
+        .prepare('SELECT * FROM task_events WHERE task_id = ? ORDER BY seq DESC LIMIT ?')
         .all(taskId, options.events)
         .map((row) => {
           const event: EventView = {
@@ -1127,7 +1322,7 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
             attempt: asNullableNumber(row.attempt),
             at: asText(row.at),
             type: asText(row.type),
-            data: parseNullableObject(row.data_json) ?? {}
+            data: parseNullableObject(row.data_json) ?? {},
           }
 
           return event
@@ -1137,12 +1332,77 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
       return { task, attempts, events }
     },
 
-    retryTask(taskId: number, options: { note: string | null; confirmSideEffects: boolean }) {
+    // 通知 loop 用: seq が指定値より大きい event を seq 昇順で。task title を添える
+    listEventsSince(seq: number, limit: number) {
+      const rows = db
+        .prepare(`
+        SELECT e.seq, e.task_id, e.attempt, e.at, e.type, e.data_json, t.title
+        FROM task_events e
+        JOIN tasks t ON t.id = e.task_id
+        WHERE e.seq > ?
+        ORDER BY e.seq ASC
+        LIMIT ?
+      `)
+        .all(seq, limit)
+
+      return rows.map((row) => {
+        return toNotificationEventRow(row)
+      })
+    },
+
+    // ある seq の event 1 件。無ければ null（通知の送り直しで同じ文章を組み立てるため）
+    getEvent(seq: number) {
+      const row = db
+        .prepare(`
+        SELECT e.seq, e.task_id, e.attempt, e.at, e.type, e.data_json, t.title
+        FROM task_events e
+        JOIN tasks t ON t.id = e.task_id
+        WHERE e.seq = ?
+      `)
+        .get(seq)
+
+      return row === undefined ? null : toNotificationEventRow(row)
+    },
+
+    // event が 1 件も無ければ 0。Discord bot の初回位置の基準
+    lastEventSeq() {
+      return asNumber(db.prepare('SELECT MAX(seq) AS seq FROM task_events').get()?.seq ?? 0)
+    },
+
+    retryTask(
+      taskId: number,
+      options: { note: string | null; confirmSideEffects: boolean; idempotencyKey?: string },
+    ) {
       return transaction(db, () => {
+        const requestHash = mutationRequestHash({
+          note: options.note,
+          confirmSideEffects: options.confirmSideEffects,
+        })
+        const receipt = readMutationReceipt(options.idempotencyKey, 'retry', taskId, requestHash)
+
+        if (receipt !== null) {
+          const previousAttempt = Number(receipt)
+
+          if (!Number.isSafeInteger(previousAttempt) || previousAttempt < 1) {
+            throw new Error('the retry mutation receipt has an invalid attempt number')
+          }
+
+          const current = readTaskView(taskId)
+
+          if (current.attempt < previousAttempt) {
+            throw new Error('the retry mutation receipt points to a future attempt')
+          }
+
+          return current
+        }
+
         const task = readTaskView(taskId)
 
         if (task.status !== 'failed' && task.status !== 'blocked') {
-          throw ledgerError('task_not_retryable', `Task ${taskId} is ${task.status}; only failed and blocked Tasks can be retried`)
+          throw ledgerError(
+            'task_not_retryable',
+            `Task ${taskId} is ${task.status}; only failed and blocked Tasks can be retried`,
+          )
         }
 
         const latest = readRun(taskId, task.attempt)
@@ -1155,25 +1415,51 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
           throw ledgerError(
             'side_effects_unconfirmed',
             `the previous attempt may have changed an external branch or pull request; confirm the previous worktree and remote state before retrying`,
-            { previousWorktrees: worktreesFromEvidence(latest.evidence) }
+            { previousWorktrees: worktreesFromEvidence(latest.evidence) },
           )
         }
 
         const at = nowIso()
         const attempt = task.attempt + 1
         insertRun(taskId, attempt, options.note, at)
-        db.prepare("UPDATE tasks SET current_attempt = ?, status = 'queued', updated_at = ? WHERE id = ?").run(attempt, at, taskId)
-        appendEvent(taskId, attempt, 'task.retried', {
-          hasNote: options.note !== null,
-          confirmedSideEffects: options.confirmSideEffects
-        }, at)
+        db.prepare(
+          "UPDATE tasks SET current_attempt = ?, status = 'queued', updated_at = ? WHERE id = ?",
+        ).run(attempt, at, taskId)
+        appendEvent(
+          taskId,
+          attempt,
+          'task.retried',
+          {
+            hasNote: options.note !== null,
+            confirmedSideEffects: options.confirmSideEffects,
+          },
+          at,
+        )
 
-        return readTaskView(taskId)
+        const retried = readTaskView(taskId)
+        writeMutationReceipt(options.idempotencyKey, 'retry', taskId, requestHash, String(attempt))
+
+        return retried
       })
     },
 
-    cancelTask(taskId: number) {
+    cancelTask(taskId: number, options: { idempotencyKey?: string } = {}) {
       return transaction(db, () => {
+        const requestHash = mutationRequestHash({})
+        const receipt = readMutationReceipt(options.idempotencyKey, 'cancel', taskId, requestHash)
+
+        if (receipt !== null) {
+          const cancel = CANCEL_RESULTS.find((result) => {
+            return result === receipt
+          })
+
+          if (cancel === undefined) {
+            throw new Error('the cancel mutation receipt has an invalid result')
+          }
+
+          return { cancel, task: readTaskView(taskId) }
+        }
+
         const task = readTaskView(taskId)
         const latest = readRun(taskId, task.attempt)
 
@@ -1188,25 +1474,49 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
             UPDATE runs SET status = 'failed', failure_reason = 'cancelled', cancel_requested_at = ?, finished_at = ?
             WHERE task_id = ? AND attempt = ?
           `).run(at, at, taskId, latest.attempt)
-          db.prepare("UPDATE tasks SET status = 'failed', updated_at = ? WHERE id = ?").run(at, taskId)
+          db.prepare("UPDATE tasks SET status = 'failed', updated_at = ? WHERE id = ?").run(
+            at,
+            taskId,
+          )
           appendEvent(taskId, latest.attempt, 'task.cancel_requested', { while: 'queued' }, at)
-          appendEvent(taskId, latest.attempt, 'run.finished', { status: 'failed', failureReason: 'cancelled' }, at)
+          appendEvent(
+            taskId,
+            latest.attempt,
+            'run.finished',
+            { status: 'failed', failureReason: 'cancelled' },
+            at,
+          )
+          writeMutationReceipt(options.idempotencyKey, 'cancel', taskId, requestHash, 'cancelled')
 
           return { cancel: 'cancelled' as const, task: readTaskView(taskId) }
         }
 
         if (latest.status === 'running') {
           if (latest.cancelRequestedAt !== null) {
+            writeMutationReceipt(
+              options.idempotencyKey,
+              'cancel',
+              taskId,
+              requestHash,
+              'already_requested',
+            )
+
             return { cancel: 'already_requested' as const, task }
           }
 
-          db.prepare('UPDATE runs SET cancel_requested_at = ? WHERE task_id = ? AND attempt = ?').run(at, taskId, latest.attempt)
+          db.prepare(
+            'UPDATE runs SET cancel_requested_at = ? WHERE task_id = ? AND attempt = ?',
+          ).run(at, taskId, latest.attempt)
           appendEvent(taskId, latest.attempt, 'task.cancel_requested', { while: 'running' }, at)
+          writeMutationReceipt(options.idempotencyKey, 'cancel', taskId, requestHash, 'requested')
 
           return { cancel: 'requested' as const, task: readTaskView(taskId) }
         }
 
-        throw ledgerError('task_not_cancellable', `Task ${taskId} is ${latest.status}; only queued and running Tasks can be cancelled`)
+        throw ledgerError(
+          'task_not_cancellable',
+          `Task ${taskId} is ${latest.status}; only queued and running Tasks can be cancelled`,
+        )
       })
     },
 
@@ -1215,7 +1525,14 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
       const row = db.prepare('SELECT * FROM runner WHERE id = 1').get()
 
       if (row === undefined) {
-        const view: RunnerView = { unit, state: 'not_started', pid: null, startedAt: null, heartbeatAt: null, stoppedAt: null }
+        const view: RunnerView = {
+          unit,
+          state: 'not_started',
+          pid: null,
+          startedAt: null,
+          heartbeatAt: null,
+          stoppedAt: null,
+        }
 
         return view
       }
@@ -1233,7 +1550,7 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
         pid: asNumber(row.pid),
         startedAt: asText(row.started_at),
         heartbeatAt,
-        stoppedAt: asNullableText(row.stopped_at)
+        stoppedAt: asNullableText(row.stopped_at),
       }
 
       return view
@@ -1269,7 +1586,10 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
     // heartbeat_at を今の時刻にし、動かしている試行の稼働時間を精算する
     heartbeat(invocationId: string, settlements: readonly Settlement[]) {
       transaction(db, () => {
-        db.prepare('UPDATE runner SET heartbeat_at = ? WHERE id = 1 AND invocation_id = ?').run(nowIso(), invocationId)
+        db.prepare('UPDATE runner SET heartbeat_at = ? WHERE id = 1 AND invocation_id = ?').run(
+          nowIso(),
+          invocationId,
+        )
         settle(settlements)
       })
     },
@@ -1285,12 +1605,17 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
     markRunnerStopped(invocationId: string, settlements: readonly Settlement[]) {
       transaction(db, () => {
         settle(settlements)
-        db.prepare("UPDATE runner SET state = 'stopped', stopped_at = ? WHERE id = 1 AND invocation_id = ?").run(nowIso(), invocationId)
+        db.prepare(
+          "UPDATE runner SET state = 'stopped', stopped_at = ? WHERE id = 1 AND invocation_id = ?",
+        ).run(nowIso(), invocationId)
       })
     },
 
     listRunningAttempts() {
-      return db.prepare("SELECT * FROM runs WHERE status = 'running' ORDER BY started_at ASC, task_id ASC, attempt ASC")
+      return db
+        .prepare(
+          "SELECT * FROM runs WHERE status = 'running' ORDER BY started_at ASC, task_id ASC, attempt ASC",
+        )
         .all()
         .map((row) => {
           const run = toRunRow(row)
@@ -1304,7 +1629,7 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
             agentFinishedAt: run.agentFinishedAt,
             cancelRequestedAt: run.cancelRequestedAt,
             stopReason: run.stopReason,
-            stopDetail: run.stopDetail
+            stopDetail: run.stopDetail,
           }
 
           return attempt
@@ -1323,7 +1648,11 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
           return null
         }
 
-        const row = db.prepare("SELECT * FROM runs WHERE status = 'queued' ORDER BY queued_at ASC, task_id ASC, attempt ASC LIMIT 1").get()
+        const row = db
+          .prepare(
+            "SELECT * FROM runs WHERE status = 'queued' ORDER BY queued_at ASC, task_id ASC, attempt ASC LIMIT 1",
+          )
+          .get()
 
         if (row === undefined) {
           return null
@@ -1331,9 +1660,13 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
 
         const run = toRunRow(row)
         const at = nowIso()
-        db.prepare("UPDATE runs SET status = 'running', started_at = ?, settings_json = ? WHERE task_id = ? AND attempt = ?")
-          .run(at, JSON.stringify(settings), run.taskId, run.attempt)
-        db.prepare("UPDATE tasks SET status = 'running', updated_at = ? WHERE id = ?").run(at, run.taskId)
+        db.prepare(
+          "UPDATE runs SET status = 'running', started_at = ?, settings_json = ? WHERE task_id = ? AND attempt = ?",
+        ).run(at, JSON.stringify(settings), run.taskId, run.attempt)
+        db.prepare("UPDATE tasks SET status = 'running', updated_at = ? WHERE id = ?").run(
+          at,
+          run.taskId,
+        )
         appendEvent(run.taskId, run.attempt, 'run.started', { taskKey: run.taskKey }, at)
 
         return toClaimedAttempt(run, settings)
@@ -1364,11 +1697,13 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
     // 試行がまだ running で stop_reason が空のとき（agent_timeout は SHIKI の終わりが未記録のときも）だけ中止を始める
     beginStop(taskKey: string, reason: StopReason, detail: string | null) {
       return transaction(db, () => {
-        const result = db.prepare(`
+        const result = db
+          .prepare(`
           UPDATE runs SET stop_reason = ?, stop_detail = ?
           WHERE task_key = ? AND status = 'running' AND stop_reason IS NULL
             AND (? <> 'agent_timeout' OR agent_finished_at IS NULL)
-        `).run(reason, redactNullable(detail, MAX_STOP_DETAIL_CHARS), taskKey, reason)
+        `)
+          .run(reason, redactNullable(detail, MAX_STOP_DETAIL_CHARS), taskKey, reason)
 
         if (asNumber(result.changes) === 0) {
           return false
@@ -1389,7 +1724,10 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
     // 状態 directory の path を、まだ記録されていなければ記録する
     recordStateDir(taskKey: string, stateDir: string) {
       transaction(db, () => {
-        db.prepare('UPDATE runs SET state_dir = ? WHERE task_key = ? AND state_dir IS NULL').run(stateDir, taskKey)
+        db.prepare('UPDATE runs SET state_dir = ? WHERE task_key = ? AND state_dir IS NULL').run(
+          stateDir,
+          taskKey,
+        )
       })
     },
 
@@ -1410,7 +1748,10 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
           return 'already_recorded' as const
         }
 
-        db.prepare('UPDATE runs SET agent_finished_at = ? WHERE task_key = ?').run(nowIso(), taskKey)
+        db.prepare('UPDATE runs SET agent_finished_at = ? WHERE task_key = ?').run(
+          nowIso(),
+          taskKey,
+        )
 
         return 'recorded' as const
       })
@@ -1431,13 +1772,20 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
           return 'dropped' as const
         }
 
-        const count = asNumber(db.prepare(`
+        const count = asNumber(
+          db
+            .prepare(`
           SELECT COUNT(*) AS count FROM task_events
           WHERE task_id = ? AND attempt = ? AND type IN ('tool.started', 'tool.finished')
-        `).get(run.taskId, run.attempt)?.count)
+        `)
+            .get(run.taskId, run.attempt)?.count,
+        )
 
         if (count >= MAX_TOOL_EVENTS_PER_ATTEMPT) {
-          const truncated = db.prepare("SELECT 1 FROM task_events WHERE task_id = ? AND attempt = ? AND type = 'events.truncated'")
+          const truncated = db
+            .prepare(
+              "SELECT 1 FROM task_events WHERE task_id = ? AND attempt = ? AND type = 'events.truncated'",
+            )
             .get(run.taskId, run.attempt)
 
           if (truncated !== undefined) {
@@ -1467,11 +1815,18 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
         }
 
         settle([settlement])
-        const activeMs = asNumber(db.prepare('SELECT active_ms FROM runs WHERE task_key = ?').get(taskKey)?.active_ms)
-        const resumes = asNumber(db.prepare(`
+        const activeMs = asNumber(
+          db.prepare('SELECT active_ms FROM runs WHERE task_key = ?').get(taskKey)?.active_ms,
+        )
+        const resumes = asNumber(
+          db
+            .prepare(`
           SELECT COUNT(*) AS count FROM task_events WHERE task_id = ? AND attempt = ? AND type = 'run.resumed'
-        `).get(run.taskId, run.attempt)?.count)
-        const cancelOverrides = run.cancelRequestedAt !== null &&
+        `)
+            .get(run.taskId, run.attempt)?.count,
+        )
+        const cancelOverrides =
+          run.cancelRequestedAt !== null &&
           !(result.status === 'failed' && result.failureReason === 'cancelled')
         const status = cancelOverrides ? 'failed' : result.status
         const failureReason = cancelOverrides ? 'cancelled' : result.failureReason
@@ -1479,7 +1834,7 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
         const evidence: Record<string, unknown> = {
           ...redactor.redactRecord(result.evidence),
           resumes,
-          activeMs
+          activeMs,
         }
 
         if (cancelOverrides) {
@@ -1488,7 +1843,7 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
           evidence.resultBeforeCancel = {
             status: result.status,
             failureReason: result.failureReason,
-            failureDetail: redactNullable(result.failureDetail)
+            failureDetail: redactNullable(result.failureDetail),
           }
         }
 
@@ -1506,13 +1861,17 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
           failureReason,
           failureDetail,
           JSON.stringify(evidence),
-          taskKey
+          taskKey,
         )
-        db.prepare('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?').run(status, at, run.taskId)
+        db.prepare('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?').run(
+          status,
+          at,
+          run.taskId,
+        )
         appendEvent(run.taskId, run.attempt, 'run.finished', { status, failureReason }, at)
 
         return { recorded: true as const, status, failureReason }
       })
-    }
+    },
   }
 }

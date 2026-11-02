@@ -11,20 +11,20 @@ import {
   type SettledTask,
   type Storage,
   type TaskId,
-  type TaskOutcome
+  type TaskOutcome,
 } from '@earendil-works/pi-durable'
-import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node'
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node'
 
-import { loadConfig, loadPiSdk } from '../config/environment.ts'
+import { loadConfig, loadPiSdk, withoutDiscordEnvironment } from '../config/environment.ts'
 import { loadConfigFile } from '../config/file.ts'
+import { createDevelopmentExecutionEnv } from '../infrastructure/development-execution-env.ts'
 import { collectSecretValues, createRedactor } from '../infrastructure/redaction.ts'
 import {
   createSystemdOps,
   dataDirHash,
   runnerUnitName,
   scopePattern,
-  type SystemdOps
+  type SystemdOps,
 } from '../infrastructure/systemd.ts'
 import {
   AttemptsDoc,
@@ -33,7 +33,7 @@ import {
   createShikiExtension,
   isAttemptResult,
   type AttemptFaults,
-  type PiModelSettings
+  type PiModelSettings,
 } from './attempt.ts'
 import {
   MAX_CONCURRENT_ATTEMPTS,
@@ -44,7 +44,7 @@ import {
   type RunningAttempt,
   type Settlement,
   type StopReason,
-  type TaskLedger
+  type TaskLedger,
 } from './ledger.ts'
 
 // runner の本体（起動、開き直したときの確認、loop、取り込み、中止、結果の記録、止めるとき、Harness が失敗で閉じたとき、log）。
@@ -94,7 +94,10 @@ export type RunnerDependencies = {
   openStorage?: (storagePath: string) => Promise<Storage>
   createModels?: (input: { agentDir: string; dataDir: string }) => Promise<ModelRuntime>
   createSystemdOps?: (env: Env) => Promise<SystemdOps>
-  createPiSettings?: (stateDir: string, agentDir: string) => PiModelSettings | Promise<PiModelSettings>
+  createPiSettings?: (
+    stateDir: string,
+    agentDir: string,
+  ) => PiModelSettings | Promise<PiModelSettings>
   // test が runner 全体を検証するときに delivery を無効化できる。製品 runner の既定は有効
   draftPrDelivery?: boolean
   // 実行枠の上限。既定は MAX_CONCURRENT_ATTEMPTS
@@ -107,7 +110,9 @@ export type RunnerDependencies = {
   faults?: RunnerFaults & AttemptFaults
 }
 
-type SettledItem = { taskKey: string; settled: SettledTask<AttemptResult> } | { taskKey: string; error: unknown }
+type SettledItem =
+  | { taskKey: string; settled: SettledTask<AttemptResult> }
+  | { taskKey: string; error: unknown }
 
 function describeError(error: unknown) {
   return error instanceof Error ? error.message : String(error)
@@ -146,9 +151,9 @@ async function settleWithin(promise: Promise<unknown>, timeoutMs: number) {
         },
         (error: unknown) => {
           return { kind: 'failed' as const, error }
-        }
+        },
       ),
-      timeout
+      timeout,
     ])
   } finally {
     clearTimeout(timer)
@@ -163,14 +168,22 @@ function describeOutcome(outcome: TaskOutcome<AttemptResult>) {
     case 'orphaned':
       return `${outcome.status}: ${outcome.reason}`
     case 'aborted':
-      return outcome.reason === undefined ? `${outcome.status}: the attempt task has no result` : `${outcome.status}: ${outcome.reason}`
+      return outcome.reason === undefined
+        ? `${outcome.status}: the attempt task has no result`
+        : `${outcome.status}: ${outcome.reason}`
     default:
       return `${outcome.status}: the attempt task has no result`
   }
 }
 
 // <dataDir>/logs/runner.log に1行1件の JSON で追記する。秘密を置き換える。書けなくても runner は止めない
-export function createRunnerLog(dataDir: string, secretValues: readonly string[], now: () => Date = () => new Date()) {
+export function createRunnerLog(
+  dataDir: string,
+  secretValues: readonly string[],
+  now: () => Date = () => {
+    return new Date()
+  },
+) {
   const redactor = createRedactor(secretValues)
   const logPath = path.join(dataDir, 'logs', LOG_FILE)
 
@@ -192,7 +205,7 @@ export async function createRunnerModelRuntime(input: { agentDir: string; dataDi
     modelsPath: path.join(input.agentDir, 'models.json'),
     modelsStorePath: path.join(input.dataDir, STORAGE_DIR, 'models-store.json'),
     allowModelNetwork: false,
-    refreshOnCreate: false
+    refreshOnCreate: false,
   })
   await runtime.refresh({ allowNetwork: false })
 
@@ -200,7 +213,10 @@ export async function createRunnerModelRuntime(input: { agentDir: string; dataDi
 }
 
 // bin の entrypoint が process に付ける handler。SIGTERM・SIGINT で止まるように求め、予期しない例外は log に書いて終了 code 1 で終わる
-export function installRunnerProcessHandlers(controller: AbortController, log: (entry: Record<string, unknown>) => void) {
+export function installRunnerProcessHandlers(
+  controller: AbortController,
+  log: (entry: Record<string, unknown>) => void,
+) {
   function requestStop() {
     controller.abort()
   }
@@ -209,7 +225,7 @@ export function installRunnerProcessHandlers(controller: AbortController, log: (
     log({
       type,
       message: describeError(error),
-      ...(error instanceof Error && error.stack !== undefined ? { stack: error.stack } : {})
+      ...(error instanceof Error && error.stack !== undefined ? { stack: error.stack } : {}),
     })
     process.exit(1)
   }
@@ -269,9 +285,11 @@ export async function runTaskRunner(deps: RunnerDependencies) {
   }
 
   const secretValues = collectSecretValues(deps.env)
-  const now = deps.now ?? (() => {
-    return new Date()
-  })
+  const now =
+    deps.now ??
+    (() => {
+      return new Date()
+    })
   const log = createRunnerLog(dataDir, secretValues, now)
   const hash = dataDirHash(dataDir)
   const unit = runnerUnitName(hash)
@@ -287,7 +305,15 @@ export async function runTaskRunner(deps: RunnerDependencies) {
 
   try {
     // 台帳、storage、unit 名が同じ dataDir を指すように、--data-dir を ARAYA_DATA_DIR にする
-    config = loadConfig({ ...deps.env, ARAYA_DATA_DIR: dataDir })
+    const loadedConfig = loadConfig({ ...deps.env, ARAYA_DATA_DIR: dataDir })
+    config = {
+      ...loadedConfig,
+      env: {
+        ...withoutDiscordEnvironment(loadedConfig.env),
+        PI_CODING_AGENT_DIR: loadedConfig.piAgentDir,
+        PI_CODING_AGENT_SESSION_DIR: undefined,
+      },
+    }
   } catch (error) {
     log({ type: 'config_failed', message: describeError(error) })
     return 1
@@ -310,12 +336,23 @@ export async function runTaskRunner(deps: RunnerDependencies) {
     const heartbeatAt = (deps.monotonicNow ?? defaultMonotonicNow)()
     log({ type: 'runner_started', unit, pid, invocationId })
 
-    return await runWithLedger({ deps, dataDir, hash, invocationId, config, ledger, log, secretValues, now, heartbeatAt })
+    return await runWithLedger({
+      deps,
+      dataDir,
+      hash,
+      invocationId,
+      config,
+      ledger,
+      log,
+      secretValues,
+      now,
+      heartbeatAt,
+    })
   } catch (error) {
     log({
       type: 'unexpected_error',
       message: describeError(error),
-      ...(error instanceof Error && error.stack !== undefined ? { stack: error.stack } : {})
+      ...(error instanceof Error && error.stack !== undefined ? { stack: error.stack } : {}),
     })
 
     return 1
@@ -408,7 +445,12 @@ async function runWithLedger(context: RunnerContext) {
     const startupStop = await systemd.stopScopes(scopePattern(hash))
 
     if (!startupStop.ok) {
-      log({ type: 'scope_stop_failed', pattern: scopePattern(hash), message: startupStop.error, remaining: startupStop.remaining })
+      log({
+        type: 'scope_stop_failed',
+        pattern: scopePattern(hash),
+        message: startupStop.error,
+        remaining: startupStop.remaining,
+      })
       return 1
     }
 
@@ -429,25 +471,35 @@ async function runWithLedger(context: RunnerContext) {
       log,
       now,
       faults,
-      ...(deps.createPiSettings === undefined ? {} : { createPiSettings: deps.createPiSettings })
+      ...(deps.createPiSettings === undefined ? {} : { createPiSettings: deps.createPiSettings }),
     })
     const registry = createRegistry()
     registry.install(extension)
     const reportRedactor = createRedactor(secretValues)
     const restartLimit = deps.restartLimit
-    const storage = await (deps.openStorage ?? openNodeSqliteStorage)(path.join(storageDir, STORAGE_FILE))
-    const harness = await Harness.open(storage, {
-      models,
-      registry,
-      ...(restartLimit === undefined ? {} : { settings: { restartLimit } }),
-      env: ({ cwd }) => {
-        return new NodeExecutionEnv({ cwd: cwd ?? config.devRoot, shellEnv: config.env })
+    const storage = await (deps.openStorage ?? openNodeSqliteStorage)(
+      path.join(storageDir, STORAGE_FILE),
+    )
+    const harness = await Harness.open(
+      storage,
+      {
+        models,
+        registry,
+        ...(restartLimit === undefined ? {} : { settings: { restartLimit } }),
+        env: ({ cwd }) => {
+          return createDevelopmentExecutionEnv({ cwd: cwd ?? config.devRoot, shellEnv: config.env })
+        },
+        onReport: (error, info) => {
+          // 切り詰めで秘密の一部や URL の @ が境界の外に出ないように、置き換えてから切り詰める
+          log({
+            type: 'report',
+            report: info.type,
+            message: reportRedactor.redact(describeError(error)).slice(0, MAX_LOG_DETAIL_CHARS),
+          })
+        },
       },
-      onReport: (error, info) => {
-        // 切り詰めで秘密の一部や URL の @ が境界の外に出ないように、置き換えてから切り詰める
-        log({ type: 'report', report: info.type, message: reportRedactor.redact(describeError(error)).slice(0, MAX_LOG_DETAIL_CHARS) })
-      }
-    }, ctx)
+      ctx,
+    )
 
     // runner が close() を呼んだか。呼んでいないのに閉じ始めたら、Harness が失敗で閉じた
     let closingByRunner = false
@@ -516,7 +568,7 @@ async function runWithLedger(context: RunnerContext) {
         (error: unknown) => {
           settledQueue.push({ taskKey, error })
           wake()
-        }
+        },
       )
     }
 
@@ -533,7 +585,10 @@ async function runWithLedger(context: RunnerContext) {
             return existing.taskId
           }
 
-          const created = await tx.createTask(attemptTask, buildAttemptInput(claimed), { ownership: { kind: 'conversation' }, background: true })
+          const created = await tx.createTask(attemptTask, buildAttemptInput(claimed), {
+            ownership: { kind: 'conversation' },
+            background: true,
+          })
           attempts.byTaskKey[claimed.taskKey] = { taskId: created }
 
           return created
@@ -544,7 +599,11 @@ async function runWithLedger(context: RunnerContext) {
       } catch (error) {
         // Harness が閉じ始めた後の失敗は、task の作成の失敗として扱わない
         if (!harnessFailed()) {
-          log({ type: 'attempt_task_create_failed', taskKey: claimed.taskKey, message: describeError(error) })
+          log({
+            type: 'attempt_task_create_failed',
+            taskKey: claimed.taskKey,
+            message: describeError(error),
+          })
         }
 
         return false
@@ -587,9 +646,11 @@ async function runWithLedger(context: RunnerContext) {
     // 開き直したときの確認（resume() の前）。ここでは waitForTask を呼ばない
     async function reconcile() {
       const running = ledger.listRunningAttempts()
-      const runningKeys = new Set(running.map((attempt) => {
-        return attempt.taskKey
-      }))
+      const runningKeys = new Set(
+        running.map((attempt) => {
+          return attempt.taskKey
+        }),
+      )
       const attempts = await harness.snapshot(AttemptsDoc, ctx)
       const keyByTaskId = new Map<string, string>()
 
@@ -612,13 +673,17 @@ async function runWithLedger(context: RunnerContext) {
 
         // 台帳で取り込んだ後、task を作る前に落ちた
         const claimed = ledger.readClaimedAttempt(attempt.taskKey)
-        const createdTask = claimed !== null && await createAttemptTask(claimed)
+        const createdTask = claimed !== null && (await createAttemptTask(claimed))
 
         if (createdTask) {
           created.push(attempt.taskKey)
         } else if (attempt.settings?.agentDir !== agentDir || attempt.stopReason !== null) {
           if (attempt.settings?.agentDir !== agentDir && attempt.stopReason === null) {
-            await beginAttemptStop(attempt.taskKey, 'attempt_error', 'Pi directory changed. Run araya pi and /login and /model, then create a new retry. Saved attempt settings were not changed.')
+            await beginAttemptStop(
+              attempt.taskKey,
+              'attempt_error',
+              'Pi directory changed. Run araya pi and /login and /model, then create a new retry. Saved attempt settings were not changed.',
+            )
           }
 
           if (!harnessFailed()) {
@@ -641,7 +706,8 @@ async function runWithLedger(context: RunnerContext) {
         }
 
         const ownKey = keyByTaskId.get(String(item.record.id))
-        const taskKey = ownKey ?? attempts?.byConversation[String(item.record.conversationId)]?.taskKey
+        const taskKey =
+          ownKey ?? attempts?.byConversation[String(item.record.conversationId)]?.taskKey
 
         if (taskKey === undefined) {
           continue
@@ -668,7 +734,11 @@ async function runWithLedger(context: RunnerContext) {
             await beginAttemptStop(taskKey, 'restart_limit', null)
           } else {
             const cause = state.error === undefined ? '' : `: ${describeError(state.error)}`
-            await beginAttemptStop(taskKey, 'attempt_error', `the attempt task is blocked (${state.reason})${cause}`)
+            await beginAttemptStop(
+              taskKey,
+              'attempt_error',
+              `the attempt task is blocked (${state.reason})${cause}`,
+            )
           }
         }
       }
@@ -684,13 +754,21 @@ async function runWithLedger(context: RunnerContext) {
         }
 
         if (attempt.settings?.agentDir !== agentDir && attempt.stopReason === null) {
-          await beginAttemptStop(attempt.taskKey, 'attempt_error', 'Pi directory changed. Run araya pi and /login and /model, then create a new retry. Saved attempt settings were not changed.')
+          await beginAttemptStop(
+            attempt.taskKey,
+            'attempt_error',
+            'Pi directory changed. Run araya pi and /login and /model, then create a new retry. Saved attempt settings were not changed.',
+          )
         } else if (attempt.stopReason !== null) {
           // 前の process が中止を始めた後に落ちた
           await abortAttemptTask(attempt.taskKey)
         } else if (attempt.cancelRequestedAt !== null) {
           await beginAttemptStop(attempt.taskKey, 'cancelled', null)
-        } else if (attempt.agentFinishedAt === null && attempt.settings !== null && attempt.activeMs >= attempt.settings.timeoutMs) {
+        } else if (
+          attempt.agentFinishedAt === null &&
+          attempt.settings !== null &&
+          attempt.activeMs >= attempt.settings.timeoutMs
+        ) {
           await beginAttemptStop(attempt.taskKey, 'agent_timeout', null)
         }
       }
@@ -707,7 +785,12 @@ async function runWithLedger(context: RunnerContext) {
           return
         }
 
-        if (!taskIds.has(attempt.taskKey) || attempt.stopReason !== null || attempt.agentFinishedAt !== null || attempt.settings === null) {
+        if (
+          !taskIds.has(attempt.taskKey) ||
+          attempt.stopReason !== null ||
+          attempt.agentFinishedAt !== null ||
+          attempt.settings === null
+        ) {
           continue
         }
 
@@ -789,7 +872,7 @@ async function runWithLedger(context: RunnerContext) {
         agentDir,
         model: developmentModel,
         timeoutMs: config.developmentTimeoutMs,
-        verificationTimeoutMs: config.verificationTimeoutMs
+        verificationTimeoutMs: config.verificationTimeoutMs,
       }
 
       return settings
@@ -836,7 +919,10 @@ async function runWithLedger(context: RunnerContext) {
       if ('settled' in item) {
         const outcome = item.settled.state.outcome
 
-        if ((outcome.status === 'completed' || outcome.status === 'aborted') && isAttemptResult(outcome.result)) {
+        if (
+          (outcome.status === 'completed' || outcome.status === 'aborted') &&
+          isAttemptResult(outcome.result)
+        ) {
           return outcome.result
         }
 
@@ -854,7 +940,7 @@ async function runWithLedger(context: RunnerContext) {
         taskKey: item.taskKey,
         settings: attempt?.settings ?? null,
         detail,
-        secretValues
+        secretValues,
       })
     }
 
@@ -879,7 +965,13 @@ async function runWithLedger(context: RunnerContext) {
 
         if (!stopped.ok) {
           // 結果を記録せず、枠も空けない。次の loop でやり直す
-          log({ type: 'scope_stop_failed', taskKey, pattern: scopePattern(hash, taskKey), message: stopped.error, remaining: stopped.remaining })
+          log({
+            type: 'scope_stop_failed',
+            taskKey,
+            pattern: scopePattern(hash, taskKey),
+            message: stopped.error,
+            remaining: stopped.remaining,
+          })
           continue
         }
 
@@ -891,14 +983,24 @@ async function runWithLedger(context: RunnerContext) {
 
         const at = monotonicNow()
         const origin = origins.get(taskKey) ?? at
-        const recorded = ledger.recordResult(taskKey, result, { taskKey, addMs: Math.max(0, at - origin) })
+        const recorded = ledger.recordResult(taskKey, result, {
+          taskKey,
+          addMs: Math.max(0, at - origin),
+        })
         pendingResults.delete(taskKey)
         origins.delete(taskKey)
         taskIds.delete(taskKey)
         abortCalled.delete(taskKey)
-        log(recorded.recorded
-          ? { type: 'attempt_finished', taskKey, status: recorded.status, failureReason: recorded.failureReason }
-          : { type: 'attempt_finished', taskKey, recorded: false })
+        log(
+          recorded.recorded
+            ? {
+                type: 'attempt_finished',
+                taskKey,
+                status: recorded.status,
+                failureReason: recorded.failureReason,
+              }
+            : { type: 'attempt_finished', taskKey, recorded: false },
+        )
       }
     }
 
@@ -951,7 +1053,12 @@ async function runWithLedger(context: RunnerContext) {
         const stopped = await systemd.stopScopes(scopePattern(hash))
 
         if (!stopped.ok) {
-          log({ type: 'scope_stop_failed', pattern: scopePattern(hash), message: stopped.error, remaining: stopped.remaining })
+          log({
+            type: 'scope_stop_failed',
+            pattern: scopePattern(hash),
+            message: stopped.error,
+            remaining: stopped.remaining,
+          })
           code = 1
         }
       }
@@ -970,12 +1077,19 @@ async function runWithLedger(context: RunnerContext) {
       log({
         type: 'harness_failed',
         ...(closed.kind === 'timeout' ? { closeTimedOut: true } : {}),
-        ...(typeof end === 'object' && end !== null && 'error' in end ? { message: describeError(end.error) } : {})
+        ...(typeof end === 'object' && end !== null && 'error' in end
+          ? { message: describeError(end.error) }
+          : {}),
       })
       const stopped = await systemd.stopScopes(scopePattern(hash))
 
       if (!stopped.ok) {
-        log({ type: 'scope_stop_failed', pattern: scopePattern(hash), message: stopped.error, remaining: stopped.remaining })
+        log({
+          type: 'scope_stop_failed',
+          pattern: scopePattern(hash),
+          message: stopped.error,
+          remaining: stopped.remaining,
+        })
       }
 
       try {
@@ -999,7 +1113,12 @@ async function runWithLedger(context: RunnerContext) {
       const stopped = await systemd.stopScopes(scopePattern(hash))
 
       if (!stopped.ok) {
-        log({ type: 'scope_stop_failed', pattern: scopePattern(hash), message: stopped.error, remaining: stopped.remaining })
+        log({
+          type: 'scope_stop_failed',
+          pattern: scopePattern(hash),
+          message: stopped.error,
+          remaining: stopped.remaining,
+        })
       }
 
       try {
@@ -1035,7 +1154,7 @@ async function runWithLedger(context: RunnerContext) {
         log({
           type: 'unexpected_error',
           message: describeError(error),
-          ...(error instanceof Error && error.stack !== undefined ? { stack: error.stack } : {})
+          ...(error instanceof Error && error.stack !== undefined ? { stack: error.stack } : {}),
         })
 
         return finishAfterError()
