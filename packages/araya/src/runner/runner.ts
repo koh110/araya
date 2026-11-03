@@ -176,6 +176,16 @@ function describeOutcome(outcome: TaskOutcome<AttemptResult>) {
   }
 }
 
+function isRestartLimitFaultDetail(detail: unknown) {
+  return (
+    typeof detail === 'object' &&
+    detail !== null &&
+    !Array.isArray(detail) &&
+    'reason' in detail &&
+    detail.reason === 'restart_limit'
+  )
+}
+
 // <dataDir>/logs/runner.log に1行1件の JSON で追記する。秘密を置き換える。書けなくても runner は止めない
 export function createRunnerLog(
   dataDir: string,
@@ -489,12 +499,20 @@ async function runWithLedger(context: RunnerContext) {
         env: ({ cwd }) => {
           return createDevelopmentExecutionEnv({ cwd: cwd ?? config.devRoot, shellEnv: config.env })
         },
-        onReport: (error, info) => {
+        onReport: (report) => {
           // 切り詰めで秘密の一部や URL の @ が境界の外に出ないように、置き換えてから切り詰める
           log({
             type: 'report',
-            report: info.type,
-            message: reportRedactor.redact(describeError(error)).slice(0, MAX_LOG_DETAIL_CHARS),
+            report: report.kind,
+            ...('task' in report && report.task !== undefined
+              ? { taskId: String(report.task.id) }
+              : {}),
+            message: reportRedactor
+              .redact(describeError(report.error))
+              .slice(0, MAX_LOG_DETAIL_CHARS),
+            ...(report.kind === 'task_faulted' || report.kind === 'task_interrupted'
+              ? { reason: report.reason }
+              : {}),
           })
         },
       },
@@ -730,16 +748,12 @@ async function runWithLedger(context: RunnerContext) {
           const state = item.state
           blocked.push({ taskKey, reason: state.reason })
 
-          if (state.reason === 'restart_limit') {
-            await beginAttemptStop(taskKey, 'restart_limit', null)
-          } else {
-            const cause = state.error === undefined ? '' : `: ${describeError(state.error)}`
-            await beginAttemptStop(
-              taskKey,
-              'attempt_error',
-              `the attempt task is blocked (${state.reason})${cause}`,
-            )
-          }
+          const cause = state.error === undefined ? '' : `: ${describeError(state.error)}`
+          await beginAttemptStop(
+            taskKey,
+            'attempt_error',
+            `the attempt task is blocked (${state.reason})${cause}`,
+          )
         }
       }
 
@@ -914,10 +928,13 @@ async function runWithLedger(context: RunnerContext) {
     }
 
     async function resultOf(item: SettledItem) {
-      let detail: string
+      let detail: string | null
+      let restartLimitFault = false
 
       if ('settled' in item) {
         const outcome = item.settled.state.outcome
+        restartLimitFault =
+          outcome.status === 'faulted' && isRestartLimitFaultDetail(outcome.error.detail)
 
         if (
           (outcome.status === 'completed' || outcome.status === 'aborted') &&
@@ -934,6 +951,24 @@ async function runWithLedger(context: RunnerContext) {
       const attempt = ledger.listRunningAttempts().find((candidate) => {
         return candidate.taskKey === item.taskKey
       })
+
+      if (restartLimitFault) {
+        const failureReason = attempt?.stopReason ?? 'restart_limit'
+
+        if (attempt?.stopReason === null && ledger.beginStop(item.taskKey, 'restart_limit', null)) {
+          log({ type: 'attempt_stopping', taskKey: item.taskKey, reason: 'restart_limit' })
+        }
+
+        return buildAttemptErrorResult({
+          dataDir,
+          taskKey: item.taskKey,
+          settings: attempt?.settings ?? null,
+          detail: failureReason === 'restart_limit' ? null : (attempt?.stopDetail ?? null),
+          secretValues,
+          status: failureReason === 'restart_limit' ? 'blocked' : 'failed',
+          failureReason,
+        })
+      }
 
       return buildAttemptErrorResult({
         dataDir,

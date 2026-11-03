@@ -9,7 +9,7 @@ repository の中で araya をビルド・テスト・変更する人向けの�
 ## checkout とテスト
 
 - Node.js 26.8 以上
-- Pi coding-agent SDK 1.4.0 は依存 package に含まれます。引数なしの `araya` または `araya pi` に、グローバルな `pi` コマンドは不要です。
+- Pi coding-agent SDK 1.5.0 は依存 package に含まれます。引数なしの `araya` または `araya pi` に、グローバルな `pi` コマンドは不要です。
 
 ```sh
 npm ci

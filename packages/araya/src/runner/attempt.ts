@@ -477,34 +477,40 @@ function toolEventData(call: ToolHookCall, result: ToolExecutionResult | undefin
 }
 
 // 試行の task が試行の結果を持たずに終わったとき（outcome が failed・orphaned・faulted、result が無い、waitForTask の失敗）に、
-// runner が記録する結果（attempt_error、worktree だけの evidence）。detail は outcome の status と error の message
+// runner が試行の task を使えない結果（既定は attempt_error、worktree だけの evidence）。detail は outcome の status と error の message
 export async function buildAttemptErrorResult(input: {
   dataDir: string
   taskKey: string
   settings: AttemptSettings | null
-  detail: string
+  detail: string | null
   secretValues: readonly string[]
+  status?: Extract<AttemptResult['status'], 'failed' | 'blocked'>
+  failureReason?: string
 }) {
+  const status = input.status ?? 'failed'
+  const failureReason = input.failureReason ?? 'attempt_error'
   const redactor = createRedactor(input.secretValues)
   const candidate = getStateDir(input.dataDir, input.taskKey)
   const stateDir = await existingDirectory(candidate) ? candidate : null
   const built = await buildWorktreeOnlyEvidence({ taskKey: input.taskKey, devRoot: input.settings?.devRoot ?? '', stateDir, redact: redactor.redact })
   // 切り詰めで秘密の一部が残らないように、置き換えてから切り詰める
-  const detail = redactor.redact(joinDetails(input.detail, built.detail) ?? input.detail).slice(0, MAX_DETAIL_CHARS)
+  const joinedDetail = joinDetails(input.detail, built.detail)
+  const unredactedDetail = joinedDetail ?? (input.detail === null ? null : input.detail)
+  const detail = unredactedDetail === null ? null : redactor.redact(unredactedDetail).slice(0, MAX_DETAIL_CHARS)
   const evidence = redactor.redactRecord({
     ...built.evidence,
-    outcome: 'failed',
-    failureReason: 'attempt_error',
-    failureDetail: detail,
+    outcome: status,
+    failureReason,
+    ...(detail === null ? {} : { failureDetail: detail }),
     ...(input.settings === null ? {} : { timeoutMs: input.settings.timeoutMs }),
     tools: [...SHIKI_TOOL_NAMES],
     decisionQuestion: await readDecisionQuestion(stateDir)
   })
   evidence.redactions = redactor.count
   const result: AttemptResult = {
-    status: 'failed',
-    failureReason: 'attempt_error',
-    failureDetail: detail,
+    status,
+    failureReason,
+    failureDetail: textOrNull(evidence.failureDetail),
     summary: null,
     decisionQuestion: textOrNull(evidence.decisionQuestion),
     model: null,

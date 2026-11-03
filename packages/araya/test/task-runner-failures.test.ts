@@ -120,18 +120,153 @@ test('runner: restartLimit で止められた試行は blocked（restart_limit�
     const attempt = blocked.attempts[0]
 
     assert.equal(blocked.task.status, 'blocked')
+    assert.equal(attempt?.status, 'blocked')
     assert.equal(attempt?.failureReason, 'restart_limit')
+    assert.equal(attempt?.failureDetail, null)
     assert.equal(attempt?.stopReason, 'restart_limit')
+    assert.equal(attempt?.evidence?.outcome, 'blocked')
+    assert.equal(attempt?.evidence?.failureReason, 'restart_limit')
     assert.equal(attempt?.evidence?.bodiesStored, false)
     assert.deepEqual(eventsOf(setup, first, 'run.stopping').map((event) => event.data), [{ reason: 'restart_limit' }])
     assert.deepEqual(eventsOf(setup, first, 'run.finished').map((event) => event.data), [{ status: 'blocked', failureReason: 'restart_limit' }])
-    // 起動し直した runner の、開き直したときの確認で見つけた
-    const reconciled = (await readLog(setup)).filter((entry) => entry.type === 'reconciled').at(-1)
-    assert.ok(records(reconciled?.blocked).some((entry) => entry.taskKey === firstKey && entry.reason === 'restart_limit'))
+    // 1.5.0 は restartLimit 到達時に blocked ではなく task_faulted report を出す
+    const restartLimitReport = (await readLog(setup)).find((entry) => {
+      return entry.type === 'report' && entry.report === 'task_faulted'
+    })
+    assert.equal(restartLimitReport?.reason, 'restart_limit')
+    assert.notEqual(restartLimitReport?.taskId, undefined)
 
     // 待っていた次の試行が取り込まれて終わる
     assert.equal((await waitForTaskStatus(setup, second, FINAL_STATUSES)).task.status, 'completed')
   } finally {
+    await teardownRunner(setup, runner)
+  }
+})
+
+test('runner: restartLimit outcome を記録する前に runner が再起動しても blocked で復旧する', async () => {
+  const setup = await setupWithRepository()
+  setup.models.script((view) => {
+    return completingStep(view)
+  })
+  const [taskId = 0] = createTasks(setup, 1)
+  const taskKey = taskKeyOf(setup, taskId)
+  const storage = createFailingStorage()
+  let injected = false
+  let enteredBeforeRecord!: () => void
+  const beforeRecordEntered = new Promise<void>((resolve) => {
+    enteredBeforeRecord = resolve
+  })
+  let releaseBeforeRecord!: () => void
+  const beforeRecordRelease = new Promise<void>((resolve) => {
+    releaseBeforeRecord = resolve
+  })
+  const failingRunner = startRunner(setup, {
+    restartLimit: 1,
+    openStorage: storage.open,
+    faults: {
+      beforePhaseCommit: (phase, currentTaskKey) => {
+        if (phase === 'agent' && currentTaskKey === taskKey && !injected) {
+          injected = true
+          storage.inject.armed = true
+        }
+      },
+    },
+  })
+  let runner: StartedRunner = failingRunner
+
+  try {
+    assert.equal(await failingRunner.done, 1)
+    assert.equal(storage.inject.hits, 1)
+
+    const restartingRunner = startRunner(setup, {
+      restartLimit: 1,
+      faults: {
+        beforeRecordResult: async (currentTaskKey) => {
+          if (currentTaskKey === taskKey) {
+            enteredBeforeRecord()
+            await beforeRecordRelease
+          }
+        },
+      },
+    })
+    runner = restartingRunner
+    await withTimeout(beforeRecordEntered, 'restart-limit result is ready to record')
+    restartingRunner.controller.abort()
+    releaseBeforeRecord()
+    assert.equal(await withTimeout(restartingRunner.done, 'runner restart before recording'), 0)
+
+    const ledger = openLedger(setup)
+
+    try {
+      assert.equal(ledger.getTask(taskId).status, 'running')
+      assert.equal(ledger.showTask(taskId, { events: 0 }).attempts[0]?.stopReason, 'restart_limit')
+    } finally {
+      ledger.close()
+    }
+
+    const attempts = await readAttemptsDoc(setup)
+
+    if (attempts === undefined) {
+      throw new Error('attempts doc is unavailable')
+    }
+
+    const durableTaskId = attempts.byTaskKey[taskKey]?.taskId
+
+    if (durableTaskId === undefined) {
+      throw new Error('restart-limit attempt has no durable task id')
+    }
+
+    const harness = await Harness.open(
+      await openNodeSqliteStorage(path.join(setup.fixture.dataDir, 'runner', 'durable.sqlite')),
+      {
+        models: setup.models.runtime,
+        registry: createRegistry(),
+      },
+      ctx,
+    )
+
+    try {
+      const settled = await harness.waitForTask(durableTaskId, ctx)
+
+      if (settled.state.outcome.status !== 'faulted') {
+        assert.fail(`expected a persisted faulted outcome, got ${settled.state.outcome.status}`)
+      }
+
+      assert.deepEqual(settled.state.outcome.error.detail, { reason: 'restart_limit' })
+    } finally {
+      await harness.close(ctx)
+    }
+
+    const reportCountBeforeRestart = (await readLog(setup)).filter((entry) => {
+      return (
+        entry.type === 'report' &&
+        entry.report === 'task_faulted' &&
+        entry.reason === 'restart_limit'
+      )
+    }).length
+
+    assert.equal(reportCountBeforeRestart, 1)
+    runner = startRunner(setup, { restartLimit: 1 })
+
+    const blocked = await waitForTaskStatus(setup, taskId, FINAL_STATUSES)
+    const attempt = blocked.attempts[0]
+
+    assert.equal(blocked.task.status, 'blocked')
+    assert.equal(attempt?.status, 'blocked')
+    assert.equal(attempt?.failureReason, 'restart_limit')
+    assert.equal(attempt?.stopReason, 'restart_limit')
+    assert.equal(
+      (await readLog(setup)).filter((entry) => {
+        return (
+          entry.type === 'report' &&
+          entry.report === 'task_faulted' &&
+          entry.reason === 'restart_limit'
+        )
+      }).length,
+      reportCountBeforeRestart,
+    )
+  } finally {
+    releaseBeforeRecord()
     await teardownRunner(setup, runner)
   }
 })
@@ -256,7 +391,7 @@ test('runner: onReport の message は秘密を置き換えてから 2000 文字
     try {
       assert.equal(await runner.done, 1)
       const text = await readRunnerLog(setup.fixture)
-      const reports = parseLogLines(text).filter((entry) => entry.type === 'report' && entry.report === 'session_failed')
+      const reports = parseLogLines(text).filter((entry) => entry.type === 'report' && entry.report === 'storage_failed')
 
       assert.equal(reports.length, 1)
       assert.equal(String(reports[0]?.message).length, 2000)
@@ -561,7 +696,7 @@ test('runner: 結果を記録する前の scope の停止の最中に Harness �
         storage.inject.armed = true
         await fs.writeFile(release, '', 'utf8')
         await waitUntil(async () => {
-          return (await readLog(setup)).some((entry) => entry.type === 'report' && entry.report === 'session_failed')
+          return (await readLog(setup)).some((entry) => entry.type === 'report' && entry.report === 'storage_failed')
         }, 'the harness fails')
         setup.clock.advance(5000)
       }

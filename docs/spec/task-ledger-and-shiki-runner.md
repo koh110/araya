@@ -173,7 +173,7 @@ CREATE TABLE runner (
 - `task.cancel_requested`: `{"while": "queued" | "running"}`
 - `run.started`: `{"taskKey": "..."}`（runner が試行を取り込んだ）
 - `run.resumed`: `{}`（runner が起動し直し、動いていた試行を続きから始めた）
-- `run.stopping`: `{"reason": "agent_timeout" | "cancelled" | "restart_limit" | "attempt_error"}`（runner が試行の中止を始めた）
+- `run.stopping`: `{"reason": "agent_timeout" | "cancelled" | "restart_limit" | "attempt_error"}`（runner が試行の中止を始めた。`restart_limit` では terminal fault を blocked として記録する）
 - `tool.started`、`tool.finished`、`events.truncated`: 「途中経過」を参照
 - `run.finished`: `{"status": "...", "failureReason": "..." | null}`
 
@@ -190,7 +190,7 @@ queued ─(runner が取り込む)→ running ─→ completed / failed / blocke
 - `running`: runner が試行を動かしているか、runner が止まっている・起動し直すのを待っている（次に runner が起動すると続きから進む）。
 - `completed`: SHIKI が成功し、差分のある worktree すべてで登録済みの検証が通った（既存の判定と同じ）。ただし、利用者が中止を求めた試行は、これに当たっても `failed`（`cancelled`）になる（「結果の判定と記録」）。
 - `failed`: それ以外。理由は `runs.failure_reason`。
-- `blocked`: 人の判断や対応が無いと進めない。SHIKI が人の判断を求めて終わった（「判断の依頼」。質問は `runs.decision_question`）か、pi-durable が試行を止めた（`runs.failure_reason` が `restart_limit`。「落ちたとき」）。
+- `blocked`: 人の判断や対応が無いと進めない。SHIKI が人の判断を求めて終わった（「判断の依頼」。質問は `runs.decision_question`）か、pi-durable の restartLimit fault を runner が `blocked` として記録した（`runs.failure_reason` が `restart_limit`。「落ちたとき」）。
 
 Task の状態（`tasks.status`）は最新の試行の状態と同じ。`failed` と `blocked` の Task だけが、再実行で次の試行（`queued`）を持てる。`completed` の Task は再実行できない。
 
@@ -256,7 +256,7 @@ runner は次の順に進む。起動してすぐ、SIGTERM と SIGINT の handl
    - `registry`: SHIKI の extension（tool と途中経過の hook。「SHIKI」「途中経過」）と、試行の task を入れる。
    - `env`: pi-durable の `NodeExecutionEnv`（cwd は会話の cwd）。
    - `settings.restartLimit` は既定（5）のまま。
-   - `onReport`: 種類と、秘密を置き換えた message を log に書く。
+   - `onReport(report)`: 1.5.0 の `Report`（`kind` と `error`）を受け取る。`kind`、task がある report の `taskId`、秘密を置き換えて 2,000 文字で切った `error` の message を log に書く。task に関する report の `reason` も記録する。
    - 開いた直後に `subscribeClose` で listener を登録し、Harness が閉じ始めたら印を付ける（listener は印を付けるだけで、Harness の API を呼ばない）。runner が `close()` を呼んでいないのに閉じ始めたら（storage の誤り）、「Harness が失敗で閉じたとき」に移る。
 6. 開き直したときの確認を行う（次の節）。
 7. `resume()` し、`running` の試行ごとに `waitForTask` で試行の task の終わりを待ち始めて、loop（「loop」）に入る。`resume()` を呼んだときの monotonic な時計の値を、`running` の試行すべての稼働時間の起点にする（「期限」）。
@@ -267,8 +267,8 @@ pi-durable は `resume()`（と `waitForTask()` など）で task を動かし�
 
 1. 台帳で `running` の試行ごとに、session の document（`araya.attempts`。taskKey と試行の task の id、会話の id と taskKey の対応を持つ）で試行の task を探す。無ければ（台帳で取り込んだ後、task を作る前に落ちた）、ここで作る（「取り込み」の手順 3）。有れば、`BEGIN IMMEDIATE` の中で `run.resumed` event を追加する。
 2. `inspect()` で終わっていない task を見る。試行の task（document の id）と、試行の会話の中の task（record の `conversationId` が試行の会話）を、その試行のものとして扱う。
-   - `blocked`（理由 `restart_limit`）: その試行を中止する（理由 `restart_limit`。「中止を始める」）。
-   - `blocked`（ほかの理由。定義が無い、定義が古い、migrate に失敗した）: その試行を中止する（理由 `attempt_error`。詳細は blocked の理由）。
+   - 1.5.0 では `restartLimit` に達した試行の task は `faulted` で終わり、`onReport` に `task_faulted`（`reason: restart_limit`）が来る。終端 outcome にも `error.detail.reason: restart_limit` が永続化され、`onReport` は開き直した Harness で再送されない。このため `waitForTask` の outcome から `blocked`（`restart_limit`）を判定して記録する。task は既に terminal なので、`inspect()` の `blocked` を探したり `abortTask` を呼んだりしない（「落ちたとき」）。
+   - `blocked`（定義が無い、定義が古い、migrate に失敗した）: その試行を中止する（理由 `attempt_error`。詳細は blocked の理由）。
    - 台帳で `running` でない試行の task（document に有るが、台帳で終わっているか、台帳に無い）: `abortTask` で中止する。台帳には何も書かない。
 3. 台帳で `running` の試行のうち、次に当たるものを中止する（上から順に、最初に当たったもの。「中止を始める」）。
    - `stop_reason` が書かれている（前の process が中止を始めた後に落ちた）: `abortTask` だけをもう一度呼ぶ。
@@ -338,7 +338,7 @@ runner が試行を中止するときは、次を行う。
 
 - runner が落ちると（SIGKILL、OOM、終了 code 1 など）、systemd は service に残った process を止め、`ExecStopPost` で dataDir の試行の scope を止めてから、間隔（1 秒から 1 分）を空けて起動し直す（`Restart=always`）。起動し直す回数は制限しない。
 - 起動し直した runner は、同じ storage を開いて `resume()` し、会話を続きから進める。実行中だった tool は、model に誤り（「Tool bash was interrupted and may have partially run」。diagnostics の code は `interrupted`）として返る。完了していた tool は再実行されない。同じ `requestId` の submit は、前の process が受け付けた submission を返す。
-- 状態を進めずに落ち続ける task は、pi-durable が `restartLimit`（5 回）で止める（parked。close は数えない）。runner は、起動し直したときにそれを見つけて（「開き直したときの確認」）、その試行を中止し、`blocked`（`restart_limit`）にする。ほかの試行は動き続ける。
+- 状態を進めずに落ち続ける task は、pi-durable が `restartLimit`（5 回）で終わらせる（close は数えない）。1.5.0 では試行の task は `faulted` となり `task_faulted`（`reason: restart_limit`）が報告され、終端 outcome に `error.detail.reason: restart_limit` が永続化される。`onReport` は再起動後に再送されないため、runner は `waitForTask` が返す outcome から理由を判定し、task が terminal であることを確認して abort せずに `run.stopping`、worktree だけの evidence、`blocked`（`restart_limit`）を記録する。ほかの試行は動き続ける。
 - Harness を開く前に落ち続ける場合（設定の誤りなど）は、試行は進まず、systemd が最大 1 分の間隔で起動し直し続ける。理由は log に残る。
 - runner が台帳の `heartbeat_at` を更新しなくなるので、CLI はそれを `not_responding` と出す（「CLI」）。
 
@@ -353,7 +353,7 @@ pi-durable は、storage の誤り（`commit()` の失敗など）が起きる�
 5. log に書き（error の message は秘密を置き換える）、終了 code 1 で終わる。3 か 4 が失敗しても、log に書いて終了 code 1 で終わる。
 
 - systemd は、落ちたときと同じく、間隔を空けて runner を起動し直す。試行は `running` のまま残り、次の起動で続きから進む。取り込みの transaction の後で task の作成が失敗した試行は、task が作られていないので（commit は atomic）、開き直したときの確認で作る（その手順 1）。
-- 失敗で閉じたときに動いていた試行の task は、`restarts` が1つ増える（`close()` では増えない。「技術調査結果」）。同じ試行の途中で storage の誤りが restartLimit（5 回）の回数くり返されると、その試行は `blocked`（`restart_limit`）になる（「落ちたとき」と同じ）。
+- 失敗で閉じたときに動いていた試行の task は、`restarts` が1つ増える（`close()` では増えない。「技術調査結果」）。同じ試行の途中で storage の誤りが restartLimit（5 回）の回数くり返されると、1.5.0 は task を `faulted` にし、終端 outcome に `error.detail.reason: restart_limit` を保存する。report は再起動後に再送されないため、再起動した runner は永続化された outcome の detail を使って、その試行を `blocked`（`restart_limit`）として記録する（「落ちたとき」）。
 - storage の誤りが続く間は、Harness を開く前に落ち続ける場合と同じく、systemd が最大 1 分の間隔で起動し直し続ける。その間、試行は進まず、中止も行われない（理由は log に残る）。
 
 ### 終了 code
@@ -363,7 +363,7 @@ pi-durable は、storage の誤り（`commit()` の失敗など）が起きる�
 
 ### log
 
-- `<dataDir>/logs/runner.log`（mode 0600）に、1行1件の JSON で追記する。起動と停止、開き直したときの確認の結果、取り込み、中止とその理由、結果、`onReport` の内容、Harness が失敗で閉じたこと、設定ファイルの誤り、scope を止められなかったこと、予期しない例外（message と stack）だけを書き、秘密を置き換える（「秘密情報の扱い」）。試行に関するものには taskKey を入れる。prompt、環境変数、tool の引数と出力、model の応答は書かない。
+- `<dataDir>/logs/runner.log`（mode 0600）に、1行1件の JSON で追記する。起動と停止、開き直したときの確認の結果、取り込み、中止とその理由、結果、`onReport` の `kind`・task report の `taskId` と `reason`・秘密を置き換えて 2,000 文字で切った error message、Harness が失敗で閉じたこと、設定ファイルの誤り、scope を止められなかったこと、予期しない例外（message と stack）だけを書き、秘密を置き換える（「秘密情報の扱い」）。試行に関するものには taskKey を入れ、taskKey が分からない report では taskId を使う。prompt、環境変数、tool の引数と出力、model の応答は書かない。
 - stdout と stderr は捨てる（`StandardOutput=null`・`StandardError=null`）。journal に秘密が残らないようにするため。runner が log を書く前に Node が止まったときは、journal に終了の状態だけが残る。
 
 ## 試行の scope
@@ -423,7 +423,6 @@ phase は次のとおり。
 - `abort`（中止）: 始めにその試行の scope を止め、台帳の `stop_reason` で結果を決める。
   - `agent_timeout`: scope を止められれば、差分を集め、登録された検証は実行せずに `not_run`（`reason` は `agent_timeout`）として記録し、`failed`（`agent_timeout`）にする。止められなければ `failed`（`termination_unconfirmed`。worktree だけの evidence）。
   - `cancelled`: `failed`（`cancelled`）。worktree だけの evidence。
-  - `restart_limit`: `blocked`（`restart_limit`）。worktree だけの evidence。
   - `attempt_error`、または理由が無い: `failed`（`attempt_error`。`failure_detail` に `stop_detail`）。worktree だけの evidence。
 
 「worktree だけの evidence」は、差分の収集と検証を行わずに作る evidence。`taskKey`、状態 directory の path（無ければ `null`）と、その `worktrees.jsonl` に記録された worktree の path と branch を残し、`bodiesStored` を `false` にする（`worktrees.jsonl` が無ければ worktree を空にし、読めなければ worktree を空にしてその旨を `failure_detail` に書く）。
@@ -444,7 +443,7 @@ phase は次のとおり。
 
 ## 中止
 
-- runner が試行を中止する理由は、利用者の中止（`cancelled`）、期限（`agent_timeout`）、pi-durable が試行を止めた（`restart_limit`）、試行の task を動かせない（`attempt_error`）。手順は「中止を始める」、結果は「試行の task」の `abort`。
+- runner が試行を中止する理由は、利用者の中止（`cancelled`）、期限（`agent_timeout`）、試行の task を動かせない（`attempt_error`）。`restart_limit` は 1.5.0 が task を `faulted` で終えた後に runner が `blocked` として記録するため、abort handler は通らない。
 - `araya task cancel <taskId>`（「CLI」）:
   - 最新の試行が `queued`: `BEGIN IMMEDIATE` の中で、試行を `failed`（`cancelled`）にし、`cancel_requested_at` と `finished_at` を今の時刻にして、`tasks.status` を `failed` にし、`task.cancel_requested`（`while: queued`）と `run.finished` event を追加する。その試行は動かない。
   - 最新の試行が `running`: `BEGIN IMMEDIATE` の中で、`cancel_requested_at` が空なら今の時刻にし、`task.cancel_requested`（`while: running`）event を追加する。既に求められていれば何もしない。runner は次の loop（2 秒以内）で中止を始める。runner が止まっていれば、次に起動したときに `resume()` の前に中止する。試行の task が既に終わっていても、その試行は `failed`（`cancelled`）で記録される（「結果の判定と記録」の「利用者の中止を優先する」）。
@@ -725,7 +724,7 @@ MVP の上限は 1。将来上げられるように、次のように作る。
 - SHIKI は `development.model` が設定されていればその model を、未設定なら Pi の設定の既定を使います。選んだ model が利用できない場合に、別の model へ切り替えません。
 - 再開した会話（一時停止の後と、落ちた後）では、途中で止まった tool が一部だけ実行されていることがある。model が同じ操作をやり直し、外部への変更をくり返すことがある。evidence の `resumes` で、再開があったかどうかが分かる。
 - 期限は runner が動いていた時間で数えるので、一時停止を挟んだ試行は、壁時計では `timeoutMs` より長くかかる。runner が落ちると、最後に精算してからの時間（10 秒まで）が数えられない。
-- pi-durable の storage の誤りでは、runner が終了して起動し直す（「Harness が失敗で閉じたとき」）。誤りが続く間は試行が進まず、中止もできない。同じ試行の途中で restartLimit の回数くり返されると、その試行は `blocked`（`restart_limit`）になる。
+- pi-durable の storage の誤りでは、runner が終了して起動し直す（「Harness が失敗で閉じたとき」）。誤りが続く間は試行が進まず、中止もできない。同じ試行の途中で restartLimit の回数くり返されると、1.5.0 は試行の task を fault させ、終端 outcome に `error.detail.reason: restart_limit` を保存する。再起動した runner は再送されない report ではなく、この永続化された detail を使って `blocked`（`restart_limit`）として記録する。
 - pi-durable の storage には、すべての試行の会話が残り、SHIKI が読んだ秘密が含まれることがある。自動では消さず、大きくなり続ける。`runner.log` も自動では消さない。
 - 置き換えられるのは、秘密とみなす環境変数の値と URL の userinfo だけ。それ以外の秘密（file の中身など）を SHIKI が報告に書けば台帳の `summary` に、test が出力すれば `evidence.json`（検証の stdout と stderr の末尾 8 KiB ずつ）に残る。
 - pi-durable は experimental で、release の間で API が変わる。version を上げたら、「技術調査結果」の確認と test をやり直す。
@@ -759,7 +758,7 @@ test は実際の Pi auth や model API を使わない。model は pi-ai の fa
 - [ ] SHIKI が、runner が動いている時間で `timeoutMs` を過ぎても終わらないと、試行は `failed`（`agent_timeout`）になり、差分が集められ、登録された検証は `not_run` になる。実行中だった bash の process group は止まる。runner を `timeoutMs` より長く止めてから起動し直しても、それだけでは期限で中止されない。`active_ms` が `timeoutMs` 以上の試行がある状態で runner を起動すると、`resume()` の前に中止を始め、その試行の model は呼ばれない。
 - [ ] SHIKI の終わりの記録と期限による中止が重なったとき（test で順番を固定する）、先に台帳に書かれた方だけが効く。SHIKI の終わりが先なら検証まで進み、期限が先なら `agent_timeout` になる。どちらでも `run.finished` は1件。
 - [ ] 試行の稼働時間は、その試行を取り込んだ時点から数える（時計を差し替えた test）。heartbeat の 8 秒後に `timeoutMs` 5,000 の試行を取り込んでも、取り込んでから 5 秒たつまでは期限で中止されない。heartbeat の間に終わった試行の `activeMs` は、取り込みから記録までの時間になる。heartbeat の間隔（10 秒）より短い間隔で runner の一時停止と起動をくり返しても、稼働時間は足され続け、`timeoutMs` に達すると `agent_timeout` で中止される。
-- [ ] 試行の task が pi-durable の `restartLimit` で止められると（test では `restartLimit` を小さくする）、試行は `blocked`（`restart_limit`）になり、待っていた次の試行が取り込まれる。試行の task が想定外の outcome（phase が例外を投げた `faulted` など。pi-durable 1.4.0 では、phase の例外は `faulted` になる）で終わったときは `failed`（`attempt_error`）になり、`failure_detail` に outcome の status が入る。
+- [ ] 試行の task が pi-durable 1.5.0 の `restartLimit` に達すると（test では `restartLimit` を小さくする）、`task_faulted` report と終端 outcome の `error.detail.reason: restart_limit` が記録される。台帳の結果を記録する前に runner を止めて再起動しても、再送されない report ではなく永続化された outcome から `blocked`（`restart_limit`）として記録し、待っていた次の試行を取り込む。task の phase が想定外の例外を投げて `faulted` で終わったときは `failed`（`attempt_error`）になり、`failure_detail` に outcome の status が入る。
 - [ ] pi-durable の storage の commit を1回だけ失敗させると（storage を包んだ test。試行の task の phase の commit と、取り込みの後の `createTask` の commit のそれぞれ）、runner は取り込みと結果の記録をやめ、scope を止めて、終了 code 1 で終わる。試行は `running` のままで、`attempt_error` にならない。同じ dataDir で起動し直すと、試行の task が続きから進み（`createTask` が失敗したときは、試行の task が1つだけ作られ）、試行は終わる。
 - [ ] `araya task cancel` は、`queued` の試行をその場で `failed`（`cancelled`）にし、その試行は取り込まれない。`running` の試行には中止を求め、runner は次の loop で中止を始め、試行は `failed`（`cancelled`）になる。実行中だった bash は止まり、差分の収集と検証は行われない。`completed`・`failed`・`blocked` の Task は `task_not_cancellable` で拒否する。
 - [ ] 試行の task が outcome を commit した後、台帳に結果を記録する前に `araya task cancel` を実行すると（test で順番を固定する）、CLI は `requested` を返し、runner の `abortTask` は `terminal` を返し、試行は `failed`（`cancelled`）になる。evidence には試行の task が集めた差分と検証の結果が残り、`resultBeforeCancel` に試行の task の結果が入る。runner の loop が中止の求めを確かめた後、結果を記録する前に中止を求めた場合も（test で順番を固定する）、`failed`（`cancelled`）になる。結果を記録した後の `araya task cancel` は `task_not_cancellable` で拒否される。どの場合も `run.finished` は1件。
@@ -827,9 +826,11 @@ test は実際の Pi auth や model API を使わない。model は pi-ai の fa
 
 ## 技術調査結果
 
-pi-durable と Pi は 1.4.0、Node.js は v26.12.1、systemd は 259、npm は 11.20.0。model は pi-ai の faux provider だけを使い、実 API と実認証情報は使っていない。
+Chord・pi-ai・pi-coding-agent・pi-durable・pi-schema は 1.5.0、Node.js は v26.12.1、systemd は 259、npm は 11.20.0。model は pi-ai の faux provider だけを使い、実 API と実認証情報は使っていない。
 
-### pi-durable
+### pi-durable 1.4.0（更新前の調査結果）
+
+以下の probe 記録は依存更新前の 1.4.0 で得たもの。restart limit の報告形式と storage failure の report 名は 1.5.0 で変わっているため、更新後の確認を下に記す。
 
 - tool の実行中に Harness を開いた process を SIGKILL し、同じ storage を別の process で開いて `resume()` すると、会話は続きから進んだ。同じ `requestId` の submit は、前の process が受け付けた submission を返した。完了していた自作の tool は再実行されなかった。
 - 途中だった bash は、model に `isError: true`、本文「Tool bash was interrupted and may have partially run」（diagnostics の code は `interrupted`）で返った。
@@ -856,7 +857,14 @@ pi-durable と Pi は 1.4.0、Node.js は v26.12.1、systemd は 259、npm は 1
 - 終わった task に `abortTask` を呼ぶと `"terminal"` を返し、task の `abort` は動かず、outcome は `completed` のままだった（probe18。実装（`dist/harness/scheduler.js`）でも、task が `terminal` なら何もせずに `"terminal"` を返す）。
 - 型定義: `Harness` は `Session` を継承し、`closed`（閉じ終わると `{ reason: "closed" }` か `{ reason: "failed", error }` で決まる）と `subscribeClose`（閉じ始めたとき、storage の誤りで閉じるときも、同期で呼ばれる。listener は block せず、Session の API を呼ばない）を持つ。README: `commit()` と `mintId()` の誤りはすべて Harness を終わらせ、再試行はしない。回復するには開き直す（commit は atomic なので storage は一貫している）。
 
-### Pi coding-agent
+### 1.5.0 更新確認
+
+- `HarnessOptions.onReport` は `(error, info)` から `(report)` に変わり、report は `kind` と `error` を持つ。storage failure は `storage_failed`、試行 task の restart limit は `task_faulted`（`reason: restart_limit`）として通知される。
+- `Storage.commit` は `(batches, receive, context)` を受ける。Araya の failure-injection test wrapper も新しい引数を保持している。
+- tool parameter は `@earendil-works/pi-schema` の `obj`・`str`・`opt`・`arr` builder で定義する。
+- `npm run typecheck` と `npm test` が成功し、実 systemd の `task-runner-systemd.test.ts` は6件成功、失敗0件。restart limit 到達後に Araya が試行を `blocked` と記録し、後続 task が完了することを確認した。実 model API と実認証情報は使用していない。
+
+### Pi coding-agent 1.4.0（更新前の調査結果）
 
 - `ModelRuntime` は pi-ai の `Models` を実装しています。SHIKI の設定で使う `ModelRuntime` に faux provider を `registerNativeProvider` で登録し、Harness の `models` に渡すと、会話は bash を実行して `done` で終わります。
 - `findInitialModel`（model を選ぶ処理）は `core/model-resolver` にありますが、package の exports（`.` と `./rpc-entry`）には含まれません。`SettingsManager` には `getDefaultProvider`・`getDefaultModel`・`getDefaultThinkingLevel` があります。
