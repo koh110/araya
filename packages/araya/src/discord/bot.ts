@@ -4,6 +4,7 @@
 
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
+import { createRequire } from 'node:module'
 import path from 'node:path'
 import { collectSecretValues, createRedactor } from '../infrastructure/redaction.ts'
 import { dataDirHash, discordUnitName, runnerUnitName } from '../infrastructure/systemd.ts'
@@ -17,6 +18,17 @@ import {
 import { handleDiscordCommand } from './interactions.ts'
 import { NOTIFICATION_POLL_MS, notificationTick } from './notifier.ts'
 import { newState, readDiscordBotState, writeDiscordBotState } from './state.ts'
+
+type ProperLockfile = {
+  lock(
+    resourcePath: string,
+    options: { lockfilePath: string; retries: number; stale: number; update: number },
+  ): Promise<() => Promise<void>>
+}
+
+const properLockfile = createRequire(import.meta.url)('proper-lockfile') as ProperLockfile
+const DISCORD_PROCESS_LOCK_STALE_MS = 30_000
+const DISCORD_PROCESS_LOCK_UPDATE_MS = 10_000
 
 export type DiscordBotDependencies = {
   dataDir: string
@@ -109,7 +121,54 @@ async function verifyDiscordUnit(
   }
 }
 
+// systemd と foreground の同じ dataDir 起動を排他し、異常終了後は stale lock を回収する。
+async function acquireDiscordProcessLock(dataDir: string) {
+  const canonicalDataDir = await fs.promises.realpath(dataDir)
+
+  return properLockfile.lock(canonicalDataDir, {
+    lockfilePath: path.join(canonicalDataDir, '.discord-bot.lock'),
+    retries: 0,
+    stale: DISCORD_PROCESS_LOCK_STALE_MS,
+    update: DISCORD_PROCESS_LOCK_UPDATE_MS,
+  })
+}
+
 export async function runDiscordBot(deps: DiscordBotDependencies) {
+  try {
+    await fs.promises.mkdir(path.join(deps.dataDir, 'logs'), { recursive: true, mode: 0o700 })
+  } catch {
+    // runDiscordBotUnlocked が設定・台帳の誤りを処理し、必要なら失敗を記録する
+  }
+
+  const log = deps.log ?? fileLogger(path.join(deps.dataDir, 'logs', 'discord.log'))
+  const redactor = createRedactor(collectSecretValues(deps.env))
+  let releaseLock: () => Promise<void>
+
+  try {
+    releaseLock = await acquireDiscordProcessLock(deps.dataDir)
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ELOCKED') {
+      log({ type: 'discord_already_running' })
+
+      return 1
+    }
+
+    log({
+      type: 'discord_instance_lock_failed',
+      message: redactor.redact(errorMessage(error)).slice(0, 500),
+    })
+
+    return 1
+  }
+
+  try {
+    return await runDiscordBotUnlocked(deps)
+  } finally {
+    await releaseLock()
+  }
+}
+
+async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
   const dataDir = deps.dataDir
   const nowMs =
     deps.nowMs ??
@@ -118,12 +177,6 @@ export async function runDiscordBot(deps: DiscordBotDependencies) {
     })
   const sleep = deps.sleep ?? defaultSleep
   const pollMs = deps.pollMs ?? NOTIFICATION_POLL_MS
-
-  try {
-    await fs.promises.mkdir(path.join(dataDir, 'logs'), { recursive: true, mode: 0o700 })
-  } catch {
-    // logs が作れない場合は次の log 呼び出しで何も書けない。設定・台帳の誤りで先に進む
-  }
 
   const log = deps.log ?? fileLogger(path.join(dataDir, 'logs', 'discord.log'))
   const environmentSecretValues = collectSecretValues(deps.env)

@@ -400,6 +400,14 @@ export function handleDiscordCommand(request: DiscordCommandRequest, deps: Comma
       return redactReplies([{ content: error.message }], deps.redactor)
     }
 
-    return redactReplies([{ content: describeLedgerError(error) }], deps.redactor)
+    const taskId =
+      request.subcommand === 'retry' &&
+      typeof request.options.task === 'number' &&
+      Number.isSafeInteger(request.options.task) &&
+      request.options.task > 0
+        ? request.options.task
+        : undefined
+
+    return redactReplies([{ content: describeLedgerError(error, taskId) }], deps.redactor)
   }
 }

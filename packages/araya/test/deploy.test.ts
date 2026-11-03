@@ -533,4 +533,6 @@ test('deploy: root の npm pack 用 manifest が Discord bot の runtime depende
 
   assert.equal(dependencyVersion(rootManifest, 'discord.js'), '^14.27.0')
   assert.equal(dependencyVersion(workspaceManifest, 'discord.js'), '^14.27.0')
+  assert.equal(dependencyVersion(rootManifest, 'proper-lockfile'), '4.1.2')
+  assert.equal(dependencyVersion(workspaceManifest, 'proper-lockfile'), '4.1.2')
 })

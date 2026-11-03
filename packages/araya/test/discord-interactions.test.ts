@@ -398,19 +398,30 @@ test('discord-interactions: retry は開始後に中断した試行の side effe
 
     try {
       db.prepare(
-        "UPDATE runs SET started_at = '2026-10-31T00:00:00.000Z' WHERE task_id = 1 AND attempt = 1",
-      ).run()
+        "UPDATE runs SET started_at = '2026-10-31T00:00:00.000Z', evidence_json = ? WHERE task_id = 1 AND attempt = 1",
+      ).run(
+        JSON.stringify({
+          worktrees: [
+            { worktreePath: '/tmp/araya/.worktree/interrupted', branch: 'feature/interrupted' },
+          ],
+        }),
+      )
     } finally {
       db.close()
     }
     ledger = openTaskLedger(dataDir)
 
     const withoutConfirm = call('retry', { task: 1 })
+    const reply = withoutConfirm[0] ?? ''
 
-    assert.ok(
-      withoutConfirm[0]?.includes('--confirm-side-effects'),
-      withoutConfirm[0] ?? 'reply がありません',
-    )
+    assert.match(reply, /Task #1/u, reply)
+    assert.match(reply, /記録された worktree: 1 件/u, reply)
+    assert.match(reply, /\/araya retry/u, reply)
+    assert.match(reply, /task=1/u, reply)
+    assert.match(reply, /confirm_side_effects=true/u, reply)
+    assert.doesNotMatch(reply, /araya task remove/u, reply)
+    assert.equal(ledger.showTask(1, { events: 0 }).attempts.length, 1)
+
     assert.deepEqual(call('retry', { task: 1, confirm_side_effects: true }), [
       `Task #1 の再実行を受け付けました（試行 2）。次は ${UNIT} の unit で実行します`,
     ])

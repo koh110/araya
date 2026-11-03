@@ -263,7 +263,7 @@ export function chunkMessage(text: string) {
 }
 
 // 台帳の誤りは message が英語なので、Discord に出す文章はこの関数で日本語に置き換える（値は出さない）
-export function describeLedgerError(error: unknown) {
+export function describeLedgerError(error: unknown, taskId?: number) {
   if (!isLedgerError(error)) {
     return '台帳の操作に失敗しました'
   }
@@ -282,28 +282,12 @@ export function describeLedgerError(error: unknown) {
     case 'task_not_retryable':
       return '失敗・判断待ちの Task だけが再実行できます'
     case 'side_effects_unconfirmed': {
-      // sideEffects・taskId はこの code の error だけに付く（LedgerError の共通型には無い）
-      const taskId = 'taskId' in error && typeof error.taskId === 'number' ? error.taskId : ''
-      const sideEffects =
-        'sideEffects' in error &&
-        typeof error.sideEffects === 'object' &&
-        error.sideEffects !== null
-          ? error.sideEffects
-          : null
-      const created =
-        sideEffects !== null &&
-        'createdCount' in sideEffects &&
-        typeof sideEffects.createdCount === 'number'
-          ? sideEffects.createdCount
-          : 0
-      const removed =
-        sideEffects !== null &&
-        'removedCount' in sideEffects &&
-        typeof sideEffects.removedCount === 'number'
-          ? sideEffects.removedCount
-          : 0
+      const worktrees = error.previousWorktrees
+      const worktreeCount = worktrees === undefined ? '不明' : String(worktrees.length)
+      const taskReference = taskId === undefined ? 'Task' : `Task #${taskId}`
+      const taskOption = taskId === undefined ? 'task を指定' : `task=${taskId}`
 
-      return `git worktree（作成 ${created} 件、削除 ${removed} 件）と agent の session の始末が必要です。araya task retry --task ${taskId} --confirm-side-effects で続けるか、araya task remove --task ${taskId} --confirm-side-effects で取り消してください`
+      return `${taskReference} の前回の試行では外部変更の可能性があるため、再実行を止めました（記録された worktree: ${worktreeCount} 件）。GitHub の branch/PR 状態も確認してください。問題がなければ Discord の /araya retry で ${taskOption} と confirm_side_effects=true を指定して再実行してください。`
     }
     case 'ledger_unsupported_version':
       return '台帳の version がこの bot より新しいです。Araya を更新してください'
