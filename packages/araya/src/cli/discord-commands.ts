@@ -1,6 +1,6 @@
 // araya discord <register|install|uninstall|run>。
-// register: slash command 定義を Discord の guild に登録する（人間が token を設定したあと一度だけ）。
-// install: 常駐 unit を書く・有効にする。設定は discord.env file（mode 0600）があること。unit file には token を書かない。
+// register: slash command 定義を Discord の guild に登録する（1Password の設定を解決して一度だけ）。
+// install: LoadCredential で保護された Service Account token と op run の launcher を使って unit を作る。
 // uninstall: unit を止めて file を消す。state.json・台帳は残す。
 // run: foreground で 1 度動かす（unit 稼働の確かめなし）。
 // unit の file 作成・enable・restart は人間の実行（runner と同じ運用）
@@ -14,13 +14,14 @@ import {
   buildDiscordUnitFile,
   commandSucceeded,
   dataDirHash,
+  discordOpServiceAccountTokenFilePath,
   discordUnitName,
-  resolveDiscordEntrypoint,
+  resolveDiscordOpRunnerEntrypoint,
+  resolveOpCliPath,
   selectUnitEnvironment,
   unitFilePath,
 } from '../infrastructure/systemd.ts'
 import {
-  DISCORD_CONFIG_KEYS,
   discordEnvFilePath,
   loadDiscordConfig,
   type DiscordConfig,
@@ -62,11 +63,12 @@ export type DiscordCommandDependencies = RunnerCommandDependencies & {
   // test 用に差し替える。既定は実際の gateway 登録と bot 実行
   registerDiscordCommands?: (config: DiscordConfig) => Promise<void>
   runBot?: (deps: DiscordBotDependencies) => Promise<number>
-  resolveDiscordEntrypoint?: () => Promise<string>
+  resolveDiscordOpRunnerEntrypoint?: () => Promise<string>
+  resolveOpCliPath?: (searchPath: string | undefined) => Promise<string>
 }
 
 function notConfiguredMessage(envFilePath: string) {
-  return `Discord の設定がありません。${envFilePath}（mode 0600）に ${DISCORD_CONFIG_KEYS.join('・')} を書くか、同じ名前の環境変数を設定してください`
+  return `Discord の設定がありません。${envFilePath}（mode 0600）に設定し、ARAYA_DISCORD_BOT_TOKEN は op:// 参照にしてください。常駐 service は 1Password CLI で解決して起動します`
 }
 
 async function loadConfiguredOrThrow(
@@ -91,6 +93,46 @@ async function registerDiscord(config: RunnerCommandConfig, deps: DiscordCommand
     guildId: source.config.guildId,
     command: 'araya',
     subcommands: ['list', 'show', 'submit', 'cancel', 'retry'],
+  }
+}
+
+async function validateOpServiceAccountCredential(filePath: string, uid: number) {
+  let stat
+
+  try {
+    stat = await fs.lstat(filePath)
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+      throw commandError(
+        'op_service_account_credential_missing',
+        `1Password Service Account credential がありません: ${filePath}`,
+      )
+    }
+
+    throw error
+  }
+
+  if (!stat.isFile() || stat.uid !== uid) {
+    throw commandError(
+      'op_service_account_credential_invalid',
+      `1Password Service Account credential は service user が所有する通常の file にしてください: ${filePath}`,
+    )
+  }
+
+  const mode = stat.mode & 0o777
+
+  if (mode !== 0o400 && mode !== 0o600) {
+    throw commandError(
+      'op_service_account_credential_permissions',
+      `1Password Service Account credential は owner のみ読める mode 0400 または 0600 にしてください: ${filePath}`,
+    )
+  }
+
+  if (stat.size === 0) {
+    throw commandError(
+      'op_service_account_credential_invalid',
+      `1Password Service Account credential が空です: ${filePath}`,
+    )
   }
 }
 
@@ -129,15 +171,22 @@ async function installDiscord(
     )
   }
 
-  // 3. unit file の内容（token は EnvironmentFile 側。unit file には書かない）
+  // 3. 認証file・1Password CLI・launcherを確認してunit fileを生成する
+  const opCredentialFile = discordOpServiceAccountTokenFilePath(deps.env, deps.homeDir)
+  await validateOpServiceAccountCredential(opCredentialFile, deps.uid)
+  const [opPath, opRunnerEntrypoint] = await Promise.all([
+    (deps.resolveOpCliPath ?? resolveOpCliPath)(deps.env.PATH),
+    (deps.resolveDiscordOpRunnerEntrypoint ?? resolveDiscordOpRunnerEntrypoint)(),
+  ])
   const unit = discordUnitName(dataDirHash(dataDirReal))
   const unitPath = unitFilePath(deps.env, deps.homeDir, unit)
   const envFile = discordEnvFilePath(dataDirReal)
   const content = buildDiscordUnitFile({
     dataDir: dataDirReal,
     nodePath: deps.nodePath,
-    entrypoint: await (deps.resolveDiscordEntrypoint ?? resolveDiscordEntrypoint)(),
-    envFile,
+    opRunnerEntrypoint,
+    opPath,
+    opCredentialFile,
     environment: selectUnitEnvironment(deps.env, {
       dataDir: config.dataDir,
       devRoot: config.devRoot,
@@ -222,11 +271,11 @@ async function installDiscord(
 
   if (!ready) {
     deps.stderr(
-      `warning: ${unit} の起動が確認できませんでした。${path.join(config.dataDir, 'logs', 'discord.log')} と systemctl --user status ${unit} を確認してください`,
+      `warning: ${unit} の起動が確認できませんでした。${path.join(config.dataDir, 'logs', 'discord.log')}、${path.join(config.dataDir, 'logs', 'discord-op.log')} と systemctl --user status ${unit} を確認してください`,
     )
   }
 
-  return { unit, unitPath, envFile, ready, linger }
+  return { unit, unitPath, envFile, opCredentialFile, ready, linger }
 }
 
 async function uninstallDiscord(

@@ -193,7 +193,7 @@ test('discord bot: Task 操作の返信では Discord unit でなく runner unit
   }
 })
 
-test('discord bot: discord.env 由来の bot token を task・retry note・reply・notification に残さない', async () => {
+test('discord bot: 1Passwordで解決したbot tokenを task・retry note・reply・notification に残さない', async () => {
   const dataDir = await fs.realpath(
     await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-secret-test-')),
   )
@@ -205,7 +205,7 @@ test('discord bot: discord.env 由来の bot token を task・retry note・reply
   await fs.writeFile(
     envFile,
     [
-      `ARAYA_DISCORD_BOT_TOKEN=${BOT_TOKEN}`,
+      'ARAYA_DISCORD_BOT_TOKEN=op://vault/item/bot-token',
       `ARAYA_DISCORD_APPLICATION_ID=${APPLICATION_ID}`,
       `ARAYA_DISCORD_GUILD_ID=${GUILD_ID}`,
       `ARAYA_DISCORD_CHANNEL_ID=${CHANNEL_ID}`,
@@ -217,7 +217,7 @@ test('discord bot: discord.env 由来の bot token を task・retry note・reply
   try {
     const exitCode = await runDiscordBot({
       dataDir,
-      env: {},
+      env: { ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN },
       stopSignal: stopController.signal,
       verifyUnit: false,
       sleep: async () => {},

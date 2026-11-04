@@ -1,15 +1,16 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
-// Discord 連携の設定。常駐 service の基準は <dataDir>/discord.env（mode 0600、グループと other に読ませない）。
-// file が無いときは環境変数を見る（araya discord register など、service を入れる前の initial setup だけ）。
-// どちらも無ければ Discord 連携は無効。一部だけ指定されているときは設定不備として、欠けた名前だけを列挙する（値はエラーに出さない）
+// Discord 連携の設定。常駐 service は <dataDir>/discord.env（mode 0600）の1Password参照を op run で解決する。
+// 解決済み環境変数が file 内の参照・値を上書きする。file が無いときだけ環境変数を使い、両方なければ無効。一部だけ指定されている場合は欠けた名前だけを列挙する。
 
 const SNOWFLAKE_PATTERN = /^[0-9]{17,20}$/u
 const ENV_NAME_PATTERN = /^[A-Z][A-Z0-9_]*$/u
 const MAX_BOT_TOKEN_CHARS = 255
 
 export const DISCORD_ENV_FILE_NAME = 'discord.env'
+export const OP_SERVICE_ACCOUNT_CREDENTIAL_NAME = 'op-service-account-token'
+export const OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME = 'OP_SERVICE_ACCOUNT_TOKEN'
 export const MAX_DISCORD_ENV_FILE_BYTES = 16 * 1024
 
 export const DISCORD_CONFIG_KEYS = [
@@ -195,7 +196,20 @@ export function validateDiscordSettings(settings: Record<string, string | undefi
   }
 }
 
-// file を先に読み、無ければ環境変数を見る。どちらも無ければ enabled: false
+function assertResolvedDiscordSettings(settings: Readonly<Record<string, string | undefined>>) {
+  const unresolved = DISCORD_CONFIG_KEYS.filter((key) => {
+    return settings[key]?.includes('op://') === true
+  })
+
+  if (unresolved.length > 0) {
+    throw discordConfigError(
+      'discord_secret_reference_unresolved',
+      `1Password の参照が解決されていません: ${unresolved.join('・')}。op run --env-file から起動してください`,
+    )
+  }
+}
+
+// file を読み、解決済み環境変数があれば優先する。未解決の op:// 参照は拒否する
 export async function loadDiscordConfig(
   dataDir: string,
   env: Readonly<Record<string, string | undefined>> = process.env,
@@ -204,11 +218,30 @@ export async function loadDiscordConfig(
   const fileSettings = await readDiscordEnvFile(envFilePath)
 
   if (fileSettings !== null) {
+    const fileBotToken = fileSettings.ARAYA_DISCORD_BOT_TOKEN
+
+    if (fileBotToken === undefined || !fileBotToken.startsWith('op://')) {
+      throw discordConfigError(
+        'discord_bot_token_must_use_1password',
+        `${DISCORD_ENV_FILE_NAME} の ARAYA_DISCORD_BOT_TOKEN は op:// 参照で指定してください`,
+      )
+    }
+
+    const settings: Record<string, string | undefined> = { ...fileSettings }
+
+    for (const key of DISCORD_CONFIG_KEYS) {
+      if (env[key] !== undefined) {
+        settings[key] = env[key]
+      }
+    }
+
+    assertResolvedDiscordSettings(settings)
+
     return {
       enabled: true,
       fromFile: true,
       envFilePath,
-      config: validateDiscordSettings(fileSettings),
+      config: validateDiscordSettings(settings),
     } satisfies DiscordConfigSource
   }
 
@@ -219,6 +252,8 @@ export async function loadDiscordConfig(
   if (present.length === 0) {
     return { enabled: false, reason: 'not_configured', envFilePath } satisfies DiscordConfigSource
   }
+
+  assertResolvedDiscordSettings(env)
 
   return {
     enabled: true,

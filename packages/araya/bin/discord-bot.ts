@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Discord bot の standalone process。systemd の unit（araya-discord-<hash>.service）の ExecStart はこの file を使う。
-// 設定は <dataDir>/discord.env（EnvironmentFile）から読む。設定が無ければ log して exit 1
+// Discord bot のstandalone process。systemd unitから1Password launcher経由で起動する。
+// launcherがop runで解決した環境変数を優先し、<dataDir>/discord.envにはop://参照を置く。
 
 import process from 'node:process'
 import { parseArgs } from 'node:util'

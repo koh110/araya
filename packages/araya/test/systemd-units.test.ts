@@ -17,8 +17,11 @@ import {
   createSystemdOps,
   dataDirHash,
   deliveryScopeUnit,
+  discordOpServiceAccountTokenFilePath,
   gitScopeUnit,
   isUnitFileValueSafe,
+  resolveDiscordOpRunnerEntrypoint,
+  resolveOpCliPath,
   resolveRunnerEntrypoint,
   runnerUnitName,
   scopePattern,
@@ -208,6 +211,66 @@ test('systemd-units: runner の entrypoint は package root の bin/ から、mo
     await fs.rmdir(path.join(root, 'bin', 'task-runner.js'))
     await fs.symlink(path.join(root, 'bin', 'task-runner.ts'), path.join(root, 'bin', 'task-runner.js'))
     await assert.rejects(resolveRunnerEntrypoint(jsModule), errorWithCode('runner_entrypoint_unavailable'))
+  } finally {
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('systemd-units: Discord 1Password launcher は package root の bin/ から通常の file として探す', async () => {
+  const root = await makeRoot('araya-discord-op-entrypoint-test-')
+
+  try {
+    await fs.mkdir(path.join(root, 'src', 'infrastructure'), { recursive: true })
+    await fs.mkdir(path.join(root, 'bin'))
+    const tsModule = pathToFileURL(path.join(root, 'src', 'infrastructure', 'systemd.ts')).href
+    const jsModule = pathToFileURL(path.join(root, 'src', 'infrastructure', 'systemd.js')).href
+
+    await assert.rejects(
+      resolveDiscordOpRunnerEntrypoint(tsModule),
+      errorWithCode('discord_op_runner_unavailable'),
+    )
+
+    const tsEntrypoint = path.join(root, 'bin', 'discord-op-runner.ts')
+    await fs.writeFile(tsEntrypoint, '', 'utf8')
+    assert.equal(await resolveDiscordOpRunnerEntrypoint(tsModule), tsEntrypoint)
+    await assert.rejects(
+      resolveDiscordOpRunnerEntrypoint(jsModule),
+      errorWithCode('discord_op_runner_unavailable'),
+    )
+
+    const jsEntrypoint = path.join(root, 'bin', 'discord-op-runner.js')
+    await fs.symlink(tsEntrypoint, jsEntrypoint)
+    await assert.rejects(
+      resolveDiscordOpRunnerEntrypoint(jsModule),
+      errorWithCode('discord_op_runner_unavailable'),
+    )
+  } finally {
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('systemd-units: 1Password CLI は PATH から実行可能な op を探し、credential path は XDG config を使う', async () => {
+  const root = await makeRoot('araya-op-path-test-')
+  const binDir = path.join(root, 'bin')
+
+  try {
+    await fs.mkdir(binDir)
+    const opPath = path.join(binDir, 'op')
+    await fs.writeFile(opPath, '', { mode: 0o700 })
+
+    assert.equal(await resolveOpCliPath(binDir), opPath)
+    await assert.rejects(
+      resolveOpCliPath(path.join(root, 'missing')),
+      errorWithCode('op_cli_unavailable'),
+    )
+    assert.equal(
+      discordOpServiceAccountTokenFilePath({ XDG_CONFIG_HOME: '/tmp/xdg' }, '/home/user'),
+      '/tmp/xdg/araya/op-service-account-token',
+    )
+    assert.equal(
+      discordOpServiceAccountTokenFilePath({ XDG_CONFIG_HOME: 'relative' }, '/home/user'),
+      '/home/user/.config/araya/op-service-account-token',
+    )
   } finally {
     await fs.rm(root, { recursive: true, force: true })
   }

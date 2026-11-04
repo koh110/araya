@@ -125,6 +125,49 @@ runner は systemd の user service です。`npm run deploy` で入ります。
 
 araya は linger を変えません。linger が無効だと、logout で runner は止まり（一時停止）、次に user manager が起動したときに続きから進みます。logout の後も動かしたいときは `loginctl enable-linger` を実行してください。runner が落ちたときは、systemd が間隔を空けて起動し直します。
 
+## Discord bot を有効にする
+
+Discord の常駐 bot は 1Password CLI で環境変数を解決してから起動します。1Password CLI 2.18 以降と、Discord bot token を読める Service Account を用意してください。Service Account は Personal / Private / Employee vault と既定の Shared vault にアクセスできないため、読み取り権限を付けたアクセス可能な vault に Bot token を置きます。Service Account token は `<XDG_CONFIG_HOME>/araya/op-service-account-token`（既定 `~/.config/araya/op-service-account-token`）へ、service user 所有・mode `0400` または `0600` で保管します。インストーラーは token を読み出したり作成したりせず、systemd `LoadCredential` で launcher に渡します。
+
+公式ドキュメント: [Service Account と 1Password CLI](https://www.1password.dev/service-accounts/use-with-1password-cli)・[op run で secret を環境変数へ渡す](https://www.1password.dev/cli/secrets-environment-variables)。
+
+`<ARAYA_DATA_DIR>/discord.env`（既定 `~/.araya/discord.env`）は mode `0600` にし、Bot token 自体ではなく 1Password secret reference を保存してください。
+
+```dotenv
+ARAYA_DISCORD_BOT_TOKEN=op://<vault>/<item>/<token-field>
+ARAYA_DISCORD_APPLICATION_ID=<discord-application-id>
+ARAYA_DISCORD_GUILD_ID=<discord-guild-id>
+ARAYA_DISCORD_CHANNEL_ID=<discord-channel-id>
+ARAYA_DISCORD_ALLOWED_USER_IDS=<discord-user-id>
+```
+
+`<...>` は実際の値に置き換えます。Application/Guild/Channel/User ID は公開 ID なので平文でも構いません。`discord.env` の Bot token が平文の場合、Araya は設定として受け付けません。
+
+slash command の登録と service のインストールは、Service Account credential を `op run` にだけ渡す形で実行します。次の例は認証関連の既存環境変数（1Password Connect / session / account）を除外し、Araya process から Service Account token と systemd credential directory を除去します。token は command argument には入りません。
+
+```sh
+data_dir="${ARAYA_DATA_DIR:-$HOME/.araya}"
+config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+case "$config_home" in
+  /*) ;;
+  *) config_home="$HOME/.config" ;;
+esac
+credential_file="$config_home/araya/op-service-account-token"
+
+araya_discord_with_1password() {
+  OP_SERVICE_ACCOUNT_TOKEN="$(cat "$credential_file")" \
+    env -u OP_CONNECT_HOST -u OP_CONNECT_TOKEN -u OP_SESSION -u OP_ACCOUNT \
+    op run --env-file="$data_dir/discord.env" -- \
+      /usr/bin/env -u OP_SERVICE_ACCOUNT_TOKEN -u CREDENTIALS_DIRECTORY \
+      araya discord "$1"
+}
+
+araya_discord_with_1password register
+araya_discord_with_1password install
+```
+
+`install` は systemd unit を生成・有効化・再起動します。unit には Bot token や Service Account token を書きません。launcher は `op run --env-file` で解決した Discord 設定だけを bot に渡し、起動失敗時は値を出さず `<ARAYA_DATA_DIR>/logs/discord-op.log` に終了理由を記録します。`run` で手動起動する場合も、上の helper のように `op run` の子 process から認証環境変数を除去してください。
+
 ## araya を更新する
 
 ```sh

@@ -5,7 +5,8 @@ import { loadConfig, loadPiSdk, withPiEnvironment } from '../config/environment.
 import { loadConfigFile } from '../config/file.ts'
 import {
   createSystemdOps,
-  resolveDiscordEntrypoint,
+  resolveDiscordOpRunnerEntrypoint,
+  resolveOpCliPath,
   resolveRunnerEntrypoint,
 } from '../infrastructure/systemd.ts'
 import {
@@ -68,13 +69,12 @@ function printHelp() {
     runner の unit を止めて無効にし、unit file を消す。台帳は変えない（動いていた試行は、入れ直すと続きから進む）。
 
   araya discord register
-    slash command（/araya list・show・submit・cancel・retry）を Discord の guild に登録する。設定（discord.env か
-    環境変数）を読めることが必要。Discord の Bot を作成し、Settings → Robots → Reset Token を押して token を得たあと、
-    1 度だけ実行する。applicationId・guildId・token は <dataDir>/discord.env（mode 0600）か環境変数に設定する。
+    slash command（/araya list・show・submit・cancel・retry）を Discord の guild に登録する。discord.env（mode 0600）または環境変数の設定が必要。
+    Service Account token を <XDG_CONFIG_HOME>/araya/op-service-account-token に保護して置き、op run --env-file で設定を解決して実行する（README参照）。
   araya discord install
     Discord bot を常駐の process（araya-discord-<hash>.service）として入れる。unit file を書き、有効にして起動し直す。
-    設定は discord.env file があること（環境変数だけの場合は使えない）。unit file には token を書かず、EnvironmentFile として
-    discord.env を参照する。linger は変えない（無効なら logout で bot が止まり、通知は次の起動から続く）。
+    1Password CLI と保護された Service Account token file が必要。systemd LoadCredential で認証し、launcher は op run で discord.env の op:// 参照を解決する。
+    OP_SERVICE_ACCOUNT_TOKEN と CREDENTIALS_DIRECTORY は bot process に渡さない。linger は変えない（無効なら logout で bot が止まる）。
   araya discord uninstall
     Discord bot の unit を止めて無効にし、unit file を消す。state.json・台帳は残す（入れ直すと cursor の続きから進む）。
     Discord 側の slash command 定義は残る（Discord 側で削除する）。
@@ -106,7 +106,7 @@ function printHelp() {
   ARAYA_DEVELOPMENT_TIMEOUT_MS
   ARAYA_VERIFICATION_TIMEOUT_MS
   ARAYA_DISCORD_APPLICATION_ID・ARAYA_DISCORD_GUILD_ID・ARAYA_DISCORD_CHANNEL_ID・ARAYA_DISCORD_BOT_TOKEN・ARAYA_DISCORD_ALLOWED_USER_IDS
-    （Discord の設定。常駐の service は <ARAYA_DATA_DIR>/discord.env（mode 0600）だけから読む。開発の process には渡さない）
+    （Discord の設定。常駐 service は <ARAYA_DATA_DIR>/discord.env（mode 0600）を op run --env-file で読む。Bot token は op:// 参照。開発 process には渡さない）
 `)
 }
 
@@ -208,10 +208,15 @@ export async function runCli(
     const deps: DiscordCommandDependencies = {
       ...defaultCommandDependencies(config.env),
       ...taskDependencies,
-      resolveDiscordEntrypoint:
-        taskDependencies.resolveDiscordEntrypoint ??
+      resolveDiscordOpRunnerEntrypoint:
+        taskDependencies.resolveDiscordOpRunnerEntrypoint ??
         (async () => {
-          return resolveDiscordEntrypoint()
+          return resolveDiscordOpRunnerEntrypoint()
+        }),
+      resolveOpCliPath:
+        taskDependencies.resolveOpCliPath ??
+        ((searchPath) => {
+          return resolveOpCliPath(searchPath)
         }),
     }
 

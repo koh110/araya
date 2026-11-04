@@ -4,6 +4,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { OP_SERVICE_ACCOUNT_CREDENTIAL_NAME } from '../discord/config.ts'
 import {
   runBoundedCommand,
   runVerificationCommand,
@@ -266,9 +267,9 @@ export function buildRunnerUnitFile(input: RunnerUnitFileInput) {
 export type DiscordUnitFileInput = {
   dataDir: string
   nodePath: string
-  entrypoint: string
-  // 設定（bot token など）を書く file。unit file には EnvironmentFile としてだけ書く
-  envFile: string
+  opRunnerEntrypoint: string
+  opPath: string
+  opCredentialFile: string
   environment: UnitEnvironment
 }
 
@@ -276,12 +277,20 @@ export function discordUnitName(hash: string) {
   return `araya-discord-${hash}.service`
 }
 
-// Discord bot の常駐 unit。runner と違い、設定は EnvironmentFile（discord.env）から読む（token を unit file に書かない）
+// Discord bot は専用のlauncherから op run 経由で起動する。認証tokenはLoadCredentialでruntimeに渡す。
 export function discordUnitSections(input: DiscordUnitFileInput) {
   assertUnitFileValue('dataDir', input.dataDir)
   assertUnitFileValue('node の実行ファイル', input.nodePath)
-  assertUnitFileValue('Discord bot の entrypoint', input.entrypoint)
-  assertUnitFileValue('discord.env', input.envFile)
+  assertUnitFileValue('Discord op runner の entrypoint', input.opRunnerEntrypoint)
+  assertUnitFileValue('1Password CLI', input.opPath)
+  assertUnitFileValue('1Password credential file', input.opCredentialFile)
+
+  if (input.opCredentialFile.includes(':')) {
+    throw systemdError(
+      'unsupported_path',
+      '1Password credential file のpathには「:」を使えません',
+    )
+  }
 
   for (const [name, value] of input.environment) {
     if (!ENV_NAME_PATTERN.test(name)) {
@@ -300,8 +309,14 @@ export function discordUnitSections(input: DiscordUnitFileInput) {
   ]
   const service: (readonly [string, string])[] = [
     ['Type', 'exec'],
-    ['ExecStart', `${input.nodePath} ${input.entrypoint} --data-dir ${input.dataDir}`],
-    ['EnvironmentFile', input.envFile],
+    [
+      'ExecStart',
+      `${input.nodePath} ${input.opRunnerEntrypoint} --data-dir ${input.dataDir} --op-path ${input.opPath}`,
+    ],
+    [
+      'LoadCredential',
+      `${OP_SERVICE_ACCOUNT_CREDENTIAL_NAME}:${input.opCredentialFile}`,
+    ],
     ['WorkingDirectory', input.dataDir],
     ...input.environment.map(([name, value]) => {
       const property: readonly [string, string] = ['Environment', `${name}=${value}`]
@@ -316,7 +331,7 @@ export function discordUnitSections(input: DiscordUnitFileInput) {
     ['TimeoutStopSec', '30'],
     ['StandardInput', 'null'],
     ['StandardOutput', 'null'],
-    ['StandardError', 'null'],
+    ['StandardError', `append:${path.join(input.dataDir, 'logs', 'discord-op.log')}`],
   ]
   const install: (readonly [string, string])[] = [['WantedBy', 'default.target']]
 
@@ -406,19 +421,63 @@ export async function resolveDiscordEntrypoint(moduleUrl: string = import.meta.u
   return entrypoint
 }
 
+// Discord の1Password launcher（bin/discord-op-runner）をpackage内から解決する
+export async function resolveDiscordOpRunnerEntrypoint(moduleUrl: string = import.meta.url) {
+  const modulePath = fileURLToPath(moduleUrl)
+  const packageRoot = path.dirname(path.dirname(path.dirname(modulePath)))
+  const entrypoint = path.join(packageRoot, 'bin', `discord-op-runner${path.extname(modulePath)}`)
+  let stat
+
+  try {
+    stat = await fs.lstat(entrypoint)
+  } catch (error) {
+    if (isErrno(error, 'ENOENT') || isErrno(error, 'ENOTDIR')) {
+      throw systemdError(
+        'discord_op_runner_unavailable',
+        `Discord 1Password launcher がありません: ${entrypoint}`,
+      )
+    }
+
+    throw error
+  }
+
+  if (!stat.isFile()) {
+    throw systemdError(
+      'discord_op_runner_unavailable',
+      `Discord 1Password launcher が通常の file ではありません: ${entrypoint}`,
+    )
+  }
+
+  return entrypoint
+}
+
+function configHomePath(env: Readonly<Record<string, string | undefined>>, homeDir: string) {
+  const configHome = env.XDG_CONFIG_HOME
+
+  return configHome !== undefined && path.isAbsolute(configHome)
+    ? configHome
+    : path.join(homeDir, '.config')
+}
+
+// 1Password Service Account credential の保護された保存先
+export function discordOpServiceAccountTokenFilePath(
+  env: Readonly<Record<string, string | undefined>>,
+  homeDir: string,
+) {
+  return path.join(
+    configHomePath(env, homeDir),
+    'araya',
+    OP_SERVICE_ACCOUNT_CREDENTIAL_NAME,
+  )
+}
+
 // <XDG_CONFIG_HOME>/systemd/user/<unit>。XDG_CONFIG_HOME が絶対 path でなければ <home>/.config
 export function unitFilePath(
   env: Readonly<Record<string, string | undefined>>,
   homeDir: string,
   unit: string,
 ) {
-  const configHome = env.XDG_CONFIG_HOME
-  const base =
-    configHome !== undefined && path.isAbsolute(configHome)
-      ? configHome
-      : path.join(homeDir, '.config')
-
-  return path.join(base, 'systemd', 'user', unit)
+  return path.join(configHomePath(env, homeDir), 'systemd', 'user', unit)
 }
 
 export function commandSucceeded(result: CommandResult) {
@@ -445,6 +504,17 @@ async function findExecutable(name: string, searchPath: string | undefined) {
   }
 
   return null
+}
+
+// unit に絶対pathで固定する1Password CLIを環境のPATHから探す
+export async function resolveOpCliPath(searchPath: string | undefined) {
+  const opPath = await findExecutable('op', searchPath)
+
+  if (opPath === null) {
+    throw systemdError('op_cli_unavailable', '1Password CLI（op）が PATH にありません')
+  }
+
+  return opPath
 }
 
 // systemctl などを打ち切り付きで実行する。起動できなかったときは exitCode を null にし、理由を stderr に入れる。

@@ -37,10 +37,15 @@ async function makeInstallEnv() {
   const configHome = path.join(root, 'xdg')
   const piAgentDir = path.join(dataDir, 'pi')
   const entrypoint = path.join(root, 'package', 'bin', 'discord-bot.ts')
+  const opRunnerEntrypoint = path.join(root, 'package', 'bin', 'discord-op-runner.ts')
+  const opPath = path.join(root, 'bin', 'op')
+  const opTokenFile = path.join(configHome, 'araya', 'op-service-account-token')
   await fs.mkdir(home)
   await fs.mkdir(dataDir, { mode: 0o700 })
   await fs.mkdir(piAgentDir)
   await fs.mkdir(path.dirname(entrypoint), { recursive: true })
+  await fs.mkdir(path.dirname(opPath), { recursive: true })
+  await fs.mkdir(path.dirname(opTokenFile), { recursive: true, mode: 0o700 })
   await fs.writeFile(
     path.join(piAgentDir, 'settings.json'),
     JSON.stringify({
@@ -50,6 +55,9 @@ async function makeInstallEnv() {
     'utf8',
   )
   await fs.writeFile(entrypoint, '', 'utf8')
+  await fs.writeFile(opRunnerEntrypoint, '', 'utf8')
+  await fs.writeFile(opPath, '', { mode: 0o700 })
+  await fs.writeFile(opTokenFile, 'synthetic-service-account-token\n', { mode: 0o600 })
   const env: NodeJS.ProcessEnv = {
     PATH: '/usr/bin:/bin',
     HOME: home,
@@ -64,7 +72,19 @@ async function makeInstallEnv() {
     PI_CODING_AGENT_DIR: piAgentDir,
   }
 
-  return { root, dataDir, devRoot, home, configHome, piAgentDir, entrypoint, env }
+  return {
+    root,
+    dataDir,
+    devRoot,
+    home,
+    configHome,
+    piAgentDir,
+    entrypoint,
+    opRunnerEntrypoint,
+    opPath,
+    opTokenFile,
+    env,
+  }
 }
 
 function unitOf(dataDirReal: string) {
@@ -80,7 +100,7 @@ async function writeDiscordEnv(installEnv: InstallEnv, mode = 0o600) {
   const lines = DISCORD_CONFIG_KEYS.map((key) => {
     const value =
       key === 'ARAYA_DISCORD_BOT_TOKEN'
-        ? BOT_TOKEN
+        ? 'op://vault/item/bot-token'
         : key === 'ARAYA_DISCORD_APPLICATION_ID'
           ? APPLICATION_ID
           : key === 'ARAYA_DISCORD_GUILD_ID'
@@ -163,8 +183,11 @@ async function runDiscord(
         return fake.ops
       },
       nodePath: NODE_PATH,
-      resolveDiscordEntrypoint: async () => {
-        return installEnv.entrypoint
+      resolveDiscordOpRunnerEntrypoint: async () => {
+        return installEnv.opRunnerEntrypoint
+      },
+      resolveOpCliPath: async () => {
+        return installEnv.opPath
       },
       homeDir: installEnv.home,
       uid: UID,
@@ -280,7 +303,46 @@ test('discord install: 設定が無ければ discord_not_configured、環境変�
   }
 })
 
-test('discord install: unit file を書き、EnvironmentFile で discord.env を参照し、token は unit file に出さない', async () => {
+test('discord install: LoadCredential 元ファイルが無い・権限過大なら unit を変更しない', async () => {
+  const installEnv = await makeInstallEnv()
+
+  await writeDiscordEnv(installEnv)
+  const fake = createFakeSystemd({
+    systemctl: defaultSystemctl(installEnv),
+  })
+
+  try {
+    await fs.rm(installEnv.opTokenFile)
+    await assert.rejects(
+      runDiscord(installEnv, ['install'], fake),
+      errorWithCode('op_service_account_credential_missing'),
+    )
+
+    await fs.writeFile(installEnv.opTokenFile, 'synthetic-service-account-token\n', {
+      mode: 0o640,
+    })
+    await assert.rejects(
+      runDiscord(installEnv, ['install'], fake),
+      errorWithCode('op_service_account_credential_permissions'),
+    )
+
+    const unitPath = unitPathOf(
+      installEnv,
+      unitOf(await fs.realpath(installEnv.dataDir)),
+    )
+    await assert.rejects(fs.access(unitPath))
+    assert.deepEqual(
+      systemdCalls(fake).filter((call) => {
+        return ['daemon-reload', 'enable', 'restart'].includes(call[2] ?? '')
+      }),
+      [],
+    )
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('discord install: op run と LoadCredential を使い、resolved token は unit file に出さない', async () => {
   const installEnv = await makeInstallEnv()
 
   await writeDiscordEnv(installEnv)
@@ -300,12 +362,13 @@ test('discord install: unit file を書き、EnvironmentFile で discord.env を
     assert.equal(readField(output, 'unit'), unit)
     assert.equal(readField(output, 'unitPath'), unitPath)
     assert.equal(readField(output, 'envFile'), discordEnvFilePath(dataDirReal))
+    assert.equal(readField(output, 'opCredentialFile'), installEnv.opTokenFile)
     assert.equal(readField(output, 'ready'), true)
     assert.equal(readField(output, 'linger'), true)
     assert.equal(stderr, '')
     assert.deepEqual(sleeps, [])
 
-    // unit file の形：token は EnvironmentFile 側。Environment= に ARAYA_DISCORD_* は現れない
+    // unit file は LoadCredential で認証し、discord.env は op run のみが読む。Environment= に Discord 設定を出さない
     assert.equal(
       await fs.readFile(unitPath, 'utf8'),
       [
@@ -315,8 +378,8 @@ test('discord install: unit file を書き、EnvironmentFile で discord.env を
         '',
         '[Service]',
         'Type=exec',
-        `ExecStart=${NODE_PATH} ${installEnv.entrypoint} --data-dir ${dataDirReal}`,
-        `EnvironmentFile=${discordEnvFilePath(dataDirReal)}`,
+        `ExecStart=${NODE_PATH} ${installEnv.opRunnerEntrypoint} --data-dir ${dataDirReal} --op-path ${installEnv.opPath}`,
+        `LoadCredential=op-service-account-token:${installEnv.opTokenFile}`,
         `WorkingDirectory=${dataDirReal}`,
         `Environment=ARAYA_DATA_DIR=${dataDirReal}`,
         `Environment=ARAYA_DEV_ROOT=${installEnv.devRoot}`,
@@ -330,14 +393,18 @@ test('discord install: unit file を書き、EnvironmentFile で discord.env を
         'TimeoutStopSec=30',
         'StandardInput=null',
         'StandardOutput=null',
-        'StandardError=null',
+        `StandardError=append:${path.join(dataDirReal, 'logs', 'discord-op.log')}`,
         '',
         '[Install]',
         'WantedBy=default.target',
         '',
       ].join('\n'),
     )
-    assert.ok(!(await fs.readFile(unitPath, 'utf8')).includes(BOT_TOKEN))
+    const unitText = await fs.readFile(unitPath, 'utf8')
+    assert.ok(!unitText.includes('EnvironmentFile='))
+    assert.ok(!unitText.includes('OP_SERVICE_ACCOUNT_TOKEN'))
+    assert.ok(!unitText.includes(BOT_TOKEN))
+    assert.ok(!unitText.includes('synthetic-service-account-token'))
     assert.equal((await fs.stat(unitPath)).mode & 0o777, 0o600)
     assert.equal((await fs.stat(path.join(installEnv.dataDir, 'logs'))).mode & 0o777, 0o700)
 
