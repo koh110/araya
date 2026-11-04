@@ -23,7 +23,7 @@ const GUILD_ID = '12345678901234567'
 const CHANNEL_ID = '12345678901234568'
 const USER_ID = '12345678901234569'
 const NODE_PATH = '/usr/bin/node'
-const UID = 1000
+const UID = process.getuid?.() ?? 1000
 
 type InstallEnv = Awaited<ReturnType<typeof makeInstallEnv>>
 
