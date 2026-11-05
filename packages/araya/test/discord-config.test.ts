@@ -239,7 +239,7 @@ test('discord-config: 1Password が解決した環境変数は .env の参照よ
   }
 })
 
-test('discord-config: 未解決の1Password参照は値を出さずに拒否する', async () => {
+test('discord-config: op:// は独自解釈せず、解決済み環境変数があれば優先する', async () => {
   const dataDir = await makeDataDir()
   const reference = 'op://vault/item/bot-token'
   const fileSettings: Record<string, string> = { ...SETTINGS, ARAYA_DISCORD_BOT_TOKEN: reference }
@@ -253,19 +253,17 @@ test('discord-config: 未解決の1Password参照は値を出さずに拒否す�
       { mode: 0o600 },
     )
 
-    await assert.rejects(
-      loadDiscordConfig(dataDir, {}),
-      (error: unknown) => {
-        if (!(error instanceof Error) || !('code' in error)) {
-          return false
-        }
+    const raw = await loadDiscordConfig(dataDir, {})
+    assert.equal(raw.enabled, true)
+    if (raw.enabled) {
+      assert.equal(raw.config.botToken, reference)
+    }
 
-        assert.equal(error.code, 'discord_secret_reference_unresolved')
-        assert.ok(!error.message.includes(reference))
-
-        return true
-      },
-    )
+    const resolved = await loadDiscordConfig(dataDir, { ...SETTINGS })
+    assert.equal(resolved.enabled, true)
+    if (resolved.enabled) {
+      assert.equal(resolved.config.botToken, BOT_TOKEN)
+    }
   } finally {
     await fs.rm(dataDir, { recursive: true, force: true })
   }
@@ -296,10 +294,11 @@ test('discord-config: .env は平文 token と任意の1Password参照の両方�
       DISCORD_CONFIG_KEYS.map((key) => `${key}=${referencedSettings[key]}`).join('\n'),
       { mode: 0o600 },
     )
-    await assert.rejects(
-      loadDiscordConfig(dataDir, {}),
-      errorWithCode('discord_secret_reference_unresolved'),
-    )
+    const raw = await loadDiscordConfig(dataDir, {})
+    assert.equal(raw.enabled, true)
+    if (raw.enabled) {
+      assert.equal(raw.config.botToken, reference)
+    }
     const resolved = await loadDiscordConfig(dataDir, SETTINGS)
     assert.equal(resolved.enabled, true)
     if (resolved.enabled) {

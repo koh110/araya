@@ -152,10 +152,6 @@ async function validateDataDir(dataDir: string) {
     throw runnerError(`.env に設定がありません: ${missing.join('・')}`)
   }
 
-  if (!settings.ARAYA_DISCORD_BOT_TOKEN?.startsWith('op://')) {
-    throw runnerError('.env の ARAYA_DISCORD_BOT_TOKEN は op:// 参照にしてください')
-  }
-
   return envFilePath
 }
 

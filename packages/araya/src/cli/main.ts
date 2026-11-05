@@ -74,11 +74,10 @@ function printHelp() {
   araya discord register
     slash command（/araya list・show・submit・cancel・retry）を Discord の guild に登録する。.env または環境変数の設定が必要。
     1Password の op:// 参照を使う場合は、op run で解決してから実行する（README参照）。
-  araya discord install
+  araya discord install [--auth-mode env-file|1password]
     Discord bot を常駐の process（araya-discord-<hash>.service）として入れる。unit file を書き、有効にして起動し直す。
-    通常は .env を systemd LoadCredential で launcher に渡す。Bot token は unit file・Environment=・bot process の起動引数に書かない。
-    .env の Bot token が op:// 参照の場合は任意で 1Password Service Account launcher を使う。詳細は README 参照。
-    linger は変えない（無効なら logout で bot が止まる）。
+    既定は平文 .env mode で、1Password CLI は使わない。1Password Service Account launcher を使う場合は --auth-mode 1password を明示する。
+    Bot token は unit file・Environment=・bot process の起動引数に書かない。linger は変えない（無効なら logout で bot が止まる）。
   araya discord uninstall
     Discord bot の unit を止めて無効にし、unit file を消す。state.json・台帳は残す（入れ直すと cursor の続きから進む）。
     Discord 側の slash command 定義は残る（Discord 側で削除する）。

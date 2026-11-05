@@ -72,10 +72,6 @@ export async function readDiscordSettings(credentialsDirectory: string | undefin
     throw runnerError('Discord 設定の credential がありません')
   }
 
-  if (settings.ARAYA_DISCORD_BOT_TOKEN?.startsWith('op://')) {
-    throw runnerError('op:// 参照には1Password用の launcher を使ってください')
-  }
-
   try {
     return validateDiscordSettings(settings)
   } catch (error) {

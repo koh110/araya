@@ -1,7 +1,7 @@
 // araya discord <init|register|install|uninstall|run>。
 // init: 標準の設定 file（<dataDir>/.env）を作る（既存 file は上書きしない）。
 // register: slash command 定義を Discord の guild に登録する（必要なら1Password参照を事前に解決する）。
-// install: 平文 .env または任意の1Password参照に合った service launcher を生成する。
+// install: 平文 .env を既定にし、明示 option で1Password launcherを選ぶ。
 // uninstall: unit を止めて file を消す。state.json・台帳は残す。
 // run: foreground で 1 度動かす（unit 稼働の確かめなし）。
 // unit の file 作成・enable・restart は人間の実行（runner と同じ運用）
@@ -27,8 +27,7 @@ import {
   createDiscordEnvFile,
   discordEnvFilePath,
   loadDiscordConfig,
-  readDiscordEnvFile,
-  validateDiscordSettings,
+  type DiscordAuthMode,
   type DiscordConfig,
 } from '../discord/config.ts'
 import { discordStateFilePath, readDiscordBotState } from '../discord/state.ts'
@@ -150,6 +149,7 @@ async function installDiscord(
   config: RunnerCommandConfig,
   deps: DiscordCommandDependencies,
   redactor: Redactor,
+  authMode: DiscordAuthMode,
 ) {
   const ops = await deps.createSystemdOps(deps.env)
 
@@ -173,17 +173,18 @@ async function installDiscord(
   await fs.mkdir(path.join(config.dataDir, 'logs'), { recursive: true, mode: 0o700 })
   const dataDirReal = await fs.realpath(config.dataDir)
   const envFile = discordEnvFilePath(dataDirReal)
-  const fileSettings = await readDiscordEnvFile(envFile)
+  const source = await loadDiscordConfig(dataDirReal, deps.env, {
+    forPersistentService: true,
+    authMode,
+  })
 
-  if (fileSettings === null) {
+  if (source.enabled !== true || !source.fromFile) {
     throw commandError(
       'discord_env_file_required',
       `常駐の service は設定を ${envFile} から読みます。araya discord init で作成してください（mode 0600）`,
     )
   }
 
-  const fileConfig = validateDiscordSettings(fileSettings)
-  const authMode = fileConfig.botToken.startsWith('op://') ? '1password' : 'env-file'
   const unit = discordUnitName(dataDirHash(dataDirReal))
   const unitPath = unitFilePath(deps.env, deps.homeDir, unit)
   const environment = selectUnitEnvironment(deps.env, {
@@ -400,9 +401,15 @@ export async function runDiscordCommand(
   config: RunnerCommandConfig,
   deps: DiscordCommandDependencies,
 ) {
-  const { positionals } = parseCommandArgs(() => {
-    return parseArgs({ args, options: {}, allowPositionals: true, strict: true })
+  const parsed = parseCommandArgs(() => {
+    return parseArgs({
+      args,
+      options: { 'auth-mode': { type: 'string' } },
+      allowPositionals: true,
+      strict: true,
+    })
   })
+  const { positionals } = parsed
   const subcommand = DISCORD_SUBCOMMANDS.find((candidate) => {
     return candidate === positionals[0]
   })
@@ -413,6 +420,22 @@ export async function runDiscordCommand(
       `不明な discord の command: ${positionals.join(' ') || '（なし）'}。${DISCORD_SUBCOMMANDS.join('・')} のどれかを指定してください`,
     )
   }
+
+  const requestedAuthMode = parsed.values['auth-mode']
+
+  if (
+    requestedAuthMode !== undefined &&
+    requestedAuthMode !== 'env-file' &&
+    requestedAuthMode !== '1password'
+  ) {
+    throw commandError('invalid_arguments', '--auth-mode は env-file または 1password を指定してください')
+  }
+
+  if (subcommand !== 'install' && requestedAuthMode !== undefined) {
+    throw commandError('invalid_arguments', '--auth-mode は discord install でのみ指定できます')
+  }
+
+  const authMode: DiscordAuthMode = requestedAuthMode ?? 'env-file'
 
   const redactor = createRedactor(collectSecretValues(deps.env))
   let body: Record<string, unknown>
@@ -425,7 +448,7 @@ export async function runDiscordCommand(
       body = await registerDiscord(config, deps)
       break
     case 'install':
-      body = await installDiscord(config, deps, redactor)
+      body = await installDiscord(config, deps, redactor, authMode)
       break
     case 'uninstall':
       body = await uninstallDiscord(config, deps, redactor)

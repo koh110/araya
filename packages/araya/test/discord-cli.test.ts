@@ -132,6 +132,14 @@ async function writeDiscordEnv(installEnv: InstallEnv, mode = 0o600) {
   await fs.writeFile(discordEnvFilePath(installEnv.dataDir), `${lines.join('\n')}\n`, { mode })
 }
 
+async function writeDiscordEnvReferences(installEnv: InstallEnv) {
+  const lines = DISCORD_CONFIG_KEYS.map((key) => `${key}=op://vault/item/${key.toLowerCase()}`)
+
+  await fs.writeFile(discordEnvFilePath(installEnv.dataDir), `${lines.join('\n')}\n`, {
+    mode: 0o600,
+  })
+}
+
 function defaultSystemctl(
   installEnv: InstallEnv,
   overrides: Partial<Record<string, (args: readonly string[]) => CommandResult>> = {},
@@ -271,7 +279,13 @@ test('discord CLI: 知らない subcommand は invalid_arguments', async () => {
   try {
     const fake = createFakeSystemd({})
 
-    const argumentSets: string[][] = [['unknown'], [], ['install', 'extra']]
+    const argumentSets: string[][] = [
+      ['unknown'],
+      [],
+      ['install', 'extra'],
+      ['install', '--auth-mode', 'unsupported'],
+      ['run', '--auth-mode', '1password'],
+    ]
 
     for (const args of argumentSets) {
       await assert.rejects(
@@ -334,7 +348,7 @@ test('discord install: LoadCredential 元ファイルが無い・権限過大な
   try {
     await fs.rm(installEnv.opTokenFile)
     await assert.rejects(
-      runDiscord(installEnv, ['install'], fake),
+      runDiscord(installEnv, ['install', '--auth-mode', '1password'], fake),
       errorWithCode('op_service_account_credential_missing'),
     )
 
@@ -342,7 +356,7 @@ test('discord install: LoadCredential 元ファイルが無い・権限過大な
       mode: 0o640,
     })
     await assert.rejects(
-      runDiscord(installEnv, ['install'], fake),
+      runDiscord(installEnv, ['install', '--auth-mode', '1password'], fake),
       errorWithCode('op_service_account_credential_permissions'),
     )
 
@@ -374,7 +388,11 @@ test('discord install: op run と LoadCredential を使い、resolved token は 
   })
 
   try {
-    const { output, stderr, sleeps } = await runDiscord(installEnv, ['install'], fake)
+    const { output, stderr, sleeps } = await runDiscord(
+      installEnv,
+      ['install', '--auth-mode', '1password'],
+      fake,
+    )
     const dataDirReal = await fs.realpath(installEnv.dataDir)
     const unit = unitOf(dataDirReal)
     const unitPath = unitPathOf(installEnv, unit)
@@ -442,9 +460,212 @@ test('discord install: op run と LoadCredential を使い、resolved token は 
   }
 })
 
+test('discord install: --auth-mode 1password で op run の解決値を使い launcher を選ぶ', async () => {
+  const installEnv = await makeInstallEnv()
+
+  await writeDiscordEnvReferences(installEnv)
+  const fake = createFakeSystemd({
+    systemctl: defaultSystemctl(installEnv),
+  })
+
+  try {
+    const { output, stderr } = await runDiscord(
+      installEnv,
+      ['install', '--auth-mode', '1password'],
+      fake,
+    )
+    const dataDirReal = await fs.realpath(installEnv.dataDir)
+    const unitPath = unitPathOf(installEnv, unitOf(dataDirReal))
+    const unitText = await fs.readFile(unitPath, 'utf8')
+
+    assert.equal(readField(output, 'authMode'), '1password')
+    assert.equal(readField(output, 'ready'), true)
+    assert.equal(stderr, '')
+    assert.ok(unitText.includes(installEnv.opRunnerEntrypoint), unitText)
+    assert.ok(!unitText.includes('Environment=ARAYA_DISCORD_'), unitText)
+    assert.ok(!unitText.includes(BOT_TOKEN), unitText)
+    assert.ok(!unitText.includes(APPLICATION_ID), unitText)
+    assert.ok(!unitText.includes(GUILD_ID), unitText)
+    assert.ok(!unitText.includes(CHANNEL_ID), unitText)
+    assert.ok(!unitText.includes(USER_ID), unitText)
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('discord install: --auth-mode 1password は平文 .env でも指定できる', async () => {
+  const installEnv = await makeInstallEnv()
+
+  await writePlainDiscordEnv(installEnv)
+  const fake = createFakeSystemd({
+    systemctl: defaultSystemctl(installEnv),
+  })
+
+  try {
+    const { output } = await runDiscord(
+      installEnv,
+      ['install', '--auth-mode', '1password'],
+      fake,
+    )
+    const dataDirReal = await fs.realpath(installEnv.dataDir)
+    const unitText = await fs.readFile(
+      unitPathOf(installEnv, unitOf(dataDirReal)),
+      'utf8',
+    )
+
+    assert.equal(readField(output, 'authMode'), '1password')
+    assert.ok(unitText.includes(installEnv.opRunnerEntrypoint), unitText)
+    assert.ok(!unitText.includes(BOT_TOKEN), unitText)
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('discord install: 1password mode は option で選び、.env の値から推測しない', async () => {
+  const installEnv = await makeInstallEnv()
+
+  await writeDiscordEnvReferences(installEnv)
+  const fake = createFakeSystemd({
+    systemctl: defaultSystemctl(installEnv),
+  })
+
+  try {
+    await assert.rejects(
+      runDiscord(installEnv, ['install'], fake, {
+        resolveOpCliPath: async () => {
+          throw new Error('既定 mode では op CLI を探さない')
+        },
+        resolveDiscordOpRunnerEntrypoint: async () => {
+          throw new Error('既定 mode では1Password launcherを探さない')
+        },
+      }),
+      errorWithCode('discord_env_file_conflict'),
+    )
+    assert.equal(await exists(unitPathOf(installEnv, unitOf(installEnv.dataDir))), false)
+    assert.deepEqual(
+      systemdCalls(fake).filter((call) => {
+        return ['daemon-reload', 'enable', 'restart'].includes(call[2] ?? '')
+      }),
+      [],
+    )
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('discord install: .env を1password modeで使う場合も op run の解決値が必要', async () => {
+  const installEnv = await makeInstallEnv()
+
+  await writeDiscordEnvReferences(installEnv)
+  for (const key of DISCORD_CONFIG_KEYS) {
+    delete installEnv.env[key]
+  }
+  const fake = createFakeSystemd({
+    systemctl: defaultSystemctl(installEnv),
+  })
+
+  try {
+    await assert.rejects(
+      runDiscord(installEnv, ['install', '--auth-mode', '1password'], fake),
+      (error: unknown) => {
+        if (!(error instanceof Error)) {
+          return false
+        }
+
+        assert.ok(errorWithCode('discord_config_invalid')(error))
+        assert.ok(!error.message.includes('op://'))
+        return true
+      },
+    )
+    assert.equal(await exists(unitPathOf(installEnv, unitOf(installEnv.dataDir))), false)
+    assert.deepEqual(
+      systemdCalls(fake).filter((call) => {
+        return ['daemon-reload', 'enable', 'restart'].includes(call[2] ?? '')
+      }),
+      [],
+    )
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('discord install: resolved environment cannot fill a missing saved setting', async () => {
+  const installEnv = await makeInstallEnv()
+
+  await writePlainDiscordEnv(installEnv)
+  const envFilePath = discordEnvFilePath(installEnv.dataDir)
+  const fileLines = (await fs.readFile(envFilePath, 'utf8'))
+    .split(/\r?\n/u)
+    .filter((line) => !line.startsWith('ARAYA_DISCORD_ALLOWED_USER_IDS='))
+  await fs.writeFile(envFilePath, `${fileLines.join('\n')}\n`, { mode: 0o600 })
+
+  const fake = createFakeSystemd({
+    systemctl: defaultSystemctl(installEnv),
+  })
+
+  try {
+    await assert.rejects(
+      runDiscord(installEnv, ['install'], fake),
+      errorWithCode('discord_env_file_incomplete'),
+    )
+    assert.equal(await exists(unitPathOf(installEnv, unitOf(installEnv.dataDir))), false)
+    assert.deepEqual(
+      systemdCalls(fake).filter((call) => {
+        return ['daemon-reload', 'enable', 'restart'].includes(call[2] ?? '')
+      }),
+      [],
+    )
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('discord install: environment override cannot mask an invalid saved setting', async () => {
+  const installEnv = await makeInstallEnv()
+
+  await writePlainDiscordEnv(installEnv)
+  const envFilePath = discordEnvFilePath(installEnv.dataDir)
+  const fileContent = (await fs.readFile(envFilePath, 'utf8')).replace(
+    `ARAYA_DISCORD_APPLICATION_ID=${APPLICATION_ID}`,
+    'ARAYA_DISCORD_APPLICATION_ID=synthetic-invalid-id',
+  )
+  await fs.writeFile(envFilePath, fileContent, { mode: 0o600 })
+
+  const fake = createFakeSystemd({
+    systemctl: defaultSystemctl(installEnv),
+  })
+
+  try {
+    await assert.rejects(
+      runDiscord(installEnv, ['install'], fake),
+      (error: unknown) => {
+        if (!(error instanceof Error)) {
+          return false
+        }
+
+        assert.ok(errorWithCode('discord_env_file_conflict')(error))
+        assert.ok(!error.message.includes('synthetic-invalid-id'))
+        return true
+      },
+    )
+    assert.equal(await exists(unitPathOf(installEnv, unitOf(installEnv.dataDir))), false)
+    assert.deepEqual(
+      systemdCalls(fake).filter((call) => {
+        return ['daemon-reload', 'enable', 'restart'].includes(call[2] ?? '')
+      }),
+      [],
+    )
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
 test('discord install: 平文 .env は1Passwordなしで systemd LoadCredential から起動する', async () => {
   const installEnv = await makeInstallEnv()
 
+  for (const key of DISCORD_CONFIG_KEYS) {
+    delete installEnv.env[key]
+  }
   await writePlainDiscordEnv(installEnv)
   await fs.rm(installEnv.opTokenFile, { force: true })
   const fake = createFakeSystemd({
@@ -493,7 +714,7 @@ test('discord install: 平文 .env は1Passwordなしで systemd LoadCredential 
 test('discord install: restart 前の readyId を今回の ready として扱わない', async () => {
   const installEnv = await makeInstallEnv()
 
-  await writeDiscordEnv(installEnv)
+  await writePlainDiscordEnv(installEnv)
   const unit = unitOf(await fs.realpath(installEnv.dataDir))
   writeDiscordBotState(installEnv.dataDir, {
     ...newState(unit),
@@ -522,7 +743,7 @@ test('discord install: restart 前の readyId を今回の ready として扱わ
 test('discord install: ready にならなければ warning を出して、そのときの値で終わる', async () => {
   const installEnv = await makeInstallEnv()
 
-  await writeDiscordEnv(installEnv)
+  await writePlainDiscordEnv(installEnv)
   const fake = createFakeSystemd({
     systemctl: defaultSystemctl(installEnv, {
       restart: () => {
@@ -552,7 +773,7 @@ test('discord install: ready にならなければ warning を出して、その
 test('discord install: user manager に接続できなければ systemd_unavailable で unit file を残さない', async () => {
   const installEnv = await makeInstallEnv()
 
-  await writeDiscordEnv(installEnv)
+  await writePlainDiscordEnv(installEnv)
   const fake = createFakeSystemd({
     systemctl: async () => {
       return commandResult('offline\n')

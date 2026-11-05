@@ -14,13 +14,33 @@ const TEST_SERVICE_TOKEN = 'synthetic-service-account-token'
 function fakeOpScript(opRecordPath: string) {
   return `#!/usr/bin/env node
 import { spawn } from 'node:child_process'
-import { writeFile } from 'node:fs/promises'
+import { readFile, writeFile } from 'node:fs/promises'
 
 const args = process.argv.slice(2)
 const separator = args.indexOf('--')
+const envFilePath = args[args.indexOf('--env-file') + 1]
 const command = args[separator + 1]
 const commandArgs = args.slice(separator + 2)
 const token = process.env.OP_SERVICE_ACCOUNT_TOKEN
+const fileEnvironment = Object.fromEntries((await readFile(envFilePath, 'utf8'))
+  .split(/\\r?\\n/u)
+  .filter((line) => line !== '' && !line.trimStart().startsWith('#'))
+  .map((line) => {
+    const separator = line.indexOf('=')
+    return [line.slice(0, separator), line.slice(separator + 1)]
+  }))
+const resolvedByOp = {
+  ARAYA_DISCORD_BOT_TOKEN: 'resolved-by-op',
+  ARAYA_DISCORD_APPLICATION_ID: '12345678901234567',
+  ARAYA_DISCORD_GUILD_ID: '23456789012345678',
+  ARAYA_DISCORD_CHANNEL_ID: '34567890123456789',
+  ARAYA_DISCORD_ALLOWED_USER_IDS: '45678901234567890',
+}
+const childEnvironment = { ...process.env }
+
+for (const [name, value] of Object.entries(fileEnvironment)) {
+  childEnvironment[name] = value.startsWith('op://') ? resolvedByOp[name] : value
+}
 
 await writeFile(${JSON.stringify(opRecordPath)}, JSON.stringify({
   args,
@@ -37,7 +57,7 @@ await writeFile(${JSON.stringify(opRecordPath)}, JSON.stringify({
 }), 'utf8')
 
 const child = spawn(command, commandArgs, {
-  env: { ...process.env, ARAYA_DISCORD_BOT_TOKEN: 'resolved-by-op' },
+  env: childEnvironment,
   stdio: 'inherit',
 })
 child.once('error', () => {
@@ -55,6 +75,7 @@ function fakeBotScript(botRecordPath: string) {
 await writeFile(${JSON.stringify(botRecordPath)}, JSON.stringify({
   args: process.argv.slice(2),
   botToken: process.env.ARAYA_DISCORD_BOT_TOKEN,
+  applicationId: process.env.ARAYA_DISCORD_APPLICATION_ID,
   serviceTokenPresent: process.env.OP_SERVICE_ACCOUNT_TOKEN !== undefined,
   credentialsDirectoryPresent: process.env.CREDENTIALS_DIRECTORY !== undefined,
   connectHostPresent: process.env.OP_CONNECT_HOST !== undefined,
@@ -163,6 +184,7 @@ test('discord-op-runner: LoadCredential token を op run にだけ渡し、Araya
     const botRecord = JSON.parse(await fs.readFile(fixture.botRecordPath, 'utf8')) as {
       args: string[]
       botToken: string
+      applicationId: string
       serviceTokenPresent: boolean
       credentialsDirectoryPresent: boolean
       connectHostPresent: boolean
@@ -212,6 +234,7 @@ test('discord-op-runner: LoadCredential token を op run にだけ渡し、Araya
     assert.deepEqual(botRecord, {
       args: ['--data-dir', fixture.dataDir],
       botToken: 'resolved-by-op',
+      applicationId: '12345678901234567',
       serviceTokenPresent: false,
       credentialsDirectoryPresent: false,
       connectHostPresent: false,
@@ -222,6 +245,40 @@ test('discord-op-runner: LoadCredential token を op run にだけ渡し、Araya
       githubTokenPresent: false,
       invocationId: 'service-invocation-id',
     })
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('discord-op-runner: Bot Token 以外の Discord 設定も op:// から解決する', async () => {
+  const fixture = await makeFixture()
+
+  try {
+    const envFilePath = path.join(fixture.dataDir, '.env')
+    const envFile = (await fs.readFile(envFilePath, 'utf8'))
+      .replace(
+        'ARAYA_DISCORD_BOT_TOKEN=op://vault/item/bot-token',
+        'ARAYA_DISCORD_BOT_TOKEN=synthetic-plain-bot-token',
+      )
+      .replace(
+        'ARAYA_DISCORD_APPLICATION_ID=12345678901234567',
+        'ARAYA_DISCORD_APPLICATION_ID=op://vault/item/application-id',
+      )
+    await fs.writeFile(envFilePath, envFile, { mode: 0o600 })
+
+    const result = spawnSync(
+      process.execPath,
+      [fixture.opRunnerPath, '--data-dir', fixture.dataDir, '--op-path', fixture.opPath],
+      { encoding: 'utf8', env: fixture.env },
+    )
+
+    assert.equal(result.status, 0, result.stderr)
+    const botRecord = JSON.parse(await fs.readFile(fixture.botRecordPath, 'utf8')) as {
+      botToken: string
+      applicationId: string
+    }
+    assert.equal(botRecord.botToken, 'synthetic-plain-bot-token')
+    assert.equal(botRecord.applicationId, '12345678901234567')
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }

@@ -74,12 +74,13 @@ test('discord-env-runner: LoadCredential の平文 .env を読み込み、設定
   }
 })
 
-test('discord-env-runner: 1Password参照や不完全な設定をbot launcherで受け付けない', async () => {
+test('discord-env-runner: .env の設定値を独自解釈せず、通常の検証だけ行う', async () => {
   const directory = await makeDirectory()
 
   try {
     await writeCredential(directory, 'op://vault/item/credential')
-    await assert.rejects(readDiscordSettings(directory), errorContaining('1Password用の launcher'))
+    const settings = await readDiscordSettings(directory)
+    assert.equal(settings.botToken, 'op://vault/item/credential')
 
     const credentialPath = path.join(directory, DISCORD_ENV_CREDENTIAL_NAME)
     await fs.writeFile(credentialPath, 'ARAYA_DISCORD_BOT_TOKEN=plain-token\n', { mode: 0o600 })

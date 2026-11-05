@@ -145,7 +145,7 @@ ARAYA_DISCORD_CHANNEL_ID=<discord-channel-id>
 ARAYA_DISCORD_ALLOWED_USER_IDS=<discord-user-id>
 ```
 
-`ARAYA_DISCORD_ALLOWED_USER_IDS` は許可する Discord user ID をカンマ区切りで指定します。例の `<...>` は実際の値に置き換えます。この `.env` は Discord 専用で、ここに示した5つ以外の設定名は受け付けません。Application/Guild/Channel/User ID は公開 ID ですが、Bot token は秘密として扱ってください。設定後、slash command を登録して bot service を入れます。
+`ARAYA_DISCORD_ALLOWED_USER_IDS` は許可する Discord user ID をカンマ区切りで指定します。例の `<...>` は実際の値に置き換えます。この `.env` は Discord 専用で、ここに示した5つ以外の設定名は受け付けません。Application/Guild/Channel/User ID は公開 ID ですが、Bot token は秘密として扱ってください。値の一部を `op://` 参照にする場合は、1Password の節も参照してください。設定後、slash command を登録して bot service を入れます。
 
 ```sh
 araya discord register
@@ -167,15 +167,24 @@ service の操作は次の通りです。
 - 動作記録: `<ARAYA_DATA_DIR>/logs/discord.log` と `discord-launcher.log`
 - linger は自動変更しません。logout 後も service を動かす場合は、必要に応じて `loginctl enable-linger` を実行してください。
 
-### 任意: 1Password CLI で Bot token を管理する
+### 任意: 1Password CLI で Discord 設定を管理する
 
-OSS の標準設定に 1Password は必要ありません。個人・組織の運用で使う場合は、Bot token を 1Password に置き、`.env` の `ARAYA_DISCORD_BOT_TOKEN` を secret reference にできます。
+OSS の標準設定に 1Password は必要ありません。通常は `.env` に値を直接書けます。個人・組織の運用で使う場合は、`.env` にある Discord 設定値の一部または全部を 1Password の `op://` 参照にできます。ID は公開 ID ですが、必要なら参照にして構いません。
 
 ```dotenv
 ARAYA_DISCORD_BOT_TOKEN=op://<vault>/<item>/<token-field>
+ARAYA_DISCORD_APPLICATION_ID=op://<vault>/<item>/<application-id-field>
 ```
 
-`araya discord install` はこの参照を検出すると 1Password launcher を選びます。その service を使うには、1Password CLI 2.18 以降と、Bot token を読む権限がある Service Account token file が必要です。token file は `<XDG_CONFIG_HOME>/araya/op-service-account-token`（既定 `~/.config/araya/op-service-account-token`）に service user 所有・mode `0400` または `0600` で保管します。Service Account token の内容は unit file や bot process に書かず、systemd `LoadCredential` 経由で launcher に渡し、`op` CLI の認証にだけ使います。解決した Bot token は bot process の実行時環境へ渡ります。
+`.env` は通常の `NAME=value` 設定として扱います。Araya は設定値から認証方式を推測しません。slash command 登録で 1Password の参照を使うときは `op run` から起動し、常駐 service でも 1Password を使う場合は install option で明示します。
+
+```sh
+data_dir="${ARAYA_DATA_DIR:-$HOME/.araya}"
+op run --env-file="$data_dir/.env" -- araya discord register
+op run --env-file="$data_dir/.env" -- araya discord install --auth-mode 1password
+```
+
+通常の `araya discord install` は `.env` file launcher を選び、1Password CLI や Service Account を必要としません。`--auth-mode 1password` を指定した service は、1Password CLI 2.18 以降と、参照する全項目を読める Service Account token file が必要です。token file は `<XDG_CONFIG_HOME>/araya/op-service-account-token`（既定 `~/.config/araya/op-service-account-token`）に service user 所有・mode `0400` または `0600` で保管します。Service Account token の内容は unit file や bot process に書かず、systemd `LoadCredential` 経由で launcher に渡し、`op` CLI の認証にだけ使います。`op` CLI が `.env` を解決し、Discord 設定値だけを bot process の実行時環境へ渡します。
 
 slash command の登録時は、Service Account token で `.env` の `op://` 参照を解決してから実行します。以下は既存の 1Password Connect/session/account 環境変数を外し、Araya process から Service Account token と systemd credential directory を除く例です。token の値をコマンド引数へ展開しません。
 

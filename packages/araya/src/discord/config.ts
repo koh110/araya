@@ -44,6 +44,8 @@ export type DiscordConfig = {
   allowedUserIds: readonly string[]
 }
 
+export type DiscordAuthMode = 'env-file' | '1password'
+
 // Discord bot に継承する systemd/runtime 環境の allowlist。Discord 設定は検証後に別途追加する。
 export const DISCORD_BOT_RUNTIME_ENVIRONMENT_NAMES = [
   'HOME',
@@ -99,7 +101,19 @@ export function discordBotEnvironment(
 
 export type DiscordConfigSource =
   | { enabled: false; reason: 'not_configured'; envFilePath: string }
-  | { enabled: true; fromFile: boolean; envFilePath: string; config: DiscordConfig }
+  | {
+      enabled: true
+      fromFile: boolean
+      envFilePath: string
+      config: DiscordConfig
+    }
+
+export type DiscordConfigLoadOptions = {
+  // 常駐 service の設定元として .env が完結していることを要求する。
+  forPersistentService?: boolean
+  // 常駐 service の認証方式。既定の env-file では保存値と環境変数の一致も要求する。
+  authMode?: DiscordAuthMode
+}
 
 export function discordConfigError(code: string, message: string) {
   return Object.assign(new Error(`${code}: ${message}`), { code })
@@ -308,37 +322,51 @@ export function validateDiscordSettings(settings: Record<string, string | undefi
   }
 }
 
-function assertResolvedDiscordSettings(settings: Readonly<Record<string, string | undefined>>) {
-  const unresolved = DISCORD_CONFIG_KEYS.filter((key) => {
-    return settings[key]?.includes('op://') === true
-  })
-
-  if (unresolved.length > 0) {
-    throw discordConfigError(
-      'discord_secret_reference_unresolved',
-      `1Password の参照が解決されていません: ${unresolved.join('・')}。op run --env-file から起動してください`,
-    )
-  }
-}
-
-// file を読み、解決済み環境変数があれば優先する。未解決の op:// 参照は拒否する
+// file を読む。解決済み環境変数があれば file より優先する。
 export async function loadDiscordConfig(
   dataDir: string,
   env: Readonly<Record<string, string | undefined>> = process.env,
+  options: DiscordConfigLoadOptions = {},
 ) {
   const envFilePath = discordEnvFilePath(dataDir)
   const fileSettings = await readDiscordEnvFile(envFilePath)
 
   if (fileSettings !== null) {
     const settings: Record<string, string | undefined> = { ...fileSettings }
+    const authMode = options.authMode ?? 'env-file'
 
-    for (const key of DISCORD_CONFIG_KEYS) {
-      if (env[key] !== undefined) {
-        settings[key] = env[key]
+    if (options.forPersistentService === true) {
+      const missingFileKeys = DISCORD_CONFIG_KEYS.filter((key) => {
+        return fileSettings[key] === undefined || fileSettings[key] === ''
+      })
+
+      if (missingFileKeys.length > 0) {
+        throw discordConfigError(
+          'discord_env_file_incomplete',
+          `.env に設定がありません: ${missingFileKeys.join('・')}`,
+        )
       }
     }
 
-    assertResolvedDiscordSettings(settings)
+    for (const key of DISCORD_CONFIG_KEYS) {
+      if (env[key] !== undefined) {
+        const fileValue = fileSettings[key]
+
+        if (
+          options.forPersistentService === true &&
+          authMode !== '1password' &&
+          fileValue !== undefined &&
+          env[key] !== fileValue
+        ) {
+          throw discordConfigError(
+            'discord_env_file_conflict',
+            `.env と環境変数の ${key} が一致しません。1Password を使う service は --auth-mode 1password を指定してください`,
+          )
+        }
+
+        settings[key] = env[key]
+      }
+    }
 
     return {
       enabled: true,
@@ -348,6 +376,10 @@ export async function loadDiscordConfig(
     } satisfies DiscordConfigSource
   }
 
+  if (options.forPersistentService === true) {
+    return { enabled: false, reason: 'not_configured', envFilePath } satisfies DiscordConfigSource
+  }
+
   const present = DISCORD_CONFIG_KEYS.filter((key) => {
     return env[key] !== undefined && env[key] !== ''
   })
@@ -355,8 +387,6 @@ export async function loadDiscordConfig(
   if (present.length === 0) {
     return { enabled: false, reason: 'not_configured', envFilePath } satisfies DiscordConfigSource
   }
-
-  assertResolvedDiscordSettings(env)
 
   return {
     enabled: true,
