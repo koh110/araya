@@ -69,9 +69,7 @@ export const DISCORD_BOT_RUNTIME_ENVIRONMENT_NAMES = [
   'LC_TIME',
 ] as const
 
-export function discordRuntimeEnvironment(
-  sourceEnv: Readonly<Record<string, string | undefined>>,
-) {
+export function discordRuntimeEnvironment(sourceEnv: Readonly<Record<string, string | undefined>>) {
   const env: NodeJS.ProcessEnv = {}
 
   for (const name of DISCORD_BOT_RUNTIME_ENVIRONMENT_NAMES) {

@@ -275,7 +275,9 @@ test('discord-config: .env は平文 token と任意の1Password参照の両方�
   try {
     await fs.writeFile(
       discordEnvFilePath(dataDir),
-      DISCORD_CONFIG_KEYS.map((key) => `${key}=${SETTINGS[key]}`).join('\n'),
+      DISCORD_CONFIG_KEYS.map((key) => {
+        return `${key}=${SETTINGS[key]}`
+      }).join('\n'),
       { mode: 0o600 },
     )
     const plain = await loadDiscordConfig(dataDir, {})
@@ -291,7 +293,9 @@ test('discord-config: .env は平文 token と任意の1Password参照の両方�
     }
     await fs.writeFile(
       discordEnvFilePath(dataDir),
-      DISCORD_CONFIG_KEYS.map((key) => `${key}=${referencedSettings[key]}`).join('\n'),
+      DISCORD_CONFIG_KEYS.map((key) => {
+        return `${key}=${referencedSettings[key]}`
+      }).join('\n'),
       { mode: 0o600 },
     )
     const raw = await loadDiscordConfig(dataDir, {})

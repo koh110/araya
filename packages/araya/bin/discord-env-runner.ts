@@ -109,13 +109,16 @@ export function discordBotEnvironment(
   return createDiscordBotEnvironment(settings, sourceEnv)
 }
 
-async function runDiscordBotProcess(dataDir: string, settings: ReturnType<typeof validateDiscordSettings>) {
+async function runDiscordBotProcess(
+  dataDir: string,
+  settings: ReturnType<typeof validateDiscordSettings>,
+) {
   const modulePath = fileURLToPath(import.meta.url)
   const botEntrypoint = path.join(
     path.dirname(modulePath),
     `discord-bot${path.extname(modulePath)}`,
   )
-  let child
+  let child: ReturnType<typeof spawn>
 
   try {
     child = spawn(process.execPath, [botEntrypoint, '--data-dir', dataDir], {
@@ -130,7 +133,7 @@ async function runDiscordBotProcess(dataDir: string, settings: ReturnType<typeof
   return await new Promise<number>((resolve) => {
     let settled = false
 
-    const finish = (code: number, message?: string) => {
+    function finish(code: number, message?: string) {
       if (settled) {
         return
       }
@@ -145,10 +148,10 @@ async function runDiscordBotProcess(dataDir: string, settings: ReturnType<typeof
 
       resolve(code)
     }
-    const forwardSigterm = () => {
+    function forwardSigterm() {
       child.kill('SIGTERM')
     }
-    const forwardSigint = () => {
+    function forwardSigint() {
       child.kill('SIGINT')
     }
 
@@ -158,7 +161,10 @@ async function runDiscordBotProcess(dataDir: string, settings: ReturnType<typeof
       finish(127, 'Discord bot を起動できません')
     })
     child.once('exit', (code) => {
-      finish(code ?? 1, code === 0 ? undefined : `Discord bot が終了しました（status=${code ?? 'signal'}）`)
+      finish(
+        code ?? 1,
+        code === 0 ? undefined : `Discord bot が終了しました（status=${code ?? 'signal'}）`,
+      )
     })
   })
 }

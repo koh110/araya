@@ -107,9 +107,13 @@ async function writePlainDiscordEnv(installEnv: InstallEnv, mode = 0o600) {
     ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
     ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
   }
-  const content = DISCORD_CONFIG_KEYS.map((key) => `${key}=${settings[key]}`).join('\n')
-
-  await fs.writeFile(discordEnvFilePath(installEnv.dataDir), `${content}\n`, { mode })
+  await fs.writeFile(
+    discordEnvFilePath(installEnv.dataDir),
+    `${DISCORD_CONFIG_KEYS.map((key) => {
+      return `${key}=${settings[key]}`
+    }).join('\n')}\n`,
+    { mode },
+  )
 }
 
 // .env を mode 0600 で書く（1Password mode の設定）
@@ -133,11 +137,13 @@ async function writeDiscordEnv(installEnv: InstallEnv, mode = 0o600) {
 }
 
 async function writeDiscordEnvReferences(installEnv: InstallEnv) {
-  const lines = DISCORD_CONFIG_KEYS.map((key) => `${key}=op://vault/item/${key.toLowerCase()}`)
-
-  await fs.writeFile(discordEnvFilePath(installEnv.dataDir), `${lines.join('\n')}\n`, {
-    mode: 0o600,
-  })
+  await fs.writeFile(
+    discordEnvFilePath(installEnv.dataDir),
+    `${DISCORD_CONFIG_KEYS.map((key) => {
+      return `${key}=op://vault/item/${key.toLowerCase()}`
+    }).join('\n')}\n`,
+    { mode: 0o600 },
+  )
 }
 
 function defaultSystemctl(
@@ -360,10 +366,7 @@ test('discord install: LoadCredential 元ファイルが無い・権限過大な
       errorWithCode('op_service_account_credential_permissions'),
     )
 
-    const unitPath = unitPathOf(
-      installEnv,
-      unitOf(await fs.realpath(installEnv.dataDir)),
-    )
+    const unitPath = unitPathOf(installEnv, unitOf(await fs.realpath(installEnv.dataDir)))
     await assert.rejects(fs.access(unitPath))
     assert.deepEqual(
       systemdCalls(fake).filter((call) => {
@@ -464,19 +467,19 @@ test('discord install: --auth-mode 1password で op run の解決値を使い la
   const installEnv = await makeInstallEnv()
 
   await writeDiscordEnvReferences(installEnv)
-  const fake = createFakeSystemd({
-    systemctl: defaultSystemctl(installEnv),
-  })
 
   try {
     const { output, stderr } = await runDiscord(
       installEnv,
       ['install', '--auth-mode', '1password'],
-      fake,
+      createFakeSystemd({
+        systemctl: defaultSystemctl(installEnv),
+      }),
     )
-    const dataDirReal = await fs.realpath(installEnv.dataDir)
-    const unitPath = unitPathOf(installEnv, unitOf(dataDirReal))
-    const unitText = await fs.readFile(unitPath, 'utf8')
+    const unitText = await fs.readFile(
+      unitPathOf(installEnv, unitOf(await fs.realpath(installEnv.dataDir))),
+      'utf8',
+    )
 
     assert.equal(readField(output, 'authMode'), '1password')
     assert.equal(readField(output, 'ready'), true)
@@ -497,19 +500,17 @@ test('discord install: --auth-mode 1password は平文 .env でも指定でき�
   const installEnv = await makeInstallEnv()
 
   await writePlainDiscordEnv(installEnv)
-  const fake = createFakeSystemd({
-    systemctl: defaultSystemctl(installEnv),
-  })
 
   try {
     const { output } = await runDiscord(
       installEnv,
       ['install', '--auth-mode', '1password'],
-      fake,
+      createFakeSystemd({
+        systemctl: defaultSystemctl(installEnv),
+      }),
     )
-    const dataDirReal = await fs.realpath(installEnv.dataDir)
     const unitText = await fs.readFile(
-      unitPathOf(installEnv, unitOf(dataDirReal)),
+      unitPathOf(installEnv, unitOf(await fs.realpath(installEnv.dataDir))),
       'utf8',
     )
 
@@ -594,10 +595,14 @@ test('discord install: resolved environment cannot fill a missing saved setting'
 
   await writePlainDiscordEnv(installEnv)
   const envFilePath = discordEnvFilePath(installEnv.dataDir)
-  const fileLines = (await fs.readFile(envFilePath, 'utf8'))
-    .split(/\r?\n/u)
-    .filter((line) => !line.startsWith('ARAYA_DISCORD_ALLOWED_USER_IDS='))
-  await fs.writeFile(envFilePath, `${fileLines.join('\n')}\n`, { mode: 0o600 })
+  await fs.writeFile(
+    envFilePath,
+    (await fs.readFile(envFilePath, 'utf8')).replace(
+      /^ARAYA_DISCORD_ALLOWED_USER_IDS=.*(?:\r?\n|$)/mu,
+      '',
+    ),
+    { mode: 0o600 },
+  )
 
   const fake = createFakeSystemd({
     systemctl: defaultSystemctl(installEnv),
@@ -625,29 +630,29 @@ test('discord install: environment override cannot mask an invalid saved setting
 
   await writePlainDiscordEnv(installEnv)
   const envFilePath = discordEnvFilePath(installEnv.dataDir)
-  const fileContent = (await fs.readFile(envFilePath, 'utf8')).replace(
-    `ARAYA_DISCORD_APPLICATION_ID=${APPLICATION_ID}`,
-    'ARAYA_DISCORD_APPLICATION_ID=synthetic-invalid-id',
+  await fs.writeFile(
+    envFilePath,
+    (await fs.readFile(envFilePath, 'utf8')).replace(
+      `ARAYA_DISCORD_APPLICATION_ID=${APPLICATION_ID}`,
+      'ARAYA_DISCORD_APPLICATION_ID=synthetic-invalid-id',
+    ),
+    { mode: 0o600 },
   )
-  await fs.writeFile(envFilePath, fileContent, { mode: 0o600 })
 
   const fake = createFakeSystemd({
     systemctl: defaultSystemctl(installEnv),
   })
 
   try {
-    await assert.rejects(
-      runDiscord(installEnv, ['install'], fake),
-      (error: unknown) => {
-        if (!(error instanceof Error)) {
-          return false
-        }
+    await assert.rejects(runDiscord(installEnv, ['install'], fake), (error: unknown) => {
+      if (!(error instanceof Error)) {
+        return false
+      }
 
-        assert.ok(errorWithCode('discord_env_file_conflict')(error))
-        assert.ok(!error.message.includes('synthetic-invalid-id'))
-        return true
-      },
-    )
+      assert.ok(errorWithCode('discord_env_file_conflict')(error))
+      assert.ok(!error.message.includes('synthetic-invalid-id'))
+      return true
+    })
     assert.equal(await exists(unitPathOf(installEnv, unitOf(installEnv.dataDir))), false)
     assert.deepEqual(
       systemdCalls(fake).filter((call) => {
@@ -691,19 +696,28 @@ test('discord install: 平文 .env は1Passwordなしで systemd LoadCredential 
     assert.equal(readField(output, 'ready'), true)
     assert.equal(stderr, '')
     assert.ok(
-      unitText.includes(`ExecStart=${NODE_PATH} ${installEnv.envRunnerEntrypoint} --data-dir ${dataDirReal}`),
+      unitText.includes(
+        `ExecStart=${NODE_PATH} ${installEnv.envRunnerEntrypoint} --data-dir ${dataDirReal}`,
+      ),
       unitText,
     )
-    assert.ok(unitText.includes(`LoadCredential=discord-env:${discordEnvFilePath(dataDirReal)}`), unitText)
+    assert.ok(
+      unitText.includes(`LoadCredential=discord-env:${discordEnvFilePath(dataDirReal)}`),
+      unitText,
+    )
     assert.ok(!unitText.includes('op-service-account-token'), unitText)
     assert.ok(!unitText.includes('OP_SERVICE_ACCOUNT_TOKEN'), unitText)
     assert.ok(!unitText.includes(BOT_TOKEN), unitText)
     assert.ok(!unitText.includes('Environment=ARAYA_DISCORD_'), unitText)
     assert.ok(!stderr.includes(BOT_TOKEN), stderr)
     assert.deepEqual(
-      systemdCalls(fake).filter((call) => {
-        return ['daemon-reload', 'enable', 'restart'].includes(call[2] ?? '')
-      }).map((call) => call[2]),
+      systemdCalls(fake)
+        .filter((call) => {
+          return ['daemon-reload', 'enable', 'restart'].includes(call[2] ?? '')
+        })
+        .map((call) => {
+          return call[2]
+        }),
       ['daemon-reload', 'enable', 'restart'],
     )
   } finally {
@@ -822,17 +836,19 @@ test('discord register: .env の平文 token から slash command を登録す�
   try {
     await fs.writeFile(
       envFile,
-      DISCORD_CONFIG_KEYS.map((key) => `${key}=${
-        key === 'ARAYA_DISCORD_BOT_TOKEN'
-          ? BOT_TOKEN
-          : key === 'ARAYA_DISCORD_APPLICATION_ID'
-            ? APPLICATION_ID
-            : key === 'ARAYA_DISCORD_GUILD_ID'
-              ? GUILD_ID
-              : key === 'ARAYA_DISCORD_CHANNEL_ID'
-                ? CHANNEL_ID
-                : USER_ID
-      }`).join('\n'),
+      DISCORD_CONFIG_KEYS.map((key) => {
+        return `${key}=${
+          key === 'ARAYA_DISCORD_BOT_TOKEN'
+            ? BOT_TOKEN
+            : key === 'ARAYA_DISCORD_APPLICATION_ID'
+              ? APPLICATION_ID
+              : key === 'ARAYA_DISCORD_GUILD_ID'
+                ? GUILD_ID
+                : key === 'ARAYA_DISCORD_CHANNEL_ID'
+                  ? CHANNEL_ID
+                  : USER_ID
+        }`
+      }).join('\n'),
       { mode: 0o600 },
     )
     for (const key of DISCORD_CONFIG_KEYS) {

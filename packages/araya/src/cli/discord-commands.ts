@@ -428,14 +428,15 @@ export async function runDiscordCommand(
     requestedAuthMode !== 'env-file' &&
     requestedAuthMode !== '1password'
   ) {
-    throw commandError('invalid_arguments', '--auth-mode は env-file または 1password を指定してください')
+    throw commandError(
+      'invalid_arguments',
+      '--auth-mode は env-file または 1password を指定してください',
+    )
   }
 
   if (subcommand !== 'install' && requestedAuthMode !== undefined) {
     throw commandError('invalid_arguments', '--auth-mode は discord install でのみ指定できます')
   }
-
-  const authMode: DiscordAuthMode = requestedAuthMode ?? 'env-file'
 
   const redactor = createRedactor(collectSecretValues(deps.env))
   let body: Record<string, unknown>
@@ -448,7 +449,7 @@ export async function runDiscordCommand(
       body = await registerDiscord(config, deps)
       break
     case 'install':
-      body = await installDiscord(config, deps, redactor, authMode)
+      body = await installDiscord(config, deps, redactor, requestedAuthMode ?? 'env-file')
       break
     case 'uninstall':
       body = await uninstallDiscord(config, deps, redactor)

@@ -11,10 +11,8 @@ import {
   DISCORD_ENV_CREDENTIAL_NAME,
   OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME,
 } from '../src/discord/config.ts'
-import {
-  discordBotEnvironment,
-  readDiscordSettings,
-} from '../bin/discord-env-runner.ts'
+import { discordBotEnvironment, readDiscordSettings } from '../bin/discord-env-runner.ts'
+import { readProcessEnvironment } from './config.ts'
 
 const BOT_TOKEN = 'discord-bot-token-value'
 const APPLICATION_ID = '123456789012345678'
@@ -37,7 +35,10 @@ async function makeDirectory() {
 
 async function writeCredential(directory: string, token = BOT_TOKEN) {
   const credentialPath = path.join(directory, DISCORD_ENV_CREDENTIAL_NAME)
-  const content = DISCORD_CONFIG_KEYS.map((key) => `${key}=${SETTINGS[key]}`).join('\n')
+  const content = DISCORD_CONFIG_KEYS.map((key) => {
+    return `${key}=${SETTINGS[key]}`
+  })
+    .join('\n')
     .replace(`ARAYA_DISCORD_BOT_TOKEN=${BOT_TOKEN}`, `ARAYA_DISCORD_BOT_TOKEN=${token}`)
 
   await fs.writeFile(credentialPath, `${content}\n`, { mode: 0o600 })
@@ -79,12 +80,14 @@ test('discord-env-runner: .env の設定値を独自解釈せず、通常の検�
 
   try {
     await writeCredential(directory, 'op://vault/item/credential')
-    const settings = await readDiscordSettings(directory)
-    assert.equal(settings.botToken, 'op://vault/item/credential')
+    assert.equal((await readDiscordSettings(directory)).botToken, 'op://vault/item/credential')
 
     const credentialPath = path.join(directory, DISCORD_ENV_CREDENTIAL_NAME)
     await fs.writeFile(credentialPath, 'ARAYA_DISCORD_BOT_TOKEN=plain-token\n', { mode: 0o600 })
-    await assert.rejects(readDiscordSettings(directory), errorContaining('Discord の設定が足りません'))
+    await assert.rejects(
+      readDiscordSettings(directory),
+      errorContaining('Discord の設定が足りません'),
+    )
     await assert.rejects(readDiscordSettings(undefined), errorContaining('CREDENTIALS_DIRECTORY'))
   } finally {
     await fs.rm(directory, { recursive: true, force: true })
@@ -105,7 +108,7 @@ test('discord-env-runner: malformed token を含む launcher error に token 値
         env: {
           CREDENTIALS_DIRECTORY: directory,
           HOME: directory,
-          PATH: process.env.PATH ?? '/usr/bin:/bin',
+          PATH: readProcessEnvironment('PATH') ?? '/usr/bin:/bin',
         },
         timeout: 5_000,
       },

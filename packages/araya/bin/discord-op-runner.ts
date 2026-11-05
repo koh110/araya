@@ -62,17 +62,11 @@ async function readServiceAccountToken(credentialsDirectory: string | undefined)
     throw runnerError('この環境では安全な credential file open を利用できません')
   }
 
-  const credentialPath = path.join(
-    credentialsDirectory,
-    OP_SERVICE_ACCOUNT_CREDENTIAL_NAME,
-  )
+  const credentialPath = path.join(credentialsDirectory, OP_SERVICE_ACCOUNT_CREDENTIAL_NAME)
   let handle
 
   try {
-    handle = await fs.open(
-      credentialPath,
-      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
-    )
+    handle = await fs.open(credentialPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
   } catch {
     throw runnerError('1Password Service Account credential を開けません')
   }
@@ -223,7 +217,7 @@ async function runOp(opPath: string, envFilePath: string, dataDir: string, token
     })
     let settled = false
 
-    const finish = (code: number, message?: string) => {
+    function finish(code: number, message?: string) {
       if (settled) {
         return
       }
@@ -238,10 +232,10 @@ async function runOp(opPath: string, envFilePath: string, dataDir: string, token
 
       resolve(code)
     }
-    const forwardSigterm = () => {
+    function forwardSigterm() {
       child.kill('SIGTERM')
     }
-    const forwardSigint = () => {
+    function forwardSigint() {
       child.kill('SIGINT')
     }
 

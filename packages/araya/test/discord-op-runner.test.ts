@@ -168,7 +168,7 @@ test('discord-op-runner: LoadCredential token を op run にだけ渡し、Araya
       { encoding: 'utf8', env: fixture.env },
     )
 
-    const opRecord = JSON.parse(await fs.readFile(fixture.opRecordPath, 'utf8')) as {
+    const opRecord: {
       args: string[]
       tokenPresent: boolean
       tokenMatchesCredential: boolean
@@ -180,8 +180,8 @@ test('discord-op-runner: LoadCredential token を op run にだけ渡し、Araya
       accountPresent: boolean
       awsSecretPresent: boolean
       githubTokenPresent: boolean
-    }
-    const botRecord = JSON.parse(await fs.readFile(fixture.botRecordPath, 'utf8')) as {
+    } = JSON.parse(await fs.readFile(fixture.opRecordPath, 'utf8'))
+    const botRecord: {
       args: string[]
       botToken: string
       applicationId: string
@@ -194,7 +194,7 @@ test('discord-op-runner: LoadCredential token を op run にだけ渡し、Araya
       awsSecretPresent: boolean
       githubTokenPresent: boolean
       invocationId: string
-    }
+    } = JSON.parse(await fs.readFile(fixture.botRecordPath, 'utf8'))
 
     assert.deepEqual(opRecord, {
       args: [
@@ -255,16 +255,19 @@ test('discord-op-runner: Bot Token 以外の Discord 設定も op:// から解�
 
   try {
     const envFilePath = path.join(fixture.dataDir, '.env')
-    const envFile = (await fs.readFile(envFilePath, 'utf8'))
-      .replace(
-        'ARAYA_DISCORD_BOT_TOKEN=op://vault/item/bot-token',
-        'ARAYA_DISCORD_BOT_TOKEN=synthetic-plain-bot-token',
-      )
-      .replace(
-        'ARAYA_DISCORD_APPLICATION_ID=12345678901234567',
-        'ARAYA_DISCORD_APPLICATION_ID=op://vault/item/application-id',
-      )
-    await fs.writeFile(envFilePath, envFile, { mode: 0o600 })
+    await fs.writeFile(
+      envFilePath,
+      (await fs.readFile(envFilePath, 'utf8'))
+        .replace(
+          'ARAYA_DISCORD_BOT_TOKEN=op://vault/item/bot-token',
+          'ARAYA_DISCORD_BOT_TOKEN=synthetic-plain-bot-token',
+        )
+        .replace(
+          'ARAYA_DISCORD_APPLICATION_ID=12345678901234567',
+          'ARAYA_DISCORD_APPLICATION_ID=op://vault/item/application-id',
+        ),
+      { mode: 0o600 },
+    )
 
     const result = spawnSync(
       process.execPath,
@@ -273,12 +276,20 @@ test('discord-op-runner: Bot Token 以外の Discord 設定も op:// から解�
     )
 
     assert.equal(result.status, 0, result.stderr)
-    const botRecord = JSON.parse(await fs.readFile(fixture.botRecordPath, 'utf8')) as {
-      botToken: string
-      applicationId: string
-    }
-    assert.equal(botRecord.botToken, 'synthetic-plain-bot-token')
-    assert.equal(botRecord.applicationId, '12345678901234567')
+    assert.deepEqual(JSON.parse(await fs.readFile(fixture.botRecordPath, 'utf8')), {
+      args: ['--data-dir', fixture.dataDir],
+      botToken: 'synthetic-plain-bot-token',
+      applicationId: '12345678901234567',
+      serviceTokenPresent: false,
+      credentialsDirectoryPresent: false,
+      connectHostPresent: false,
+      connectTokenPresent: false,
+      sessionPresent: false,
+      accountPresent: false,
+      awsSecretPresent: false,
+      githubTokenPresent: false,
+      invocationId: 'service-invocation-id',
+    })
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
