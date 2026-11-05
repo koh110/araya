@@ -7,6 +7,7 @@ import test from 'node:test'
 import {
   DISCORD_CONFIG_KEYS,
   MAX_DISCORD_ENV_FILE_BYTES,
+  createDiscordEnvFile,
   discordEnvFilePath,
   loadDiscordConfig,
   parseDiscordEnvFile,
@@ -43,7 +44,7 @@ async function makeDataDir() {
   return fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-config-test-')))
 }
 
-test('discord-config: discord.env の本文は comment と空行を無視して NAME=value を読む', () => {
+test('discord-config: .env の本文は comment と空行を無視して NAME=value を読む', () => {
   const settings = parseDiscordEnvFile(
     [
       '# setup',
@@ -66,6 +67,18 @@ test('discord-config: discord.env の本文は comment と空行を無視して 
   assert.throws(() => {
     return parseDiscordEnvFile('lower_name=value')
   }, errorWithCode('discord_env_file_invalid'))
+  assert.throws(
+    () => {
+      return parseDiscordEnvFile('AWS_SECRET_ACCESS_KEY=do-not-leak-this-value')
+    },
+    (error: unknown) => {
+      assert.ok(error instanceof Error)
+      assert.ok(errorWithCode('discord_env_file_invalid')(error))
+      assert.ok(!error.message.includes('do-not-leak-this-value'))
+
+      return true
+    },
+  )
   assert.throws(() => {
     return parseDiscordEnvFile('A=1\nA=2')
   }, errorWithCode('discord_env_file_invalid'))
@@ -119,7 +132,24 @@ test('discord-config: 設定の検証。値はエラー消息に出さず、欠�
   }
 })
 
-test('discord-config: discord.env は mode 0600 の通常の file だけ読む', async () => {
+test('discord-config: NUL byte を含む bot token は値を出さず拒否する', () => {
+  const token = 'synthetic-discord-token\u0000'
+
+  assert.throws(
+    () => {
+      return validateDiscordSettings({ ...SETTINGS, ARAYA_DISCORD_BOT_TOKEN: token })
+    },
+    (error: unknown) => {
+      assert.ok(error instanceof Error)
+      assert.ok(errorWithCode('discord_config_invalid')(error))
+      assert.ok(!error.message.includes('synthetic-discord-token'))
+
+      return true
+    },
+  )
+})
+
+test('discord-config: .env は mode 0600 の通常の file だけ読む', async () => {
   const dataDir = await makeDataDir()
 
   try {
@@ -158,7 +188,31 @@ test('discord-config: discord.env は mode 0600 の通常の file だけ読む',
   }
 })
 
-test('discord-config: 1Password が解決した環境変数は discord.env の参照より優先する', async () => {
+test('discord-config: init は ARAYA_DATA_DIR/.env を mode 0600 で作成し、既存 file を上書きしない', async () => {
+  const root = await makeDataDir()
+  const dataDir = path.join(root, 'new-data')
+
+  try {
+    const created = await createDiscordEnvFile(dataDir)
+    const envFilePath = path.join(dataDir, '.env')
+    const content = await fs.readFile(envFilePath, 'utf8')
+
+    assert.deepEqual(created, { created: true, envFilePath, mode: '0600' })
+    assert.equal((await fs.stat(envFilePath)).mode & 0o777, 0o600)
+    for (const key of DISCORD_CONFIG_KEYS) {
+      assert.ok(content.includes(`${key}=`), key)
+    }
+    assert.ok(!content.includes('op://'))
+
+    await fs.writeFile(envFilePath, 'keep-this-file\n', { mode: 0o600 })
+    await assert.rejects(createDiscordEnvFile(dataDir), errorWithCode('discord_env_file_exists'))
+    assert.equal(await fs.readFile(envFilePath, 'utf8'), 'keep-this-file\n')
+  } finally {
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('discord-config: 1Password が解決した環境変数は .env の参照より優先する', async () => {
   const dataDir = await makeDataDir()
   const reference = 'op://vault/item/bot-token'
   const fileSettings: Record<string, string> = { ...SETTINGS, ARAYA_DISCORD_BOT_TOKEN: reference }
@@ -217,22 +271,40 @@ test('discord-config: 未解決の1Password参照は値を出さずに拒否す�
   }
 })
 
-test('discord-config: discord.env に Bot token の平文を保存しない', async () => {
+test('discord-config: .env は平文 token と任意の1Password参照の両方を扱う', async () => {
   const dataDir = await makeDataDir()
 
   try {
     await fs.writeFile(
       discordEnvFilePath(dataDir),
-      DISCORD_CONFIG_KEYS.map((key) => {
-        return `${key}=${SETTINGS[key]}`
-      }).join('\n'),
+      DISCORD_CONFIG_KEYS.map((key) => `${key}=${SETTINGS[key]}`).join('\n'),
       { mode: 0o600 },
     )
+    const plain = await loadDiscordConfig(dataDir, {})
+    assert.equal(plain.enabled, true)
+    if (plain.enabled) {
+      assert.equal(plain.config.botToken, BOT_TOKEN)
+    }
 
+    const reference = 'op://vault/item/bot-token'
+    const referencedSettings: Record<string, string> = {
+      ...SETTINGS,
+      ARAYA_DISCORD_BOT_TOKEN: reference,
+    }
+    await fs.writeFile(
+      discordEnvFilePath(dataDir),
+      DISCORD_CONFIG_KEYS.map((key) => `${key}=${referencedSettings[key]}`).join('\n'),
+      { mode: 0o600 },
+    )
     await assert.rejects(
       loadDiscordConfig(dataDir, {}),
-      errorWithCode('discord_bot_token_must_use_1password'),
+      errorWithCode('discord_secret_reference_unresolved'),
     )
+    const resolved = await loadDiscordConfig(dataDir, SETTINGS)
+    assert.equal(resolved.enabled, true)
+    if (resolved.enabled) {
+      assert.equal(resolved.config.botToken, BOT_TOKEN)
+    }
   } finally {
     await fs.rm(dataDir, { recursive: true, force: true })
   }

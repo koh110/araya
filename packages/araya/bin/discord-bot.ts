@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Discord bot のstandalone process。systemd unitから1Password launcher経由で起動する。
-// launcherがop runで解決した環境変数を優先し、<dataDir>/discord.envにはop://参照を置く。
+// Discord bot のstandalone process。標準 env-file launcher または任意の1Password launcherから起動する。
+// launcherが設定値を環境変数へ渡し、1Password modeでは<dataDir>/.envのop://参照を解決する。
 
 import process from 'node:process'
 import { parseArgs } from 'node:util'

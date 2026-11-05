@@ -205,7 +205,7 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
   }
 
   const config = source.config
-  // discord.env から読んだ bot token も ledger、reply、notification の全経路で伏せる
+  // .env から読んだ bot token も ledger、reply、notification の全経路で伏せる
   const secretValues = [...new Set([...environmentSecretValues, config.botToken])]
   redactor = createRedactor(secretValues)
   const dataHash = dataDirHash(await fs.promises.realpath(dataDir))

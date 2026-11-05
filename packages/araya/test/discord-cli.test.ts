@@ -37,6 +37,7 @@ async function makeInstallEnv() {
   const configHome = path.join(root, 'xdg')
   const piAgentDir = path.join(dataDir, 'pi')
   const entrypoint = path.join(root, 'package', 'bin', 'discord-bot.ts')
+  const envRunnerEntrypoint = path.join(root, 'package', 'bin', 'discord-env-runner.ts')
   const opRunnerEntrypoint = path.join(root, 'package', 'bin', 'discord-op-runner.ts')
   const opPath = path.join(root, 'bin', 'op')
   const opTokenFile = path.join(configHome, 'araya', 'op-service-account-token')
@@ -55,6 +56,7 @@ async function makeInstallEnv() {
     'utf8',
   )
   await fs.writeFile(entrypoint, '', 'utf8')
+  await fs.writeFile(envRunnerEntrypoint, '', 'utf8')
   await fs.writeFile(opRunnerEntrypoint, '', 'utf8')
   await fs.writeFile(opPath, '', { mode: 0o700 })
   await fs.writeFile(opTokenFile, 'synthetic-service-account-token\n', { mode: 0o600 })
@@ -80,6 +82,7 @@ async function makeInstallEnv() {
     configHome,
     piAgentDir,
     entrypoint,
+    envRunnerEntrypoint,
     opRunnerEntrypoint,
     opPath,
     opTokenFile,
@@ -95,7 +98,21 @@ function unitPathOf(installEnv: InstallEnv, unit: string) {
   return path.join(installEnv.configHome, 'systemd', 'user', unit)
 }
 
-// discord.env を mode 0600 で書く（常駐 service の設定の基準）
+// .env を mode 0600 で書く（通常の設定形式）
+async function writePlainDiscordEnv(installEnv: InstallEnv, mode = 0o600) {
+  const settings: Record<string, string> = {
+    ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
+    ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
+    ARAYA_DISCORD_GUILD_ID: GUILD_ID,
+    ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
+    ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
+  }
+  const content = DISCORD_CONFIG_KEYS.map((key) => `${key}=${settings[key]}`).join('\n')
+
+  await fs.writeFile(discordEnvFilePath(installEnv.dataDir), `${content}\n`, { mode })
+}
+
+// .env を mode 0600 で書く（1Password mode の設定）
 async function writeDiscordEnv(installEnv: InstallEnv, mode = 0o600) {
   const lines = DISCORD_CONFIG_KEYS.map((key) => {
     const value =
@@ -183,6 +200,9 @@ async function runDiscord(
         return fake.ops
       },
       nodePath: NODE_PATH,
+      resolveDiscordEnvRunnerEntrypoint: async () => {
+        return installEnv.envRunnerEntrypoint
+      },
       resolveDiscordOpRunnerEntrypoint: async () => {
         return installEnv.opRunnerEntrypoint
       },
@@ -265,7 +285,7 @@ test('discord CLI: 知らない subcommand は invalid_arguments', async () => {
   }
 })
 
-test('discord install: 設定が無ければ discord_not_configured、環境変数だけなら discord_env_file_required', async () => {
+test('discord install: .env が無ければ env file required。環境変数だけでは systemd 設定に使わない', async () => {
   const installEnv = await makeInstallEnv()
 
   try {
@@ -277,7 +297,7 @@ test('discord install: 設定が無ければ discord_not_configured、環境変�
     }
     await assert.rejects(
       runDiscord(installEnv, ['install'], fake),
-      errorWithCode('discord_not_configured'),
+      errorWithCode('discord_env_file_required'),
     )
     assert.equal(await exists(unitPathOf(installEnv, unitOf(installEnv.dataDir))), false)
 
@@ -292,7 +312,7 @@ test('discord install: 設定が無ければ discord_not_configured、環境変�
       errorWithCode('discord_env_file_required'),
     )
 
-    // discord.env の mode が緩い
+    // .env の mode が緩い
     await writeDiscordEnv(installEnv, 0o640)
     await assert.rejects(
       runDiscord(installEnv, ['install'], fake),
@@ -362,13 +382,14 @@ test('discord install: op run と LoadCredential を使い、resolved token は 
     assert.equal(readField(output, 'unit'), unit)
     assert.equal(readField(output, 'unitPath'), unitPath)
     assert.equal(readField(output, 'envFile'), discordEnvFilePath(dataDirReal))
+    assert.equal(readField(output, 'authMode'), '1password')
     assert.equal(readField(output, 'opCredentialFile'), installEnv.opTokenFile)
     assert.equal(readField(output, 'ready'), true)
     assert.equal(readField(output, 'linger'), true)
     assert.equal(stderr, '')
     assert.deepEqual(sleeps, [])
 
-    // unit file は LoadCredential で認証し、discord.env は op run のみが読む。Environment= に Discord 設定を出さない
+    // unit file は LoadCredential で認証し、.env は op run のみが読む。Environment= に Discord 設定を出さない
     assert.equal(
       await fs.readFile(unitPath, 'utf8'),
       [
@@ -393,7 +414,7 @@ test('discord install: op run と LoadCredential を使い、resolved token は 
         'TimeoutStopSec=30',
         'StandardInput=null',
         'StandardOutput=null',
-        `StandardError=append:${path.join(dataDirReal, 'logs', 'discord-op.log')}`,
+        `StandardError=append:${path.join(dataDirReal, 'logs', 'discord-launcher.log')}`,
         '',
         '[Install]',
         'WantedBy=default.target',
@@ -416,6 +437,54 @@ test('discord install: op run と LoadCredential を使い、resolved token は 
       ['systemctl', '--user', 'restart', unit, '90000'],
       ['loginctl', 'show-user', String(UID), '--property=Linger', '--value', '30000'],
     ])
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('discord install: 平文 .env は1Passwordなしで systemd LoadCredential から起動する', async () => {
+  const installEnv = await makeInstallEnv()
+
+  await writePlainDiscordEnv(installEnv)
+  await fs.rm(installEnv.opTokenFile, { force: true })
+  const fake = createFakeSystemd({
+    systemctl: defaultSystemctl(installEnv),
+  })
+
+  try {
+    const { output, stderr } = await runDiscord(installEnv, ['install'], fake, {
+      resolveOpCliPath: async () => {
+        throw new Error('plain .env mode は op CLI を探さない')
+      },
+      resolveDiscordOpRunnerEntrypoint: async () => {
+        throw new Error('plain .env mode は1Password launcherを探さない')
+      },
+    })
+    const dataDirReal = await fs.realpath(installEnv.dataDir)
+    const unitPath = unitPathOf(installEnv, unitOf(dataDirReal))
+    const unitText = await fs.readFile(unitPath, 'utf8')
+
+    assert.equal(readField(output, 'authMode'), 'env-file')
+    assert.equal(readField(output, 'envFile'), discordEnvFilePath(dataDirReal))
+    assert.equal(readField(output, 'opCredentialFile'), undefined)
+    assert.equal(readField(output, 'ready'), true)
+    assert.equal(stderr, '')
+    assert.ok(
+      unitText.includes(`ExecStart=${NODE_PATH} ${installEnv.envRunnerEntrypoint} --data-dir ${dataDirReal}`),
+      unitText,
+    )
+    assert.ok(unitText.includes(`LoadCredential=discord-env:${discordEnvFilePath(dataDirReal)}`), unitText)
+    assert.ok(!unitText.includes('op-service-account-token'), unitText)
+    assert.ok(!unitText.includes('OP_SERVICE_ACCOUNT_TOKEN'), unitText)
+    assert.ok(!unitText.includes(BOT_TOKEN), unitText)
+    assert.ok(!unitText.includes('Environment=ARAYA_DISCORD_'), unitText)
+    assert.ok(!stderr.includes(BOT_TOKEN), stderr)
+    assert.deepEqual(
+      systemdCalls(fake).filter((call) => {
+        return ['daemon-reload', 'enable', 'restart'].includes(call[2] ?? '')
+      }).map((call) => call[2]),
+      ['daemon-reload', 'enable', 'restart'],
+    )
   } finally {
     await fs.rm(installEnv.root, { recursive: true, force: true })
   }
@@ -501,7 +570,72 @@ test('discord install: user manager に接続できなければ systemd_unavaila
   }
 })
 
-test('discord register: 設定（discord.env か環境変数）から slash command を guild に登録する', async () => {
+test('discord init: .env を mode 0600 で作り、内容を表示せず path を返す', async () => {
+  const installEnv = await makeInstallEnv()
+  const fake = createFakeSystemd({})
+
+  try {
+    const { output } = await runDiscord(installEnv, ['init'], fake)
+    const envFile = discordEnvFilePath(installEnv.dataDir)
+    const content = await fs.readFile(envFile, 'utf8')
+
+    assert.deepEqual(output, { created: true, envFilePath: envFile, mode: '0600' })
+    assert.equal((await fs.stat(envFile)).mode & 0o777, 0o600)
+    assert.ok(content.includes('ARAYA_DISCORD_BOT_TOKEN='))
+    assert.ok(!content.includes('op://'))
+    assert.deepEqual(systemdCalls(fake), [])
+    await assert.rejects(
+      runDiscord(installEnv, ['init'], fake),
+      errorWithCode('discord_env_file_exists'),
+    )
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('discord register: .env の平文 token から slash command を登録する', async () => {
+  const installEnv = await makeInstallEnv()
+  const fake = createFakeSystemd({})
+  const envFile = discordEnvFilePath(installEnv.dataDir)
+
+  try {
+    await fs.writeFile(
+      envFile,
+      DISCORD_CONFIG_KEYS.map((key) => `${key}=${
+        key === 'ARAYA_DISCORD_BOT_TOKEN'
+          ? BOT_TOKEN
+          : key === 'ARAYA_DISCORD_APPLICATION_ID'
+            ? APPLICATION_ID
+            : key === 'ARAYA_DISCORD_GUILD_ID'
+              ? GUILD_ID
+              : key === 'ARAYA_DISCORD_CHANNEL_ID'
+                ? CHANNEL_ID
+                : USER_ID
+      }`).join('\n'),
+      { mode: 0o600 },
+    )
+    for (const key of DISCORD_CONFIG_KEYS) {
+      delete installEnv.env[key]
+    }
+    let registered: Record<string, unknown> | null = null
+    await runDiscord(installEnv, ['register'], fake, {
+      registerDiscordCommands: async (config) => {
+        registered = { ...config }
+      },
+    })
+    assert.deepEqual(registered, {
+      botToken: BOT_TOKEN,
+      applicationId: APPLICATION_ID,
+      guildId: GUILD_ID,
+      channelId: CHANNEL_ID,
+      allowedUserIds: [USER_ID],
+    })
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('discord register: 設定（.env か環境変数）から slash command を guild に登録する', async () => {
   const installEnv = await makeInstallEnv()
   const fake = createFakeSystemd({})
 

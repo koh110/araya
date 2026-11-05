@@ -14,6 +14,7 @@ import {
   OP_SERVICE_ACCOUNT_CREDENTIAL_NAME,
   OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME,
   discordEnvFilePath,
+  discordRuntimeEnvironment,
   readDiscordEnvFile,
 } from '../src/discord/config.ts'
 
@@ -140,7 +141,7 @@ async function validateDataDir(dataDir: string) {
   const settings = await readDiscordEnvFile(envFilePath)
 
   if (settings === null) {
-    throw runnerError('discord.env がありません')
+    throw runnerError('.env がありません')
   }
 
   const missing = DISCORD_CONFIG_KEYS.filter((key) => {
@@ -148,11 +149,11 @@ async function validateDataDir(dataDir: string) {
   })
 
   if (missing.length > 0) {
-    throw runnerError(`discord.env に設定がありません: ${missing.join('・')}`)
+    throw runnerError(`.env に設定がありません: ${missing.join('・')}`)
   }
 
   if (!settings.ARAYA_DISCORD_BOT_TOKEN?.startsWith('op://')) {
-    throw runnerError('discord.env の ARAYA_DISCORD_BOT_TOKEN は op:// 参照にしてください')
+    throw runnerError('.env の ARAYA_DISCORD_BOT_TOKEN は op:// 参照にしてください')
   }
 
   return envFilePath
@@ -191,34 +192,32 @@ function parseRunnerArguments(args: string[]) {
 }
 
 async function runOp(opPath: string, envFilePath: string, dataDir: string, token: string) {
-  const opEnvironment: NodeJS.ProcessEnv = { ...process.env }
+  const opEnvironment = discordRuntimeEnvironment(process.env)
 
   for (const name of OP_AUTH_ENVIRONMENT_NAMES) {
     delete opEnvironment[name]
   }
 
-  delete opEnvironment[OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME]
   opEnvironment[OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME] = token
 
   const botEntrypoint = path.join(
     path.dirname(fileURLToPath(import.meta.url)),
     `discord-bot${path.extname(fileURLToPath(import.meta.url))}`,
   )
-  const args = [
-    'run',
-    '--env-file',
-    envFilePath,
-    '--',
-    SYSTEM_ENV_EXECUTABLE,
+  const args = ['run', '--env-file', envFilePath, '--', SYSTEM_ENV_EXECUTABLE]
+
+  for (const name of OP_AUTH_ENVIRONMENT_NAMES) {
+    args.push('-u', name)
+  }
+
+  args.push(
     '-u',
     OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME,
-    '-u',
-    'CREDENTIALS_DIRECTORY',
     process.execPath,
     botEntrypoint,
     '--data-dir',
     dataDir,
-  ]
+  )
 
   return await new Promise<number>((resolve) => {
     const child = spawn(opPath, args, {

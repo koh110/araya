@@ -125,7 +125,8 @@ test('CLI: help は現行 command を案内する', async () => {
     'araya task retry <taskId> [--note <text> | --note-file <path|->] [--confirm-side-effects]',
     'araya task cancel <taskId>',
     'araya runner install',
-    'araya runner uninstall'
+    'araya runner uninstall',
+    'araya discord init',
   ]) {
     assert.ok(help.includes(`\n  ${command}\n`), command)
   }
@@ -137,6 +138,8 @@ test('CLI: help は現行 command を案内する', async () => {
   assert.match(help, /SHIKI（開発の agent）/u)
   assert.match(help, /runner（台帳の Task を取り込んで SHIKI を動かす常駐の process）を、systemd の user service/u)
   assert.match(help, /<dataDir>\/pi\/settings\.json に defaultProvider と defaultModel が両方ある場合だけ model を初期設定する/u)
+  assert.match(help, /<ARAYA_DATA_DIR>\/\.env（既定: ~\/\.araya\/\.env）を mode 0600 で作る/u)
+  assert.match(help, /1Password の op:\/\/ 参照は任意/u)
   assert.match(help, /既存 config は変更せず/u)
 })
 

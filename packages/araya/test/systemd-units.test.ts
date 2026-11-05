@@ -11,6 +11,7 @@ import { collectDevelopmentResult } from '../src/development/result.ts'
 import { createTaskState, createWorktreeService } from '../src/development/worktrees.ts'
 import {
   bashScopeUnit,
+  buildDiscordUnitFile,
   buildRunnerUnitFile,
   createScopedRunner,
   createScopedVerificationRunner,
@@ -20,6 +21,7 @@ import {
   discordOpServiceAccountTokenFilePath,
   gitScopeUnit,
   isUnitFileValueSafe,
+  resolveDiscordEnvRunnerEntrypoint,
   resolveDiscordOpRunnerEntrypoint,
   resolveOpCliPath,
   resolveRunnerEntrypoint,
@@ -247,6 +249,89 @@ test('systemd-units: Discord 1Password launcher は package root の bin/ から
   } finally {
     await fs.rm(root, { recursive: true, force: true })
   }
+})
+
+test('systemd-units: Discord env-file launcher は package root の bin/ から通常の file として探す', async () => {
+  const root = await makeRoot('araya-discord-env-entrypoint-test-')
+
+  try {
+    await fs.mkdir(path.join(root, 'src', 'infrastructure'), { recursive: true })
+    await fs.mkdir(path.join(root, 'bin'))
+    const tsModule = pathToFileURL(path.join(root, 'src', 'infrastructure', 'systemd.ts')).href
+    const jsModule = pathToFileURL(path.join(root, 'src', 'infrastructure', 'systemd.js')).href
+
+    await assert.rejects(
+      resolveDiscordEnvRunnerEntrypoint(tsModule),
+      errorWithCode('discord_env_runner_unavailable'),
+    )
+
+    const tsEntrypoint = path.join(root, 'bin', 'discord-env-runner.ts')
+    await fs.writeFile(tsEntrypoint, '', 'utf8')
+    assert.equal(await resolveDiscordEnvRunnerEntrypoint(tsModule), tsEntrypoint)
+    await assert.rejects(
+      resolveDiscordEnvRunnerEntrypoint(jsModule),
+      errorWithCode('discord_env_runner_unavailable'),
+    )
+
+    await fs.symlink(tsEntrypoint, path.join(root, 'bin', 'discord-env-runner.js'))
+    await assert.rejects(
+      resolveDiscordEnvRunnerEntrypoint(jsModule),
+      errorWithCode('discord_env_runner_unavailable'),
+    )
+  } finally {
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('systemd-units: Discord service unit は標準 .env と任意1Password modeを分離する', () => {
+  const dataDir = '/home/user/.araya'
+  const runnerEntrypoint = '/opt/araya/packages/araya/bin/discord-env-runner.js'
+  const environment = [['ARAYA_DATA_DIR', dataDir], ['PATH', '/usr/bin:/bin']] as const
+  const plain = buildDiscordUnitFile({
+    authMode: 'env-file',
+    dataDir,
+    nodePath: '/usr/bin/node',
+    runnerEntrypoint,
+    envFilePath: `${dataDir}/.env`,
+    environment: [...environment],
+  })
+
+  assert.ok(plain.includes(`ExecStart=/usr/bin/node ${runnerEntrypoint} --data-dir ${dataDir}`), plain)
+  assert.ok(plain.includes(`LoadCredential=discord-env:${dataDir}/.env`), plain)
+  assert.ok(!plain.includes('op-service-account-token'), plain)
+  assert.ok(!plain.includes('OP_SERVICE_ACCOUNT_TOKEN'), plain)
+  assert.ok(!plain.includes('Environment=ARAYA_DISCORD_'), plain)
+
+  const op = buildDiscordUnitFile({
+    authMode: '1password',
+    dataDir,
+    nodePath: '/usr/bin/node',
+    runnerEntrypoint: '/opt/araya/packages/araya/bin/discord-op-runner.js',
+    opPath: '/usr/bin/op',
+    opCredentialFile: '/home/user/.config/araya/op-service-account-token',
+    environment: [...environment],
+  })
+
+  assert.ok(
+    op.includes(`ExecStart=/usr/bin/node /opt/araya/packages/araya/bin/discord-op-runner.js --data-dir ${dataDir} --op-path /usr/bin/op`),
+    op,
+  )
+  assert.ok(
+    op.includes('LoadCredential=op-service-account-token:/home/user/.config/araya/op-service-account-token'),
+    op,
+  )
+  assert.ok(!op.includes('OP_SERVICE_ACCOUNT_TOKEN'), op)
+
+  assert.throws(() => {
+    return buildDiscordUnitFile({
+      authMode: 'env-file',
+      dataDir,
+      nodePath: '/usr/bin/node',
+      runnerEntrypoint,
+      envFilePath: '/home/user/.env:backup',
+      environment: [...environment],
+    })
+  }, errorWithCode('unsupported_path'))
 })
 
 test('systemd-units: 1Password CLI は PATH から実行可能な op を探し、credential path は XDG config を使う', async () => {

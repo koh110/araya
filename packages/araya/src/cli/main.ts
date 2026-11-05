@@ -5,6 +5,7 @@ import { loadConfig, loadPiSdk, withPiEnvironment } from '../config/environment.
 import { loadConfigFile } from '../config/file.ts'
 import {
   createSystemdOps,
+  resolveDiscordEnvRunnerEntrypoint,
   resolveDiscordOpRunnerEntrypoint,
   resolveOpCliPath,
   resolveRunnerEntrypoint,
@@ -68,18 +69,22 @@ function printHelp() {
   araya runner uninstall
     runner の unit を止めて無効にし、unit file を消す。台帳は変えない（動いていた試行は、入れ直すと続きから進む）。
 
+  araya discord init
+    <ARAYA_DATA_DIR>/.env（既定: ~/.araya/.env）を mode 0600 で作る。既存 file は上書きしない。
   araya discord register
-    slash command（/araya list・show・submit・cancel・retry）を Discord の guild に登録する。discord.env（mode 0600）または環境変数の設定が必要。
-    Service Account token を <XDG_CONFIG_HOME>/araya/op-service-account-token に保護して置き、op run --env-file で設定を解決して実行する（README参照）。
+    slash command（/araya list・show・submit・cancel・retry）を Discord の guild に登録する。.env または環境変数の設定が必要。
+    1Password の op:// 参照を使う場合は、op run で解決してから実行する（README参照）。
   araya discord install
     Discord bot を常駐の process（araya-discord-<hash>.service）として入れる。unit file を書き、有効にして起動し直す。
-    1Password CLI と保護された Service Account token file が必要。systemd LoadCredential で認証し、launcher は op run で discord.env の op:// 参照を解決する。
-    OP_SERVICE_ACCOUNT_TOKEN と CREDENTIALS_DIRECTORY は bot process に渡さない。linger は変えない（無効なら logout で bot が止まる）。
+    通常は .env を systemd LoadCredential で launcher に渡す。Bot token は unit file・Environment=・bot process の起動引数に書かない。
+    .env の Bot token が op:// 参照の場合は任意で 1Password Service Account launcher を使う。詳細は README 参照。
+    linger は変えない（無効なら logout で bot が止まる）。
   araya discord uninstall
     Discord bot の unit を止めて無効にし、unit file を消す。state.json・台帳は残す（入れ直すと cursor の続きから進む）。
     Discord 側の slash command 定義は残る（Discord 側で削除する）。
   araya discord run
     unit 稼働の確かめをせず、foreground で Discord bot を 1 度動かす（試験起動）。Ctrl+C で止める。
+    1Password の op:// 参照を使う場合は op run で設定を解決してから実行する。
 
   /araya list: Task 一覧と runner の状態。/araya show <task>: Task の詳細（SHIKI の要約と途中経過）。
   /araya submit <title> <goal> [targets] [constraints] [permissions]: Task を登録する（targets・constraints・permissions はカンマ区切り）。
@@ -106,7 +111,7 @@ function printHelp() {
   ARAYA_DEVELOPMENT_TIMEOUT_MS
   ARAYA_VERIFICATION_TIMEOUT_MS
   ARAYA_DISCORD_APPLICATION_ID・ARAYA_DISCORD_GUILD_ID・ARAYA_DISCORD_CHANNEL_ID・ARAYA_DISCORD_BOT_TOKEN・ARAYA_DISCORD_ALLOWED_USER_IDS
-    （Discord の設定。常駐 service は <ARAYA_DATA_DIR>/discord.env（mode 0600）を op run --env-file で読む。Bot token は op:// 参照。開発 process には渡さない）
+    （Discord の設定。通常は araya discord init で作る <ARAYA_DATA_DIR>/.env（mode 0600）を使う。1Password の op:// 参照は任意）
 `)
 }
 
@@ -208,6 +213,11 @@ export async function runCli(
     const deps: DiscordCommandDependencies = {
       ...defaultCommandDependencies(config.env),
       ...taskDependencies,
+      resolveDiscordEnvRunnerEntrypoint:
+        taskDependencies.resolveDiscordEnvRunnerEntrypoint ??
+        (async () => {
+          return resolveDiscordEnvRunnerEntrypoint()
+        }),
       resolveDiscordOpRunnerEntrypoint:
         taskDependencies.resolveDiscordOpRunnerEntrypoint ??
         (async () => {

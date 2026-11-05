@@ -200,7 +200,7 @@ test('discord bot: 1Passwordで解決したbot tokenを task・retry note・repl
   const stopController = new AbortController()
   const replies: string[] = []
   const notifications: string[] = []
-  const envFile = path.join(dataDir, 'discord.env')
+  const envFile = path.join(dataDir, '.env')
 
   await fs.writeFile(
     envFile,

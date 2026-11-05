@@ -1,17 +1,30 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
-// Discord 連携の設定。常駐 service は <dataDir>/discord.env（mode 0600）の1Password参照を op run で解決する。
-// 解決済み環境変数が file 内の参照・値を上書きする。file が無いときだけ環境変数を使い、両方なければ無効。一部だけ指定されている場合は欠けた名前だけを列挙する。
+// Discord 連携の設定は <dataDir>/.env（mode 0600）または環境変数から読む。
+// 1Password の op:// 参照は任意で、op run が解決した環境変数を file より優先する。
+// file が無いときだけ環境変数を使い、両方なければ無効。一部だけ指定されている場合は欠けた名前だけを列挙する。
 
 const SNOWFLAKE_PATTERN = /^[0-9]{17,20}$/u
 const ENV_NAME_PATTERN = /^[A-Z][A-Z0-9_]*$/u
 const MAX_BOT_TOKEN_CHARS = 255
 
-export const DISCORD_ENV_FILE_NAME = 'discord.env'
+export const DISCORD_ENV_FILE_NAME = '.env'
+export const DISCORD_ENV_CREDENTIAL_NAME = 'discord-env'
 export const OP_SERVICE_ACCOUNT_CREDENTIAL_NAME = 'op-service-account-token'
 export const OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME = 'OP_SERVICE_ACCOUNT_TOKEN'
 export const MAX_DISCORD_ENV_FILE_BYTES = 16 * 1024
+
+const DISCORD_ENV_TEMPLATE = [
+  '# Araya Discord settings. Keep this file private (mode 0600).',
+  '# The default location is <ARAYA_DATA_DIR>/.env, not the repository root.',
+  'ARAYA_DISCORD_BOT_TOKEN=',
+  'ARAYA_DISCORD_APPLICATION_ID=',
+  'ARAYA_DISCORD_GUILD_ID=',
+  'ARAYA_DISCORD_CHANNEL_ID=',
+  'ARAYA_DISCORD_ALLOWED_USER_IDS=',
+  '',
+].join('\n')
 
 export const DISCORD_CONFIG_KEYS = [
   'ARAYA_DISCORD_BOT_TOKEN',
@@ -21,12 +34,67 @@ export const DISCORD_CONFIG_KEYS = [
   'ARAYA_DISCORD_ALLOWED_USER_IDS',
 ] as const
 
+const DISCORD_CONFIG_KEY_SET = new Set<string>(DISCORD_CONFIG_KEYS)
+
 export type DiscordConfig = {
   botToken: string
   applicationId: string
   guildId: string
   channelId: string
   allowedUserIds: readonly string[]
+}
+
+// Discord bot に継承する systemd/runtime 環境の allowlist。Discord 設定は検証後に別途追加する。
+export const DISCORD_BOT_RUNTIME_ENVIRONMENT_NAMES = [
+  'HOME',
+  'PATH',
+  'LANG',
+  'LANGUAGE',
+  'TZ',
+  'INVOCATION_ID',
+  'LC_ALL',
+  'LC_ADDRESS',
+  'LC_COLLATE',
+  'LC_CTYPE',
+  'LC_IDENTIFICATION',
+  'LC_MEASUREMENT',
+  'LC_MESSAGES',
+  'LC_MONETARY',
+  'LC_NAME',
+  'LC_NUMERIC',
+  'LC_PAPER',
+  'LC_TELEPHONE',
+  'LC_TIME',
+] as const
+
+export function discordRuntimeEnvironment(
+  sourceEnv: Readonly<Record<string, string | undefined>>,
+) {
+  const env: NodeJS.ProcessEnv = {}
+
+  for (const name of DISCORD_BOT_RUNTIME_ENVIRONMENT_NAMES) {
+    const value = sourceEnv[name]
+
+    if (value !== undefined) {
+      env[name] = value
+    }
+  }
+
+  return env
+}
+
+export function discordBotEnvironment(
+  settings: DiscordConfig,
+  sourceEnv: Readonly<Record<string, string | undefined>>,
+) {
+  const env = discordRuntimeEnvironment(sourceEnv)
+  env.ARAYA_DISCORD_BOT_TOKEN = settings.botToken
+  env.ARAYA_DISCORD_APPLICATION_ID = settings.applicationId
+  env.ARAYA_DISCORD_GUILD_ID = settings.guildId
+  env.ARAYA_DISCORD_CHANNEL_ID = settings.channelId
+  env.ARAYA_DISCORD_ALLOWED_USER_IDS = settings.allowedUserIds.join(',')
+
+  return env
 }
 
 export type DiscordConfigSource =
@@ -41,7 +109,37 @@ export function discordEnvFilePath(dataDir: string) {
   return path.join(dataDir, DISCORD_ENV_FILE_NAME)
 }
 
-// discord.env の本文を読む。空行と # から始まる comment 行は無視し、それ以外の行は NAME=value の形でなければならない
+export async function createDiscordEnvFile(dataDir: string) {
+  const envFilePath = discordEnvFilePath(dataDir)
+  await fs.mkdir(dataDir, { recursive: true, mode: 0o700 })
+
+  let handle
+
+  try {
+    handle = await fs.open(envFilePath, 'wx', 0o600)
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'EEXIST') {
+      throw discordConfigError(
+        'discord_env_file_exists',
+        `${envFilePath} は既にあります。既存 file は変更しません`,
+      )
+    }
+
+    throw error
+  }
+
+  try {
+    await handle.chmod(0o600)
+    await handle.writeFile(DISCORD_ENV_TEMPLATE, 'utf8')
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+
+  return { created: true, envFilePath, mode: '0600' } as const
+}
+
+// .env の本文を読む。空行と # から始まる comment 行は無視し、それ以外の行は NAME=value の形でなければならない
 export function parseDiscordEnvFile(text: string) {
   const settings: Record<string, string> = {}
   const lines = text.split(/\r?\n/u)
@@ -64,6 +162,13 @@ export function parseDiscordEnvFile(text: string) {
       )
     }
 
+    if (!DISCORD_CONFIG_KEY_SET.has(name)) {
+      throw discordConfigError(
+        'discord_env_file_invalid',
+        `${DISCORD_ENV_FILE_NAME} の ${index + 1} 行目に未対応の設定名 ${name} があります`,
+      )
+    }
+
     if (settings[name] !== undefined) {
       throw discordConfigError(
         'discord_env_file_invalid',
@@ -77,7 +182,7 @@ export function parseDiscordEnvFile(text: string) {
   return settings
 }
 
-// discord.env を読む。無ければ null。mode が group・other に読ませる form なら誤り
+// .env を読む。無ければ null。mode が group・other に読ませる値なら誤り
 export async function readDiscordEnvFile(filePath: string) {
   let stat
 
@@ -146,6 +251,13 @@ export function validateDiscordSettings(settings: Record<string, string | undefi
   const guildId = settings.ARAYA_DISCORD_GUILD_ID ?? ''
   const channelId = settings.ARAYA_DISCORD_CHANNEL_ID ?? ''
   const allowedUserIdsValue = settings.ARAYA_DISCORD_ALLOWED_USER_IDS ?? ''
+
+  if (botToken.includes('\u0000')) {
+    throw discordConfigError(
+      'discord_config_invalid',
+      'ARAYA_DISCORD_BOT_TOKEN に NUL byte は使用できません',
+    )
+  }
 
   if (botToken.length > MAX_BOT_TOKEN_CHARS) {
     throw discordConfigError('discord_config_invalid', 'ARAYA_DISCORD_BOT_TOKEN が長すぎます')
@@ -218,15 +330,6 @@ export async function loadDiscordConfig(
   const fileSettings = await readDiscordEnvFile(envFilePath)
 
   if (fileSettings !== null) {
-    const fileBotToken = fileSettings.ARAYA_DISCORD_BOT_TOKEN
-
-    if (fileBotToken === undefined || !fileBotToken.startsWith('op://')) {
-      throw discordConfigError(
-        'discord_bot_token_must_use_1password',
-        `${DISCORD_ENV_FILE_NAME} の ARAYA_DISCORD_BOT_TOKEN は op:// 参照で指定してください`,
-      )
-    }
-
     const settings: Record<string, string | undefined> = { ...fileSettings }
 
     for (const key of DISCORD_CONFIG_KEYS) {

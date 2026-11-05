@@ -11,7 +11,8 @@ const opRunnerSource = path.join(packageRoot, 'bin', 'discord-op-runner.ts')
 const discordConfigSource = path.join(packageRoot, 'src', 'discord', 'config.ts')
 const TEST_SERVICE_TOKEN = 'synthetic-service-account-token'
 
-const fakeOpScript = `#!/usr/bin/env node
+function fakeOpScript(opRecordPath: string) {
+  return `#!/usr/bin/env node
 import { spawn } from 'node:child_process'
 import { writeFile } from 'node:fs/promises'
 
@@ -21,7 +22,7 @@ const command = args[separator + 1]
 const commandArgs = args.slice(separator + 2)
 const token = process.env.OP_SERVICE_ACCOUNT_TOKEN
 
-await writeFile(process.env.ARAYA_TEST_OP_RECORD, JSON.stringify({
+await writeFile(${JSON.stringify(opRecordPath)}, JSON.stringify({
   args,
   tokenPresent: token !== undefined,
   tokenMatchesCredential: token === ${JSON.stringify(TEST_SERVICE_TOKEN)},
@@ -31,6 +32,8 @@ await writeFile(process.env.ARAYA_TEST_OP_RECORD, JSON.stringify({
   connectTokenPresent: process.env.OP_CONNECT_TOKEN !== undefined,
   sessionPresent: process.env.OP_SESSION !== undefined,
   accountPresent: process.env.OP_ACCOUNT !== undefined,
+  awsSecretPresent: process.env.AWS_SECRET_ACCESS_KEY !== undefined,
+  githubTokenPresent: process.env.GITHUB_TOKEN !== undefined,
 }), 'utf8')
 
 const child = spawn(command, commandArgs, {
@@ -44,10 +47,12 @@ child.once('exit', (code) => {
   process.exitCode = code ?? 1
 })
 `
+}
 
-const fakeBotScript = `import { writeFile } from 'node:fs/promises'
+function fakeBotScript(botRecordPath: string) {
+  return `import { writeFile } from 'node:fs/promises'
 
-await writeFile(process.env.ARAYA_TEST_BOT_RECORD, JSON.stringify({
+await writeFile(${JSON.stringify(botRecordPath)}, JSON.stringify({
   args: process.argv.slice(2),
   botToken: process.env.ARAYA_DISCORD_BOT_TOKEN,
   serviceTokenPresent: process.env.OP_SERVICE_ACCOUNT_TOKEN !== undefined,
@@ -56,8 +61,12 @@ await writeFile(process.env.ARAYA_TEST_BOT_RECORD, JSON.stringify({
   connectTokenPresent: process.env.OP_CONNECT_TOKEN !== undefined,
   sessionPresent: process.env.OP_SESSION !== undefined,
   accountPresent: process.env.OP_ACCOUNT !== undefined,
+  awsSecretPresent: process.env.AWS_SECRET_ACCESS_KEY !== undefined,
+  githubTokenPresent: process.env.GITHUB_TOKEN !== undefined,
+  invocationId: process.env.INVOCATION_ID,
 }), 'utf8')
 `
+}
 
 async function makeFixture() {
   const root = await fs.realpath(
@@ -83,11 +92,11 @@ async function makeFixture() {
   await fs.writeFile(path.join(packageDir, 'package.json'), '{"type":"module"}\n', 'utf8')
   await fs.copyFile(opRunnerSource, opRunnerPath)
   await fs.copyFile(discordConfigSource, path.join(packageConfigDir, 'config.ts'))
-  await fs.writeFile(botPath, fakeBotScript, 'utf8')
-  await fs.writeFile(opPath, fakeOpScript, { mode: 0o700 })
+  await fs.writeFile(botPath, fakeBotScript(botRecordPath), 'utf8')
+  await fs.writeFile(opPath, fakeOpScript(opRecordPath), { mode: 0o700 })
   await fs.writeFile(credentialPath, `${TEST_SERVICE_TOKEN}\n`, { mode: 0o400 })
   await fs.writeFile(
-    path.join(dataDir, 'discord.env'),
+    path.join(dataDir, '.env'),
     [
       'ARAYA_DISCORD_BOT_TOKEN=op://vault/item/bot-token',
       'ARAYA_DISCORD_APPLICATION_ID=12345678901234567',
@@ -102,6 +111,7 @@ async function makeFixture() {
   const env: NodeJS.ProcessEnv = {
     PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin`,
     HOME: root,
+    INVOCATION_ID: 'service-invocation-id',
     ARAYA_DATA_DIR: dataDir,
     CREDENTIALS_DIRECTORY: credentialsDirectory,
     OP_SERVICE_ACCOUNT_TOKEN: 'ambient-test-token',
@@ -109,8 +119,8 @@ async function makeFixture() {
     OP_CONNECT_TOKEN: 'synthetic-connect-token',
     OP_SESSION: 'synthetic-op-session',
     OP_ACCOUNT: 'synthetic-account',
-    ARAYA_TEST_OP_RECORD: opRecordPath,
-    ARAYA_TEST_BOT_RECORD: botRecordPath,
+    AWS_SECRET_ACCESS_KEY: 'synthetic-aws-secret',
+    GITHUB_TOKEN: 'synthetic-github-secret',
   }
 
   return {
@@ -147,6 +157,8 @@ test('discord-op-runner: LoadCredential token を op run にだけ渡し、Araya
       connectTokenPresent: boolean
       sessionPresent: boolean
       accountPresent: boolean
+      awsSecretPresent: boolean
+      githubTokenPresent: boolean
     }
     const botRecord = JSON.parse(await fs.readFile(fixture.botRecordPath, 'utf8')) as {
       args: string[]
@@ -157,19 +169,30 @@ test('discord-op-runner: LoadCredential token を op run にだけ渡し、Araya
       connectTokenPresent: boolean
       sessionPresent: boolean
       accountPresent: boolean
+      awsSecretPresent: boolean
+      githubTokenPresent: boolean
+      invocationId: string
     }
 
     assert.deepEqual(opRecord, {
       args: [
         'run',
         '--env-file',
-        path.join(fixture.dataDir, 'discord.env'),
+        path.join(fixture.dataDir, '.env'),
         '--',
         '/usr/bin/env',
         '-u',
-        'OP_SERVICE_ACCOUNT_TOKEN',
-        '-u',
         'CREDENTIALS_DIRECTORY',
+        '-u',
+        'OP_CONNECT_HOST',
+        '-u',
+        'OP_CONNECT_TOKEN',
+        '-u',
+        'OP_SESSION',
+        '-u',
+        'OP_ACCOUNT',
+        '-u',
+        'OP_SERVICE_ACCOUNT_TOKEN',
         process.execPath,
         fixture.botPath,
         '--data-dir',
@@ -183,6 +206,8 @@ test('discord-op-runner: LoadCredential token を op run にだけ渡し、Araya
       connectTokenPresent: false,
       sessionPresent: false,
       accountPresent: false,
+      awsSecretPresent: false,
+      githubTokenPresent: false,
     })
     assert.deepEqual(botRecord, {
       args: ['--data-dir', fixture.dataDir],
@@ -193,7 +218,36 @@ test('discord-op-runner: LoadCredential token を op run にだけ渡し、Araya
       connectTokenPresent: false,
       sessionPresent: false,
       accountPresent: false,
+      awsSecretPresent: false,
+      githubTokenPresent: false,
+      invocationId: 'service-invocation-id',
     })
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('discord-op-runner: .env の未対応な secret key を op と bot に渡す前に拒否する', async () => {
+  const fixture = await makeFixture()
+
+  try {
+    await fs.appendFile(
+      path.join(fixture.dataDir, '.env'),
+      'AWS_SECRET_ACCESS_KEY=do-not-leak-this-value\n',
+      'utf8',
+    )
+
+    const result = spawnSync(
+      process.execPath,
+      [fixture.opRunnerPath, '--data-dir', fixture.dataDir, '--op-path', fixture.opPath],
+      { encoding: 'utf8', env: fixture.env },
+    )
+
+    assert.notEqual(result.status, 0)
+    assert.ok(result.stderr.includes('未対応の設定名 AWS_SECRET_ACCESS_KEY'))
+    assert.ok(!result.stderr.includes('do-not-leak-this-value'))
+    await assert.rejects(fs.access(fixture.opRecordPath))
+    await assert.rejects(fs.access(fixture.botRecordPath))
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }

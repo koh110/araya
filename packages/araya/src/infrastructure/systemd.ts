@@ -4,7 +4,10 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { OP_SERVICE_ACCOUNT_CREDENTIAL_NAME } from '../discord/config.ts'
+import {
+  DISCORD_ENV_CREDENTIAL_NAME,
+  OP_SERVICE_ACCOUNT_CREDENTIAL_NAME,
+} from '../discord/config.ts'
 import {
   runBoundedCommand,
   runVerificationCommand,
@@ -161,7 +164,7 @@ export function selectUnitEnvironment(
       continue
     }
 
-    // Discord 設定は unit file に書かない。Discord bot は discord.env から読み、開発の process には渡さない
+    // Discord 設定は unit file に書かない。Discord bot は .env から読み、開発の process には渡さない
     if (name.startsWith('ARAYA_DISCORD_')) {
       continue
     }
@@ -264,32 +267,59 @@ export function buildRunnerUnitFile(input: RunnerUnitFileInput) {
   return `${lines.join('\n')}\n`
 }
 
-export type DiscordUnitFileInput = {
+export type DiscordUnitFileCommon = {
   dataDir: string
   nodePath: string
-  opRunnerEntrypoint: string
-  opPath: string
-  opCredentialFile: string
+  runnerEntrypoint: string
   environment: UnitEnvironment
 }
+
+export type DiscordUnitFileInput =
+  | (DiscordUnitFileCommon & {
+      authMode: 'env-file'
+      envFilePath: string
+    })
+  | (DiscordUnitFileCommon & {
+      authMode: '1password'
+      opPath: string
+      opCredentialFile: string
+    })
 
 export function discordUnitName(hash: string) {
   return `araya-discord-${hash}.service`
 }
 
-// Discord bot は専用のlauncherから op run 経由で起動する。認証tokenはLoadCredentialでruntimeに渡す。
+// Discord bot は専用 launcher から起動する。env-file mode は systemd LoadCredential、1Password mode は Service Account credential を使う。
 export function discordUnitSections(input: DiscordUnitFileInput) {
   assertUnitFileValue('dataDir', input.dataDir)
   assertUnitFileValue('node の実行ファイル', input.nodePath)
-  assertUnitFileValue('Discord op runner の entrypoint', input.opRunnerEntrypoint)
-  assertUnitFileValue('1Password CLI', input.opPath)
-  assertUnitFileValue('1Password credential file', input.opCredentialFile)
+  assertUnitFileValue('Discord service runner の entrypoint', input.runnerEntrypoint)
 
-  if (input.opCredentialFile.includes(':')) {
-    throw systemdError(
-      'unsupported_path',
-      '1Password credential file のpathには「:」を使えません',
-    )
+  let credential: string
+  let execStart: string
+
+  if (input.authMode === 'env-file') {
+    assertUnitFileValue('.env', input.envFilePath)
+
+    if (input.envFilePath.includes(':')) {
+      throw systemdError('unsupported_path', '.env のpathには「:」を使えません')
+    }
+
+    credential = `${DISCORD_ENV_CREDENTIAL_NAME}:${input.envFilePath}`
+    execStart = `${input.nodePath} ${input.runnerEntrypoint} --data-dir ${input.dataDir}`
+  } else {
+    assertUnitFileValue('1Password CLI', input.opPath)
+    assertUnitFileValue('1Password credential file', input.opCredentialFile)
+
+    if (input.opCredentialFile.includes(':')) {
+      throw systemdError(
+        'unsupported_path',
+        '1Password credential file のpathには「:」を使えません',
+      )
+    }
+
+    credential = `${OP_SERVICE_ACCOUNT_CREDENTIAL_NAME}:${input.opCredentialFile}`
+    execStart = `${input.nodePath} ${input.runnerEntrypoint} --data-dir ${input.dataDir} --op-path ${input.opPath}`
   }
 
   for (const [name, value] of input.environment) {
@@ -309,14 +339,8 @@ export function discordUnitSections(input: DiscordUnitFileInput) {
   ]
   const service: (readonly [string, string])[] = [
     ['Type', 'exec'],
-    [
-      'ExecStart',
-      `${input.nodePath} ${input.opRunnerEntrypoint} --data-dir ${input.dataDir} --op-path ${input.opPath}`,
-    ],
-    [
-      'LoadCredential',
-      `${OP_SERVICE_ACCOUNT_CREDENTIAL_NAME}:${input.opCredentialFile}`,
-    ],
+    ['ExecStart', execStart],
+    ['LoadCredential', credential],
     ['WorkingDirectory', input.dataDir],
     ...input.environment.map(([name, value]) => {
       const property: readonly [string, string] = ['Environment', `${name}=${value}`]
@@ -331,7 +355,7 @@ export function discordUnitSections(input: DiscordUnitFileInput) {
     ['TimeoutStopSec', '30'],
     ['StandardInput', 'null'],
     ['StandardOutput', 'null'],
-    ['StandardError', `append:${path.join(input.dataDir, 'logs', 'discord-op.log')}`],
+    ['StandardError', `append:${path.join(input.dataDir, 'logs', 'discord-launcher.log')}`],
   ]
   const install: (readonly [string, string])[] = [['WantedBy', 'default.target']]
 
@@ -445,6 +469,36 @@ export async function resolveDiscordOpRunnerEntrypoint(moduleUrl: string = impor
     throw systemdError(
       'discord_op_runner_unavailable',
       `Discord 1Password launcher が通常の file ではありません: ${entrypoint}`,
+    )
+  }
+
+  return entrypoint
+}
+
+// Discord の標準 env-file launcher（bin/discord-env-runner）を package 内から解決する
+export async function resolveDiscordEnvRunnerEntrypoint(moduleUrl: string = import.meta.url) {
+  const modulePath = fileURLToPath(moduleUrl)
+  const packageRoot = path.dirname(path.dirname(path.dirname(modulePath)))
+  const entrypoint = path.join(packageRoot, 'bin', `discord-env-runner${path.extname(modulePath)}`)
+  let stat
+
+  try {
+    stat = await fs.lstat(entrypoint)
+  } catch (error) {
+    if (isErrno(error, 'ENOENT') || isErrno(error, 'ENOTDIR')) {
+      throw systemdError(
+        'discord_env_runner_unavailable',
+        `Discord env-file launcher がありません: ${entrypoint}`,
+      )
+    }
+
+    throw error
+  }
+
+  if (!stat.isFile()) {
+    throw systemdError(
+      'discord_env_runner_unavailable',
+      `Discord env-file launcher が通常の file ではありません: ${entrypoint}`,
     )
   }
 
