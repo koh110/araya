@@ -26,6 +26,9 @@ const GIT_SCOPE_ID_CHARS = 12
 const CALL_ID_HASH_CHARS = 12
 const SCOPE_STOP_TIMEOUT_MS = 30_000
 const COMMAND_OUTPUT_BYTES = 64 * 1024
+const SYSTEMD_CREDS_TIMEOUT_MS = 30_000
+const SYSTEMD_CREDENTIAL_OUTPUT_BYTES = 64 * 1024
+const SYSTEMD_CREDS_STDERR_BYTES = 8 * 1024
 const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/u
 // unit file では % が specifier、$ が変数として展開され、空白・引用符・\ にも意味がある。; は ExecStart の区切り
 const UNIT_FILE_UNSAFE_PATTERN = /[\u0000-\u001f\u007f "'\\$%;]/u
@@ -41,6 +44,16 @@ export type CommandResult = {
   stdout: string
   stderr: string
   timedOut: boolean
+}
+
+export type SystemdCredentialEncryptor = (
+  plaintext: string,
+  credentialName: string,
+) => Promise<string>
+
+export type SystemdCredentialEncryptionDependencies = {
+  resolveExecutable?: () => Promise<string>
+  runCommand?: GitCommandRunner
 }
 
 export type ScopeStopResult = { ok: true } | { ok: false; error: string; remaining: string[] }
@@ -296,6 +309,7 @@ export function discordUnitSections(input: DiscordUnitFileInput) {
   assertUnitFileValue('Discord service runner の entrypoint', input.runnerEntrypoint)
 
   let credential: string
+  let credentialProperty: 'LoadCredential' | 'LoadCredentialEncrypted'
   let execStart: string
 
   if (input.authMode === 'env-file') {
@@ -306,6 +320,7 @@ export function discordUnitSections(input: DiscordUnitFileInput) {
     }
 
     credential = `${DISCORD_ENV_CREDENTIAL_NAME}:${input.envFilePath}`
+    credentialProperty = 'LoadCredential'
     execStart = `${input.nodePath} ${input.runnerEntrypoint} --data-dir ${input.dataDir}`
   } else {
     assertUnitFileValue('1Password CLI', input.opPath)
@@ -319,6 +334,7 @@ export function discordUnitSections(input: DiscordUnitFileInput) {
     }
 
     credential = `${OP_SERVICE_ACCOUNT_CREDENTIAL_NAME}:${input.opCredentialFile}`
+    credentialProperty = 'LoadCredentialEncrypted'
     execStart = `${input.nodePath} ${input.runnerEntrypoint} --data-dir ${input.dataDir} --op-path ${input.opPath}`
   }
 
@@ -340,7 +356,7 @@ export function discordUnitSections(input: DiscordUnitFileInput) {
   const service: (readonly [string, string])[] = [
     ['Type', 'exec'],
     ['ExecStart', execStart],
-    ['LoadCredential', credential],
+    [credentialProperty, credential],
     ['WorkingDirectory', input.dataDir],
     ...input.environment.map(([name, value]) => {
       const property: readonly [string, string] = ['Environment', `${name}=${value}`]
@@ -513,16 +529,20 @@ function configHomePath(env: Readonly<Record<string, string | undefined>>, homeD
     : path.join(homeDir, '.config')
 }
 
-// 1Password Service Account credential の保護された保存先
+// 暗号化した 1Password Service Account credential は、設定や state と同じ ~/.araya に集約する
 export function discordOpServiceAccountTokenFilePath(
+  _env: Readonly<Record<string, string | undefined>>,
+  homeDir: string,
+) {
+  return path.join(homeDir, '.araya', `${OP_SERVICE_ACCOUNT_CREDENTIAL_NAME}.cred`)
+}
+
+// 以前の平文 credential source。暗号化 credential へ切替後の cleanup にのみ使う
+export function legacyDiscordOpServiceAccountTokenFilePath(
   env: Readonly<Record<string, string | undefined>>,
   homeDir: string,
 ) {
-  return path.join(
-    configHomePath(env, homeDir),
-    'araya',
-    OP_SERVICE_ACCOUNT_CREDENTIAL_NAME,
-  )
+  return path.join(configHomePath(env, homeDir), 'araya', OP_SERVICE_ACCOUNT_CREDENTIAL_NAME)
 }
 
 // <XDG_CONFIG_HOME>/systemd/user/<unit>。XDG_CONFIG_HOME が絶対 path でなければ <home>/.config
@@ -569,6 +589,135 @@ export async function resolveOpCliPath(searchPath: string | undefined) {
   }
 
   return opPath
+}
+
+const SYSTEMD_CREDS_CANDIDATES = [
+  '/usr/bin/systemd-creds',
+  '/usr/sbin/systemd-creds',
+  '/bin/systemd-creds',
+  '/sbin/systemd-creds',
+  '/usr/lib/systemd/systemd-creds',
+] as const
+
+async function trustedSystemdCredsExecutable(candidate: string) {
+  let canonicalPath: string
+  let fileStat
+
+  try {
+    canonicalPath = await fs.realpath(candidate)
+    fileStat = await fs.stat(canonicalPath)
+  } catch {
+    return null
+  }
+
+  if (
+    !fileStat.isFile() ||
+    fileStat.uid !== 0 ||
+    (fileStat.mode & 0o111) === 0 ||
+    (fileStat.mode & 0o022) !== 0
+  ) {
+    return null
+  }
+
+  let directory = path.dirname(canonicalPath)
+
+  while (true) {
+    let stat
+
+    try {
+      stat = await fs.lstat(directory)
+
+      if (
+        !stat.isDirectory() ||
+        stat.uid !== 0 ||
+        (stat.mode & 0o022) !== 0 ||
+        (await fs.realpath(directory)) !== directory
+      ) {
+        return null
+      }
+    } catch {
+      return null
+    }
+
+    const parent = path.dirname(directory)
+
+    if (parent === directory) {
+      break
+    }
+
+    directory = parent
+  }
+
+  return canonicalPath
+}
+
+// systemd-creds は token を stdin から受け取るため、PATH 上の user-owned executable は使わない
+export async function resolveSystemdCredsPath() {
+  for (const candidate of SYSTEMD_CREDS_CANDIDATES) {
+    const executable = await trustedSystemdCredsExecutable(candidate)
+
+    if (executable !== null) {
+      return executable
+    }
+  }
+
+  throw systemdError(
+    'systemd_creds_unavailable',
+    '信頼できる system directory に systemd-creds がありません',
+  )
+}
+
+export async function encryptSystemdCredential(
+  plaintext: string,
+  credentialName: string,
+  dependencies: SystemdCredentialEncryptionDependencies = {},
+) {
+  if (plaintext === '' || !/^[A-Za-z0-9_.-]+$/u.test(credentialName)) {
+    throw systemdError('systemd_credential_encryption_failed', 'credential の入力が不正です')
+  }
+
+  const executable = await (dependencies.resolveExecutable ?? resolveSystemdCredsPath)()
+  let result: BoundedProcessResult
+
+  try {
+    result = await (dependencies.runCommand ?? runBoundedCommand)(
+      executable,
+      ['--user', `--name=${credentialName}`, '--with-key=auto', 'encrypt', '-', '-'],
+      {
+        // 実行 UID と systemd-creds socket で対象を特定するため、bus・環境変数を継承しない。
+        env: {},
+        input: plaintext,
+        timeoutMs: SYSTEMD_CREDS_TIMEOUT_MS,
+        stdout: { mode: 'strict', limitBytes: SYSTEMD_CREDENTIAL_OUTPUT_BYTES },
+        stderr: { mode: 'strict', limitBytes: SYSTEMD_CREDS_STDERR_BYTES },
+      },
+    )
+  } catch {
+    throw systemdError(
+      'systemd_credential_encryption_failed',
+      'systemd-creds で credential を暗号化できませんでした',
+    )
+  }
+
+  const outputBytes = Buffer.byteLength(result.stdout, 'utf8')
+
+  if (
+    result.exitCode !== 0 ||
+    result.signal !== null ||
+    result.terminationReason !== undefined ||
+    !result.terminationConfirmed ||
+    outputBytes === 0 ||
+    outputBytes > SYSTEMD_CREDENTIAL_OUTPUT_BYTES ||
+    result.stdoutBytes !== outputBytes ||
+    result.stdout.includes(plaintext)
+  ) {
+    throw systemdError(
+      'systemd_credential_encryption_failed',
+      'systemd-creds で credential を暗号化できませんでした',
+    )
+  }
+
+  return result.stdout
 }
 
 // systemctl などを打ち切り付きで実行する。起動できなかったときは exitCode を null にし、理由を stderr に入れる。

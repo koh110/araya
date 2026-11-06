@@ -184,7 +184,11 @@ op run --env-file="$data_dir/.env" -- araya discord register
 op run --env-file="$data_dir/.env" -- araya discord install --auth-mode 1password
 ```
 
-通常の `araya discord install` は `.env` file launcher を選び、1Password CLI や Service Account を必要としません。`--auth-mode 1password` を使うには、install process の環境に `OP_SERVICE_ACCOUNT_TOKEN` を設定し、1Password CLI 2.18 以降と、`.env` の参照項目を読める Service Account を用意してください。Araya は token を `<XDG_CONFIG_HOME>/araya/op-service-account-token`（既定 `~/.config/araya/op-service-account-token`）へ mode `0600` で保存し、親 directory も mode `0700` にします。利用者が token file を別途作る必要はありません。常駐 service の再起動時にも認証が必要なため、この内部 credential source は保持されます。systemd `LoadCredential` 経由で launcher だけに渡し、token を unit file、systemd control command の環境、bot process には渡しません。`op` CLI が `.env` を解決し、Discord 設定値だけを bot process の実行時環境へ渡します。
+通常の `araya discord install` は `.env` file launcher を選び、1Password CLI や Service Account を必要としません。`--auth-mode 1password` を使うには、install process の環境に `OP_SERVICE_ACCOUNT_TOKEN` を設定し、1Password CLI 2.18 以降と、`.env` の参照項目を読める Service Account を用意してください。1Password mode は systemd user manager v258 以降と `systemd-creds` が必要です。古い manager では平文保存へ fallback せず、install を拒否します。
+
+install は token を `systemd-creds --user --with-key=auto encrypt` の stdin に渡し、暗号文だけを `~/.araya/op-service-account-token.cred`（file mode `0600`、directory mode `0700`）へ保存します。暗号鍵の値を `.env` や環境変数で別途与える必要はありません。`auto` では systemd が利用可能な TPM2 と永続ホスト鍵を使い、どちらも利用できない場合は暗号化に失敗して install を中止します。鍵はアプリのホーム directory には保存せず、systemd 管理下の TPM2 や root のみ読める `/var/lib/systemd/credential.secret` が使われます。したがって暗号文だけを別 host や OS 再install後へ移しても復号できるとは限りません。常駐 unit は `LoadCredentialEncrypted=` を使い、systemd が復号した credential を service 実行中に `$CREDENTIALS_DIRECTORY` の file として渡します。Service Account token は unit file、systemd control command の環境、bot process には渡しません。`op` CLI が `.env` を解決し、Discord 設定値だけを bot process の実行時環境へ渡します。
+
+旧形式の平文 source (`~/.config/araya/op-service-account-token`) が見つかった場合は、新しい unit の restart 成功後に、安全性を再確認して unlink します。安全に削除できない場合は warning を出します。unlink は媒体上の secure erase を保証するものではありません。systemd の unit 定義自体は `~/.config/systemd/user/` に置かれ、実行中の credential は systemd 管理の一時領域に置かれます。
 
 slash command の登録時は、`OP_SERVICE_ACCOUNT_TOKEN` が設定された環境から `op run` を起動し、`.env` の `op://` 参照を解決します。以下は既存の 1Password Connect/session/account 環境変数を外し、Araya process から Service Account token と systemd credential directory を除く例です。token の値をコマンド引数へ展開しません。
 

@@ -28,6 +28,7 @@ const CHANNEL_ID = '12345678901234568'
 const USER_ID = '12345678901234569'
 const NODE_PATH = '/usr/bin/node'
 const SERVICE_ACCOUNT_TOKEN = 'synthetic-service-account-token'
+const ENCRYPTED_SERVICE_ACCOUNT_CREDENTIAL = 'Y2lwaGVydGV4dA==\n'
 const UID = process.getuid?.() ?? 1000
 
 type InstallEnv = Awaited<ReturnType<typeof makeInstallEnv>>
@@ -45,8 +46,9 @@ async function makeInstallEnv() {
   const envRunnerEntrypoint = path.join(root, 'package', 'bin', 'discord-env-runner.ts')
   const opRunnerEntrypoint = path.join(root, 'package', 'bin', 'discord-op-runner.ts')
   const opPath = path.join(root, 'bin', 'op')
-  const opTokenFile = path.join(configHome, 'araya', 'op-service-account-token')
-  await fs.mkdir(home)
+  const opTokenFile = path.join(home, '.araya', 'op-service-account-token.cred')
+  const legacyOpTokenFile = path.join(configHome, 'araya', 'op-service-account-token')
+  await fs.mkdir(home, { mode: 0o700 })
   await fs.mkdir(dataDir, { mode: 0o700 })
   await fs.mkdir(piAgentDir)
   await fs.mkdir(path.dirname(entrypoint), { recursive: true })
@@ -90,6 +92,7 @@ async function makeInstallEnv() {
     opRunnerEntrypoint,
     opPath,
     opTokenFile,
+    legacyOpTokenFile,
     env,
   }
 }
@@ -168,6 +171,10 @@ function defaultSystemctl(
       return commandResult('running\n')
     }
 
+    if (command === 'show' && args.includes('--property=Version')) {
+      return commandResult('259.9-0ubuntu0.1\n')
+    }
+
     if (command === 'show' && args.includes('--property=FragmentPath')) {
       return commandResult(`${unitPathOf(installEnv, unit)}\n`)
     }
@@ -226,6 +233,9 @@ async function runDiscord(
       },
       resolveOpCliPath: async () => {
         return installEnv.opPath
+      },
+      encryptSystemdCredential: async () => {
+        return ENCRYPTED_SERVICE_ACCOUNT_CREDENTIAL
       },
       homeDir: installEnv.home,
       uid: UID,
@@ -399,16 +409,249 @@ test('discord install: OP_SERVICE_ACCOUNT_TOKEN から credential を用意し�
   }
 })
 
-test('discord install: credential file の置換可能な ancestor を拒否して unit を変更しない', async () => {
+test('discord install: user manager が v258 未満なら credential 作成前に拒否する', async () => {
+  const installEnv = await makeInstallEnv()
+
+  await writeDiscordEnv(installEnv)
+  const defaultHandler = defaultSystemctl(installEnv)
+  let encryptionAttempted = false
+  const fake = createFakeSystemd({
+    systemctl: async (args) => {
+      if (args[1] === 'show' && args.includes('--property=Version')) {
+        return commandResult('257.9\n')
+      }
+
+      return defaultHandler(args)
+    },
+  })
+
+  try {
+    await assert.rejects(
+      runDiscord(installEnv, ['install', '--auth-mode', '1password'], fake, {
+        encryptSystemdCredential: async () => {
+          encryptionAttempted = true
+          return ENCRYPTED_SERVICE_ACCOUNT_CREDENTIAL
+        },
+      }),
+      errorWithCode('systemd_encrypted_credentials_unsupported'),
+    )
+
+    assert.equal(encryptionAttempted, false)
+    assert.equal(await exists(installEnv.opTokenFile), false)
+    assert.equal(await exists(path.join(installEnv.home, '.araya')), false)
+    assert.equal(await exists(unitPathOf(installEnv, unitOf(installEnv.dataDir))), false)
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('discord install: multiline manager version は malformed として credential 作成前に拒否する', async () => {
+  const installEnv = await makeInstallEnv()
+
+  await writeDiscordEnv(installEnv)
+  const defaultHandler = defaultSystemctl(installEnv)
+  let encryptionAttempted = false
+  const fake = createFakeSystemd({
+    systemctl: async (args) => {
+      if (args[1] === 'show' && args.includes('--property=Version')) {
+        return commandResult('258.\ninvalid\n')
+      }
+
+      return defaultHandler(args)
+    },
+  })
+
+  try {
+    await assert.rejects(
+      runDiscord(installEnv, ['install', '--auth-mode', '1password'], fake, {
+        encryptSystemdCredential: async () => {
+          encryptionAttempted = true
+          return ENCRYPTED_SERVICE_ACCOUNT_CREDENTIAL
+        },
+      }),
+      errorWithCode('systemd_encrypted_credentials_unsupported'),
+    )
+
+    assert.equal(encryptionAttempted, false)
+    assert.equal(await exists(installEnv.opTokenFile), false)
+    assert.equal(await exists(path.join(installEnv.home, '.araya')), false)
+    assert.equal(await exists(unitPathOf(installEnv, unitOf(installEnv.dataDir))), false)
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('discord install: systemd-creds が失敗したら token を漏らさず persistent state を変更しない', async () => {
+  const installEnv = await makeInstallEnv()
+
+  await writeDiscordEnv(installEnv)
+  const fake = createFakeSystemd({
+    systemctl: defaultSystemctl(installEnv),
+  })
+
+  try {
+    await assert.rejects(
+      runDiscord(installEnv, ['install', '--auth-mode', '1password'], fake, {
+        encryptSystemdCredential: async (token) => {
+          throw new Error(`synthetic failure ${token}`)
+        },
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error)
+        assert.equal(
+          'code' in error ? error.code : undefined,
+          'op_service_account_credential_encryption_failed',
+        )
+        assert.equal(error.message.includes(SERVICE_ACCOUNT_TOKEN), false)
+        return true
+      },
+    )
+
+    assert.equal(await exists(installEnv.opTokenFile), false)
+    assert.equal(await exists(unitPathOf(installEnv, unitOf(installEnv.dataDir))), false)
+    assert.equal(
+      systemdCalls(fake).some((call) => {
+        return ['daemon-reload', 'enable', 'restart'].includes(call[2] ?? '')
+      }),
+      false,
+    )
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('discord install: encryptor が誤って平文を返したら保存せず unit も変更しない', async () => {
+  const installEnv = await makeInstallEnv()
+
+  await writeDiscordEnv(installEnv)
+  const fake = createFakeSystemd({
+    systemctl: defaultSystemctl(installEnv),
+  })
+
+  try {
+    await assert.rejects(
+      runDiscord(installEnv, ['install', '--auth-mode', '1password'], fake, {
+        encryptSystemdCredential: async () => {
+          return SERVICE_ACCOUNT_TOKEN
+        },
+      }),
+      errorWithCode('op_service_account_credential_encryption_failed'),
+    )
+
+    assert.equal(await exists(installEnv.opTokenFile), false)
+    assert.equal(await exists(unitPathOf(installEnv, unitOf(installEnv.dataDir))), false)
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('discord install: 旧 credential が公開 permission なら切替・削除せず停止する', async () => {
+  const installEnv = await makeInstallEnv()
+
+  await writeDiscordEnv(installEnv)
+  await fs.mkdir(path.dirname(installEnv.legacyOpTokenFile), { recursive: true, mode: 0o700 })
+  await fs.writeFile(installEnv.legacyOpTokenFile, 'legacy-token', { mode: 0o640 })
+  const fake = createFakeSystemd({
+    systemctl: defaultSystemctl(installEnv),
+  })
+  let encryptionAttempted = false
+
+  try {
+    await assert.rejects(
+      runDiscord(installEnv, ['install', '--auth-mode', '1password'], fake, {
+        encryptSystemdCredential: async () => {
+          encryptionAttempted = true
+          return ENCRYPTED_SERVICE_ACCOUNT_CREDENTIAL
+        },
+      }),
+      errorWithCode('op_service_account_legacy_credential_unsafe'),
+    )
+
+    assert.equal(encryptionAttempted, false)
+    assert.equal(await fs.readFile(installEnv.legacyOpTokenFile, 'utf8'), 'legacy-token')
+    assert.equal(await exists(installEnv.opTokenFile), false)
+    assert.equal(await exists(unitPathOf(installEnv, unitOf(installEnv.dataDir))), false)
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('discord install: dangling symlink の legacy parent を credential なし扱いしない', async () => {
+  const installEnv = await makeInstallEnv()
+
+  await writeDiscordEnv(installEnv)
+  await fs.mkdir(installEnv.configHome, { mode: 0o700 })
+  await fs.symlink(
+    path.join(installEnv.root, 'missing-legacy-target'),
+    path.dirname(installEnv.legacyOpTokenFile),
+  )
+  const fake = createFakeSystemd({
+    systemctl: defaultSystemctl(installEnv),
+  })
+  let encryptionAttempted = false
+
+  try {
+    await assert.rejects(
+      runDiscord(installEnv, ['install', '--auth-mode', '1password'], fake, {
+        encryptSystemdCredential: async () => {
+          encryptionAttempted = true
+          return ENCRYPTED_SERVICE_ACCOUNT_CREDENTIAL
+        },
+      }),
+      errorWithCode('op_service_account_credential_directory_invalid'),
+    )
+
+    assert.equal(encryptionAttempted, false)
+    assert.equal(await exists(installEnv.opTokenFile), false)
+    assert.equal(await exists(unitPathOf(installEnv, unitOf(installEnv.dataDir))), false)
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('discord install: world-writable legacy parent では移行せず停止する', async () => {
+  const installEnv = await makeInstallEnv()
+
+  await writeDiscordEnv(installEnv)
+  const legacyDirectory = path.dirname(installEnv.legacyOpTokenFile)
+  await fs.mkdir(legacyDirectory, { recursive: true, mode: 0o700 })
+  await fs.chmod(legacyDirectory, 0o777)
+  await fs.writeFile(installEnv.legacyOpTokenFile, 'legacy-token', { mode: 0o600 })
+  const fake = createFakeSystemd({
+    systemctl: defaultSystemctl(installEnv),
+  })
+  let encryptionAttempted = false
+
+  try {
+    await assert.rejects(
+      runDiscord(installEnv, ['install', '--auth-mode', '1password'], fake, {
+        encryptSystemdCredential: async () => {
+          encryptionAttempted = true
+          return ENCRYPTED_SERVICE_ACCOUNT_CREDENTIAL
+        },
+      }),
+      errorWithCode('op_service_account_credential_directory_unsafe'),
+    )
+
+    assert.equal(encryptionAttempted, false)
+    assert.equal(await fs.readFile(installEnv.legacyOpTokenFile, 'utf8'), 'legacy-token')
+    assert.equal(await exists(installEnv.opTokenFile), false)
+    assert.equal(await exists(unitPathOf(installEnv, unitOf(installEnv.dataDir))), false)
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('discord install: ~/.araya の置換可能な ancestor を拒否して unit を変更しない', async () => {
   const installEnv = await makeInstallEnv()
 
   await writeDiscordEnv(installEnv)
   const unsafeAncestor = path.join(installEnv.root, 'unsafe-ancestor')
-  const xdgConfigHome = path.join(unsafeAncestor, 'xdg')
-  await fs.mkdir(xdgConfigHome, { recursive: true, mode: 0o700 })
+  const unsafeHome = path.join(unsafeAncestor, 'home')
+  await fs.mkdir(unsafeHome, { recursive: true, mode: 0o700 })
   await fs.chmod(unsafeAncestor, 0o777)
-  installEnv.env.XDG_CONFIG_HOME = xdgConfigHome
-  installEnv.configHome = xdgConfigHome
+  installEnv.home = unsafeHome
+  installEnv.env.HOME = unsafeHome
   const fake = createFakeSystemd({
     systemctl: defaultSystemctl(installEnv),
   })
@@ -419,8 +662,7 @@ test('discord install: credential file の置換可能な ancestor を拒否し�
       errorWithCode('op_service_account_credential_directory_unsafe'),
     )
 
-    await assert.rejects(fs.access(path.join(xdgConfigHome, 'araya')))
-    await assert.rejects(fs.access(path.join(xdgConfigHome, 'araya', 'op-service-account-token')))
+    await assert.rejects(fs.access(path.join(unsafeHome, '.araya')))
     await assert.rejects(
       fs.access(unitPathOf(installEnv, unitOf(await fs.realpath(installEnv.dataDir)))),
     )
@@ -435,16 +677,16 @@ test('discord install: credential file の置換可能な ancestor を拒否し�
   }
 })
 
-test('discord install: 所有者が service user 以外の mode 0755 ancestor を拒否して unit を変更しない', async (t) => {
+test('discord install: 所有者が service user 以外の mode 0755 ~/.araya ancestor を拒否して unit を変更しない', async (t) => {
   const installEnv = await makeInstallEnv()
 
   await writeDiscordEnv(installEnv)
   const unsafeAncestor = path.join(installEnv.root, 'untrusted-owner')
-  const xdgConfigHome = path.join(unsafeAncestor, 'xdg')
-  await fs.mkdir(xdgConfigHome, { recursive: true, mode: 0o700 })
+  const unsafeHome = path.join(unsafeAncestor, 'home')
+  await fs.mkdir(unsafeHome, { recursive: true, mode: 0o700 })
   await fs.chmod(unsafeAncestor, 0o755)
-  installEnv.env.XDG_CONFIG_HOME = xdgConfigHome
-  installEnv.configHome = xdgConfigHome
+  installEnv.home = unsafeHome
+  installEnv.env.HOME = unsafeHome
 
   const originalLstat = fs.lstat.bind(fs)
   t.mock.method(fs, 'lstat', async (filePath: Parameters<typeof fs.lstat>[0]) => {
@@ -469,8 +711,7 @@ test('discord install: 所有者が service user 以外の mode 0755 ancestor �
       errorWithCode('op_service_account_credential_directory_unsafe'),
     )
 
-    await assert.rejects(fs.access(path.join(xdgConfigHome, 'araya')))
-    await assert.rejects(fs.access(path.join(xdgConfigHome, 'araya', 'op-service-account-token')))
+    await assert.rejects(fs.access(path.join(unsafeHome, '.araya')))
     await assert.rejects(
       fs.access(unitPathOf(installEnv, unitOf(await fs.realpath(installEnv.dataDir)))),
     )
@@ -485,10 +726,12 @@ test('discord install: 所有者が service user 以外の mode 0755 ancestor �
   }
 })
 
-test('discord install: op run と LoadCredential を使い、resolved token は unit file に出さない', async () => {
+test('discord install: 暗号化 credential と LoadCredentialEncrypted を使い、resolved token は保存物に出さない', async () => {
   const installEnv = await makeInstallEnv()
 
   await writeDiscordEnv(installEnv)
+  await fs.mkdir(path.dirname(installEnv.legacyOpTokenFile), { recursive: true, mode: 0o700 })
+  await fs.writeFile(installEnv.legacyOpTokenFile, 'legacy-plaintext-token', { mode: 0o600 })
   const fake = createFakeSystemd({
     systemctl: defaultSystemctl(installEnv),
     loginctl: async () => {
@@ -526,7 +769,7 @@ test('discord install: op run と LoadCredential を使い、resolved token は 
     assert.equal(stderr.includes(SERVICE_ACCOUNT_TOKEN), false)
     assert.deepEqual(sleeps, [])
 
-    // unit file は LoadCredential で認証し、.env は op run のみが読む。Environment= に Discord 設定を出さない
+    // unit file は LoadCredentialEncrypted で認証し、.env は op run のみが読む。Environment= に Discord 設定を出さない
     assert.equal(
       await fs.readFile(unitPath, 'utf8'),
       [
@@ -537,7 +780,7 @@ test('discord install: op run と LoadCredential を使い、resolved token は 
         '[Service]',
         'Type=exec',
         `ExecStart=${NODE_PATH} ${installEnv.opRunnerEntrypoint} --data-dir ${dataDirReal} --op-path ${installEnv.opPath}`,
-        `LoadCredential=op-service-account-token:${installEnv.opTokenFile}`,
+        `LoadCredentialEncrypted=op-service-account-token:${installEnv.opTokenFile}`,
         `WorkingDirectory=${dataDirReal}`,
         `Environment=ARAYA_DATA_DIR=${dataDirReal}`,
         `Environment=ARAYA_DEV_ROOT=${installEnv.devRoot}`,
@@ -567,12 +810,18 @@ test('discord install: op run と LoadCredential を使い、resolved token は 
     assert.equal(credentialStat.uid, UID)
     assert.equal(credentialStat.mode & 0o777, 0o600)
     assert.equal((await fs.stat(path.dirname(installEnv.opTokenFile))).mode & 0o777, 0o700)
-    assert.equal(await fs.readFile(installEnv.opTokenFile, 'utf8'), SERVICE_ACCOUNT_TOKEN)
+    assert.equal(
+      await fs.readFile(installEnv.opTokenFile, 'utf8'),
+      ENCRYPTED_SERVICE_ACCOUNT_CREDENTIAL,
+    )
+    assert.notEqual(await fs.readFile(installEnv.opTokenFile, 'utf8'), SERVICE_ACCOUNT_TOKEN)
+    assert.equal(await exists(installEnv.legacyOpTokenFile), false)
     assert.equal((await fs.stat(unitPath)).mode & 0o777, 0o600)
     assert.equal((await fs.stat(path.join(installEnv.dataDir, 'logs'))).mode & 0o777, 0o700)
 
     assert.deepEqual(systemdCalls(fake), [
       ['systemctl', '--user', 'is-system-running', '10000'],
+      ['systemctl', '--user', 'show', '--property=Version', '--value', '10000'],
       ['systemctl', '--user', 'daemon-reload', '30000'],
       ['systemctl', '--user', 'show', '--property=FragmentPath', '--value', unit, '30000'],
       ['systemctl', '--user', 'enable', unit, '30000'],

@@ -17,17 +17,21 @@ import {
   commandSucceeded,
   dataDirHash,
   discordOpServiceAccountTokenFilePath,
+  encryptSystemdCredential,
+  legacyDiscordOpServiceAccountTokenFilePath,
   discordUnitName,
   resolveDiscordEnvRunnerEntrypoint,
   resolveDiscordOpRunnerEntrypoint,
   resolveOpCliPath,
   selectUnitEnvironment,
   unitFilePath,
+  type SystemdCredentialEncryptor,
 } from '../infrastructure/systemd.ts'
 import {
   createDiscordEnvFile,
   discordEnvFilePath,
   loadDiscordConfig,
+  OP_SERVICE_ACCOUNT_CREDENTIAL_NAME,
   OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME,
   type DiscordAuthMode,
   type DiscordConfig,
@@ -53,6 +57,8 @@ const SYSTEMD_CONNECT_TIMEOUT_MS = 10_000
 const UNIT_START_WAIT_MS = 10_000
 const UNIT_START_POLL_MS = 200
 const MAX_OP_SERVICE_ACCOUNT_TOKEN_BYTES = 16 * 1024
+const MAX_OP_SERVICE_ACCOUNT_CREDENTIAL_BYTES = 64 * 1024
+const SYSTEMD_ENCRYPTED_CREDENTIAL_MIN_VERSION = 258
 const REACHABLE_MANAGER_STATES = [
   'initializing',
   'starting',
@@ -73,6 +79,8 @@ export type DiscordCommandDependencies = RunnerCommandDependencies & {
   resolveDiscordEnvRunnerEntrypoint?: () => Promise<string>
   resolveDiscordOpRunnerEntrypoint?: () => Promise<string>
   resolveOpCliPath?: (searchPath: string | undefined) => Promise<string>
+  // systemd-creds を使う暗号化処理。test では秘密を含まないciphertextに差し替える
+  encryptSystemdCredential?: SystemdCredentialEncryptor
 }
 
 function notConfiguredMessage(envFilePath: string) {
@@ -148,7 +156,7 @@ async function validateOpServiceAccountCredential(
     )
   }
 
-  if (stat.size === 0 || stat.size > MAX_OP_SERVICE_ACCOUNT_TOKEN_BYTES) {
+  if (stat.size === 0 || stat.size > MAX_OP_SERVICE_ACCOUNT_CREDENTIAL_BYTES) {
     throw commandError(
       'op_service_account_credential_invalid',
       `1Password Service Account credential の size が不正です: ${filePath}`,
@@ -168,6 +176,61 @@ function hasControlCharacter(value: string) {
   }
 
   return false
+}
+
+function validateOpServiceAccountToken(token: string) {
+  if (
+    token === '' ||
+    Buffer.byteLength(token, 'utf8') > MAX_OP_SERVICE_ACCOUNT_TOKEN_BYTES ||
+    hasControlCharacter(token)
+  ) {
+    throw commandError(
+      'op_service_account_token_invalid',
+      `${OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME} の内容が不正です`,
+    )
+  }
+}
+
+function parseSystemdManagerMajorVersion(stdout: string) {
+  const version = stdout.endsWith('\r\n')
+    ? stdout.slice(0, -2)
+    : stdout.endsWith('\n')
+      ? stdout.slice(0, -1)
+      : stdout
+
+  if (
+    version === '' ||
+    version.trim() !== version ||
+    version.includes('\r') ||
+    version.includes('\n')
+  ) {
+    return undefined
+  }
+
+  const match = /^(\d+)(?:\.\d+)*(?:[-+~][A-Za-z0-9][A-Za-z0-9.+_~-]*)?$/u.exec(version)
+  const majorVersion = match?.[1] === undefined ? undefined : Number(match[1])
+
+  return majorVersion !== undefined && Number.isSafeInteger(majorVersion) ? majorVersion : undefined
+}
+
+async function requireEncryptedUserCredentialSupport(
+  ops: Awaited<ReturnType<RunnerCommandDependencies['createSystemdOps']>>,
+  redactor: Redactor,
+) {
+  const result = await runSystemctl(
+    ops,
+    ['--user', 'show', '--property=Version', '--value'],
+    SYSTEMD_CONNECT_TIMEOUT_MS,
+    redactor,
+  )
+  const majorVersion = parseSystemdManagerMajorVersion(result.stdout)
+
+  if (majorVersion === undefined || majorVersion < SYSTEMD_ENCRYPTED_CREDENTIAL_MIN_VERSION) {
+    throw commandError(
+      'systemd_encrypted_credentials_unsupported',
+      `1Password mode には systemd user manager v${SYSTEMD_ENCRYPTED_CREDENTIAL_MIN_VERSION} 以降が必要です`,
+    )
+  }
 }
 
 async function validateCredentialDirectoryAncestors(directoryPath: string, uid: number) {
@@ -245,6 +308,15 @@ async function validateExistingCredentialDirectoryPath(directoryPath: string, ui
       )
     }
 
+    const mode = stat.mode & 0o7777
+
+    if ((mode & 0o022) !== 0 && (mode & 0o1000) === 0) {
+      throw commandError(
+        'op_service_account_credential_directory_unsafe',
+        `旧形式の1Password credential の directory が置換可能です: ${current}`,
+      )
+    }
+
     if (current === directoryPath) {
       if (stat.uid !== uid) {
         throw commandError(
@@ -306,15 +378,94 @@ async function ensurePrivateCredentialDirectory(directoryPath: string, uid: numb
   await validateCredentialDirectoryAncestors(directoryPath, uid)
 }
 
-async function writeOpServiceAccountCredential(filePath: string, token: string, uid: number) {
+type LegacyOpCredentialIdentity = {
+  filePath: string
+  dev: number
+  ino: number
+}
+
+async function findLegacyOpServiceAccountCredential(filePath: string, uid: number) {
+  await validateExistingCredentialDirectoryPath(path.dirname(filePath), uid)
+  let stat
+
+  try {
+    stat = await fs.lstat(filePath)
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+      await validateExistingCredentialDirectoryPath(path.dirname(filePath), uid)
+      return null
+    }
+
+    throw commandError(
+      'op_service_account_legacy_credential_unsafe',
+      '旧形式の1Password credential を安全に確認できません',
+    )
+  }
+
+  const mode = stat.mode & 0o777
+
   if (
-    token === '' ||
-    Buffer.byteLength(token, 'utf8') > MAX_OP_SERVICE_ACCOUNT_TOKEN_BYTES ||
-    hasControlCharacter(token)
+    !stat.isFile() ||
+    stat.uid !== uid ||
+    (mode !== 0o400 && mode !== 0o600) ||
+    stat.size === 0 ||
+    stat.size > MAX_OP_SERVICE_ACCOUNT_TOKEN_BYTES
   ) {
     throw commandError(
-      'op_service_account_token_invalid',
-      `${OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME} の内容が不正です`,
+      'op_service_account_legacy_credential_unsafe',
+      '旧形式の1Password credential の所有者・権限・size が不正です。安全に切替できません',
+    )
+  }
+
+  await validateExistingCredentialDirectoryPath(path.dirname(filePath), uid)
+
+  return { filePath, dev: stat.dev, ino: stat.ino } satisfies LegacyOpCredentialIdentity
+}
+
+async function removeLegacyOpServiceAccountCredential(
+  legacy: LegacyOpCredentialIdentity,
+  uid: number,
+) {
+  try {
+    await validateExistingCredentialDirectoryPath(path.dirname(legacy.filePath), uid)
+    const stat = await fs.lstat(legacy.filePath)
+    const mode = stat.mode & 0o777
+
+    if (
+      !stat.isFile() ||
+      stat.uid !== uid ||
+      stat.dev !== legacy.dev ||
+      stat.ino !== legacy.ino ||
+      (mode !== 0o400 && mode !== 0o600) ||
+      stat.size === 0 ||
+      stat.size > MAX_OP_SERVICE_ACCOUNT_TOKEN_BYTES
+    ) {
+      return false
+    }
+
+    await fs.unlink(legacy.filePath)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function writeEncryptedOpServiceAccountCredential(
+  filePath: string,
+  encryptedCredential: string,
+  token: string,
+  uid: number,
+) {
+  validateOpServiceAccountToken(token)
+
+  if (
+    encryptedCredential.trim() === '' ||
+    Buffer.byteLength(encryptedCredential, 'utf8') > MAX_OP_SERVICE_ACCOUNT_CREDENTIAL_BYTES ||
+    encryptedCredential.includes(token)
+  ) {
+    throw commandError(
+      'op_service_account_credential_encryption_failed',
+      '暗号化 credential の結果が不正です。token は保存しませんでした',
     )
   }
 
@@ -343,7 +494,7 @@ async function writeOpServiceAccountCredential(filePath: string, token: string, 
     temporaryCreated = true
 
     try {
-      await handle.writeFile(token, 'utf8')
+      await handle.writeFile(encryptedCredential, 'utf8')
       await handle.sync()
     } finally {
       await handle.close()
@@ -359,6 +510,14 @@ async function writeOpServiceAccountCredential(filePath: string, token: string, 
   }
 
   await validateOpServiceAccountCredential(filePath, uid)
+  const savedCredential = await fs.readFile(filePath, 'utf8')
+
+  if (savedCredential !== encryptedCredential || savedCredential.includes(token)) {
+    throw commandError(
+      'op_service_account_credential_write_failed',
+      '暗号化 credential の保存を確認できませんでした',
+    )
+  }
 }
 
 async function installDiscord(
@@ -384,6 +543,11 @@ async function installDiscord(
       'systemd_unavailable',
       `systemd の user manager に接続できません（${state === '' ? stderr || '応答なし' : state}）`,
     )
+  }
+
+  // 1password mode は user manager の v258+ で LoadCredentialEncrypted が必要
+  if (authMode === '1password') {
+    await requireEncryptedUserCredentialSupport(ops, redactor)
   }
 
   // 2. dataDir・logs を用意し、設定 file（.env）を確かめる
@@ -412,10 +576,12 @@ async function installDiscord(
   })
   let content: string
   let opCredentialFile: string | undefined
+  let legacyOpCredential: LegacyOpCredentialIdentity | null = null
 
   if (authMode === '1password') {
-    // 3a. install の環境変数から Service Account credential を保存する
+    // 3a. install の環境変数を systemd-creds に渡し、ciphertext だけを ~/.araya に保存する
     opCredentialFile = discordOpServiceAccountTokenFilePath(deps.env, deps.homeDir)
+    const legacyPath = legacyDiscordOpServiceAccountTokenFilePath(deps.env, deps.homeDir)
     const [opPath, opRunnerEntrypoint] = await Promise.all([
       (deps.resolveOpCliPath ?? resolveOpCliPath)(deps.env.PATH),
       (deps.resolveDiscordOpRunnerEntrypoint ?? resolveDiscordOpRunnerEntrypoint)(),
@@ -429,6 +595,9 @@ async function installDiscord(
       )
     }
 
+    validateOpServiceAccountToken(serviceAccountToken)
+    legacyOpCredential = await findLegacyOpServiceAccountCredential(legacyPath, deps.uid)
+
     content = buildDiscordUnitFile({
       authMode: '1password',
       dataDir: dataDirReal,
@@ -438,7 +607,34 @@ async function installDiscord(
       opCredentialFile,
       environment,
     })
-    await writeOpServiceAccountCredential(opCredentialFile, serviceAccountToken, deps.uid)
+
+    let encryptedCredential: string
+
+    try {
+      encryptedCredential = await (deps.encryptSystemdCredential ?? encryptSystemdCredential)(
+        serviceAccountToken,
+        OP_SERVICE_ACCOUNT_CREDENTIAL_NAME,
+      )
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'systemd_creds_unavailable') {
+        throw commandError(
+          'systemd_creds_unavailable',
+          '信頼できる system directory に systemd-creds がありません',
+        )
+      }
+
+      throw commandError(
+        'op_service_account_credential_encryption_failed',
+        'systemd-creds で credential を暗号化できませんでした。unit は変更していません',
+      )
+    }
+
+    await writeEncryptedOpServiceAccountCredential(
+      opCredentialFile,
+      encryptedCredential,
+      serviceAccountToken,
+      deps.uid,
+    )
   } else {
     // 3b. 通常の .env mode は systemd LoadCredential で file を launcher に渡す
     const envRunnerEntrypoint = await (
@@ -488,6 +684,15 @@ async function installDiscord(
   }
 
   await runSystemctl(ops, ['--user', 'restart', unit], SYSTEMCTL_RESTART_TIMEOUT_MS, redactor)
+
+  if (
+    legacyOpCredential !== null &&
+    !(await removeLegacyOpServiceAccountCredential(legacyOpCredential, deps.uid))
+  ) {
+    deps.stderr(
+      `warning: 切替前の平文 credential を削除できませんでした。token を確認せず、必要なら手動で削除してください: ${legacyOpCredential.filePath}`,
+    )
+  }
 
   // restart 前の ready 識別子を再利用せず、新しい process の readyId が現れるのを待つ
   const deadline = deps.nowMs() + UNIT_START_WAIT_MS
