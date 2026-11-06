@@ -6,6 +6,7 @@
 // run: foreground で 1 度動かす（unit 稼働の確かめなし）。
 // unit の file 作成・enable・restart は人間の実行（runner と同じ運用）
 
+import { randomBytes } from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import process from 'node:process'
@@ -27,6 +28,7 @@ import {
   createDiscordEnvFile,
   discordEnvFilePath,
   loadDiscordConfig,
+  OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME,
   type DiscordAuthMode,
   type DiscordConfig,
 } from '../discord/config.ts'
@@ -50,6 +52,7 @@ const SYSTEMCTL_RESTART_TIMEOUT_MS = 90_000
 const SYSTEMD_CONNECT_TIMEOUT_MS = 10_000
 const UNIT_START_WAIT_MS = 10_000
 const UNIT_START_POLL_MS = 200
+const MAX_OP_SERVICE_ACCOUNT_TOKEN_BYTES = 16 * 1024
 const REACHABLE_MANAGER_STATES = [
   'initializing',
   'starting',
@@ -105,13 +108,21 @@ async function registerDiscord(config: RunnerCommandConfig, deps: DiscordCommand
   }
 }
 
-async function validateOpServiceAccountCredential(filePath: string, uid: number) {
+async function validateOpServiceAccountCredential(
+  filePath: string,
+  uid: number,
+  allowMissing = false,
+) {
   let stat
 
   try {
     stat = await fs.lstat(filePath)
   } catch (error) {
     if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+      if (allowMissing) {
+        return false
+      }
+
       throw commandError(
         'op_service_account_credential_missing',
         `1Password Service Account credential がありません: ${filePath}`,
@@ -137,12 +148,217 @@ async function validateOpServiceAccountCredential(filePath: string, uid: number)
     )
   }
 
-  if (stat.size === 0) {
+  if (stat.size === 0 || stat.size > MAX_OP_SERVICE_ACCOUNT_TOKEN_BYTES) {
     throw commandError(
       'op_service_account_credential_invalid',
-      `1Password Service Account credential が空です: ${filePath}`,
+      `1Password Service Account credential の size が不正です: ${filePath}`,
     )
   }
+
+  return true
+}
+
+function hasControlCharacter(value: string) {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0)
+
+    if (codePoint !== undefined && (codePoint <= 0x1f || codePoint === 0x7f)) {
+      return true
+    }
+  }
+
+  return false
+}
+
+async function validateCredentialDirectoryAncestors(directoryPath: string, uid: number) {
+  let current = directoryPath
+
+  while (true) {
+    const stat = await fs.lstat(current)
+    const mode = stat.mode & 0o7777
+
+    if (
+      !stat.isDirectory() ||
+      (stat.uid !== 0 && stat.uid !== uid) ||
+      ((mode & 0o022) !== 0 && (mode & 0o1000) === 0)
+    ) {
+      throw commandError(
+        'op_service_account_credential_directory_unsafe',
+        `1Password Service Account credential の path に置換可能な ancestor があります: ${current}`,
+      )
+    }
+
+    const parent = path.dirname(current)
+
+    if (parent === current) {
+      return
+    }
+
+    current = parent
+  }
+}
+
+async function validateExistingCredentialDirectoryPath(directoryPath: string, uid: number) {
+  let current = directoryPath
+
+  while (true) {
+    let stat
+
+    try {
+      stat = await fs.lstat(current)
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+        const parent = path.dirname(current)
+
+        if (parent === current) {
+          throw commandError(
+            'op_service_account_credential_directory_invalid',
+            '1Password Service Account credential の保存先を確認できません',
+          )
+        }
+
+        current = parent
+        continue
+      }
+
+      throw commandError(
+        'op_service_account_credential_directory_invalid',
+        '1Password Service Account credential の保存先を確認できません',
+      )
+    }
+
+    let resolvedPath
+
+    try {
+      resolvedPath = await fs.realpath(current)
+    } catch {
+      throw commandError(
+        'op_service_account_credential_directory_invalid',
+        '1Password Service Account credential の保存先を確認できません',
+      )
+    }
+
+    if (!stat.isDirectory() || resolvedPath !== current) {
+      throw commandError(
+        'op_service_account_credential_directory_invalid',
+        '1Password Service Account credential の保存先は通常の directory にしてください',
+      )
+    }
+
+    if (current === directoryPath) {
+      if (stat.uid !== uid) {
+        throw commandError(
+          'op_service_account_credential_directory_invalid',
+          '1Password Service Account credential の保存先は service user 所有の directory にしてください',
+        )
+      }
+
+      await validateCredentialDirectoryAncestors(path.dirname(current), uid)
+    } else {
+      await validateCredentialDirectoryAncestors(current, uid)
+    }
+
+    return
+  }
+}
+
+async function ensurePrivateCredentialDirectory(directoryPath: string, uid: number) {
+  await validateExistingCredentialDirectoryPath(directoryPath, uid)
+  await fs.mkdir(directoryPath, { recursive: true, mode: 0o700 })
+
+  let directoryStat
+  let resolvedDirectory
+
+  try {
+    directoryStat = await fs.lstat(directoryPath)
+    resolvedDirectory = await fs.realpath(directoryPath)
+  } catch {
+    throw commandError(
+      'op_service_account_credential_directory_invalid',
+      '1Password Service Account credential の保存先を確認できません',
+    )
+  }
+
+  if (
+    !directoryStat.isDirectory() ||
+    directoryStat.uid !== uid ||
+    resolvedDirectory !== directoryPath
+  ) {
+    throw commandError(
+      'op_service_account_credential_directory_invalid',
+      '1Password Service Account credential の保存先は service user 所有の通常の directory にしてください',
+    )
+  }
+
+  await validateCredentialDirectoryAncestors(path.dirname(directoryPath), uid)
+
+  if ((directoryStat.mode & 0o777) !== 0o700) {
+    try {
+      await fs.chmod(directoryPath, 0o700)
+    } catch {
+      throw commandError(
+        'op_service_account_credential_directory_permissions',
+        `1Password Service Account credential の保存先を mode 0700 にできません: ${directoryPath}`,
+      )
+    }
+  }
+
+  await validateCredentialDirectoryAncestors(directoryPath, uid)
+}
+
+async function writeOpServiceAccountCredential(filePath: string, token: string, uid: number) {
+  if (
+    token === '' ||
+    Buffer.byteLength(token, 'utf8') > MAX_OP_SERVICE_ACCOUNT_TOKEN_BYTES ||
+    hasControlCharacter(token)
+  ) {
+    throw commandError(
+      'op_service_account_token_invalid',
+      `${OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME} の内容が不正です`,
+    )
+  }
+
+  const directoryPath = path.dirname(filePath)
+
+  if (!path.isAbsolute(directoryPath) || path.resolve(directoryPath) !== directoryPath) {
+    throw commandError(
+      'op_service_account_credential_directory_invalid',
+      '1Password Service Account credential の保存先が不正です',
+    )
+  }
+
+  await ensurePrivateCredentialDirectory(directoryPath, uid)
+
+  // 既存 file が symlink・別 user 所有・公開 permission なら、置き換えずに停止する。
+  await validateOpServiceAccountCredential(filePath, uid, true)
+
+  const temporaryPath = path.join(
+    directoryPath,
+    `.${path.basename(filePath)}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`,
+  )
+  let temporaryCreated = false
+
+  try {
+    const handle = await fs.open(temporaryPath, 'wx', 0o600)
+    temporaryCreated = true
+
+    try {
+      await handle.writeFile(token, 'utf8')
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+
+    await fs.chmod(temporaryPath, 0o600)
+    await fs.rename(temporaryPath, filePath)
+    temporaryCreated = false
+  } finally {
+    if (temporaryCreated) {
+      await fs.rm(temporaryPath, { force: true })
+    }
+  }
+
+  await validateOpServiceAccountCredential(filePath, uid)
 }
 
 async function installDiscord(
@@ -151,7 +367,9 @@ async function installDiscord(
   redactor: Redactor,
   authMode: DiscordAuthMode,
 ) {
-  const ops = await deps.createSystemdOps(deps.env)
+  const systemdEnvironment = { ...deps.env }
+  delete systemdEnvironment[OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME]
+  const ops = await deps.createSystemdOps(systemdEnvironment)
 
   // 1. user manager に接続できることを確かめる（runner install と同じ）
   const managerState = await ops.systemctl(
@@ -196,13 +414,21 @@ async function installDiscord(
   let opCredentialFile: string | undefined
 
   if (authMode === '1password') {
-    // 3a. 1Password mode のみ Service Account credential と op CLI を確認する
+    // 3a. install の環境変数から Service Account credential を保存する
     opCredentialFile = discordOpServiceAccountTokenFilePath(deps.env, deps.homeDir)
-    await validateOpServiceAccountCredential(opCredentialFile, deps.uid)
     const [opPath, opRunnerEntrypoint] = await Promise.all([
       (deps.resolveOpCliPath ?? resolveOpCliPath)(deps.env.PATH),
       (deps.resolveDiscordOpRunnerEntrypoint ?? resolveDiscordOpRunnerEntrypoint)(),
     ])
+    const serviceAccountToken = deps.env[OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME]
+
+    if (serviceAccountToken === undefined) {
+      throw commandError(
+        'op_service_account_token_missing',
+        `${OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME} を環境変数に設定してください`,
+      )
+    }
+
     content = buildDiscordUnitFile({
       authMode: '1password',
       dataDir: dataDirReal,
@@ -212,6 +438,7 @@ async function installDiscord(
       opCredentialFile,
       environment,
     })
+    await writeOpServiceAccountCredential(opCredentialFile, serviceAccountToken, deps.uid)
   } else {
     // 3b. 通常の .env mode は systemd LoadCredential で file を launcher に渡す
     const envRunnerEntrypoint = await (

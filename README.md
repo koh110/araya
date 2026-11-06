@@ -184,21 +184,13 @@ op run --env-file="$data_dir/.env" -- araya discord register
 op run --env-file="$data_dir/.env" -- araya discord install --auth-mode 1password
 ```
 
-通常の `araya discord install` は `.env` file launcher を選び、1Password CLI や Service Account を必要としません。`--auth-mode 1password` を指定した service は、1Password CLI 2.18 以降と、参照する全項目を読める Service Account token file が必要です。token file は `<XDG_CONFIG_HOME>/araya/op-service-account-token`（既定 `~/.config/araya/op-service-account-token`）に service user 所有・mode `0400` または `0600` で保管します。Service Account token の内容は unit file や bot process に書かず、systemd `LoadCredential` 経由で launcher に渡し、`op` CLI の認証にだけ使います。`op` CLI が `.env` を解決し、Discord 設定値だけを bot process の実行時環境へ渡します。
+通常の `araya discord install` は `.env` file launcher を選び、1Password CLI や Service Account を必要としません。`--auth-mode 1password` を使うには、install process の環境に `OP_SERVICE_ACCOUNT_TOKEN` を設定し、1Password CLI 2.18 以降と、`.env` の参照項目を読める Service Account を用意してください。Araya は token を `<XDG_CONFIG_HOME>/araya/op-service-account-token`（既定 `~/.config/araya/op-service-account-token`）へ mode `0600` で保存し、親 directory も mode `0700` にします。利用者が token file を別途作る必要はありません。常駐 service の再起動時にも認証が必要なため、この内部 credential source は保持されます。systemd `LoadCredential` 経由で launcher だけに渡し、token を unit file、systemd control command の環境、bot process には渡しません。`op` CLI が `.env` を解決し、Discord 設定値だけを bot process の実行時環境へ渡します。
 
-slash command の登録時は、Service Account token で `.env` の `op://` 参照を解決してから実行します。以下は既存の 1Password Connect/session/account 環境変数を外し、Araya process から Service Account token と systemd credential directory を除く例です。token の値をコマンド引数へ展開しません。
+slash command の登録時は、`OP_SERVICE_ACCOUNT_TOKEN` が設定された環境から `op run` を起動し、`.env` の `op://` 参照を解決します。以下は既存の 1Password Connect/session/account 環境変数を外し、Araya process から Service Account token と systemd credential directory を除く例です。token の値をコマンド引数へ展開しません。
 
 ```sh
 data_dir="${ARAYA_DATA_DIR:-$HOME/.araya}"
-config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
-case "$config_home" in
-  /*) ;;
-  *) config_home="$HOME/.config" ;;
-esac
-credential_file="$config_home/araya/op-service-account-token"
-
-OP_SERVICE_ACCOUNT_TOKEN="$(cat "$credential_file")" \
-  env -u OP_CONNECT_HOST -u OP_CONNECT_TOKEN -u OP_SESSION -u OP_ACCOUNT \
+env -u OP_CONNECT_HOST -u OP_CONNECT_TOKEN -u OP_SESSION -u OP_ACCOUNT \
   op run --env-file="$data_dir/.env" -- \
     /usr/bin/env -u OP_SERVICE_ACCOUNT_TOKEN -u CREDENTIALS_DIRECTORY \
     araya discord register
