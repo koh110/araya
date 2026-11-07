@@ -15,7 +15,7 @@ import {
   selectUnitEnvironment,
   unitFilePath,
   type CommandResult,
-  type SystemdOps
+  type SystemdOps,
 } from '../infrastructure/systemd.ts'
 import {
   isLedgerError,
@@ -28,7 +28,7 @@ import {
   TASK_STATUSES,
   type AttemptView,
   type RunnerView,
-  type TaskLedger
+  type TaskLedger,
 } from '../runner/ledger.ts'
 
 // araya task の command。台帳だけを読み書きし、runner を起動しない
@@ -47,12 +47,20 @@ const RUNNER_START_WAIT_MS = 10_000
 const RUNNER_START_POLL_MS = 200
 const MAX_COMMAND_STDERR_CHARS = 500
 // systemctl --user is-system-running の1行目がこれなら user manager に接続できた
-const REACHABLE_MANAGER_STATES = ['initializing', 'starting', 'running', 'degraded', 'maintenance', 'stopping']
+const REACHABLE_MANAGER_STATES = [
+  'initializing',
+  'starting',
+  'running',
+  'degraded',
+  'maintenance',
+  'stopping',
+]
 const UNIT_MISSING_PATTERN = /does not exist|not loaded|not found/iu
 // systemctl --user stop の、unit が読み込まれていないための失敗（systemd 259 では終了 code 5、stderr は Unit <unit> not loaded.）
 const UNIT_NOT_LOADED_PATTERN = /not loaded/iu
 
-const SIDE_EFFECTS_MESSAGE = '前回の試行では外部の branch や Draft PR が作成・更新された可能性がある、または結果を確認できません。前回の worktree と GitHub の状態を確かめてから、--confirm-side-effects を付けて再実行してください'
+const SIDE_EFFECTS_MESSAGE =
+  '前回の試行では外部の branch や Draft PR が作成・更新された可能性がある、または結果を確認できません。前回の worktree と GitHub の状態を確かめてから、--confirm-side-effects を付けて再実行してください'
 
 export type TaskCommandDependencies = {
   platform: NodeJS.Platform
@@ -87,7 +95,8 @@ export type FullEvidenceError = 'not_stored' | 'missing' | 'unreadable' | 'diges
 
 export type FullAttemptView = AttemptView & { fullEvidenceError?: FullEvidenceError }
 
-function commandError(code: string, message: string) {
+// CLI command 共通の誤り（code を付けて throw する）。discord-commands からも使う
+export function commandError(code: string, message: string) {
   return Object.assign(new Error(`${code}: ${message}`), { code })
 }
 
@@ -102,7 +111,10 @@ function isErrno(error: unknown, code: string) {
 // araya task と araya runner は Linux と systemd の user manager を前提にする
 export function assertSupportedPlatform(platform: NodeJS.Platform) {
   if (platform !== 'linux') {
-    throw commandError('unsupported_platform', `araya task と araya runner は Linux でだけ使えます（${platform}）`)
+    throw commandError(
+      'unsupported_platform',
+      `araya task と araya runner は Linux でだけ使えます（${platform}）`,
+    )
   }
 }
 
@@ -113,7 +125,10 @@ async function readBoundedFile(filePath: string, limit: number) {
     // FIFO などで止まらないように non-blocking で開く
     fileHandle = await fs.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK)
   } catch (error) {
-    throw commandError('invalid_arguments', `${filePath} を読めません（${error instanceof Error ? error.message : String(error)}）`)
+    throw commandError(
+      'invalid_arguments',
+      `${filePath} を読めません（${error instanceof Error ? error.message : String(error)}）`,
+    )
   }
 
   try {
@@ -125,7 +140,12 @@ async function readBoundedFile(filePath: string, limit: number) {
     let length = 0
 
     while (length < buffer.byteLength) {
-      const { bytesRead } = await fileHandle.read(buffer, length, buffer.byteLength - length, length)
+      const { bytesRead } = await fileHandle.read(
+        buffer,
+        length,
+        buffer.byteLength - length,
+        length,
+      )
 
       if (bytesRead === 0) {
         break
@@ -163,14 +183,24 @@ async function readInput(source: string, limit: number, deps: TaskCommandDepende
 }
 
 function parseTaskId(value: string | undefined) {
-  if (value === undefined || !/^[1-9][0-9]*$/u.test(value) || !Number.isSafeInteger(Number(value))) {
+  if (
+    value === undefined ||
+    !/^[1-9][0-9]*$/u.test(value) ||
+    !Number.isSafeInteger(Number(value))
+  ) {
     throw commandError('invalid_arguments', 'taskId は 1 以上の10進の整数で指定してください')
   }
 
   return Number(value)
 }
 
-function parseBoundedInteger(value: string | undefined, name: string, minimum: number, maximum: number, fallback: number) {
+function parseBoundedInteger(
+  value: string | undefined,
+  name: string,
+  minimum: number,
+  maximum: number,
+  fallback: number,
+) {
   if (value === undefined) {
     return fallback
   }
@@ -178,13 +208,16 @@ function parseBoundedInteger(value: string | undefined, name: string, minimum: n
   const parsed = Number(value)
 
   if (!/^[0-9]+$/u.test(value) || parsed < minimum || parsed > maximum) {
-    throw commandError('invalid_arguments', `${name} は ${minimum} から ${maximum} の整数で指定してください`)
+    throw commandError(
+      'invalid_arguments',
+      `${name} は ${minimum} から ${maximum} の整数で指定してください`,
+    )
   }
 
   return parsed
 }
 
-function parseCommandArgs<T>(parse: () => T) {
+export function parseCommandArgs<T>(parse: () => T) {
   try {
     return parse()
   } catch (error) {
@@ -202,7 +235,11 @@ async function withFullEvidence(attempt: AttemptView) {
     return view
   }
 
-  if (evidence === null || evidence.bodiesStored !== true || typeof evidence.bodiesSha256 !== 'string') {
+  if (
+    evidence === null ||
+    evidence.bodiesStored !== true ||
+    typeof evidence.bodiesSha256 !== 'string'
+  ) {
     return failed('not_stored')
   }
 
@@ -234,24 +271,31 @@ async function withFullEvidence(attempt: AttemptView) {
     return failed('unreadable')
   }
 
-  const view: FullAttemptView = { ...attempt, evidence: { ...evidence, worktrees: parsed.worktrees } }
+  const view: FullAttemptView = {
+    ...attempt,
+    evidence: { ...evidence, worktrees: parsed.worktrees },
+  }
 
   return view
 }
 
 function warnIfRunnerStopped(runner: RunnerView, deps: TaskCommandDependencies) {
   if (runner.state !== 'running') {
-    deps.stderr(`runner が動いていません（${runner.state}）。araya runner install で入れるか、systemctl --user start ${runner.unit} で起動してください`)
+    deps.stderr(
+      `runner が動いていません（${runner.state}）。araya runner install で入れるか、systemctl --user start ${runner.unit} で起動してください`,
+    )
   }
 }
 
 async function createTask(args: string[], ledger: TaskLedger, deps: TaskCommandDependencies) {
-  const { values, positionals } = parseCommandArgs(() => parseArgs({
-    args,
-    options: { file: { type: 'string' } },
-    allowPositionals: true,
-    strict: true
-  }))
+  const { values, positionals } = parseCommandArgs(() => {
+    return parseArgs({
+      args,
+      options: { file: { type: 'string' } },
+      allowPositionals: true,
+      strict: true,
+    })
+  })
 
   if (positionals.length > 0) {
     throw commandError('invalid_arguments', `不明な引数: ${positionals.join(' ')}`)
@@ -268,25 +312,31 @@ async function createTask(args: string[], ledger: TaskLedger, deps: TaskCommandD
 }
 
 function listTasks(args: string[], ledger: TaskLedger) {
-  const { values, positionals } = parseCommandArgs(() => parseArgs({
-    args,
-    options: { status: { type: 'string' }, limit: { type: 'string' } },
-    allowPositionals: true,
-    strict: true
-  }))
+  const { values, positionals } = parseCommandArgs(() => {
+    return parseArgs({
+      args,
+      options: { status: { type: 'string' }, limit: { type: 'string' } },
+      allowPositionals: true,
+      strict: true,
+    })
+  })
 
   if (positionals.length > 0) {
     throw commandError('invalid_arguments', `不明な引数: ${positionals.join(' ')}`)
   }
 
-  const status = values.status === undefined
-    ? undefined
-    : TASK_STATUSES.find((candidate) => {
-      return candidate === values.status
-    })
+  const status =
+    values.status === undefined
+      ? undefined
+      : TASK_STATUSES.find((candidate) => {
+          return candidate === values.status
+        })
 
   if (values.status !== undefined && status === undefined) {
-    throw commandError('invalid_arguments', `--status は ${TASK_STATUSES.join('・')} のどれかで指定してください`)
+    throw commandError(
+      'invalid_arguments',
+      `--status は ${TASK_STATUSES.join('・')} のどれかで指定してください`,
+    )
   }
 
   const limit = parseBoundedInteger(values.limit, '--limit', 1, MAX_LIST_LIMIT, DEFAULT_LIST_LIMIT)
@@ -295,12 +345,14 @@ function listTasks(args: string[], ledger: TaskLedger) {
 }
 
 async function showTask(args: string[], ledger: TaskLedger) {
-  const { values, positionals } = parseCommandArgs(() => parseArgs({
-    args,
-    options: { events: { type: 'string' }, full: { type: 'boolean', default: false } },
-    allowPositionals: true,
-    strict: true
-  }))
+  const { values, positionals } = parseCommandArgs(() => {
+    return parseArgs({
+      args,
+      options: { events: { type: 'string' }, full: { type: 'boolean', default: false } },
+      allowPositionals: true,
+      strict: true,
+    })
+  })
 
   if (positionals.length !== 1) {
     throw commandError('invalid_arguments', 'task show には taskId を1つ指定してください')
@@ -324,16 +376,18 @@ async function showTask(args: string[], ledger: TaskLedger) {
 }
 
 async function retryTask(args: string[], ledger: TaskLedger, deps: TaskCommandDependencies) {
-  const { values, positionals } = parseCommandArgs(() => parseArgs({
-    args,
-    options: {
-      note: { type: 'string' },
-      'note-file': { type: 'string' },
-      'confirm-side-effects': { type: 'boolean', default: false }
-    },
-    allowPositionals: true,
-    strict: true
-  }))
+  const { values, positionals } = parseCommandArgs(() => {
+    return parseArgs({
+      args,
+      options: {
+        note: { type: 'string' },
+        'note-file': { type: 'string' },
+        'confirm-side-effects': { type: 'boolean', default: false },
+      },
+      allowPositionals: true,
+      strict: true,
+    })
+  })
 
   if (positionals.length !== 1) {
     throw commandError('invalid_arguments', 'task retry には taskId を1つ指定してください')
@@ -375,15 +429,22 @@ async function retryTask(args: string[], ledger: TaskLedger, deps: TaskCommandDe
   } catch (error) {
     if (isLedgerError(error) && error.code === 'side_effects_unconfirmed') {
       const worktrees = error.previousWorktrees ?? []
-      const lines = worktrees.length === 0
-        ? ['前回の worktree: なし']
-        : ['前回の worktree:', ...worktrees.map((worktree) => {
-          return `  - ${worktree.worktreePath}（branch ${worktree.branch}）`
-        })]
+      const lines =
+        worktrees.length === 0
+          ? ['前回の worktree: なし']
+          : [
+              '前回の worktree:',
+              ...worktrees.map((worktree) => {
+                return `  - ${worktree.worktreePath}（branch ${worktree.branch}）`
+              }),
+            ]
 
-      throw Object.assign(new Error([`side_effects_unconfirmed: ${SIDE_EFFECTS_MESSAGE}`, ...lines].join('\n')), {
-        code: error.code
-      })
+      throw Object.assign(
+        new Error([`side_effects_unconfirmed: ${SIDE_EFFECTS_MESSAGE}`, ...lines].join('\n')),
+        {
+          code: error.code,
+        },
+      )
     }
 
     throw error
@@ -391,7 +452,9 @@ async function retryTask(args: string[], ledger: TaskLedger, deps: TaskCommandDe
 }
 
 function cancelTask(args: string[], ledger: TaskLedger) {
-  const { positionals } = parseCommandArgs(() => parseArgs({ args, options: {}, allowPositionals: true, strict: true }))
+  const { positionals } = parseCommandArgs(() => {
+    return parseArgs({ args, options: {}, allowPositionals: true, strict: true })
+  })
 
   if (positionals.length !== 1) {
     throw commandError('invalid_arguments', 'task cancel には taskId を1つ指定してください')
@@ -401,12 +464,25 @@ function cancelTask(args: string[], ledger: TaskLedger) {
 }
 
 // araya task <subcommand>。dataDir は loadConfig で解決した絶対 path
-export async function runTaskCommand(args: string[], config: { dataDir: string }, deps: TaskCommandDependencies) {
+export async function runTaskCommand(
+  args: string[],
+  config: { dataDir: string },
+  deps: TaskCommandDependencies,
+) {
   const subcommand = args[0]
   const rest = args.slice(1)
 
-  if (subcommand !== 'create' && subcommand !== 'list' && subcommand !== 'show' && subcommand !== 'retry' && subcommand !== 'cancel') {
-    throw commandError('invalid_arguments', `不明な task の command: ${subcommand ?? '（なし）'}。create・list・show・retry・cancel のどれかを指定してください`)
+  if (
+    subcommand !== 'create' &&
+    subcommand !== 'list' &&
+    subcommand !== 'show' &&
+    subcommand !== 'retry' &&
+    subcommand !== 'cancel'
+  ) {
+    throw commandError(
+      'invalid_arguments',
+      `不明な task の command: ${subcommand ?? '（なし）'}。create・list・show・retry・cancel のどれかを指定してください`,
+    )
   }
 
   const ledger = openTaskLedger(config.dataDir, { secretValues: collectSecretValues(deps.env) })
@@ -442,14 +518,27 @@ export async function runTaskCommand(args: string[], config: { dataDir: string }
 }
 
 // systemctl などの失敗。stderr は秘密を置き換えた先頭 500 文字
-function systemdCommandError(name: string, args: readonly string[], result: CommandResult, redactor: Redactor) {
+export function systemdCommandError(
+  name: string,
+  args: readonly string[],
+  result: CommandResult,
+  redactor: Redactor,
+) {
   const status = result.timedOut ? '時間切れで打ち切り' : `終了 code ${result.exitCode ?? 'なし'}`
   const stderr = redactor.redact(result.stderr.trim()).slice(0, MAX_COMMAND_STDERR_CHARS)
 
-  return commandError(`${name}_failed`, `${name} ${args.join(' ')} が失敗しました（${status}）${stderr === '' ? '' : `: ${stderr}`}`)
+  return commandError(
+    `${name}_failed`,
+    `${name} ${args.join(' ')} が失敗しました（${status}）${stderr === '' ? '' : `: ${stderr}`}`,
+  )
 }
 
-async function runSystemctl(ops: SystemdOps, args: readonly string[], timeoutMs: number, redactor: Redactor) {
+export async function runSystemctl(
+  ops: SystemdOps,
+  args: readonly string[],
+  timeoutMs: number,
+  redactor: Redactor,
+) {
   const result = await ops.systemctl(args, timeoutMs)
 
   if (!commandSucceeded(result)) {
@@ -459,7 +548,7 @@ async function runSystemctl(ops: SystemdOps, args: readonly string[], timeoutMs:
   return result
 }
 
-async function realpathOrResolved(target: string) {
+export async function realpathOrResolved(target: string) {
   try {
     return await fs.realpath(target)
   } catch (error) {
@@ -472,10 +561,13 @@ async function realpathOrResolved(target: string) {
 }
 
 // 同じ directory の一時 file（mode 0600）に書いてから rename する。directory が無ければ mode 0700 で作る
-async function writeUnitFile(unitPath: string, content: string) {
+export async function writeUnitFile(unitPath: string, content: string) {
   const directory = path.dirname(unitPath)
   await fs.mkdir(directory, { recursive: true, mode: 0o700 })
-  const temporaryPath = path.join(directory, `.${path.basename(unitPath)}.${randomBytes(6).toString('hex')}.tmp`)
+  const temporaryPath = path.join(
+    directory,
+    `.${path.basename(unitPath)}.${randomBytes(6).toString('hex')}.tmp`,
+  )
 
   try {
     await fs.writeFile(temporaryPath, content, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
@@ -486,23 +578,36 @@ async function writeUnitFile(unitPath: string, content: string) {
   }
 }
 
-async function readLinger(ops: SystemdOps, uid: number) {
-  const result = await ops.loginctl(['show-user', String(uid), '--property=Linger', '--value'], SYSTEMCTL_TIMEOUT_MS)
+export async function readLinger(ops: SystemdOps, uid: number) {
+  const result = await ops.loginctl(
+    ['show-user', String(uid), '--property=Linger', '--value'],
+    SYSTEMCTL_TIMEOUT_MS,
+  )
   const value = commandSucceeded(result) ? result.stdout.trim() : ''
 
   return value === 'yes' ? true : value === 'no' ? false : null
 }
 
-async function installRunner(config: RunnerCommandConfig, deps: RunnerCommandDependencies, redactor: Redactor) {
+async function installRunner(
+  config: RunnerCommandConfig,
+  deps: RunnerCommandDependencies,
+  redactor: Redactor,
+) {
   const ops = await deps.createSystemdOps(deps.env)
 
   // 1. user manager に接続できることを確かめる（終了 code は見ない）
-  const managerState = await ops.systemctl(['--user', 'is-system-running'], SYSTEMD_CONNECT_TIMEOUT_MS)
+  const managerState = await ops.systemctl(
+    ['--user', 'is-system-running'],
+    SYSTEMD_CONNECT_TIMEOUT_MS,
+  )
   const state = managerState.stdout.split('\n')[0]?.trim() ?? ''
 
   if (!REACHABLE_MANAGER_STATES.includes(state)) {
     const stderr = redactor.redact(managerState.stderr.trim()).slice(0, MAX_COMMAND_STDERR_CHARS)
-    throw commandError('systemd_unavailable', `systemd の user manager に接続できません（${state === '' ? stderr || '応答なし' : state}）`)
+    throw commandError(
+      'systemd_unavailable',
+      `systemd の user manager に接続できません（${state === '' ? stderr || '応答なし' : state}）`,
+    )
   }
 
   // 2. dataDir と logs を用意し、unit file の内容を作る
@@ -519,12 +624,12 @@ async function installRunner(config: RunnerCommandConfig, deps: RunnerCommandDep
     environment: selectUnitEnvironment(deps.env, {
       dataDir: config.dataDir,
       devRoot: config.devRoot,
-      piAgentDir: config.piAgentDir
-    })
+      piAgentDir: config.piAgentDir,
+    }),
   })
   const configInitialization = await initializeConfigFromPiSettings(
     path.join(config.dataDir, 'config.json'),
-    path.join(config.piAgentDir, 'settings.json')
+    path.join(config.piAgentDir, 'settings.json'),
   )
 
   if (configInitialization.status === 'skipped') {
@@ -550,10 +655,20 @@ async function installRunner(config: RunnerCommandConfig, deps: RunnerCommandDep
 
   // 4. user manager が書いた file を読んだことを確かめる
   await runSystemctl(ops, ['--user', 'daemon-reload'], SYSTEMCTL_TIMEOUT_MS, redactor)
-  const fragmentPath = (await runSystemctl(ops, ['--user', 'show', '--property=FragmentPath', '--value', unit], SYSTEMCTL_TIMEOUT_MS, redactor)).stdout.trim()
+  const fragmentPath = (
+    await runSystemctl(
+      ops,
+      ['--user', 'show', '--property=FragmentPath', '--value', unit],
+      SYSTEMCTL_TIMEOUT_MS,
+      redactor,
+    )
+  ).stdout.trim()
 
   if (fragmentPath !== unitPath) {
-    throw commandError('unit_not_loaded', `user manager が ${unitPath} ではなく ${fragmentPath === '' ? '（なし）' : fragmentPath} を読んでいます`)
+    throw commandError(
+      'unit_not_loaded',
+      `user manager が ${unitPath} ではなく ${fragmentPath === '' ? '（なし）' : fragmentPath} を読んでいます`,
+    )
   }
 
   // 5. 有効にして起動し直す
@@ -561,7 +676,14 @@ async function installRunner(config: RunnerCommandConfig, deps: RunnerCommandDep
   await runSystemctl(ops, ['--user', 'restart', unit], SYSTEMCTL_RESTART_TIMEOUT_MS, redactor)
 
   // 6. 台帳の runner の行が新しい invocation の running になるのを待つ（待てなければ、そのときの値を出す）
-  const invocationId = (await runSystemctl(ops, ['--user', 'show', '--property=InvocationID', '--value', unit], SYSTEMCTL_TIMEOUT_MS, redactor)).stdout.trim()
+  const invocationId = (
+    await runSystemctl(
+      ops,
+      ['--user', 'show', '--property=InvocationID', '--value', unit],
+      SYSTEMCTL_TIMEOUT_MS,
+      redactor,
+    )
+  ).stdout.trim()
   const ledger = openTaskLedger(config.dataDir, { secretValues: collectSecretValues(deps.env) })
   let runner: RunnerView
 
@@ -569,7 +691,14 @@ async function installRunner(config: RunnerCommandConfig, deps: RunnerCommandDep
     const deadline = deps.nowMs() + RUNNER_START_WAIT_MS
     runner = ledger.readRunner(unit, deps.nowMs())
 
-    while (!(runner.state === 'running' && invocationId !== '' && ledger.readRunnerInvocationId() === invocationId) && deps.nowMs() < deadline) {
+    while (
+      !(
+        runner.state === 'running' &&
+        invocationId !== '' &&
+        ledger.readRunnerInvocationId() === invocationId
+      ) &&
+      deps.nowMs() < deadline
+    ) {
       await deps.sleep(RUNNER_START_POLL_MS)
       runner = ledger.readRunner(unit, deps.nowMs())
     }
@@ -581,13 +710,19 @@ async function installRunner(config: RunnerCommandConfig, deps: RunnerCommandDep
   const linger = await readLinger(ops, deps.uid)
 
   if (linger === false) {
-    deps.stderr('logout すると runner が止まります。logout の後も動かすには、loginctl enable-linger で linger を有効にしてください')
+    deps.stderr(
+      'logout すると runner が止まります。logout の後も動かすには、loginctl enable-linger で linger を有効にしてください',
+    )
   }
 
   return { unit, unitPath, linger, runner, config: configInitialization }
 }
 
-async function uninstallRunner(config: RunnerCommandConfig, deps: RunnerCommandDependencies, redactor: Redactor) {
+async function uninstallRunner(
+  config: RunnerCommandConfig,
+  deps: RunnerCommandDependencies,
+  redactor: Redactor,
+) {
   const ops = await deps.createSystemdOps(deps.env)
   const unit = runnerUnitName(dataDirHash(await realpathOrResolved(config.dataDir)))
   const unitPath = unitFilePath(deps.env, deps.homeDir, unit)
@@ -604,7 +739,10 @@ async function uninstallRunner(config: RunnerCommandConfig, deps: RunnerCommandD
     const stopArgs = ['--user', 'stop', unit]
     const stopped = await ops.systemctl(stopArgs, SYSTEMCTL_RESTART_TIMEOUT_MS)
 
-    if (!commandSucceeded(stopped) && (stopped.timedOut || !UNIT_NOT_LOADED_PATTERN.test(stopped.stderr))) {
+    if (
+      !commandSucceeded(stopped) &&
+      (stopped.timedOut || !UNIT_NOT_LOADED_PATTERN.test(stopped.stderr))
+    ) {
       throw systemdCommandError('systemctl', stopArgs, stopped, redactor)
     }
   }
@@ -626,18 +764,28 @@ async function uninstallRunner(config: RunnerCommandConfig, deps: RunnerCommandD
 }
 
 // araya runner <install|uninstall>。台帳の試行は変えない
-export async function runRunnerCommand(args: string[], config: RunnerCommandConfig, deps: RunnerCommandDependencies) {
-  const { positionals } = parseCommandArgs(() => parseArgs({ args, options: {}, allowPositionals: true, strict: true }))
+export async function runRunnerCommand(
+  args: string[],
+  config: RunnerCommandConfig,
+  deps: RunnerCommandDependencies,
+) {
+  const { positionals } = parseCommandArgs(() => {
+    return parseArgs({ args, options: {}, allowPositionals: true, strict: true })
+  })
   const subcommand = positionals[0]
 
   if ((subcommand !== 'install' && subcommand !== 'uninstall') || positionals.length !== 1) {
-    throw commandError('invalid_arguments', `不明な runner の command: ${positionals.join(' ') || '（なし）'}。install・uninstall のどちらかを指定してください`)
+    throw commandError(
+      'invalid_arguments',
+      `不明な runner の command: ${positionals.join(' ') || '（なし）'}。install・uninstall のどちらかを指定してください`,
+    )
   }
 
   const redactor = createRedactor(collectSecretValues(deps.env))
-  const body = subcommand === 'install'
-    ? await installRunner(config, deps, redactor)
-    : await uninstallRunner(config, deps, redactor)
+  const body =
+    subcommand === 'install'
+      ? await installRunner(config, deps, redactor)
+      : await uninstallRunner(config, deps, redactor)
 
   deps.stdout(JSON.stringify(body, null, 2))
 }
