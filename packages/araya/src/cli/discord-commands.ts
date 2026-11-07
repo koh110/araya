@@ -261,7 +261,11 @@ async function validateCredentialDirectoryAncestors(directoryPath: string, uid: 
   }
 }
 
-async function validateExistingCredentialDirectoryPath(directoryPath: string, uid: number) {
+async function validateExistingCredentialDirectoryPath(
+  directoryPath: string,
+  uid: number,
+  options: { allowWritableTargetDirectory?: boolean } = {},
+) {
   let current = directoryPath
 
   while (true) {
@@ -309,11 +313,18 @@ async function validateExistingCredentialDirectoryPath(directoryPath: string, ui
     }
 
     const mode = stat.mode & 0o7777
-
-    if ((mode & 0o022) !== 0 && (mode & 0o1000) === 0) {
+    if (
+      (mode & 0o022) !== 0 &&
+      (mode & 0o1000) === 0 &&
+      !(
+        options.allowWritableTargetDirectory === true &&
+        current === directoryPath &&
+        stat.uid === uid
+      )
+    ) {
       throw commandError(
         'op_service_account_credential_directory_unsafe',
-        `旧形式の1Password credential の directory が置換可能です: ${current}`,
+        `1Password Service Account credential の path に置換可能な directory があります: ${current}`,
       )
     }
 
@@ -335,7 +346,9 @@ async function validateExistingCredentialDirectoryPath(directoryPath: string, ui
 }
 
 async function ensurePrivateCredentialDirectory(directoryPath: string, uid: number) {
-  await validateExistingCredentialDirectoryPath(directoryPath, uid)
+  await validateExistingCredentialDirectoryPath(directoryPath, uid, {
+    allowWritableTargetDirectory: true,
+  })
   await fs.mkdir(directoryPath, { recursive: true, mode: 0o700 })
 
   let directoryStat

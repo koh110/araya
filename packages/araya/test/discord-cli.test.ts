@@ -730,6 +730,8 @@ test('discord install: 暗号化 credential と LoadCredentialEncrypted を使�
   const installEnv = await makeInstallEnv()
 
   await writeDiscordEnv(installEnv)
+  await fs.mkdir(path.dirname(installEnv.opTokenFile), { recursive: true, mode: 0o700 })
+  await fs.chmod(path.dirname(installEnv.opTokenFile), 0o775)
   await fs.mkdir(path.dirname(installEnv.legacyOpTokenFile), { recursive: true, mode: 0o700 })
   await fs.writeFile(installEnv.legacyOpTokenFile, 'legacy-plaintext-token', { mode: 0o600 })
   const fake = createFakeSystemd({
