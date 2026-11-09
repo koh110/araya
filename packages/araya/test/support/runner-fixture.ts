@@ -153,7 +153,7 @@ export async function openAttemptHarness(fixture: RunnerFixture, options: Attemp
   const secretValues = collectSecretValues(fixture.env)
   const ledger = openTaskLedger(fixture.dataDir, { secretValues })
   const logs: Record<string, unknown>[] = []
-  const reports: { type: string; message: string }[] = []
+  const reports: { kind: string; message: string }[] = []
   const { extension, attemptTask } = createShikiExtension({
     dataDir: fixture.dataDir,
     hash: fixture.hash,
@@ -179,8 +179,8 @@ export async function openAttemptHarness(fixture: RunnerFixture, options: Attemp
     env: ({ cwd }) => {
       return new NodeExecutionEnv({ cwd: cwd ?? fixture.devRoot, shellEnv: fixture.env })
     },
-    onReport: (error, info) => {
-      reports.push({ type: info.type, message: error instanceof Error ? error.message : String(error) })
+    onReport: (report) => {
+      reports.push({ kind: report.kind, message: report.error instanceof Error ? report.error.message : String(report.error) })
     }
   }, ctx)
   harness.resume()

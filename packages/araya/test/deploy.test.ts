@@ -7,6 +7,7 @@ import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 
 import { shellQuote } from '../src/infrastructure/systemd.ts'
+import { readProcessEnvironment } from './config.ts'
 
 // scripts/deploy.sh（npm run deploy）の test。npm と、npm が入れる araya を偽物にする。本物の npm を使う test と、
 // 本物の araya の CLI を使う test もある。どの test も、利用者の prefix・dataDir・systemd には触れない
@@ -15,7 +16,8 @@ const REPO_ROOT = path.resolve(fileURLToPath(new URL('../../../', import.meta.ur
 const DEPLOY_SCRIPT = path.join(REPO_ROOT, 'scripts', 'deploy.sh')
 const CLI_PATH = fileURLToPath(new URL('../bin/cli.ts', import.meta.url))
 // npm 11 の npm run が PATH に足す node-gyp-bin の場所（「技術調査結果」）
-const NODE_GYP_BIN = '/usr/local/lib/node_modules/npm/node_modules/@npmcli/run-script/lib/node-gyp-bin'
+const NODE_GYP_BIN =
+  '/usr/local/lib/node_modules/npm/node_modules/@npmcli/run-script/lib/node-gyp-bin'
 
 // 偽物の npm。呼ばれ方を記録し、pack では tarball を、install では DEPLOY_TEST_ARAYA を <prefix>/bin/araya に置く
 const FAKE_NPM = `#!/bin/sh
@@ -80,11 +82,18 @@ async function makeDeployFixture() {
     TMPDIR: path.join(root, 'tmp'),
     ARAYA_INSTALL_PREFIX: prefix,
     DEPLOY_TEST_LOG: logPath,
-    DEPLOY_TEST_ARAYA: fakeAraya
+    DEPLOY_TEST_ARAYA: fakeAraya,
   }
 
   // 元の PATH（npm run deploy を実行した shell の PATH の代わり）。偽物の npm はここにある
-  return { root, binDir, prefix, logPath, env, originalPath: [binDir, '/usr/bin', '/bin'].join(':') }
+  return {
+    root,
+    binDir,
+    prefix,
+    logPath,
+    env,
+    originalPath: [binDir, '/usr/bin', '/bin'].join(':'),
+  }
 }
 
 // npm run が PATH の先頭に足す entry。package の directory から / までの node_modules/.bin と、npm の node-gyp-bin
@@ -113,18 +122,29 @@ async function runProcess(command: string, args: string[], env: NodeJS.ProcessEn
   child.stderr.setEncoding('utf8').on('data', (chunk: string) => {
     stderr.push(chunk)
   })
-  const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
-    child.once('error', reject)
-    child.once('close', (code, signal) => {
-      resolve({ code, signal })
-    })
-  })
+  const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+    (resolve, reject) => {
+      child.once('error', reject)
+      child.once('close', (code, signal) => {
+        resolve({ code, signal })
+      })
+    },
+  )
 
   return { exit, stdout: stdout.join(''), stderr: stderr.join('') }
 }
 
-function runDeployScript(fixture: DeployFixture, pathValue: string, extraEnv: NodeJS.ProcessEnv = {}) {
-  return runProcess('/bin/sh', [DEPLOY_SCRIPT], { ...fixture.env, ...extraEnv, PATH: pathValue }, REPO_ROOT)
+function runDeployScript(
+  fixture: DeployFixture,
+  pathValue: string,
+  extraEnv: NodeJS.ProcessEnv = {},
+) {
+  return runProcess(
+    '/bin/sh',
+    [DEPLOY_SCRIPT],
+    { ...fixture.env, ...extraEnv, PATH: pathValue },
+    REPO_ROOT,
+  )
 }
 
 async function readCalls(logPath: string) {
@@ -138,14 +158,17 @@ async function readCalls(logPath: string) {
     }
   }
 
-  return text.split('\n').filter((line) => {
-    return line !== ''
-  }).map((line) => {
-    const [command = '', args = '', self = '', pathValue = ''] = line.split('\t')
-    const call: Call = { command, args, self, path: pathValue }
+  return text
+    .split('\n')
+    .filter((line) => {
+      return line !== ''
+    })
+    .map((line) => {
+      const [command = '', args = '', self = '', pathValue = ''] = line.split('\t')
+      const call: Call = { command, args, self, path: pathValue }
 
-    return call
-  })
+      return call
+    })
 }
 
 function commandsOf(calls: Call[]) {
@@ -154,15 +177,29 @@ function commandsOf(calls: Call[]) {
   })
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function dependencyVersion(manifest: unknown, name: string) {
+  if (!isRecord(manifest) || !isRecord(manifest.dependencies)) {
+    return undefined
+  }
+
+  const version = manifest.dependencies[name]
+
+  return typeof version === 'string' ? version : undefined
+}
+
 // test を動かしている npm の npm-cli.js。npm test から動かせば npm_execpath にある
 async function findNpmCli() {
-  const execPath = process.env.npm_execpath
+  const execPath = readProcessEnvironment('npm_execpath')
 
   if (execPath !== undefined && execPath.endsWith('.js')) {
     return execPath
   }
 
-  for (const directory of (process.env.PATH ?? '').split(':')) {
+  for (const directory of (readProcessEnvironment('PATH') ?? '').split(':')) {
     if (directory === '') {
       continue
     }
@@ -185,11 +222,19 @@ test('deploy: npm install の後に、入れた araya で runner install を、n
   const fixture = await makeDeployFixture()
 
   try {
-    const result = await runDeployScript(fixture, [...npmRunEntries(REPO_ROOT), fixture.originalPath].join(':'))
+    const result = await runDeployScript(
+      fixture,
+      [...npmRunEntries(REPO_ROOT), fixture.originalPath].join(':'),
+    )
 
     assert.deepEqual(result.exit, { code: 0, signal: null }, result.stderr)
     const calls = await readCalls(fixture.logPath)
-    assert.deepEqual(commandsOf(calls), ['npm pack', 'npm uninstall', 'npm install', 'araya runner'])
+    assert.deepEqual(commandsOf(calls), [
+      'npm pack',
+      'npm uninstall',
+      'npm install',
+      'araya runner',
+    ])
     const runnerInstall = calls[3]
     assert.ok(runnerInstall)
     assert.equal(runnerInstall.args, 'runner install')
@@ -208,7 +253,10 @@ test('deploy: npm run を入れ子で実行したときは、重ねて足され�
 
   try {
     const originalPath = ['/home/user/project/node_modules/.bin', fixture.originalPath].join(':')
-    const result = await runDeployScript(fixture, [...npmRunEntries(REPO_ROOT), ...npmRunEntries(REPO_ROOT), originalPath].join(':'))
+    const result = await runDeployScript(
+      fixture,
+      [...npmRunEntries(REPO_ROOT), ...npmRunEntries(REPO_ROOT), originalPath].join(':'),
+    )
 
     assert.deepEqual(result.exit, { code: 0, signal: null }, result.stderr)
     const runnerInstall = (await readCalls(fixture.logPath)).at(-1)
@@ -241,7 +289,10 @@ test('deploy: runner install が終了 code 69（この環境では runner を�
     const fixture = await makeDeployFixture()
 
     try {
-      const result = await runDeployScript(fixture, fixture.originalPath, { DEPLOY_TEST_ARAYA_RESULT: code, DEPLOY_TEST_ARAYA_EXIT: '69' })
+      const result = await runDeployScript(fixture, fixture.originalPath, {
+        DEPLOY_TEST_ARAYA_RESULT: code,
+        DEPLOY_TEST_ARAYA_EXIT: '69',
+      })
 
       assert.deepEqual(result.exit, { code: 0, signal: null }, `${code}: ${result.stderr}`)
       assert.match(result.stderr, new RegExp(`^${code}: test の失敗$`, 'mu'))
@@ -259,14 +310,17 @@ test('deploy: runner install がほかの終了 code で終わったときは、
     { code: 'systemctl_failed', exit: '1' },
     { code: 'unsupported_path', exit: '1' },
     { code: 'systemd_unavailable', exit: '1' },
-    { code: 'unsupported_platform', exit: '3' }
+    { code: 'unsupported_platform', exit: '3' },
   ]
 
   for (const item of cases) {
     const fixture = await makeDeployFixture()
 
     try {
-      const result = await runDeployScript(fixture, fixture.originalPath, { DEPLOY_TEST_ARAYA_RESULT: item.code, DEPLOY_TEST_ARAYA_EXIT: item.exit })
+      const result = await runDeployScript(fixture, fixture.originalPath, {
+        DEPLOY_TEST_ARAYA_RESULT: item.code,
+        DEPLOY_TEST_ARAYA_EXIT: item.exit,
+      })
 
       assert.deepEqual(result.exit, { code: 1, signal: null }, `${item.code}: ${result.stderr}`)
       assert.match(result.stderr, new RegExp(`^${item.code}: test の失敗$`, 'mu'))
@@ -283,10 +337,16 @@ test('deploy: npm install が失敗したときは、runner install を実行し
   const fixture = await makeDeployFixture()
 
   try {
-    const result = await runDeployScript(fixture, fixture.originalPath, { DEPLOY_TEST_NPM_INSTALL: 'fail' })
+    const result = await runDeployScript(fixture, fixture.originalPath, {
+      DEPLOY_TEST_NPM_INSTALL: 'fail',
+    })
 
     assert.notEqual(result.exit.code, 0)
-    assert.deepEqual(commandsOf(await readCalls(fixture.logPath)), ['npm pack', 'npm uninstall', 'npm install'])
+    assert.deepEqual(commandsOf(await readCalls(fixture.logPath)), [
+      'npm pack',
+      'npm uninstall',
+      'npm install',
+    ])
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
@@ -306,24 +366,40 @@ test('deploy: 本物の npm で npm run deploy を実行しても、npm run が�
     // npm run deploy を実行する package。npm run が PATH の先頭に足す node_modules/.bin に偽物の npm を置くので、deploy.sh の中の npm はその偽物になる
     const packageDir = path.join(fixture.root, 'package')
     await fs.mkdir(path.join(packageDir, 'node_modules', '.bin'), { recursive: true })
-    await fs.writeFile(path.join(packageDir, 'node_modules', '.bin', 'npm'), FAKE_NPM, { mode: 0o755 })
-    await fs.writeFile(path.join(packageDir, 'package.json'), JSON.stringify({
-      private: true,
-      name: 'araya-deploy-test',
-      version: '0.0.0',
-      scripts: { deploy: `sh ${shellQuote(DEPLOY_SCRIPT)}` }
-    }), 'utf8')
+    await fs.writeFile(path.join(packageDir, 'node_modules', '.bin', 'npm'), FAKE_NPM, {
+      mode: 0o755,
+    })
+    await fs.writeFile(
+      path.join(packageDir, 'package.json'),
+      JSON.stringify({
+        private: true,
+        name: 'araya-deploy-test',
+        version: '0.0.0',
+        scripts: { deploy: `sh ${shellQuote(DEPLOY_SCRIPT)}` },
+      }),
+      'utf8',
+    )
     const outerPath = '/usr/bin:/bin'
-    const result = await runProcess(process.execPath, [npmCli, 'run', 'deploy'], {
-      ...fixture.env,
-      PATH: outerPath,
-      npm_config_cache: path.join(fixture.root, 'npm-cache'),
-      npm_config_update_notifier: 'false'
-    }, packageDir)
+    const result = await runProcess(
+      process.execPath,
+      [npmCli, 'run', 'deploy'],
+      {
+        ...fixture.env,
+        PATH: outerPath,
+        npm_config_cache: path.join(fixture.root, 'npm-cache'),
+        npm_config_update_notifier: 'false',
+      },
+      packageDir,
+    )
 
     assert.deepEqual(result.exit, { code: 0, signal: null }, result.stderr)
     const calls = await readCalls(fixture.logPath)
-    assert.deepEqual(commandsOf(calls), ['npm pack', 'npm uninstall', 'npm install', 'araya runner'])
+    assert.deepEqual(commandsOf(calls), [
+      'npm pack',
+      'npm uninstall',
+      'npm install',
+      'araya runner',
+    ])
     // deploy.sh の中の npm は、npm run が足した entry の付いた PATH で動いた
     const pack = calls[0]
     assert.ok(pack)
@@ -344,24 +420,37 @@ async function runDeployWithRealAraya(fixture: DeployFixture, cliPath: string | 
   await fs.mkdir(systemdDir)
 
   for (const name of ['systemctl', 'systemd-run', 'loginctl']) {
-    await fs.writeFile(path.join(systemdDir, name), `#!/bin/sh\nprintf '%s\\n' "$0 $*" >> ${shellQuote(systemdLog)}\nexit 1\n`, { mode: 0o755 })
+    await fs.writeFile(
+      path.join(systemdDir, name),
+      `#!/bin/sh\nprintf '%s\\n' "$0 $*" >> ${shellQuote(systemdLog)}\nexit 1\n`,
+      { mode: 0o755 },
+    )
   }
 
   const realAraya = path.join(fixture.root, 'real-araya')
   const setPath = cliPath === null ? '' : `PATH=${shellQuote(cliPath)}\nexport PATH\n`
-  await fs.writeFile(realAraya, `#!/bin/sh\n${setPath}exec ${shellQuote(process.execPath)} ${shellQuote(CLI_PATH)} "$@"\n`, { mode: 0o755 })
+  await fs.writeFile(
+    realAraya,
+    `#!/bin/sh\n${setPath}exec ${shellQuote(process.execPath)} ${shellQuote(CLI_PATH)} "$@"\n`,
+    { mode: 0o755 },
+  )
   const configHome = path.join(fixture.root, 'xdg-config')
   const runtimeDir = path.join(fixture.root, 'xdg-runtime')
   await fs.mkdir(runtimeDir, { mode: 0o700 })
-  const result = await runProcess('/bin/sh', [DEPLOY_SCRIPT], {
-    ...fixture.env,
-    PATH: [systemdDir, fixture.originalPath].join(':'),
-    DEPLOY_TEST_ARAYA: realAraya,
-    ARAYA_DATA_DIR: path.join(fixture.root, 'data'),
-    PI_CODING_AGENT_DIR: path.join(fixture.root, 'pi-agent'),
-    XDG_CONFIG_HOME: configHome,
-    XDG_RUNTIME_DIR: runtimeDir
-  }, REPO_ROOT)
+  const result = await runProcess(
+    '/bin/sh',
+    [DEPLOY_SCRIPT],
+    {
+      ...fixture.env,
+      PATH: [systemdDir, fixture.originalPath].join(':'),
+      DEPLOY_TEST_ARAYA: realAraya,
+      ARAYA_DATA_DIR: path.join(fixture.root, 'data'),
+      PI_CODING_AGENT_DIR: path.join(fixture.root, 'pi-agent'),
+      XDG_CONFIG_HOME: configHome,
+      XDG_RUNTIME_DIR: runtimeDir,
+    },
+    REPO_ROOT,
+  )
 
   return { result, systemdDir, systemdLog, configHome }
 }
@@ -370,12 +459,17 @@ test('deploy: 本物の araya の CLI が、systemd の user manager に接続�
   const fixture = await makeDeployFixture()
 
   try {
-    const { result, systemdDir, systemdLog, configHome } = await runDeployWithRealAraya(fixture, null)
+    const { result, systemdDir, systemdLog, configHome } = await runDeployWithRealAraya(
+      fixture,
+      null,
+    )
 
     assert.deepEqual(result.exit, { code: 0, signal: null }, result.stderr)
     assert.match(result.stderr, /^systemd_unavailable: systemd の user manager に接続できません/mu)
     assert.match(result.stderr, /runner を入れずに終わります/u)
-    assert.deepEqual((await fs.readFile(systemdLog, 'utf8')).trim().split('\n'), [`${path.join(systemdDir, 'systemctl')} --user is-system-running`])
+    assert.deepEqual((await fs.readFile(systemdLog, 'utf8')).trim().split('\n'), [
+      `${path.join(systemdDir, 'systemctl')} --user is-system-running`,
+    ])
     await assert.rejects(fs.access(path.join(configHome, 'systemd')), { code: 'ENOENT' })
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
@@ -391,7 +485,10 @@ test('deploy: 本物の araya の CLI が、PATH に systemctl が無くて syst
     const { result, systemdLog, configHome } = await runDeployWithRealAraya(fixture, emptyDir)
 
     assert.deepEqual(result.exit, { code: 0, signal: null }, result.stderr)
-    assert.match(result.stderr, /^systemd_unavailable: PATH に systemd-run・systemctl・bash がありません$/mu)
+    assert.match(
+      result.stderr,
+      /^systemd_unavailable: PATH に systemd-run・systemctl・bash がありません$/mu,
+    )
     assert.match(result.stderr, /runner を入れずに終わります/u)
     await assert.rejects(fs.access(systemdLog), { code: 'ENOENT' })
     await assert.rejects(fs.access(path.join(configHome, 'systemd')), { code: 'ENOENT' })
@@ -407,7 +504,11 @@ test('deploy: 本物の araya の CLI が設定ファイルの誤りで失敗し
     // 未知の key は、そのまま誤りのメッセージに入る。key の中の改行で「systemd_unavailable: 」で始まる行ができる
     const dataDir = path.join(fixture.root, 'data')
     await fs.mkdir(dataDir)
-    await fs.writeFile(path.join(dataDir, 'config.json'), JSON.stringify({ '\nsystemd_unavailable: test': true }), 'utf8')
+    await fs.writeFile(
+      path.join(dataDir, 'config.json'),
+      JSON.stringify({ '\nsystemd_unavailable: test': true }),
+      'utf8',
+    )
     const { result, systemdLog, configHome } = await runDeployWithRealAraya(fixture, null)
 
     assert.deepEqual(result.exit, { code: 1, signal: null }, result.stderr)
@@ -420,4 +521,18 @@ test('deploy: 本物の araya の CLI が設定ファイルの誤りで失敗し
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
+})
+
+test('deploy: root の npm pack 用 manifest が Discord bot の runtime dependency を宣言する', async () => {
+  const rootManifest: unknown = JSON.parse(
+    await fs.readFile(path.join(REPO_ROOT, 'package.json'), 'utf8'),
+  )
+  const workspaceManifest: unknown = JSON.parse(
+    await fs.readFile(path.join(REPO_ROOT, 'packages', 'araya', 'package.json'), 'utf8'),
+  )
+
+  assert.equal(dependencyVersion(rootManifest, 'discord.js'), '^14.27.0')
+  assert.equal(dependencyVersion(workspaceManifest, 'discord.js'), '^14.27.0')
+  assert.equal(dependencyVersion(rootManifest, 'proper-lockfile'), '4.1.2')
+  assert.equal(dependencyVersion(workspaceManifest, 'proper-lockfile'), '4.1.2')
 })

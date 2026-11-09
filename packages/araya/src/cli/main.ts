@@ -3,13 +3,20 @@ import os from 'node:os'
 import { parseCliArguments } from './arguments.ts'
 import { loadConfig, loadPiSdk, withPiEnvironment } from '../config/environment.ts'
 import { loadConfigFile } from '../config/file.ts'
-import { createSystemdOps, resolveRunnerEntrypoint } from '../infrastructure/systemd.ts'
+import {
+  createSystemdOps,
+  resolveDiscordEnvRunnerEntrypoint,
+  resolveDiscordOpRunnerEntrypoint,
+  resolveOpCliPath,
+  resolveRunnerEntrypoint,
+} from '../infrastructure/systemd.ts'
 import {
   assertSupportedPlatform,
   runRunnerCommand,
   runTaskCommand,
-  type RunnerCommandDependencies
+  type RunnerCommandDependencies,
 } from './task-commands.ts'
+import { runDiscordCommand, type DiscordCommandDependencies } from './discord-commands.ts'
 
 async function launchPi(args: string[], agentDir: string) {
   const { main } = await loadPiSdk(agentDir)
@@ -62,7 +69,30 @@ function printHelp() {
   araya runner uninstall
     runner の unit を止めて無効にし、unit file を消す。台帳は変えない（動いていた試行は、入れ直すと続きから進む）。
 
-  araya task と araya runner は Linux と systemd（254 以降）の user manager が必要。
+  araya discord init
+    <ARAYA_DATA_DIR>/.env（既定: ~/.araya/.env）を mode 0600 で作る。既存 file は上書きしない。
+  araya discord register
+    slash command（/araya list・show・submit・cancel・retry）を Discord の guild に登録する。.env または環境変数の設定が必要。
+    1Password の op:// 参照を使う場合は、op run で解決してから実行する（README参照）。
+  araya discord install [--auth-mode env-file|1password]
+    Discord bot を常駐の process（araya-discord-<hash>.service）として入れる。unit file を書き、有効にして起動し直す。
+    既定は平文 .env mode で、1Password CLI は使わない。1Password Service Account launcher を使う場合は --auth-mode 1password を明示する。
+    Bot token は unit file・Environment=・bot process の起動引数に書かない。linger は変えない（無効なら logout で bot が止まる）。
+  araya discord uninstall
+    Discord bot の unit を止めて無効にし、unit file を消す。state.json・台帳は残す（入れ直すと cursor の続きから進む）。
+    Discord 側の slash command 定義は残る（Discord 側で削除する）。
+  araya discord run
+    unit 稼働の確かめをせず、foreground で Discord bot を 1 度動かす（試験起動）。Ctrl+C で止める。
+    1Password の op:// 参照を使う場合は op run で設定を解決してから実行する。
+
+  /araya list: Task 一覧と runner の状態。/araya show <task>: Task の詳細（SHIKI の要約と途中経過）。
+  /araya submit <title> <goal> [targets] [constraints] [permissions]: Task を登録する（targets・constraints・permissions はカンマ区切り）。
+  /araya cancel <task>: 中止を求める。/araya retry <task> [note] [confirm_side_effects]: 終わった Task の再実行を求める。
+  外部 branch・Draft PR が作成された可能性がある Task の retry は、confirm_side_effects を認めてから実行する。
+  通知は Task 登録・再実行・中止・実行の開始・再開・終了だけ ARAYA_DISCORD_CHANNEL_ID の既定送信先に出す。
+  slash command の受付 channel は絞らない。設定した Guild 内で、Discord 側が許可する channel から実行できる。
+
+  araya task と araya runner と araya discord は Linux と systemd（254 以降）の user manager が必要。
 
 設定ファイル:
   <ARAYA_DATA_DIR>/config.json（既定: ~/.araya/config.json）
@@ -80,6 +110,8 @@ function printHelp() {
   ARAYA_DEV_ROOT
   ARAYA_DEVELOPMENT_TIMEOUT_MS
   ARAYA_VERIFICATION_TIMEOUT_MS
+  ARAYA_DISCORD_APPLICATION_ID・ARAYA_DISCORD_GUILD_ID・ARAYA_DISCORD_CHANNEL_ID・ARAYA_DISCORD_BOT_TOKEN・ARAYA_DISCORD_ALLOWED_USER_IDS
+    （Discord の設定。通常は araya discord init で作る <ARAYA_DATA_DIR>/.env（mode 0600）を使う。1Password の op:// 参照は任意）
 `)
 }
 
@@ -91,7 +123,12 @@ export const UNSUPPORTED_ENVIRONMENT_EXIT_CODE = 69
 
 // CLI の誤りの終了 code。この環境では使えない誤りは UNSUPPORTED_ENVIRONMENT_EXIT_CODE、それ以外は 1
 export function exitCodeOf(error: unknown) {
-  if (error instanceof Error && 'code' in error && typeof error.code === 'string' && UNSUPPORTED_ENVIRONMENT_CODES.includes(error.code)) {
+  if (
+    error instanceof Error &&
+    'code' in error &&
+    typeof error.code === 'string' &&
+    UNSUPPORTED_ENVIRONMENT_CODES.includes(error.code)
+  ) {
     return UNSUPPORTED_ENVIRONMENT_EXIT_CODE
   }
 
@@ -111,17 +148,27 @@ function defaultCommandDependencies(env: Readonly<Record<string, string | undefi
     platform: process.platform,
     env,
     stdin: process.stdin,
-    stdout: (text) => console.log(text),
-    stderr: (text) => console.error(text),
-    nowMs: () => Date.now(),
+    stdout: (text) => {
+      return console.log(text)
+    },
+    stderr: (text) => {
+      return console.error(text)
+    },
+    nowMs: () => {
+      return Date.now()
+    },
     createSystemdOps,
     nodePath: process.execPath,
-    resolveRunnerEntrypoint: () => resolveRunnerEntrypoint(),
+    resolveRunnerEntrypoint: () => {
+      return resolveRunnerEntrypoint()
+    },
     homeDir: os.homedir(),
     uid: process.getuid?.() ?? -1,
-    sleep: (ms) => new Promise((resolve) => {
-      setTimeout(resolve, ms)
-    })
+    sleep: (ms) => {
+      return new Promise((resolve) => {
+        setTimeout(resolve, ms)
+      })
+    },
   }
 
   return deps
@@ -132,7 +179,7 @@ export async function runCli(
   args: string[],
   startPi = launchPi,
   env?: NodeJS.ProcessEnv,
-  taskDependencies: Partial<RunnerCommandDependencies> = {}
+  taskDependencies: Partial<DiscordCommandDependencies> = {},
 ) {
   if (args.length === 0) {
     await startPi([], loadConfig(env).piAgentDir)
@@ -155,6 +202,35 @@ export async function runCli(
     } else {
       await runRunnerCommand(args.slice(1), config, deps)
     }
+
+    return
+  }
+
+  // Discord の command も独自の option を持つので、共通の引数の解析より先に振り分ける
+  if (args[0] === 'discord') {
+    assertSupportedPlatform(taskDependencies.platform ?? process.platform)
+    const config = await loadCliConfig(env)
+    const deps: DiscordCommandDependencies = {
+      ...defaultCommandDependencies(config.env),
+      ...taskDependencies,
+      resolveDiscordEnvRunnerEntrypoint:
+        taskDependencies.resolveDiscordEnvRunnerEntrypoint ??
+        (async () => {
+          return resolveDiscordEnvRunnerEntrypoint()
+        }),
+      resolveDiscordOpRunnerEntrypoint:
+        taskDependencies.resolveDiscordOpRunnerEntrypoint ??
+        (async () => {
+          return resolveDiscordOpRunnerEntrypoint()
+        }),
+      resolveOpCliPath:
+        taskDependencies.resolveOpCliPath ??
+        ((searchPath) => {
+          return resolveOpCliPath(searchPath)
+        }),
+    }
+
+    await runDiscordCommand(args.slice(1), config, deps)
 
     return
   }

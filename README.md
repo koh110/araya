@@ -125,6 +125,85 @@ runner は systemd の user service です。`npm run deploy` で入ります。
 
 araya は linger を変えません。linger が無効だと、logout で runner は止まり（一時停止）、次に user manager が起動したときに続きから進みます。logout の後も動かしたいときは `loginctl enable-linger` を実行してください。runner が落ちたときは、systemd が間隔を空けて起動し直します。
 
+## Discord bot を有効にする
+
+標準の設定は `<ARAYA_DATA_DIR>/.env`（既定 `~/.araya/.env`）です。repository root ではなく Araya の data directory に置き、Bot token を Git に含めないようにします。
+
+まず設定 file を作ります。`init` は空の template を mode `0600` で作成し、既存 file は上書きしません。
+
+```sh
+araya discord init
+```
+
+`.env` を開き、Discord Developer Portal の Bot token と対象 Discord の ID を設定します。
+
+```dotenv
+ARAYA_DISCORD_BOT_TOKEN=<discord-bot-token>
+ARAYA_DISCORD_APPLICATION_ID=<discord-application-id>
+ARAYA_DISCORD_GUILD_ID=<discord-guild-id>
+ARAYA_DISCORD_CHANNEL_ID=<discord-channel-id>
+ARAYA_DISCORD_ALLOWED_USER_IDS=<discord-user-id>
+```
+
+`ARAYA_DISCORD_ALLOWED_USER_IDS` は許可する Discord user ID をカンマ区切りで指定します。例の `<...>` は実際の値に置き換えます。この `.env` は Discord 専用で、ここに示した5つ以外の設定名は受け付けません。Application/Guild/Channel/User ID は公開 ID ですが、Bot token は秘密として扱ってください。値の一部を `op://` 参照にする場合は、1Password の節も参照してください。設定後、slash command を登録して bot service を入れます。
+
+`ARAYA_DISCORD_CHANNEL_ID` は Task 通知の既定送信先です。Araya は slash command の受付 channel を制限しません。slash command は設定した Guild 内で、Discord 側が利用を許可する channel から実行できます。実行者は `ARAYA_DISCORD_ALLOWED_USER_IDS` で制限します。
+
+```sh
+araya discord register
+araya discord install
+```
+
+`.env` の値を後から変更した場合は、既存の Discord unit を再起動して読み直します。`araya discord install` を再実行すれば、設定を再検証して unit の再起動まで行います。
+
+```sh
+systemctl --user restart araya-discord-<hash>.service
+```
+
+`install` は systemd user service を作成・有効化・再起動します。通常の平文 `.env` mode では systemd `LoadCredential` で設定 file を service 用 credential directory へ渡し、専用 launcher が読み込みます。Bot token は unit file の `Environment=` や起動引数には書きません。launcher は必要な Discord 設定を bot process の実行時環境へ渡し、credential directory の環境変数は引き継ぎません。設定が不完全な場合や file の権限が緩い場合は install/startup を拒否します。
+
+service の操作は次の通りです。
+
+- 一時停止・再開: `systemctl --user stop|start araya-discord-<hash>.service`
+- 取り除く: `araya discord uninstall`（state.json・台帳は残します）
+- 動作記録: `<ARAYA_DATA_DIR>/logs/discord.log` と `discord-launcher.log`
+- linger は自動変更しません。logout 後も service を動かす場合は、必要に応じて `loginctl enable-linger` を実行してください。
+
+### 任意: 1Password CLI で Discord 設定を管理する
+
+OSS の標準設定に 1Password は必要ありません。通常は `.env` に値を直接書けます。個人・組織の運用で使う場合は、`.env` にある Discord 設定値の一部または全部を 1Password の `op://` 参照にできます。ID は公開 ID ですが、必要なら参照にして構いません。
+
+```dotenv
+ARAYA_DISCORD_BOT_TOKEN=op://<vault>/<item>/<token-field>
+ARAYA_DISCORD_APPLICATION_ID=op://<vault>/<item>/<application-id-field>
+```
+
+`.env` は通常の `NAME=value` 設定として扱います。Araya は設定値から認証方式を推測しません。slash command 登録で 1Password の参照を使うときは `op run` から起動し、常駐 service でも 1Password を使う場合は install option で明示します。
+
+```sh
+data_dir="${ARAYA_DATA_DIR:-$HOME/.araya}"
+op run --env-file="$data_dir/.env" -- araya discord register
+op run --env-file="$data_dir/.env" -- araya discord install --auth-mode 1password
+```
+
+通常の `araya discord install` は `.env` file launcher を選び、1Password CLI や Service Account を必要としません。`--auth-mode 1password` を使うには、install process の環境に `OP_SERVICE_ACCOUNT_TOKEN` を設定し、1Password CLI 2.18 以降と、`.env` の参照項目を読める Service Account を用意してください。1Password mode は systemd user manager v258 以降と `systemd-creds` が必要です。古い manager では平文保存へ fallback せず、install を拒否します。
+
+install は token を `systemd-creds --user --with-key=auto encrypt` の stdin に渡し、暗号文だけを `~/.araya/op-service-account-token.cred`（file mode `0600`、directory mode `0700`）へ保存します。暗号鍵の値を `.env` や環境変数で別途与える必要はありません。`auto` では systemd が利用可能な TPM2 と永続ホスト鍵を使い、どちらも利用できない場合は暗号化に失敗して install を中止します。鍵はアプリのホーム directory には保存せず、systemd 管理下の TPM2 や root のみ読める `/var/lib/systemd/credential.secret` が使われます。したがって暗号文だけを別 host や OS 再install後へ移しても復号できるとは限りません。常駐 unit は `LoadCredentialEncrypted=` を使い、systemd が復号した credential を service 実行中に `$CREDENTIALS_DIRECTORY` の file として渡します。Service Account token は unit file、systemd control command の環境、bot process には渡しません。`op` CLI が `.env` を解決し、Discord 設定値だけを bot process の実行時環境へ渡します。
+
+旧形式の平文 source (`~/.config/araya/op-service-account-token`) が見つかった場合は、新しい unit の restart 成功後に、安全性を再確認して unlink します。安全に削除できない場合は warning を出します。unlink は媒体上の secure erase を保証するものではありません。systemd の unit 定義自体は `~/.config/systemd/user/` に置かれ、実行中の credential は systemd 管理の一時領域に置かれます。
+
+slash command の登録時は、`OP_SERVICE_ACCOUNT_TOKEN` が設定された環境から `op run` を起動し、`.env` の `op://` 参照を解決します。以下は既存の 1Password Connect/session/account 環境変数を外し、Araya process から Service Account token と systemd credential directory を除く例です。token の値をコマンド引数へ展開しません。
+
+```sh
+data_dir="${ARAYA_DATA_DIR:-$HOME/.araya}"
+env -u OP_CONNECT_HOST -u OP_CONNECT_TOKEN -u OP_SESSION -u OP_ACCOUNT \
+  op run --env-file="$data_dir/.env" -- \
+    /usr/bin/env -u OP_SERVICE_ACCOUNT_TOKEN -u CREDENTIALS_DIRECTORY \
+    araya discord register
+```
+
+手動の `araya discord run` でも `.env` の参照を使う場合は、同様に `op run --env-file="$data_dir/.env"` から起動してください。systemd service の 1Password credential 設定については、[Service Account と 1Password CLI](https://www.1password.dev/service-accounts/use-with-1password-cli) と [op run で secret を環境変数へ渡す](https://www.1password.dev/cli/secrets-environment-variables) を参照してください。
+
 ## araya を更新する
 
 ```sh

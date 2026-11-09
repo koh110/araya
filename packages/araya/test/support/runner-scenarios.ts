@@ -123,14 +123,14 @@ export function createFailingStorage(message = 'injected storage failure') {
 
   async function open(storagePath: string) {
     const storage = await openNodeSqliteStorage(storagePath)
-    const commit: Storage['commit'] = async (writes, context) => {
+    async function commit(...args: Parameters<Storage['commit']>) {
       if (inject.armed) {
         inject.armed = false
         inject.hits += 1
         throw new Error(message)
       }
 
-      return storage.commit(writes, context)
+      return storage.commit(...args)
     }
     const wrapped: Storage = new Proxy(storage, {
       get(target, property) {

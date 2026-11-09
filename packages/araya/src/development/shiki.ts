@@ -1,7 +1,7 @@
 import path from 'node:path'
 
 import type { Context } from '@earendil-works/chord'
-import { Type } from '@earendil-works/pi-ai'
+import { arr, obj, opt, str } from '@earendil-works/pi-schema'
 import { defineTool, type DocumentReader, type ToolExecutionResult } from '@earendil-works/pi-durable'
 import { createBashTool, createEditTool, createReadTool, createWriteTool } from '@earendil-works/pi-durable/tools'
 
@@ -330,9 +330,9 @@ export function createShikiTools(deps: ShikiToolDependencies) {
   const createWorktree = defineTool({
     name: CREATE_WORKTREE_TOOL_TEXT.name,
     description: CREATE_WORKTREE_TOOL_TEXT.description,
-    parameters: Type.Object({
-      repository: Type.String(CREATE_WORKTREE_TOOL_TEXT.parameters.repository),
-      base: Type.Optional(Type.String(CREATE_WORKTREE_TOOL_TEXT.parameters.base))
+    parameters: obj({
+      repository: str(CREATE_WORKTREE_TOOL_TEXT.parameters.repository),
+      base: opt(str(CREATE_WORKTREE_TOOL_TEXT.parameters.base))
     }),
     executionMode: 'sequential',
     async execute(args, api, context) {
@@ -356,10 +356,10 @@ export function createShikiTools(deps: ShikiToolDependencies) {
   const registerVerification = defineTool({
     name: REGISTER_VERIFICATION_TOOL_TEXT.name,
     description: REGISTER_VERIFICATION_TOOL_TEXT.description,
-    parameters: Type.Object({
-      repository: Type.String(REGISTER_VERIFICATION_TOOL_TEXT.parameters.repository),
-      command: Type.Array(Type.String(), REGISTER_VERIFICATION_TOOL_TEXT.parameters.command),
-      cwd: Type.Optional(Type.String(REGISTER_VERIFICATION_TOOL_TEXT.parameters.cwd))
+    parameters: obj({
+      repository: str(REGISTER_VERIFICATION_TOOL_TEXT.parameters.repository),
+      command: arr(str(), REGISTER_VERIFICATION_TOOL_TEXT.parameters.command),
+      cwd: opt(str(REGISTER_VERIFICATION_TOOL_TEXT.parameters.cwd))
     }),
     executionMode: 'sequential',
     async execute(args, api, context) {
@@ -378,8 +378,8 @@ export function createShikiTools(deps: ShikiToolDependencies) {
   const requestDecision = defineTool({
     name: REQUEST_DECISION_TOOL_TEXT.name,
     description: REQUEST_DECISION_TOOL_TEXT.description,
-    parameters: Type.Object({
-      question: Type.String(REQUEST_DECISION_TOOL_TEXT.parameters.question)
+    parameters: obj({
+      question: str(REQUEST_DECISION_TOOL_TEXT.parameters.question)
     }),
     executionMode: 'sequential',
     async execute(args, api, context) {
