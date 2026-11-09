@@ -165,7 +165,7 @@ export function isUnitFileValueSafe(value: string) {
 }
 
 // unit file の Environment= に書く変数。秘密とみなす名前と一覧に無い変数は書かない。
-// ARAYA_DATA_DIR・ARAYA_DEV_ROOT・PI_CODING_AGENT_DIR は、呼び出し側が解決した絶対 path を書く
+// ARAYA_DATA_DIR・ARAYA_DEV_ROOT・ARAYA_CODING_AGENT_DIR は、呼び出し側が解決した絶対 path を書く
 export function selectUnitEnvironment(
   env: Readonly<Record<string, string | undefined>>,
   resolved: { dataDir: string; devRoot: string; piAgentDir: string },
@@ -190,7 +190,7 @@ export function selectUnitEnvironment(
   selected.set('ARAYA_DATA_DIR', resolved.dataDir)
   selected.set('ARAYA_DEV_ROOT', resolved.devRoot)
 
-  selected.set('PI_CODING_AGENT_DIR', resolved.piAgentDir)
+  selected.set('ARAYA_CODING_AGENT_DIR', resolved.piAgentDir)
 
   const environment: UnitEnvironment = [...selected.entries()].sort(([left], [right]) => {
     return left < right ? -1 : left > right ? 1 : 0

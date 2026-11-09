@@ -60,13 +60,15 @@ async function captureConsoleLog(run: () => Promise<void>) {
   return lines.join('\n')
 }
 
-test('config: Pi agent directory is isolated from the host environment variable', () => {
+test('config: Araya Pi directory ignores the legacy host PI variable', () => {
   const config = loadConfig({
     ARAYA_DATA_DIR: '/tmp/araya-config-test',
     PI_CODING_AGENT_DIR: '/tmp/host-pi',
   })
 
   assert.equal(config.piAgentDir, '/tmp/araya-config-test/pi')
+  assert.equal(config.env.ARAYA_CODING_AGENT_DIR, config.piAgentDir)
+  assert.equal(config.env.PI_CODING_AGENT_DIR, undefined)
 })
 
 test('config: 開発 root と timeout の範囲を設定から読む', () => {
@@ -102,8 +104,11 @@ test('config: 子 process に引き継ぐ環境変数を copy として持つ', 
 
   assert.deepEqual(config.env, {
     ...env,
-    PI_CODING_AGENT_DIR: path.join(config.dataDir, 'pi'),
+    ARAYA_CODING_AGENT_DIR: path.join(config.dataDir, 'pi'),
+    ARAYA_CODING_AGENT_SESSION_DIR: undefined,
+    PI_CODING_AGENT_DIR: undefined,
     PI_CODING_AGENT_SESSION_DIR: undefined,
+    PI_PACKAGE_DIR: undefined,
   })
   assert.notEqual(config.env, env)
 })

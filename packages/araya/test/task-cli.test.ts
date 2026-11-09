@@ -22,7 +22,7 @@ async function makeTaskEnv() {
   const taskEnv: TaskEnv = {
     root,
     dataDir,
-    env: { ARAYA_DATA_DIR: dataDir, HOME: root, PI_CODING_AGENT_DIR: path.join(root, 'pi-agent') }
+    env: { ARAYA_DATA_DIR: dataDir, HOME: root, ARAYA_CODING_AGENT_DIR: path.join(root, 'pi-agent') }
   }
 
   return taskEnv

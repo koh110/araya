@@ -147,7 +147,7 @@ test('runner: completed の試行の summary・model・evidence（resumes 0, act
 
     // 別の process（araya task show）から同じ内容を読める
     const { stdout } = await execFileAsync(process.execPath, [CLI_PATH, 'task', 'show', String(taskId), '--events', '500'], {
-      env: { PATH: process.env.PATH, HOME: setup.fixture.home, ARAYA_DATA_DIR: setup.fixture.dataDir, PI_CODING_AGENT_DIR: setup.fixture.agentDir }
+      env: { PATH: process.env.PATH, HOME: setup.fixture.home, ARAYA_DATA_DIR: setup.fixture.dataDir, ARAYA_CODING_AGENT_DIR: setup.fixture.agentDir }
     })
     const output: unknown = JSON.parse(stdout)
     assert.ok(isRecord(output))
@@ -502,7 +502,7 @@ async function runTaskShow(setup: RunnerSetup, args: string[]) {
   const stdout: string[] = []
   await runCli(['task', 'show', ...args], async () => {
     throw new Error('Pi を起動しない')
-  }, { ARAYA_DATA_DIR: setup.fixture.dataDir, HOME: setup.fixture.home, PI_CODING_AGENT_DIR: setup.fixture.agentDir, ARAYA_TEST_TOKEN: SECRET }, {
+  }, { ARAYA_DATA_DIR: setup.fixture.dataDir, HOME: setup.fixture.home, ARAYA_CODING_AGENT_DIR: setup.fixture.agentDir, ARAYA_TEST_TOKEN: SECRET }, {
     platform: 'linux',
     stdin: Readable.from([]),
     stdout: (text) => stdout.push(text),

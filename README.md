@@ -32,7 +32,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ## model を選ぶ
 
-Araya 内蔵 Pi は `<ARAYA_DATA_DIR>/pi`（既定 `~/.araya/pi`）を使います。`settings.json`・`auth.json`・`models.json`・`models-store.json`・`sessions/` と Pi SDK が管理する `bin/` はこの専用 directory に置きます。standalone Pi の設定・認証は自動移行しません。継承した `PI_CODING_AGENT_DIR`・`PI_CODING_AGENT_SESSION_DIR` は内蔵 Pi の保存先に使いません。
+Araya のインストール時に内蔵 Pi の app name を `araya` に設定し、program-status の `app` も `araya` と表示します。Pi の設定・認証・session は `<ARAYA_DATA_DIR>/pi`（既定 `~/.araya/pi`）に置きます。`ARAYA_CODING_AGENT_DIR` をこの directory に設定し、旧 `PI_CODING_AGENT_DIR` は使いません。standalone Pi の設定・認証は自動移行しません。
 
 Task を動かす前に、Araya 側で SHIKI が使う model と認証を設定し直します。checkout で `araya` を引数なしで動かすと（`npm run araya`）Pi の TUI が立ちます。
 

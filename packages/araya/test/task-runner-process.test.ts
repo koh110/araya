@@ -131,7 +131,7 @@ async function runTaskShow(setup: RunnerSetup, args: string[]) {
   const stdout: string[] = []
   await runCli(['task', 'show', ...args], async () => {
     throw new Error('Pi を起動しない')
-  }, { ARAYA_DATA_DIR: setup.fixture.dataDir, HOME: setup.fixture.home, PI_CODING_AGENT_DIR: setup.fixture.agentDir }, {
+  }, { ARAYA_DATA_DIR: setup.fixture.dataDir, HOME: setup.fixture.home, ARAYA_CODING_AGENT_DIR: setup.fixture.agentDir }, {
     platform: 'linux',
     stdin: Readable.from([]),
     stdout: (text) => stdout.push(text),

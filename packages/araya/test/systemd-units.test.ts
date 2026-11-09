@@ -142,7 +142,7 @@ test('systemd-units: Environment= には一覧の変数だけを選び、秘密�
       ARAYA_TEST_TOKEN: 'not-written-token',
       ARAYA_DATA_DIR: 'relative-data',
       ARAYA_DEV_ROOT: 'relative-dev',
-      PI_CODING_AGENT_DIR: 'relative-agent',
+      ARAYA_CODING_AGENT_DIR: 'relative-agent',
       'ARAYA_BAD-NAME': 'x',
       ARAYA_UNSET: undefined,
     },
@@ -150,21 +150,21 @@ test('systemd-units: Environment= には一覧の変数だけを選び、秘密�
   )
 
   assert.deepEqual(environment, [
+    ['ARAYA_CODING_AGENT_DIR', '/abs/agent'],
     ['ARAYA_DATA_DIR', '/abs/data'],
     ['ARAYA_DEV_ROOT', '/abs/dev'],
     ['LANG', 'ja_JP.UTF-8'],
     ['LANGUAGE', 'ja'],
     ['LC_ALL', 'C.UTF-8'],
     ['PATH', '/usr/bin:/bin'],
-    ['PI_CODING_AGENT_DIR', '/abs/agent'],
     ['TZ', 'Asia/Tokyo'],
   ])
   assert.deepEqual(
     selectUnitEnvironment({}, { dataDir: '/d', devRoot: '/v', piAgentDir: '/d/pi' }),
     [
+      ['ARAYA_CODING_AGENT_DIR', '/d/pi'],
       ['ARAYA_DATA_DIR', '/d'],
       ['ARAYA_DEV_ROOT', '/v'],
-      ['PI_CODING_AGENT_DIR', '/d/pi'],
     ],
   )
 })
