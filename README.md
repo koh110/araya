@@ -147,6 +147,8 @@ ARAYA_DISCORD_ALLOWED_USER_IDS=<discord-user-id>
 
 `ARAYA_DISCORD_ALLOWED_USER_IDS` は許可する Discord user ID をカンマ区切りで指定します。例の `<...>` は実際の値に置き換えます。この `.env` は Discord 専用で、ここに示した5つ以外の設定名は受け付けません。Application/Guild/Channel/User ID は公開 ID ですが、Bot token は秘密として扱ってください。値の一部を `op://` 参照にする場合は、1Password の節も参照してください。設定後、slash command を登録して bot service を入れます。
 
+`ARAYA_DISCORD_CHANNEL_ID` は Task 通知の既定送信先です。Araya は slash command の受付 channel を制限しません。slash command は設定した Guild 内で、Discord 側が利用を許可する channel から実行できます。実行者は `ARAYA_DISCORD_ALLOWED_USER_IDS` で制限します。
+
 ```sh
 araya discord register
 araya discord install

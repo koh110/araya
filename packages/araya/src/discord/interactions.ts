@@ -368,11 +368,10 @@ function redactReplies(replies: CommandReply[], redactor: Redactor) {
 export function handleDiscordCommand(request: DiscordCommandRequest, deps: CommandHandlerDeps) {
   if (
     request.guildId !== deps.config.guildId ||
-    request.channelId !== deps.config.channelId ||
     !deps.config.allowedUserIds.includes(request.userId)
   ) {
     return redactReplies(
-      [{ content: 'この操作は、設定された channel と許可された user だけが使えます' }],
+      [{ content: 'この操作は、設定された guild 内で許可された user だけが使えます' }],
       deps.redactor,
     )
   }

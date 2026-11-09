@@ -96,16 +96,21 @@ function replyAt(replies: string[], index: number) {
   return reply
 }
 
-test('discord-interactions: 設定した guild・channel・user の外は reply しない', async () => {
+test('discord-interactions: 設定した guild・user の外は reply しない', async () => {
   await withEnv(({ replies }) => {
-    const boundary = 'この操作は、設定された channel と許可された user だけが使えます'
+    const boundary = 'この操作は、設定された guild 内で許可された user だけが使えます'
 
     assert.deepEqual(replies('list', {}, { guildId: '99999999999999999' }), [boundary])
-    assert.deepEqual(replies('list', {}, { channelId: '99999999999999999' }), [boundary])
     assert.deepEqual(replies('list', {}, { userId: '99999999999999999' }), [boundary])
     assert.deepEqual(replies('unknown'), [
       '知らない subcommand です（list・show・submit・cancel・retry）',
     ])
+  })
+})
+
+test('discord-interactions: 設定 channel 以外でも command を実行する', async () => {
+  await withEnv(({ replies }) => {
+    assert.match(replies('list', {}, { channelId: '99999999999999999' })[0] ?? '', /^runner:/u)
   })
 })
 

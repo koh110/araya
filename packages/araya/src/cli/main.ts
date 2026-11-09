@@ -89,7 +89,8 @@ function printHelp() {
   /araya submit <title> <goal> [targets] [constraints] [permissions]: Task を登録する（targets・constraints・permissions はカンマ区切り）。
   /araya cancel <task>: 中止を求める。/araya retry <task> [note] [confirm_side_effects]: 終わった Task の再実行を求める。
   外部 branch・Draft PR が作成された可能性がある Task の retry は、confirm_side_effects を認めてから実行する。
-  通知は Task 登録・再実行・中止・実行の開始・再開・終了だけ channel に出す。
+  通知は Task 登録・再実行・中止・実行の開始・再開・終了だけ ARAYA_DISCORD_CHANNEL_ID の既定送信先に出す。
+  slash command の受付 channel は絞らない。設定した Guild 内で、Discord 側が許可する channel から実行できる。
 
   araya task と araya runner と araya discord は Linux と systemd（254 以降）の user manager が必要。
 
