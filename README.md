@@ -152,6 +152,8 @@ araya discord register
 araya discord install
 ```
 
+Task 操作の slash command は CLI と同じ階層です。`/araya task list`・`/araya task show`・`/araya task submit`・`/araya task cancel`・`/araya task retry` を使います。command 定義を変更した後は `araya discord register` を再実行して Discord 側を更新します。
+
 `.env` の値を後から変更した場合は、既存の Discord unit を再起動して読み直します。`araya discord install` を再実行すれば、設定を再検証して unit の再起動まで行います。
 
 ```sh

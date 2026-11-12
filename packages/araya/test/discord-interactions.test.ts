@@ -6,7 +6,11 @@ import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 
 import { createRedactor } from '../src/infrastructure/redaction.ts'
-import { handleDiscordCommand, type DiscordCommandRequest } from '../src/discord/interactions.ts'
+import {
+  discordCommandDefinitionJson,
+  handleDiscordCommand,
+  type DiscordCommandRequest,
+} from '../src/discord/interactions.ts'
 import { MAX_DISCORD_MESSAGE_CHARS } from '../src/discord/render.ts'
 import { openTaskLedger, type TaskLedger } from '../src/runner/ledger.ts'
 
@@ -24,6 +28,29 @@ const CONFIG = {
   channelId: CHANNEL_ID,
   allowedUserIds: [USER_ID],
 } as const
+
+test('discord command definition: Task operations are nested under /araya task', () => {
+  const command = discordCommandDefinitionJson()[0]
+
+  assert.ok(command)
+  assert.deepEqual(
+    command.options.map((option) => {
+      return option.name
+    }),
+    ['task'],
+  )
+
+  const taskGroup = command.options[0]
+
+  assert.ok(taskGroup)
+  assert.equal(taskGroup.type, 2)
+  assert.deepEqual(
+    taskGroup.options.map((option) => {
+      return option.name
+    }),
+    ['list', 'show', 'submit', 'cancel', 'retry'],
+  )
+})
 
 type Env = {
   dataDir: string
@@ -54,6 +81,7 @@ async function makeEnv() {
         userId: USER_ID,
         guildId: GUILD_ID,
         channelId: CHANNEL_ID,
+        subcommandGroup: 'task',
         subcommand,
         options,
         ...overrides,
@@ -103,8 +131,17 @@ test('discord-interactions: 設定した guild・user の外は reply しない'
     assert.deepEqual(replies('list', {}, { guildId: '99999999999999999' }), [boundary])
     assert.deepEqual(replies('list', {}, { userId: '99999999999999999' }), [boundary])
     assert.deepEqual(replies('unknown'), [
-      '知らない subcommand です（list・show・submit・cancel・retry）',
+      '知らない command です（/araya task list・show・submit・cancel・retry）',
     ])
+  })
+})
+
+test('discord-interactions: Task commands require the task slash-command group', async () => {
+  await withEnv(({ replies }) => {
+    assert.deepEqual(replies('list', {}, { subcommandGroup: null }), [
+      '知らない command です（/araya task list・show・submit・cancel・retry）',
+    ])
+    assert.match(replyAt(replies('list'), 0), /^runner:/u)
   })
 })
 
@@ -213,6 +250,7 @@ test('discord-interactions: submit は option を台帳の Task にする。同�
       userId: USER_ID,
       guildId: GUILD_ID,
       channelId: CHANNEL_ID,
+      subcommandGroup: 'task',
       subcommand: 'submit',
       options: { title: '違う title', goal: 'goal' },
     }
@@ -375,6 +413,7 @@ test('discord-interactions: retry は開始後に中断した試行の side effe
           userId: USER_ID,
           guildId: GUILD_ID,
           channelId: CHANNEL_ID,
+          subcommandGroup: 'task',
           subcommand,
           options,
         },
@@ -421,7 +460,7 @@ test('discord-interactions: retry は開始後に中断した試行の side effe
 
     assert.match(reply, /Task #1/u, reply)
     assert.match(reply, /記録された worktree: 1 件/u, reply)
-    assert.match(reply, /\/araya retry/u, reply)
+    assert.match(reply, /\/araya task retry/u, reply)
     assert.match(reply, /task=1/u, reply)
     assert.match(reply, /confirm_side_effects=true/u, reply)
     assert.doesNotMatch(reply, /araya task remove/u, reply)

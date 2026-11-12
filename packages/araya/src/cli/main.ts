@@ -72,7 +72,7 @@ function printHelp() {
   araya discord init
     <ARAYA_DATA_DIR>/.env（既定: ~/.araya/.env）を mode 0600 で作る。既存 file は上書きしない。
   araya discord register
-    slash command（/araya list・show・submit・cancel・retry）を Discord の guild に登録する。.env または環境変数の設定が必要。
+    slash command（/araya task list・show・submit・cancel・retry）を Discord の guild に登録する。.env または環境変数の設定が必要。
     1Password の op:// 参照を使う場合は、op run で解決してから実行する（README参照）。
   araya discord install [--auth-mode env-file|1password]
     Discord bot を常駐の process（araya-discord-<hash>.service）として入れる。unit file を書き、有効にして起動し直す。
@@ -85,9 +85,9 @@ function printHelp() {
     unit 稼働の確かめをせず、foreground で Discord bot を 1 度動かす（試験起動）。Ctrl+C で止める。
     1Password の op:// 参照を使う場合は op run で設定を解決してから実行する。
 
-  /araya list: Task 一覧と runner の状態。/araya show <task>: Task の詳細（SHIKI の要約と途中経過）。
-  /araya submit <title> <goal> [targets] [constraints] [permissions]: Task を登録する（targets・constraints・permissions はカンマ区切り）。
-  /araya cancel <task>: 中止を求める。/araya retry <task> [note] [confirm_side_effects]: 終わった Task の再実行を求める。
+  /araya task list: Task 一覧と runner の状態。/araya task show <task>: Task の詳細（SHIKI の要約と途中経過）。
+  /araya task submit <title> <goal> [targets] [constraints] [permissions]: Task を登録する（targets・constraints・permissions はカンマ区切り）。
+  /araya task cancel <task>: 中止を求める。/araya task retry <task> [note] [confirm_side_effects]: 終わった Task の再実行を求める。
   外部 branch・Draft PR が作成された可能性がある Task の retry は、confirm_side_effects を認めてから実行する。
   通知は Task 登録・再実行・中止・実行の開始・再開・終了だけ ARAYA_DISCORD_CHANNEL_ID の既定送信先に出す。
   slash command の受付 channel は絞らない。設定した Guild 内で、Discord 側が許可する channel から実行できる。
