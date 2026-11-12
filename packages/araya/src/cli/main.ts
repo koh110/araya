@@ -101,9 +101,8 @@ function printHelp() {
 
 内蔵 Pi の設定:
   <ARAYA_DATA_DIR>/pi（既定: ~/.araya/pi）に settings.json・auth.json・models.json・models-store.json・sessions/・Pi SDK が管理する bin/ を置く。
-  Pi SDK は ARAYA_CODING_AGENT_DIR を使い、旧 PI_CODING_AGENT_DIR・PI_CODING_AGENT_SESSION_DIR は使わない。
-  standalone Pi の認証は自動移行しない。araya 側で /login と /model を設定する。
-  旧 directory を記録した running 試行は attempt_error で失敗する。設定後、新規 retry が必要。
+  Pi SDK は ARAYA_CODING_AGENT_DIR を使う。
+  araya 側で /login と /model を設定する。
 
 環境変数:
   ARAYA_DATA_DIR

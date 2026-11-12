@@ -1,6 +1,6 @@
 # Task の台帳と SHIKI の実行
 
-内蔵 Pi の設定・認証・session は `<dataDir>/pi`（既定 `~/.araya/pi`）に隔離します。`settings.json`・`auth.json`・`models.json`・`models-store.json`・`sessions/`・Pi SDK が管理する `bin/` はここに置き、runner の model cache は既存の `<dataDir>/runner/models-store.json` を維持します。host Pi からの fallback・copy・migration・symlink は追加しません。Araya 側の TUI（`araya` または `araya pi`）で `/login` と `/model` を設定し直してください。Araya 自身の `config.json`・台帳・runner storage の配置、既存 config の model は変更しません。旧 host agentDir を保存した running 試行は、再開前に host 設定を読まず既存の `attempt_error` で失敗させます。保存済み入力は書き換えず、再設定後の新規 retry を必要とします。DB schema 変更・rewrite・migration は行いません。
+内蔵 Pi の設定・認証・session は `<dataDir>/pi`（既定 `~/.araya/pi`）に置きます。`settings.json`・`auth.json`・`models.json`・`models-store.json`・`sessions/`・Pi SDK が管理する `bin/` はここに置き、runner の model cache は `<dataDir>/runner/models-store.json` に置きます。Araya 側の TUI（`araya` または `araya pi`）で `/login` と `/model` を設定します。
 
 ## 位置づけ
 
@@ -237,7 +237,7 @@ WantedBy=default.target
 - `Environment=` は1変数に1行。`araya runner install` を実行した process の環境変数のうち、次だけを書く。値は unit file と `systemctl --user show` に出るため、秘密を書かない（「秘密情報の扱い」）。
   - `PATH`、`LANG`、`LANGUAGE`、`TZ`、名前が `LC_` で始まるもの
   - 名前が `ARAYA_` で始まり、秘密とみなす名前（「秘密情報の扱い」）に当たらないもの。ただし `ARAYA_DATA_DIR` と `ARAYA_DEV_ROOT` は、`loadConfig` で解決した絶対 path にして書く（環境変数に無くても書く）。`loadConfig` は相対 path を process の cwd を基準に解決するため、そのまま書くと、cwd の違う runner が別の台帳や開発 root を使ってしまう。
-  - `ARAYA_CODING_AGENT_DIR`（常に `<dataDir>/pi` の絶対 path に正規化し、host の指定は継承しない）。旧 `PI_CODING_AGENT_DIR` は書かない
+  - `ARAYA_CODING_AGENT_DIR`（常に `<dataDir>/pi` の絶対 path に正規化し、host の指定は継承しない）
   - これ以外（`HOME`、`XDG_RUNTIME_DIR` など）は、systemd の user manager の環境になる。
 - unit file では、`%` が specifier として、`ExecStart` などの `$` が変数として展開され、空白や引用符にも意味がある。escape の処理を作らないため、unit file に書く値（node の実行ファイル、entrypoint、dataDir、systemctl の path、`Environment=` の値）のどれかが、ASCII の制御文字、空白、`"`、`'`、`\`、`$`、`%`、`;` を含むときは、unit file を書かずに `unsupported_path` で失敗する（stderr にどの値かを出す）。環境変数は、名前が `^[A-Za-z_][A-Za-z0-9_]*$` に当たるものだけを書く。
 - `StartLimitIntervalSec=0` で、systemd は起動し直す回数を制限しない。`RestartSteps` と `RestartMaxDelaySec` で、起動し直すまでの間隔を 1 秒から 1 分まで伸ばす。くり返し落ちる試行は、systemd ではなく pi-durable の restartLimit で止める（「落ちたとき」）。

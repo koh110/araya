@@ -32,16 +32,14 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ## model を選ぶ
 
-Araya のインストール時に内蔵 Pi の app name を `araya` に設定し、program-status の `app` も `araya` と表示します。Pi の設定・認証・session は `<ARAYA_DATA_DIR>/pi`（既定 `~/.araya/pi`）に置きます。`ARAYA_CODING_AGENT_DIR` をこの directory に設定し、旧 `PI_CODING_AGENT_DIR` は使いません。standalone Pi の設定・認証は自動移行しません。
+Araya のインストール時に内蔵 Pi の app name を `araya` に設定し、program-status の `app` も `araya` と表示します。Pi の設定・認証・session は `<ARAYA_DATA_DIR>/pi`（既定 `~/.araya/pi`）に置きます。Araya は内蔵 Pi の `ARAYA_CODING_AGENT_DIR` をこの directory に設定します。
 
-Task を動かす前に、Araya 側で SHIKI が使う model と認証を設定し直します。checkout で `araya` を引数なしで動かすと（`npm run araya`）Pi の TUI が立ちます。
+Task を動かす前に、SHIKI が使う model と認証を Araya 側で設定します。checkout で `araya` を引数なしで動かすと（`npm run araya`）Pi の TUI が立ちます。
 
 1. `/login` で provider に接続する
 2. `/model` で model を選び、既定として保存する
 
-旧 host directory を記録した既存の running 試行は、再開時に host 設定を読まず `failed`（`attempt_error`）になります。Araya 側で `/login` と `/model` を設定してから新規 retry してください。保存済みの試行入力・DB schema は変更しません。Araya 自身の `config.json`・台帳・runner storage の場所も変わりません。
-
-この状態で `npm run deploy`（または `araya runner install`）を実行すると、araya はその既定 model を設定ファイル `<dataDir>/config.json`（既定 `~/.araya/config.json`）に保存します。保存するのは設定ファイルが無いときだけです。認証情報は写さず、API は呼ばず、既存の設定ファイルは変更しません。
+これで `npm run deploy`（または `araya runner install`）を実行すると、araya はその既定 model を設定ファイル `<dataDir>/config.json`（既定 `~/.araya/config.json`）に保存します。保存するのは設定ファイルが無いときだけです。認証情報は写さず、API は呼ばず、既存の設定ファイルは変更しません。
 
 設定ファイルは自分で書くこともできます。
 
