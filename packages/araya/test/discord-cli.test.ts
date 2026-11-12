@@ -77,7 +77,7 @@ async function makeInstallEnv() {
     ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
     ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
     [OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME]: SERVICE_ACCOUNT_TOKEN,
-    PI_CODING_AGENT_DIR: piAgentDir,
+    ARAYA_CODING_AGENT_DIR: piAgentDir,
   }
 
   return {
@@ -784,10 +784,10 @@ test('discord install: 暗号化 credential と LoadCredentialEncrypted を使�
         `ExecStart=${NODE_PATH} ${installEnv.opRunnerEntrypoint} --data-dir ${dataDirReal} --op-path ${installEnv.opPath}`,
         `LoadCredentialEncrypted=op-service-account-token:${installEnv.opTokenFile}`,
         `WorkingDirectory=${dataDirReal}`,
+        `Environment=ARAYA_CODING_AGENT_DIR=${installEnv.piAgentDir}`,
         `Environment=ARAYA_DATA_DIR=${dataDirReal}`,
         `Environment=ARAYA_DEV_ROOT=${installEnv.devRoot}`,
         'Environment=PATH=/usr/bin:/bin',
-        `Environment=PI_CODING_AGENT_DIR=${installEnv.piAgentDir}`,
         'KillMode=control-group',
         'Restart=always',
         'RestartSec=1s',

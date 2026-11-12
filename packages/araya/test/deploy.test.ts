@@ -445,7 +445,7 @@ async function runDeployWithRealAraya(fixture: DeployFixture, cliPath: string | 
       PATH: [systemdDir, fixture.originalPath].join(':'),
       DEPLOY_TEST_ARAYA: realAraya,
       ARAYA_DATA_DIR: path.join(fixture.root, 'data'),
-      PI_CODING_AGENT_DIR: path.join(fixture.root, 'pi-agent'),
+      ARAYA_CODING_AGENT_DIR: path.join(fixture.root, 'pi-agent'),
       XDG_CONFIG_HOME: configHome,
       XDG_RUNTIME_DIR: runtimeDir,
     },

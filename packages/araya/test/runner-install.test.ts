@@ -42,7 +42,7 @@ async function makeInstallEnv() {
     XDG_CONFIG_HOME: configHome,
     ARAYA_DATA_DIR: dataDir,
     ARAYA_DEV_ROOT: devRoot,
-    PI_CODING_AGENT_DIR: piAgentDir
+    ARAYA_CODING_AGENT_DIR: piAgentDir
   }
 
   return { root, dataDir, devRoot, home, configHome, entrypoint, env }
@@ -194,10 +194,10 @@ test('runner install: unit file を mode 0600 で書き、daemon-reload・enable
       entrypoint: installEnv.entrypoint,
       systemctlPath: fake.ops.systemctlPath,
       environment: [
+        ['ARAYA_CODING_AGENT_DIR', path.join(installEnv.dataDir, 'pi')],
         ['ARAYA_DATA_DIR', installEnv.dataDir],
         ['ARAYA_DEV_ROOT', installEnv.devRoot],
-        ['PATH', '/usr/bin:/bin'],
-        ['PI_CODING_AGENT_DIR', path.join(installEnv.dataDir, 'pi')]
+        ['PATH', '/usr/bin:/bin']
       ]
     }))
     assert.equal((await fs.stat(unitPath)).mode & 0o777, 0o600)
@@ -257,10 +257,10 @@ test('runner install: Pi の明示的な default model があれば config.json 
   }
 })
 
-test('runner install: PI_CODING_AGENT_DIR 未指定時も Araya 専用 settings.json を使う', async () => {
+test('runner install: ARAYA_CODING_AGENT_DIR 未指定時も Araya 専用 settings.json を使う', async () => {
   const installEnv = await makeInstallEnv()
   const env = { ...installEnv.env }
-  delete env.PI_CODING_AGENT_DIR
+  delete env.ARAYA_CODING_AGENT_DIR
   const settingsPath = path.join(installEnv.home, '.pi', 'agent', 'settings.json')
   await fs.mkdir(path.dirname(settingsPath), { recursive: true })
   await fs.writeFile(settingsPath, JSON.stringify({ defaultProvider: 'faux', defaultModel: 'home-model' }), 'utf8')
@@ -317,10 +317,10 @@ test('runner install: host の指定を無視して専用 settings から初期�
   await fs.writeFile(path.join(hostPi, 'settings.json'), hostSettings)
   const fake = createFakeSystemd({ systemctl: defaultSystemctl(installEnv), loginctl: async () => commandResult('yes\n') })
   try {
-    await runRunner({ ...installEnv, env: { ...installEnv.env, PI_CODING_AGENT_DIR: hostPi, PI_CODING_AGENT_SESSION_DIR: path.join(hostPi, 'sessions') } }, ['install'], fake)
+    await runRunner({ ...installEnv, env: { ...installEnv.env, ARAYA_CODING_AGENT_DIR: hostPi, PI_CODING_AGENT_SESSION_DIR: path.join(hostPi, 'sessions') } }, ['install'], fake)
     assert.deepEqual(JSON.parse(await fs.readFile(path.join(installEnv.dataDir, 'config.json'), 'utf8')), { development: { model: 'faux/test-model' } })
     const unit = await fs.readFile(unitPathOf(installEnv, unitOf(await fs.realpath(installEnv.dataDir))), 'utf8')
-    assert.ok(unit.includes(`Environment=PI_CODING_AGENT_DIR=${path.join(installEnv.dataDir, 'pi')}`))
+    assert.ok(unit.includes(`Environment=ARAYA_CODING_AGENT_DIR=${path.join(installEnv.dataDir, 'pi')}`))
     assert.equal(unit.includes(hostPi), false)
     assert.equal(unit.includes('PI_CODING_AGENT_SESSION_DIR'), false)
     assert.deepEqual(await fs.readFile(path.join(hostPi, 'settings.json')), hostSettings)
@@ -355,7 +355,7 @@ test('runner install: Pi に明示的な default model がなければ config.js
   }
 })
 
-test('runner install: 相対 path の ARAYA_DATA_DIR・ARAYA_DEV_ROOT・PI_CODING_AGENT_DIR は、dataDir と違う cwd から実行しても絶対 path で書く', async () => {
+test('runner install: 相対 path の ARAYA_DATA_DIR・ARAYA_DEV_ROOT・ARAYA_CODING_AGENT_DIR は、dataDir と違う cwd から実行しても絶対 path で書く', async () => {
   const installEnv = await makeInstallEnv()
   const work = path.join(installEnv.root, 'work')
   await fs.mkdir(work)
@@ -366,7 +366,7 @@ test('runner install: 相対 path の ARAYA_DATA_DIR・ARAYA_DEV_ROOT・PI_CODIN
     process.chdir(work)
     await runRunner({
       ...installEnv,
-      env: { ...installEnv.env, ARAYA_DATA_DIR: '../data', ARAYA_DEV_ROOT: '../dev', PI_CODING_AGENT_DIR: '../pi-agent' }
+      env: { ...installEnv.env, ARAYA_DATA_DIR: '../data', ARAYA_DEV_ROOT: '../dev', ARAYA_CODING_AGENT_DIR: '../pi-agent' }
     }, ['install'], fake)
     process.chdir(previousCwd)
     const dataDirReal = await fs.realpath(installEnv.dataDir)
@@ -375,10 +375,10 @@ test('runner install: 相対 path の ARAYA_DATA_DIR・ARAYA_DEV_ROOT・PI_CODIN
     assert.ok(unitFile.includes(`\nExecStart=${NODE_PATH} ${installEnv.entrypoint} --data-dir ${dataDirReal}\n`), unitFile)
     assert.ok(unitFile.includes(`\nWorkingDirectory=${dataDirReal}\n`), unitFile)
     assert.deepEqual(environmentLines(unitFile), [
+      `Environment=ARAYA_CODING_AGENT_DIR=${path.join(installEnv.dataDir, 'pi')}`,
       `Environment=ARAYA_DATA_DIR=${installEnv.dataDir}`,
       `Environment=ARAYA_DEV_ROOT=${installEnv.devRoot}`,
-      'Environment=PATH=/usr/bin:/bin',
-      `Environment=PI_CODING_AGENT_DIR=${path.join(installEnv.dataDir, 'pi')}`
+      'Environment=PATH=/usr/bin:/bin'
     ])
   } finally {
     process.chdir(previousCwd)
@@ -408,12 +408,12 @@ test('runner install: 秘密とみなす名前の変数と一覧に無い変数�
     const unitFile = await fs.readFile(unitPathOf(installEnv, unitOf(await fs.realpath(installEnv.dataDir))), 'utf8')
 
     assert.deepEqual(environmentLines(unitFile), [
+      `Environment=ARAYA_CODING_AGENT_DIR=${path.join(installEnv.dataDir, 'pi')}`,
       `Environment=ARAYA_DATA_DIR=${installEnv.dataDir}`,
       `Environment=ARAYA_DEV_ROOT=${installEnv.devRoot}`,
       'Environment=LANG=ja_JP.UTF-8',
       'Environment=LC_ALL=C.UTF-8',
       'Environment=PATH=/usr/bin:/bin',
-      `Environment=PI_CODING_AGENT_DIR=${path.join(installEnv.dataDir, 'pi')}`,
       'Environment=TZ=Asia/Tokyo'
     ])
 

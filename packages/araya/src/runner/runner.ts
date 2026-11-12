@@ -320,8 +320,11 @@ export async function runTaskRunner(deps: RunnerDependencies) {
       ...loadedConfig,
       env: {
         ...withoutDiscordEnvironment(loadedConfig.env),
-        PI_CODING_AGENT_DIR: loadedConfig.piAgentDir,
+        ARAYA_CODING_AGENT_DIR: loadedConfig.piAgentDir,
+        ARAYA_CODING_AGENT_SESSION_DIR: undefined,
+        PI_CODING_AGENT_DIR: undefined,
         PI_CODING_AGENT_SESSION_DIR: undefined,
+        PI_PACKAGE_DIR: undefined,
       },
     }
   } catch (error) {

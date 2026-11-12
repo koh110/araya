@@ -26,7 +26,7 @@ function numberFromEnv(
   return Math.min(options.maximum ?? Number.MAX_SAFE_INTEGER, bounded)
 }
 
-// SDK は process.env を実行時と import 時の両方で読む。import 時の保存先を固定するので、最初の import を Araya の環境内で行う。
+// SDK は process.env を実行時と import 時の両方で読む。最初の import 前に Araya 用の環境変数を設定する。
 let piEnvironmentActive = false
 let piSdkModule: Promise<typeof import('@earendil-works/pi-coding-agent')> | undefined
 
@@ -37,13 +37,15 @@ export async function withPiEnvironment<T>(agentDir: string, start: () => Promis
 
   piEnvironmentActive = true
   const previous = {
-    PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
-    PI_CODING_AGENT_SESSION_DIR: process.env.PI_CODING_AGENT_SESSION_DIR,
+    ARAYA_CODING_AGENT_DIR: process.env.ARAYA_CODING_AGENT_DIR,
+    ARAYA_CODING_AGENT_SESSION_DIR: process.env.ARAYA_CODING_AGENT_SESSION_DIR,
+    PI_PACKAGE_DIR: process.env.PI_PACKAGE_DIR,
   }
 
   try {
-    process.env.PI_CODING_AGENT_DIR = agentDir
-    delete process.env.PI_CODING_AGENT_SESSION_DIR
+    process.env.ARAYA_CODING_AGENT_DIR = agentDir
+    delete process.env.ARAYA_CODING_AGENT_SESSION_DIR
+    delete process.env.PI_PACKAGE_DIR
     return await start()
   } finally {
     for (const [name, value] of Object.entries(previous)) {
@@ -107,8 +109,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     // araya task・araya runner の command が使う環境変数（unit file に書く変数の選別、秘密の値の置き換え）
     env: {
       ...env,
-      PI_CODING_AGENT_DIR: path.join(dataDir, 'pi'),
+      ARAYA_CODING_AGENT_DIR: path.join(dataDir, 'pi'),
+      ARAYA_CODING_AGENT_SESSION_DIR: undefined,
+      PI_CODING_AGENT_DIR: undefined,
       PI_CODING_AGENT_SESSION_DIR: undefined,
+      PI_PACKAGE_DIR: undefined,
     },
   }
 }

@@ -38,39 +38,75 @@ function readSettings(dataDir: string, taskId: number) {
   }
 }
 
-test('Pi isolation: SDK main environment uses dedicated directory and restores unset, empty and set values after success and failure', async () => {
-  const originalAgent = process.env.PI_CODING_AGENT_DIR
-  const originalSession = process.env.PI_CODING_AGENT_SESSION_DIR
+test('Pi branding: program status uses the Araya app name', async () => {
+  const sdkEntry = import.meta.resolve('@earendil-works/pi-coding-agent')
+  const { APP_NAME, ENV_AGENT_DIR } = await import(fileURLToPath(new URL('./config.js', sdkEntry)))
+  const { ProgramStatusReporter } = await import(
+    fileURLToPath(new URL('./modes/interactive/program-status-reporter.js', sdkEntry))
+  )
+  const reports: unknown[] = []
+
+  new ProgramStatusReporter(
+    () => {
+      return {
+        setProgramStatus: (status: unknown) => {
+          reports.push(status)
+        },
+      }
+    },
+    () => {
+      return 'session'
+    },
+  ).reset()
+  assert.equal(APP_NAME, 'araya')
+  assert.equal(ENV_AGENT_DIR, 'ARAYA_CODING_AGENT_DIR')
+  assert.deepEqual(reports.at(-1), { state: 'idle', app: 'araya' })
+})
+
+function readPiEnvironment() {
+  return Object.fromEntries(
+    ['ARAYA_CODING_AGENT_DIR', 'ARAYA_CODING_AGENT_SESSION_DIR', 'PI_PACKAGE_DIR'].map((name) => {
+      return [name, process.env[name]]
+    }),
+  )
+}
+
+test('Pi isolation: SDK uses Araya directory and restores environment after success and failure', async () => {
+  const original = readPiEnvironment()
+
   try {
-    for (const previous of [undefined, '', '/tmp/standalone-pi']) {
-      if (previous === undefined) {
-        delete process.env.PI_CODING_AGENT_DIR
-        delete process.env.PI_CODING_AGENT_SESSION_DIR
-      } else {
-        process.env.PI_CODING_AGENT_DIR = previous
-        process.env.PI_CODING_AGENT_SESSION_DIR = previous
-      }
-      for (const fail of [false, true]) {
-        const call = withPiEnvironment('/tmp/araya-data/pi', async () => {
-          assert.equal(getAgentDir(), '/tmp/araya-data/pi')
-          assert.equal(process.env.PI_CODING_AGENT_SESSION_DIR, undefined)
-          await assert.rejects(withPiEnvironment('/tmp/other/pi', async () => {}), /already active/u)
-          assert.equal(getAgentDir(), '/tmp/araya-data/pi')
-          if (fail) {
-            throw new Error('faux SDK failure')
-          }
+    for (const fail of [false, true]) {
+      Object.assign(process.env, {
+        ARAYA_CODING_AGENT_DIR: '/tmp/host-araya',
+        ARAYA_CODING_AGENT_SESSION_DIR: '/tmp/host-sessions',
+        PI_PACKAGE_DIR: '/tmp/host-package',
+      })
+      const call = withPiEnvironment('/tmp/araya-data/pi', async () => {
+        assert.equal(getAgentDir(), '/tmp/araya-data/pi')
+        assert.deepEqual(readPiEnvironment(), {
+          ARAYA_CODING_AGENT_DIR: '/tmp/araya-data/pi',
+          ARAYA_CODING_AGENT_SESSION_DIR: undefined,
+          PI_PACKAGE_DIR: undefined,
         })
+        await assert.rejects(withPiEnvironment('/tmp/other/pi', async () => {}), /already active/u)
         if (fail) {
-          await assert.rejects(call, /faux SDK failure/u)
-        } else {
-          await call
+          throw new Error('faux SDK failure')
         }
-        assert.equal(process.env.PI_CODING_AGENT_DIR, previous)
-        assert.equal(process.env.PI_CODING_AGENT_SESSION_DIR, previous)
+      })
+
+      if (fail) {
+        await assert.rejects(call, /faux SDK failure/u)
+      } else {
+        await call
       }
+      assert.deepEqual(readPiEnvironment(), {
+        ARAYA_CODING_AGENT_DIR: '/tmp/host-araya',
+        ARAYA_CODING_AGENT_SESSION_DIR: '/tmp/host-sessions',
+        PI_PACKAGE_DIR: '/tmp/host-package',
+      })
     }
   } finally {
-    for (const [name, value] of Object.entries({ PI_CODING_AGENT_DIR: originalAgent, PI_CODING_AGENT_SESSION_DIR: originalSession })) {
+    for (const [name, value] of Object.entries(original)) {
       if (value === undefined) {
         delete process.env[name]
       } else {
@@ -87,8 +123,11 @@ test('Pi isolation: default, empty, relative and custom dataDir ignore host PI_*
       const expected = path.resolve(dataDir || '/tmp/araya-faux-home/.araya')
       assert.equal(config.dataDir, expected)
       assert.equal(config.piAgentDir, path.join(expected, 'pi'))
-      assert.equal(config.env.PI_CODING_AGENT_DIR, config.piAgentDir)
+      assert.equal(config.env.ARAYA_CODING_AGENT_DIR, config.piAgentDir)
+      assert.equal(config.env.ARAYA_CODING_AGENT_SESSION_DIR, undefined)
+      assert.equal(config.env.PI_CODING_AGENT_DIR, undefined)
       assert.equal(config.env.PI_CODING_AGENT_SESSION_DIR, undefined)
+      assert.equal(config.env.PI_PACKAGE_DIR, undefined)
       assert.equal(config.configPath, path.join(expected, 'config.json'))
     }
   }
@@ -229,8 +268,8 @@ test('Pi isolation: runner records dedicated agentDir and normalizes child envir
   let childSessionDir: string | undefined = 'not-checked'
   let runtimeAgentDir: string | undefined
   const runner = startRunner(setup, { createSystemdOps: async (env) => {
-    childAgentDir = env.PI_CODING_AGENT_DIR
-    childSessionDir = env.PI_CODING_AGENT_SESSION_DIR
+    childAgentDir = env.ARAYA_CODING_AGENT_DIR
+    childSessionDir = env.ARAYA_CODING_AGENT_SESSION_DIR
     return setup.systemd.ops
   }, createModels: async ({ agentDir }) => {
     runtimeAgentDir = agentDir

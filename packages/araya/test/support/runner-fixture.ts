@@ -54,7 +54,7 @@ export async function createRunnerFixture(extraEnv: Record<string, string> = {})
     GIT_AUTHOR_EMAIL: 'a@e.io',
     GIT_COMMITTER_NAME: 'Araya',
     GIT_COMMITTER_EMAIL: 'a@e.io',
-    PI_CODING_AGENT_DIR: agentDir,
+    ARAYA_CODING_AGENT_DIR: agentDir,
     ...extraEnv
   }
 

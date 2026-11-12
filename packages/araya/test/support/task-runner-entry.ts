@@ -29,10 +29,10 @@ const workDirArg = values['work-dir']
 const fault = values.fault
 const verifyUnit = values['verify-unit'] === true
 const restartLimit = values['restart-limit'] === undefined ? undefined : Number(values['restart-limit'])
-const agentDir = process.env.PI_CODING_AGENT_DIR
+const agentDir = process.env.ARAYA_CODING_AGENT_DIR
 
 if (dataDirArg === undefined || workDirArg === undefined || agentDir === undefined) {
-  console.error('--data-dir、--work-dir と PI_CODING_AGENT_DIR が必要です')
+  console.error('--data-dir、--work-dir と ARAYA_CODING_AGENT_DIR が必要です')
   process.exit(2)
 }
 

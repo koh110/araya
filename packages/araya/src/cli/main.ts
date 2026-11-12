@@ -62,7 +62,7 @@ function printHelp() {
     unit file を書き、有効にして起動し直す。linger は変えない（無効なら logout で runner が止まり、次に起動したときに続きから進む）。
     <dataDir>/config.json が無ければ、<dataDir>/pi/settings.json に defaultProvider と defaultModel が両方ある場合だけ model を初期設定する（thinkingLevel・認証情報は写さない）。
     既存 config は変更せず、default が足りなければ warning を出して続ける。npm run deploy もこの処理を行う。
-    unit file に書く環境変数は PATH・LANG・LANGUAGE・TZ・LC_*・ARAYA_*（秘密とみなす名前を除く）・PI_CODING_AGENT_DIR だけ。
+    unit file に書く環境変数は PATH・LANG・LANGUAGE・TZ・LC_*・秘密を除いた ARAYA_* だけ。
     環境変数を変えたときは、やり直す（npm run deploy は、araya を入れた後にこれを実行する）。ARAYA_DATA_DIR を変えると別の runner になる
     （前の runner を残さないときは、先に前の ARAYA_DATA_DIR で araya runner uninstall を実行する）。
 
@@ -101,9 +101,8 @@ function printHelp() {
 
 内蔵 Pi の設定:
   <ARAYA_DATA_DIR>/pi（既定: ~/.araya/pi）に settings.json・auth.json・models.json・models-store.json・sessions/・Pi SDK が管理する bin/ を置く。
-  継承した PI_CODING_AGENT_DIR・PI_CODING_AGENT_SESSION_DIR は保存先として使わない。
-  standalone Pi の認証は自動移行しない。araya 側で /login と /model を設定する。
-  旧 directory を記録した running 試行は attempt_error で失敗する。設定後、新規 retry が必要。
+  Pi SDK は ARAYA_CODING_AGENT_DIR を使う。
+  araya 側で /login と /model を設定する。
 
 環境変数:
   ARAYA_DATA_DIR

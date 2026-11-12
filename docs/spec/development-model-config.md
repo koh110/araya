@@ -1,6 +1,6 @@
 # 設定ファイルによる開発 agent の model 指定
 
-内蔵 Pi の設定・認証・session は `<dataDir>/pi`（既定 `~/.araya/pi`）に隔離します。`settings.json`・`auth.json`・`models.json`・`models-store.json`・`sessions/`・Pi SDK が管理する `bin/` はここに置き、runner の model cache は `<dataDir>/runner/models-store.json` に置きます。host Pi からの fallback・copy・migration・symlink は追加しません。Araya 側の TUI（`araya` または `araya pi`）で `/login` と `/model` を設定してください。
+内蔵 Pi の設定・認証・session は `<dataDir>/pi`（既定 `~/.araya/pi`）に置きます。`settings.json`・`auth.json`・`models.json`・`models-store.json`・`sessions/`・Pi SDK が管理する `bin/` はここに置き、runner の model cache は `<dataDir>/runner/models-store.json` に置きます。Araya 側の TUI（`araya` または `araya pi`）で `/login` と `/model` を設定します。
 
 ## 概要
 
