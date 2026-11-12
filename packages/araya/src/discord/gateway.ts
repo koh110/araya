@@ -8,12 +8,15 @@ import {
   discordCommandDefinitionJson,
   type DiscordCommandRequest,
 } from './interactions.ts'
+import { isDiscordChatMessageAllowed, type DiscordChatMessage } from './chat.ts'
 
 export type DiscordCommandReplyFn = (content: string) => Promise<void>
+export type DiscordMessageReplyFn = (content: string, nonce: string) => Promise<void>
 
 export type DiscordGatewayHandlers = {
-  onReady(): Promise<void> | void
+  onReady(botUserId?: string): Promise<void> | void
   onInteraction(request: DiscordCommandRequest, reply: DiscordCommandReplyFn): Promise<void> | void
+  onMessage(message: DiscordChatMessage, reply: DiscordMessageReplyFn): Promise<void> | void
   onError(message: string): void
 }
 
@@ -25,6 +28,10 @@ export type DiscordGateway = {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
+}
+
+export function discordGatewayIntents(bits: { Guilds: number; GuildMessages: number }) {
+  return [bits.Guilds, bits.GuildMessages]
 }
 
 export function discordNotificationPayload(content: string, nonce: string) {
@@ -58,10 +65,11 @@ export function flattenDiscordCommandOptions(entries: readonly InteractionOption
 // slash command 定義を Discord の guild へ登録する（araya discord register）
 export async function registerDiscordCommands(config: DiscordConfig) {
   const { REST, Routes } = await import('discord.js')
-  const rest = new REST({ version: '10' }).setToken(config.botToken)
-  await rest.put(Routes.applicationGuildCommands(config.applicationId, config.guildId), {
-    body: discordCommandDefinitionJson(),
-  })
+  await new REST({ version: '10' })
+    .setToken(config.botToken)
+    .put(Routes.applicationGuildCommands(config.applicationId, config.guildId), {
+      body: discordCommandDefinitionJson(),
+    })
 }
 
 export async function createDiscordGateway(
@@ -69,7 +77,7 @@ export async function createDiscordGateway(
   handlers: DiscordGatewayHandlers,
 ) {
   const discord = await import('discord.js')
-  const client = new discord.Client({ intents: [discord.GatewayIntentBits.Guilds] })
+  const client = new discord.Client({ intents: discordGatewayIntents(discord.GatewayIntentBits) })
 
   // login() は ready を待つが、test の fake と揃えるため ready を待つ promise を明示する
   const readyCallbacks: { resolve?: () => void; reject?: (error: Error) => void } = {}
@@ -82,7 +90,7 @@ export async function createDiscordGateway(
   client.once('ready', () => {
     readySettled = true
     readyCallbacks.resolve?.()
-    void Promise.resolve(handlers.onReady()).catch((error: unknown) => {
+    void Promise.resolve(handlers.onReady(client.user?.id)).catch((error: unknown) => {
       handlers.onError(errorMessage(error))
     })
   })
@@ -150,7 +158,45 @@ export async function createDiscordGateway(
     })
   })
 
-  const gateway: DiscordGateway = {
+  client.on('messageCreate', (message) => {
+    const botUserId = client.user?.id
+    const metadata = {
+      guildId: message.guildId,
+      channelId: message.channelId,
+      userId: message.author.id,
+      isBot: message.author.bot,
+      isWebhook: message.webhookId !== null,
+      mentionsBot: botUserId !== undefined && message.mentions.users.has(botUserId),
+    }
+
+    // channel/user/mention を確認する前に本文を読み込まない。
+    if (!isDiscordChatMessageAllowed(metadata, config)) {
+      return
+    }
+
+    async function reply(content: string, nonce: string) {
+      if (!message.channel.isTextBased()) {
+        throw new Error('Discord message の返信先が text channel ではありません')
+      }
+
+      await message.reply(discordNotificationPayload(content, nonce))
+    }
+
+    void Promise.resolve(
+      handlers.onMessage(
+        {
+          ...metadata,
+          messageId: message.id,
+          content: message.content,
+        },
+        reply,
+      ),
+    ).catch((error: unknown) => {
+      handlers.onError(errorMessage(error))
+    })
+  })
+
+  return {
     connect: async () => {
       await client.login(config.botToken)
       await readyPromise
@@ -168,7 +214,5 @@ export async function createDiscordGateway(
     close: async () => {
       await client.destroy()
     },
-  }
-
-  return gateway
+  } satisfies DiscordGateway
 }
