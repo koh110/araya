@@ -202,6 +202,14 @@ Task の状態（`tasks.status`）は最新の試行の状態と同じ。`failed
 
 ## runner
 
+### runtime target
+
+Runner と Discord bot は独立した systemd service のまま動かす。dataDir の実 path から計算した同じ `<h>` を使い、target 名を `araya-runtime-<h>.target` とする。target は既存の `araya-runner-<h>.service` と `araya-discord-<h>.service` を `Wants=` と `After=` で指定し、両 component unit は `[Unit]` の `PartOf=araya-runtime-<h>.target` で target の stop/restart に連動する。component unit の `ExecStart`、実行 identity、環境、Discord credential の読み込み、restart policy、task scope の後始末は変更しない。
+
+`araya runtime install` は既存 component unit を自動修正しない。期待する unit file が通常 file として存在し、user manager の `FragmentPath` がその file に一致し、両 unit の `PartOf` が target 名と一致することを先に確認する。条件を満たしたときだけ target file を書き、`daemon-reload` 後に manager がその file を読んでいることを確かめて enable/start する。既存 service が未導入・未load・target と未連動なら失敗し、component unit は変更しない。
+
+`araya runtime uninstall` は target のみを disable/stop して unit file を削除し、manager を reload する。Runner / Discord service、台帳、設定、credential は削除しない。standalone の `araya runner` と `araya discord` lifecycle command は引き続き利用できる。
+
 ### unit の名前と file
 
 unit 名は `araya-runner-<h>.service`。`<h>` は dataDir の実 path（`realpath`）を UTF-8 にした byte 列の SHA-256 の16進表記の先頭12文字。dataDir ごとに runner は1つで、同じ名前の unit は systemd が1つしか動かさない。test などで別の dataDir を使えば、名前も分かれる。
@@ -558,6 +566,10 @@ SHIKI の system prompt（`development/shiki.ts` の `buildSystemPrompt`）を `
 - 1件は `data_json` の UTF-8 で 2 KiB まで（超える値は短くする）。1試行で 2,000 件まで。超えたら `events.truncated` を1件書き、それ以降は書かない。件数は台帳の event の数で数える（runner が起動し直しても続きから数える）。
 - 台帳に書けなかったときは、log に書いて、tool はそのまま進める。
 - 再開した会話では、途中で止まった tool の `tool.finished` は書かれない。
+- `tool.started` / `tool.finished` を台帳へ commit した後、runner は `<dataDir>/runtime/progress.sock` に `{"type":"wake"}\n` を送る。wake は固定 payload で event 内容・command・tool output を含まず、接続待ちは短い上限を設ける。送信失敗・timeout は無視し、task と tool はそのまま進める。
+- Discord bot は同じ socket を listen し、wake を受けると既存の notification cursor から未配信 event を直列に drain する。polling fallback と cursor/retry の復旧動作は残し、socket wake は永続 event ではなく best-effort hint とする。
+- socket は `<dataDir>/runtime` の mode 0700 directory に作り、socket file は mode 0600 とする。stale socket の削除前に directory・socket の type, owner, identity を確認する。
+- Discord の tool progress 表示は Task ID、attempt、許可 pattern に一致する tool 名、開始/完了/失敗 status に限定し、command や tool output を含めない。Discord bot は runner と別 service/process のまま稼働する。
 
 ## 結果の判定と記録
 
@@ -625,7 +637,7 @@ Issue #1 の「Secrets を通常ログや Task 台帳に複製しない」のた
 
 ## CLI
 
-- Linux 以外では、`araya task` と `araya runner` のどの command も何もせずに `unsupported_platform` で終わる。
+- Linux 以外では、`araya task` と `araya runner` / `araya runtime` のどの command も何もせずに `unsupported_platform` で終わる。
 - 各 command は起動時に設定ファイルを読み、不正なら何もせずに終わる（既存の command と同じ）。
 - 出力は JSON 1件を stdout に出す。誤りは stderr にメッセージを出し、終了 code 1 で終わる。ただし、この環境では使えないことを表す誤り（`unsupported_platform`、`systemd_unavailable`）では、終了 code 69（sysexits.h の EX_UNAVAILABLE）で終わる（`npm run deploy` は、この終了 code で見分ける。「`npm run deploy`」）。code のある誤り（`unsupported_platform`、`systemd_unavailable`、`task_not_found` など）のメッセージは、`<code>: <説明>` の形にする。
 - `<taskId>` は 1 以上の10進の整数。存在しない Task ID は `task_not_found`。
@@ -659,6 +671,13 @@ command:
 - `araya runner uninstall`
   - `systemctl --user disable --now <unit>`（90 秒で打ち切る）、unit file の削除、`systemctl --user daemon-reload` を行う。`disable --now` の失敗のうち、unit が無いための失敗だけを無視する。そのときは、unit file が無くても unit が読み込まれたまま動いていることがある（unit file を消した後など）ので、続けて `systemctl --user stop <unit>`（90 秒で打ち切る）を行い、unit が読み込まれていないための失敗だけを無視する。それ以外の失敗は、`install` と同じく扱う（終了 code 1）。台帳は変えない。動いていた試行は `running` のまま残り、runner を入れ直すと続きから進む。
   - 出力: `{"unit": "...", "removed": boolean}`（`removed` は unit file を消したかどうか）
+- `araya runtime install`
+  - user manager が接続可能で、同じ dataDir の Runner / Discord component unit file が通常 file として存在し、`FragmentPath` が各 file に一致して、各 unit の `PartOf` が runtime target を指すことを確認する。不一致なら target を書く前に失敗し、component unit は変更しない。
+  - target file を書き、`daemon-reload` 後に `FragmentPath` を確認して、target を enable/start する。component service 自体の `ExecStart`・credential・restart policy は書き換えない。
+  - 出力: `{"target": "...", "targetPath": "...", "runner": "...", "discord": "..."}`
+- `araya runtime uninstall`
+  - target の `disable --now` と unit file の削除、`daemon-reload` を行う。target が無いときも、読み込まれた target が残っていないことを確認してから続ける。component service、台帳、設定、credential は削除・変更しない。
+  - 出力: `{"target": "...", "targetPath": "...", "removed": boolean}`
 
 出力の形:
 

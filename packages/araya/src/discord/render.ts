@@ -20,6 +20,8 @@ export const NOTIFICATION_EVENT_TYPES = [
   'run.resumed',
   'run.stopping',
   'run.finished',
+  'tool.started',
+  'tool.finished',
 ] as const
 
 export const MAX_DISCORD_MESSAGE_CHARS = 2_000
@@ -106,6 +108,19 @@ export function renderNotification(event: NotificationEvent) {
       }
 
       return base
+    }
+    case 'tool.started':
+    case 'tool.finished': {
+      const tool = typeof event.data.tool === 'string' && /^[A-Za-z0-9_-]{1,80}$/u.test(event.data.tool)
+        ? event.data.tool
+        : 'tool'
+      const action = event.type === 'tool.started'
+        ? `${tool} を開始しました`
+        : event.data.isError === true
+          ? `${tool} が失敗しました`
+          : `${tool} を完了しました`
+
+      return `Task #${event.taskId}（${attemptLabel(event.attempt)}）: ${action}`
     }
     default:
       return null

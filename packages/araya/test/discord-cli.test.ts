@@ -6,7 +6,7 @@ import { Readable } from 'node:stream'
 import test from 'node:test'
 
 import { runCli } from '../src/cli/main.ts'
-import { dataDirHash, discordUnitName, type CommandResult } from '../src/infrastructure/systemd.ts'
+import { dataDirHash, discordUnitName, runtimeTargetUnitName, type CommandResult } from '../src/infrastructure/systemd.ts'
 import type { DiscordCommandDependencies } from '../src/cli/discord-commands.ts'
 import {
   DISCORD_CONFIG_KEYS,
@@ -777,6 +777,7 @@ test('discord install: 暗号化 credential と LoadCredentialEncrypted を使�
       [
         '[Unit]',
         `Description=araya discord ${dataDirReal}`,
+        `PartOf=${runtimeTargetUnitName(dataDirHash(dataDirReal))}`,
         'StartLimitIntervalSec=0',
         '',
         '[Service]',

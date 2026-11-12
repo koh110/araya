@@ -12,6 +12,7 @@ import { createTaskState, createWorktreeService } from '../src/development/workt
 import {
   bashScopeUnit,
   buildDiscordUnitFile,
+  buildRuntimeTargetUnitFile,
   buildRunnerUnitFile,
   createScopedRunner,
   createScopedVerificationRunner,
@@ -28,6 +29,7 @@ import {
   resolveOpCliPath,
   resolveRunnerEntrypoint,
   runnerUnitName,
+  runtimeTargetUnitName,
   scopePattern,
   selectUnitEnvironment,
   shellQuote,
@@ -188,6 +190,7 @@ test('systemd-units: unit file は仕様の property を書き、書けない値
     [
       '[Unit]',
       `Description=araya runner ${dataDir}`,
+      `PartOf=${runtimeTargetUnitName(hash)}`,
       'StartLimitIntervalSec=0',
       '',
       '[Service]',
@@ -233,6 +236,57 @@ test('systemd-units: unit file は仕様の property を書き、書けない値
       JSON.stringify(override),
     )
   }
+})
+
+test('systemd-units: runtime target は既存の runner・Discord service を束ね、component の停止に連動する', () => {
+  const dataDir = '/home/user/.araya'
+  const hash = dataDirHash(dataDir)
+  const target = runtimeTargetUnitName(hash)
+  const runner = runnerUnitName(hash)
+  const discord = `araya-discord-${hash}.service`
+
+  assert.equal(target, `araya-runtime-${hash}.target`)
+  assert.equal(
+    buildRuntimeTargetUnitFile({ dataDir }),
+    [
+      '[Unit]',
+      `Description=araya runtime ${dataDir}`,
+      `Wants=${runner}`,
+      `Wants=${discord}`,
+      `After=${runner}`,
+      `After=${discord}`,
+      '',
+      '[Install]',
+      'WantedBy=default.target',
+      '',
+    ].join('\n'),
+  )
+
+  const runnerUnit = buildRunnerUnitFile({
+    dataDir,
+    nodePath: '/usr/bin/node',
+    entrypoint: '/opt/araya/bin/task-runner.js',
+    systemctlPath: '/usr/bin/systemctl',
+    environment: [['PATH', '/usr/bin:/bin']],
+  })
+  const discordUnit = buildDiscordUnitFile({
+    authMode: 'env-file',
+    dataDir,
+    nodePath: '/usr/bin/node',
+    runnerEntrypoint: '/opt/araya/bin/discord-env-runner.js',
+    envFilePath: `${dataDir}/.env`,
+    environment: [['PATH', '/usr/bin:/bin']],
+  })
+
+  assert.ok(runnerUnit.includes(`PartOf=${target}`), runnerUnit)
+  assert.ok(discordUnit.includes(`PartOf=${target}`), discordUnit)
+  assert.ok(runnerUnit.includes('Restart=always'), runnerUnit)
+  assert.ok(runnerUnit.includes(`ExecStart=/usr/bin/node /opt/araya/bin/task-runner.js --data-dir ${dataDir}`), runnerUnit)
+  assert.ok(discordUnit.includes(`ExecStart=/usr/bin/node /opt/araya/bin/discord-env-runner.js --data-dir ${dataDir}`), discordUnit)
+  assert.ok(discordUnit.includes(`LoadCredential=discord-env:${dataDir}/.env`), discordUnit)
+  assert.ok(!runnerUnit.includes('CREDENTIALS_DIRECTORY'), runnerUnit)
+  assert.ok(!runnerUnit.includes('ARAYA_DISCORD_'), runnerUnit)
+  assert.ok(!buildRuntimeTargetUnitFile({ dataDir }).includes('Credential'), 'target must not load Discord credentials')
 })
 
 test('systemd-units: runner の entrypoint は package root の bin/ から、module と同じ拡張子の通常の file を探す', async () => {
@@ -361,6 +415,7 @@ test('systemd-units: Discord service unit は標準 .env と任意1Password mode
     plain.includes(`ExecStart=/usr/bin/node ${runnerEntrypoint} --data-dir ${dataDir}`),
     plain,
   )
+  assert.ok(plain.includes(`PartOf=${runtimeTargetUnitName(dataDirHash(dataDir))}`), plain)
   assert.ok(plain.includes(`LoadCredential=discord-env:${dataDir}/.env`), plain)
   assert.ok(!plain.includes('op-service-account-token'), plain)
   assert.ok(!plain.includes('OP_SERVICE_ACCOUNT_TOKEN'), plain)
@@ -389,6 +444,7 @@ test('systemd-units: Discord service unit は標準 .env と任意1Password mode
     op,
   )
   assert.ok(!op.includes('OP_SERVICE_ACCOUNT_TOKEN'), op)
+  assert.ok(op.includes(`PartOf=${runtimeTargetUnitName(dataDirHash(dataDir))}`), op)
 
   assert.throws(() => {
     return buildDiscordUnitFile({
