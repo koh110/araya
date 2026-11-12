@@ -17,6 +17,7 @@ import {
   type RunnerCommandDependencies,
 } from './task-commands.ts'
 import { runDiscordCommand, type DiscordCommandDependencies } from './discord-commands.ts'
+import { runRuntimeCommand } from './runtime-commands.ts'
 
 async function launchPi(args: string[], agentDir: string) {
   const { main } = await loadPiSdk(agentDir)
@@ -85,14 +86,21 @@ function printHelp() {
     unit 稼働の確かめをせず、foreground で Discord bot を 1 度動かす（試験起動）。Ctrl+C で止める。
     1Password の op:// 参照を使う場合は op run で設定を解決してから実行する。
 
+  araya runtime install
+    既存の runner / Discord unit を1つの araya-runtime-<hash>.target で起動・停止する設定を入れて起動する。
+    先に araya runner install と araya discord install を実行し、両 unit が runtime target に連動する状態にする。
+    component service・ExecStart・Discord credential は変更しない。
+  araya runtime uninstall
+    runtime target だけを停止・無効化して削除する。runner / Discord service・台帳・設定・credential は残す。
+
   /araya task list: Task 一覧と runner の状態。/araya task show <task>: Task の詳細（SHIKI の要約と途中経過）。
   /araya task submit <title> <goal> [targets] [constraints] [permissions]: Task を登録する（targets・constraints・permissions はカンマ区切り）。
   /araya task cancel <task>: 中止を求める。/araya task retry <task> [note] [confirm_side_effects]: 終わった Task の再実行を求める。
   外部 branch・Draft PR が作成された可能性がある Task の retry は、confirm_side_effects を認めてから実行する。
-  通知は Task 登録・再実行・中止・実行の開始・再開・終了だけ ARAYA_DISCORD_CHANNEL_ID の既定送信先に出す。
+  通知は Task 登録・再実行・中止・実行の開始・再開・終了と、SHIKI tool の開始・完了だけ ARAYA_DISCORD_CHANNEL_ID の既定送信先に出す。tool 通知に command や出力は含めない。
   slash command の受付 channel は絞らない。設定した Guild 内で、Discord 側が許可する channel から実行できる。
 
-  araya task と araya runner と araya discord は Linux と systemd（254 以降）の user manager が必要。
+  araya task・runner・discord・runtime は Linux と systemd（254 以降）の user manager が必要。
 
 設定ファイル:
   <ARAYA_DATA_DIR>/config.json（既定: ~/.araya/config.json）
@@ -201,6 +209,16 @@ export async function runCli(
     } else {
       await runRunnerCommand(args.slice(1), config, deps)
     }
+
+    return
+  }
+
+  if (args[0] === 'runtime') {
+    assertSupportedPlatform(taskDependencies.platform ?? process.platform)
+    const config = await loadCliConfig(env)
+    const deps = { ...defaultCommandDependencies(config.env), ...taskDependencies }
+
+    await runRuntimeCommand(args.slice(1), config, deps)
 
     return
   }

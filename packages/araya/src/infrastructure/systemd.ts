@@ -229,6 +229,7 @@ export function runnerUnitSections(input: RunnerUnitFileInput) {
   const hash = dataDirHash(input.dataDir)
   const unit: (readonly [string, string])[] = [
     ['Description', `araya runner ${input.dataDir}`],
+    ['PartOf', runtimeTargetUnitName(hash)],
     ['StartLimitIntervalSec', '0'],
   ]
   const service: (readonly [string, string])[] = [
@@ -302,6 +303,10 @@ export function discordUnitName(hash: string) {
   return `araya-discord-${hash}.service`
 }
 
+export function runtimeTargetUnitName(hash: string) {
+  return `araya-runtime-${hash}.target`
+}
+
 // Discord bot は専用 launcher から起動する。env-file mode は systemd LoadCredential、1Password mode は Service Account credential を使う。
 export function discordUnitSections(input: DiscordUnitFileInput) {
   assertUnitFileValue('dataDir', input.dataDir)
@@ -351,6 +356,7 @@ export function discordUnitSections(input: DiscordUnitFileInput) {
 
   const unit: (readonly [string, string])[] = [
     ['Description', `araya discord ${input.dataDir}`],
+    ['PartOf', runtimeTargetUnitName(dataDirHash(input.dataDir))],
     ['StartLimitIntervalSec', '0'],
   ]
   const service: (readonly [string, string])[] = [
@@ -399,6 +405,32 @@ export function buildDiscordUnitFile(input: DiscordUnitFileInput) {
   }
 
   return `${lines.join('\n')}\n`
+}
+
+export type RuntimeTargetUnitFileInput = {
+  dataDir: string
+}
+
+// runner と Discord bot は既存の別 service のまま、1つの target で操作する
+export function buildRuntimeTargetUnitFile(input: RuntimeTargetUnitFileInput) {
+  assertUnitFileValue('dataDir', input.dataDir)
+  const hash = dataDirHash(input.dataDir)
+  const runner = runnerUnitName(hash)
+  const discord = discordUnitName(hash)
+  const lines = [
+    '[Unit]',
+    `Description=araya runtime ${input.dataDir}`,
+    `Wants=${runner}`,
+    `Wants=${discord}`,
+    `After=${runner}`,
+    `After=${discord}`,
+    '',
+    '[Install]',
+    'WantedBy=default.target',
+    '',
+  ]
+
+  return `${lines.join('\n')}`
 }
 
 // build 前は .ts、build 後は .js の runner の entrypoint を、この module と同じ package の bin/ から探す

@@ -51,6 +51,8 @@ npm run araya -- runner install
 
 `araya runner install` を実行した araya のコードで runner が動きます（unit file の `ExecStart` は Node.js を起動し、runner の entrypoint の絶対 path を引数に渡します。`npm run deploy` で入れた araya なら、entrypoint は install 先の `packages/araya/dist/bin/task-runner.js` です）。checkout で `npm run araya -- runner install` を実行すると、runner はその checkout の `packages/araya/bin/task-runner.ts` で動きます。その checkout の file を変えると runner の動作が変わり、checkout を移動・削除すると runner は起動できなくなります。
 
+Runner と Discord bot は別々の systemd service と process のままです。両方の service を既に install した環境では `araya runtime install` で runtime target を有効化・起動できます。target は両 service の起動をまとめ、停止・再起動を連動させます。runtime install は component unit が期待する file から読み込まれ、target との連動設定も存在することを確認し、不一致なら既存 service を変更せず失敗します。`araya runtime uninstall` は target だけを停止・無効化・削除し、component service とデータは残します。Discord credential は従来どおり Discord service 内に閉じます。
+
 ## deploy の仕組み
 
 root で `npm run deploy`（`scripts/deploy.sh`）を実行すると、次のことが起きます。

@@ -146,6 +146,8 @@ export type AttemptHarnessOptions = {
   faults?: AttemptFaults
   createPiSettings?: (stateDir: string, agentDir: string) => PiModelSettings
   draftPrDelivery?: boolean
+  // ledger append 後に tool progress wake を模擬する
+  notifyProgress?: () => Promise<void> | void
 }
 
 // 試行の task を動かす Harness を開く。runner と同じく、storage は <dataDir>/runner/durable.sqlite
@@ -166,6 +168,7 @@ export async function openAttemptHarness(fixture: RunnerFixture, options: Attemp
     log: (entry) => {
       logs.push(entry)
     },
+    ...(options.notifyProgress === undefined ? {} : { notifyProgress: options.notifyProgress }),
     ...(options.faults === undefined ? {} : { faults: options.faults }),
     ...(options.createPiSettings === undefined ? {} : { createPiSettings: options.createPiSettings })
   })

@@ -8,6 +8,7 @@ import { createRequire } from 'node:module'
 import path from 'node:path'
 import { collectSecretValues, createRedactor } from '../infrastructure/redaction.ts'
 import { dataDirHash, discordUnitName, runnerUnitName } from '../infrastructure/systemd.ts'
+import { startProgressSocketServer, type ProgressSocketServer } from '../infrastructure/progress-socket.ts'
 import { openTaskLedger, type TaskLedger } from '../runner/ledger.ts'
 import { loadDiscordConfig, type DiscordConfig } from './config.ts'
 import {
@@ -23,7 +24,7 @@ import {
 } from './gateway.ts'
 import { handleDiscordCommand } from './interactions.ts'
 import { NOTIFICATION_POLL_MS, notificationTick } from './notifier.ts'
-import { newState, readDiscordBotState, writeDiscordBotState } from './state.ts'
+import { newState, readDiscordBotState, writeDiscordBotState, type DiscordBotState } from './state.ts'
 
 type ProperLockfile = {
   lock(
@@ -240,7 +241,7 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     return 1
   }
 
-  let state
+  let state: DiscordBotState
 
   try {
     state = readDiscordBotState(dataDir) ?? newState(null)
@@ -249,6 +250,12 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     ledger.close()
 
     return 1
+  }
+
+  if (state.cursor === null) {
+    // 初回起動前の event は遡らず、gateway 接続中の event は後で回収できるよう、接続前に境界を保存する。
+    state.cursor = ledger.lastEventSeq()
+    writeDiscordBotState(dataDir, state)
   }
 
   let chatSession: DiscordChatSession | null = null
@@ -287,11 +294,6 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
       state.readyId = readyId
       state.lastReadyAt = new Date(nowMs()).toISOString()
 
-      // 初回は、この起動より前の event をさかのぼって送らない
-      if (state.cursor === null) {
-        state.cursor = ledger.lastEventSeq()
-      }
-
       // install の ready 判定と、再開時の cursor 継続は state file を読む
       writeDiscordBotState(dataDir, state)
       logSafe({ type: 'discord_ready', unit, cursor: state.cursor })
@@ -329,6 +331,112 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     return 1
   }
 
+  let progressSocket: ProgressSocketServer | null = null
+  let notificationDrainRunning = false
+  let notificationDrainPending = false
+  let notificationDrainPromise: Promise<void> = Promise.resolve()
+  let notificationWakeGeneration = 0
+  let resolveNotificationWake: (() => void) | null = null
+
+  function requestNotificationDrain() {
+    if (deps.stopSignal.aborted) {
+      return
+    }
+
+    notificationWakeGeneration += 1
+    notificationDrainPending = true
+    const resolve = resolveNotificationWake
+    resolveNotificationWake = null
+    resolve?.()
+
+    if (!notificationDrainRunning) {
+      notificationDrainPromise = drainNotifications()
+    }
+  }
+
+  async function drainNotifications() {
+    if (notificationDrainRunning) {
+      notificationDrainPending = true
+      return
+    }
+
+    notificationDrainRunning = true
+
+    try {
+      do {
+        notificationDrainPending = false
+
+        for (;;) {
+          const result = await notificationTick({
+            dataDir,
+            ledger,
+            state,
+            send: gateway.sendText,
+            nowMs,
+            log: logSafe,
+            redactor,
+          })
+
+          if (result.sent > 0 || result.skipped > 0) {
+            logSafe({
+              type: 'discord_notifications',
+              sent: result.sent,
+              skipped: result.skipped,
+              cursor: state.cursor,
+            })
+          }
+
+          if (deps.stopSignal.aborted) {
+            break
+          }
+
+          if (result.sent === 0 && result.skipped === 0) {
+            break
+          }
+        }
+      } while (notificationDrainPending && !deps.stopSignal.aborted)
+    } catch (error) {
+      logError('discord_tick_failed', error)
+    } finally {
+      notificationDrainRunning = false
+    }
+  }
+
+  async function waitForNotificationWakeOrPoll() {
+    const generation = notificationWakeGeneration
+    const waitController = new AbortController()
+    let removeWaiter = () => {}
+    const wake = new Promise<void>((resolve) => {
+      if (notificationWakeGeneration !== generation) {
+        resolve()
+        return
+      }
+
+      resolveNotificationWake = resolve
+      removeWaiter = () => {
+        if (resolveNotificationWake === resolve) {
+          resolveNotificationWake = null
+        }
+      }
+    })
+    const abortWait = () => waitController.abort()
+
+    deps.stopSignal.addEventListener('abort', abortWait, { once: true })
+
+    if (deps.stopSignal.aborted) {
+      abortWait()
+    }
+
+    try {
+      await Promise.race([sleep(pollMs, waitController.signal), wake])
+    } finally {
+      removeWaiter()
+      deps.stopSignal.removeEventListener('abort', abortWait)
+      // socket wake が先に届いた場合、残ったpoll timerを破棄して wake の回数に比例するtimer漏れを防ぐ
+      waitController.abort()
+    }
+  }
+
   try {
     try {
       await gateway.connect()
@@ -338,41 +446,40 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
       return 1
     }
 
-    logSafe({ type: 'discord_started', unit, pollMs })
+    try {
+      progressSocket = await startProgressSocketServer(dataDir, requestNotificationDrain)
+    } catch (error) {
+      // IPC は best-effort。ledger cursor と低頻度の回復 tick で通知を続ける
+      logError('discord_progress_socket_unavailable', error)
+    }
+
+    logSafe({ type: 'discord_started', unit, pollMs, progressSocket: progressSocket !== null })
+    await drainNotifications()
 
     while (!deps.stopSignal.aborted) {
-      await sleep(pollMs, deps.stopSignal)
+      await waitForNotificationWakeOrPoll()
 
       if (deps.stopSignal.aborted) {
         break
       }
 
-      try {
-        const result = await notificationTick({
-          dataDir,
-          ledger,
-          state,
-          send: gateway.sendText,
-          nowMs,
-          log: logSafe,
-          redactor,
-        })
-
-        if (result.sent > 0 || result.skipped > 0) {
-          logSafe({
-            type: 'discord_notifications',
-            sent: result.sent,
-            skipped: result.skipped,
-            cursor: state.cursor,
-          })
-        }
-      } catch (error) {
-        logError('discord_tick_failed', error)
-      }
+      await drainNotifications()
     }
   } finally {
     chatHandlerRef.current?.stopAccepting()
     await chatHandlerRef.current?.drain()
+
+    try {
+      await progressSocket?.close()
+    } catch (error) {
+      logError('discord_progress_socket_close_failed', error)
+    }
+
+    try {
+      await notificationDrainPromise
+    } catch (error) {
+      logError('discord_notification_drain_failed', error)
+    }
 
     try {
       await gateway.close()

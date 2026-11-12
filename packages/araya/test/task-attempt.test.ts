@@ -794,9 +794,17 @@ test('attempt: 途中経過は決まった key だけで記録し、bash のコ�
   const secret = 'progress-secret-value-5678'
   const value = await setup({ ARAYA_TEST_TOKEN: secret })
   const { fixture, models, systemd } = value
+  const published: { type: string; tool: unknown }[] = []
   const attempt = await openAttemptHarness(fixture, {
     models: models.runtime,
     systemd: systemd.ops,
+    notifyProgress: async () => {
+      const event = readEvents(fixture).at(-1)
+
+      assert.ok(event)
+      published.push({ type: event.type, tool: event.data.tool })
+      throw new Error('progress socket unavailable')
+    },
   })
 
   try {
@@ -851,6 +859,12 @@ test('attempt: 途中経過は決まった key だけで記録し、bash のコ�
         ['tool.started', 'read'],
         ['tool.finished', 'read'],
       ],
+    )
+    assert.deepEqual(
+      published,
+      events.map((event) => {
+        return { type: event.type, tool: event.data.tool }
+      }),
     )
     const worktreePath = path.join(fixture.devRoot, 'repo', '.worktree', `araya-${done.taskKey}`)
     assert.deepEqual(events[0]?.data, {

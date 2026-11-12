@@ -153,6 +153,8 @@ test('CLI: help は現行 command を案内する', async () => {
     'araya task cancel <taskId>',
     'araya runner install',
     'araya runner uninstall',
+    'araya runtime install',
+    'araya runtime uninstall',
     'araya discord init',
   ]) {
     assert.ok(help.includes(`\n  ${command}\n`), command)
@@ -180,6 +182,9 @@ test('CLI: help は現行 command を案内する', async () => {
   assert.doesNotMatch(help, /Bot token が op:\/\/ 参照の場合/u)
   assert.match(help, /1Password の op:\/\/ 参照は任意/u)
   assert.match(help, /既存 config は変更せず/u)
+  assert.match(help, /araya runtime install/u)
+  assert.match(help, /component service・ExecStart・Discord credential は変更しない/u)
+  assert.match(help, /runtime target だけを停止・無効化して削除/u)
 })
 
 test('CLI: unknown command は設定を読まず、dataDir に変更を加えない', async () => {
@@ -253,6 +258,7 @@ test('CLI: task・runner command は不正な設定 file で何も処理せず�
     for (const args of [
       ['task', 'list'],
       ['runner', 'install'],
+      ['runtime', 'install'],
     ]) {
       await assert.rejects(
         runCli(args, async () => {}, env, { platform: 'linux' }),
