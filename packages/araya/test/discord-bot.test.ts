@@ -155,6 +155,7 @@ test('discord bot: Task 操作の返信では Discord unit でなく runner unit
                 userId: USER_ID,
                 guildId: GUILD_ID,
                 channelId: CHANNEL_ID,
+                subcommandGroup: 'task',
                 subcommand: 'submit',
                 options: { title: 'unit name', goal: 'check displayed service' },
               },
@@ -230,6 +231,7 @@ test('discord bot: 1Passwordで解決したbot tokenを task・retry note・repl
               userId: USER_ID,
               guildId: GUILD_ID,
               channelId: CHANNEL_ID,
+              subcommandGroup: 'task',
             }
 
             await handlers.onInteraction(

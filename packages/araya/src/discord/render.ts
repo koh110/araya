@@ -287,7 +287,7 @@ export function describeLedgerError(error: unknown, taskId?: number) {
       const taskReference = taskId === undefined ? 'Task' : `Task #${taskId}`
       const taskOption = taskId === undefined ? 'task を指定' : `task=${taskId}`
 
-      return `${taskReference} の前回の試行では外部変更の可能性があるため、再実行を止めました（記録された worktree: ${worktreeCount} 件）。GitHub の branch/PR 状態も確認してください。問題がなければ Discord の /araya retry で ${taskOption} と confirm_side_effects=true を指定して再実行してください。`
+      return `${taskReference} の前回の試行では外部変更の可能性があるため、再実行を止めました（記録された worktree: ${worktreeCount} 件）。GitHub の branch/PR 状態も確認してください。問題がなければ Discord の /araya task retry で ${taskOption} と confirm_side_effects=true を指定して再実行してください。`
     }
     case 'ledger_unsupported_version':
       return '台帳の version がこの bot より新しいです。Araya を更新してください'

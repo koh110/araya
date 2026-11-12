@@ -1,6 +1,7 @@
 // discord.js との接続。型Importだけにして discord.js の実行時 import は関内に行う（CLI 起動や test で load しない）
 // gateway interface を関数にすることで bot.ts の loop を fake で test できる
 
+import type { ChatInputCommandInteraction } from 'discord.js'
 import { type DiscordConfig } from './config.ts'
 import {
   ARAYA_COMMAND_NAME,
@@ -28,6 +29,30 @@ function errorMessage(error: unknown) {
 
 export function discordNotificationPayload(content: string, nonce: string) {
   return { content, nonce, enforceNonce: true, allowedMentions: { parse: [] } }
+}
+
+type InteractionOption = ChatInputCommandInteraction['options']['data'][number]
+
+export function flattenDiscordCommandOptions(entries: readonly InteractionOption[]) {
+  const options: Record<string, string | number | boolean | undefined> = {}
+
+  for (const entry of entries) {
+    if (entry.type === 1 || entry.type === 2) {
+      Object.assign(options, flattenDiscordCommandOptions(entry.options ?? []))
+      continue
+    }
+
+    if (typeof entry.name !== 'string') {
+      continue
+    }
+
+    options[entry.name] =
+      typeof entry.value === 'number' || typeof entry.value === 'boolean'
+        ? entry.value
+        : String(entry.value)
+  }
+
+  return options
 }
 
 // slash command 定義を Discord の guild へ登録する（araya discord register）
@@ -81,9 +106,11 @@ export async function createDiscordGateway(
       return
     }
 
+    let subcommandGroup: string | null
     let subcommand: string
 
     try {
+      subcommandGroup = interaction.options.getSubcommandGroup(false)
       subcommand = interaction.options.getSubcommand()
     } catch {
       handlers.onError('slash command の subcommand が読めません')
@@ -91,24 +118,7 @@ export async function createDiscordGateway(
       return
     }
 
-    const options: Record<string, string | number | boolean | undefined> = {}
-
-    // 定義されていない option を getString で引くと誤りになるため、届いた option だけを読む
-    for (const entry of interaction.options.data) {
-      const nested = entry.type === 1 ? (entry.options ?? []) : [entry]
-
-      for (const option of nested) {
-        if (typeof option.name !== 'string') {
-          continue
-        }
-
-        options[option.name] =
-          typeof option.value === 'number' || typeof option.value === 'boolean'
-            ? option.value
-            : String(option.value)
-      }
-    }
-
+    // group と subcommand を再帰的に除き、実際に指定された option だけを渡す
     let replied = false
     const commandInteraction = interaction
     async function reply(content: string) {
@@ -129,8 +139,9 @@ export async function createDiscordGateway(
           userId: interaction.user.id,
           guildId: interaction.guildId,
           channelId: interaction.channelId,
+          subcommandGroup,
           subcommand,
-          options,
+          options: flattenDiscordCommandOptions(interaction.options.data),
         },
         reply,
       ),

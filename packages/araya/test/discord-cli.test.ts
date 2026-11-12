@@ -1260,11 +1260,11 @@ test('discord register: 設定（.env か環境変数）から slash command を
     assert.equal(readField(output, 'guildId'), GUILD_ID)
     assert.equal(readField(output, 'command'), 'araya')
     assert.deepEqual(readField(output, 'subcommands'), [
-      'list',
-      'show',
-      'submit',
-      'cancel',
-      'retry',
+      'task list',
+      'task show',
+      'task submit',
+      'task cancel',
+      'task retry',
     ])
     assert.deepEqual(registered, {
       botToken: BOT_TOKEN,

@@ -24,6 +24,7 @@ export type DiscordCommandRequest = {
   userId: string
   guildId: string | null
   channelId: string | null
+  subcommandGroup: string | null
   subcommand: string
   options: Record<string, string | number | boolean | undefined>
 }
@@ -122,65 +123,77 @@ export function discordCommandDefinitionJson() {
       description: 'Araya の開発 Task を確認・操作する',
       options: [
         {
-          type: 1,
-          name: 'list',
-          description: 'Task の一覧と runner の状態を出す',
+          type: 2,
+          name: 'task',
+          description: 'Task を確認・操作する',
           options: [
             {
-              type: 3,
-              name: 'status',
-              description: '状態でのしぼり込み',
-              required: false,
-              choices: statusChoices,
-            },
-          ],
-        },
-        {
-          type: 1,
-          name: 'show',
-          description: 'Task の詳細（SHIKI の要約と途中経過）を出す',
-          options: [{ type: 4, name: 'task', description: 'Task ID', required: true }],
-        },
-        {
-          type: 1,
-          name: 'submit',
-          description: '開発の Task を登録する',
-          options: [
-            { type: 3, name: 'title', description: '1 行の目的（1〜100 字）', required: true },
-            { type: 3, name: 'goal', description: 'ゴール（1〜2000 字）', required: true },
-            { type: 3, name: 'targets', description: '変更対象（カンマ区切り）', required: false },
-            {
-              type: 3,
-              name: 'constraints',
-              description: '守る条件（カンマ区切り）',
-              required: false,
+              type: 1,
+              name: 'list',
+              description: 'Task の一覧と runner の状態を出す',
+              options: [
+                {
+                  type: 3,
+                  name: 'status',
+                  description: '状態でのしぼり込み',
+                  required: false,
+                  choices: statusChoices,
+                },
+              ],
             },
             {
-              type: 3,
-              name: 'permissions',
-              description: '認める操作（カンマ区切り）',
-              required: false,
+              type: 1,
+              name: 'show',
+              description: 'Task の詳細（SHIKI の要約と途中経過）を出す',
+              options: [{ type: 4, name: 'task', description: 'Task ID', required: true }],
             },
-          ],
-        },
-        {
-          type: 1,
-          name: 'cancel',
-          description: 'Task の中止を求める',
-          options: [{ type: 4, name: 'task', description: 'Task ID', required: true }],
-        },
-        {
-          type: 1,
-          name: 'retry',
-          description: '終わった Task の再実行を求める',
-          options: [
-            { type: 4, name: 'task', description: 'Task ID', required: true },
-            { type: 3, name: 'note', description: '次の試行に渡す指示', required: false },
             {
-              type: 5,
-              name: 'confirm_side_effects',
-              description: '前の試行の git worktree・agent session の始末を認める',
-              required: false,
+              type: 1,
+              name: 'submit',
+              description: '開発の Task を登録する',
+              options: [
+                { type: 3, name: 'title', description: '1 行の目的（1〜100 字）', required: true },
+                { type: 3, name: 'goal', description: 'ゴール（1〜2000 字）', required: true },
+                {
+                  type: 3,
+                  name: 'targets',
+                  description: '変更対象（カンマ区切り）',
+                  required: false,
+                },
+                {
+                  type: 3,
+                  name: 'constraints',
+                  description: '守る条件（カンマ区切り）',
+                  required: false,
+                },
+                {
+                  type: 3,
+                  name: 'permissions',
+                  description: '認める操作（カンマ区切り）',
+                  required: false,
+                },
+              ],
+            },
+            {
+              type: 1,
+              name: 'cancel',
+              description: 'Task の中止を求める',
+              options: [{ type: 4, name: 'task', description: 'Task ID', required: true }],
+            },
+            {
+              type: 1,
+              name: 'retry',
+              description: '終わった Task の再実行を求める',
+              options: [
+                { type: 4, name: 'task', description: 'Task ID', required: true },
+                { type: 3, name: 'note', description: '次の試行に渡す指示', required: false },
+                {
+                  type: 5,
+                  name: 'confirm_side_effects',
+                  description: '前の試行が外部に変更を残した可能性を確認した',
+                  required: false,
+                },
+              ],
             },
           ],
         },
@@ -377,6 +390,13 @@ export function handleDiscordCommand(request: DiscordCommandRequest, deps: Comma
   }
 
   try {
+    if (request.subcommandGroup !== 'task') {
+      return redactReplies(
+        [{ content: '知らない command です（/araya task list・show・submit・cancel・retry）' }],
+        deps.redactor,
+      )
+    }
+
     switch (request.subcommand) {
       case 'list':
         return redactReplies(listTasks(request, deps), deps.redactor)
@@ -390,7 +410,7 @@ export function handleDiscordCommand(request: DiscordCommandRequest, deps: Comma
         return redactReplies(retryTask(request, deps), deps.redactor)
       default:
         return redactReplies(
-          [{ content: '知らない subcommand です（list・show・submit・cancel・retry）' }],
+          [{ content: '知らない command です（/araya task list・show・submit・cancel・retry）' }],
           deps.redactor,
         )
     }
@@ -400,6 +420,7 @@ export function handleDiscordCommand(request: DiscordCommandRequest, deps: Comma
     }
 
     const taskId =
+      request.subcommandGroup === 'task' &&
       request.subcommand === 'retry' &&
       typeof request.options.task === 'number' &&
       Number.isSafeInteger(request.options.task) &&
