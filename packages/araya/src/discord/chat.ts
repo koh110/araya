@@ -8,6 +8,7 @@ export type DiscordChatMessageMetadata = {
   userId: string
   isBot: boolean
   isWebhook: boolean
+  isSystem: boolean
   mentionsBot: boolean
 }
 
@@ -98,7 +99,7 @@ export function isDiscordChatMessageAllowed(
     config.allowedUserIds.includes(message.userId) &&
     !message.isBot &&
     !message.isWebhook &&
-    message.mentionsBot
+    !message.isSystem
   )
 }
 
@@ -151,16 +152,18 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
   }
 
   async function process(message: DiscordChatMessage, reply: DiscordChatReply) {
-    if (deps.session === null) {
-      await send(message, reply, CHAT_UNAVAILABLE_REPLY)
+    const content = stripDiscordBotMention(message.content, deps.botUserId)
+
+    if (content === '') {
+      if (message.mentionsBot) {
+        await send(message, reply, 'メッセージを入力してください。')
+      }
 
       return
     }
 
-    const content = stripDiscordBotMention(message.content, deps.botUserId)
-
-    if (content === '') {
-      await send(message, reply, 'メンションの後にメッセージを入力してください。')
+    if (deps.session === null) {
+      await send(message, reply, CHAT_UNAVAILABLE_REPLY)
 
       return
     }

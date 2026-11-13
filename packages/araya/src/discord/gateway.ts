@@ -30,8 +30,12 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
 
-export function discordGatewayIntents(bits: { Guilds: number; GuildMessages: number }) {
-  return [bits.Guilds, bits.GuildMessages]
+export function discordGatewayIntents(bits: {
+  Guilds: number
+  GuildMessages: number
+  MessageContent: number
+}) {
+  return [bits.Guilds, bits.GuildMessages, bits.MessageContent]
 }
 
 export function discordNotificationPayload(content: string, nonce: string) {
@@ -166,10 +170,11 @@ export async function createDiscordGateway(
       userId: message.author.id,
       isBot: message.author.bot,
       isWebhook: message.webhookId !== null,
+      isSystem: message.system,
       mentionsBot: botUserId !== undefined && message.mentions.users.has(botUserId),
     }
 
-    // channel/user/mention を確認する前に本文を読み込まない。
+    // Message Content intent は有効だが、本文を取り出す前に guild/channel/user を絞る。
     if (!isDiscordChatMessageAllowed(metadata, config)) {
       return
     }

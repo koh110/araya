@@ -26,10 +26,11 @@ const message: DiscordChatMessageMetadata = {
   userId: '42345678901234567',
   isBot: false,
   isWebhook: false,
+  isSystem: false,
   mentionsBot: true,
 }
 
-test('discord chat: 設定 guild/channel の許可 user が bot を mention したときだけ受け付ける', () => {
+test('discord chat: 設定 guild/channel の許可 user は mention なしでも受け付ける', () => {
   assert.equal(isDiscordChatMessageAllowed(message, config), true)
   assert.equal(isDiscordChatMessageAllowed({ ...message, guildId: null }, config), false)
   assert.equal(
@@ -46,7 +47,8 @@ test('discord chat: 設定 guild/channel の許可 user が bot を mention し�
   )
   assert.equal(isDiscordChatMessageAllowed({ ...message, isBot: true }, config), false)
   assert.equal(isDiscordChatMessageAllowed({ ...message, isWebhook: true }, config), false)
-  assert.equal(isDiscordChatMessageAllowed({ ...message, mentionsBot: false }, config), false)
+  assert.equal(isDiscordChatMessageAllowed({ ...message, isSystem: true }, config), false)
+  assert.equal(isDiscordChatMessageAllowed({ ...message, mentionsBot: false }, config), true)
 })
 
 test('discord chat: bot mention を本文から除き、他の user mention は残す', () => {
@@ -85,7 +87,7 @@ test('discord chat: reply nonce は同じ message/chunk で安定し、25文字�
   assert.ok(discordChatReplyNonce('123456789012345678', 0).length <= 25)
 })
 
-test('discord chat: 許可 message は mention を外して redaction 後に同じ message ID で submit する', async () => {
+test('discord chat: 許可 channel の mention なし message を redaction 後に submit する', async () => {
   const submitted: { content: string; requestId: string }[] = []
   const replies: { content: string; nonce: string }[] = []
   await createDiscordChatHandler({
@@ -104,8 +106,9 @@ test('discord chat: 許可 message は mention を外して redaction 後に同�
   }).handle(
     {
       ...message,
+      mentionsBot: false,
       messageId: '82345678901234567',
-      content: '<@12345678901234567> secret-tokenを確認して',
+      content: 'secret-tokenを確認して',
     },
     async (content, nonce) => {
       replies.push({ content, nonce })
@@ -125,6 +128,41 @@ test('discord chat: 許可 message は mention を外して redaction 後に同�
     ['回答 [REDACTED]です'],
   )
   assert.ok(replies[0]?.nonce.startsWith('araya-'))
+})
+
+test('discord chat: mention なしの空本文は無視し、mention だけなら入力を促す', async () => {
+  const submitted: string[] = []
+  const replies: string[] = []
+  const handler = createDiscordChatHandler({
+    config,
+    botUserId: '12345678901234567',
+    redactor: createRedactor([]),
+    session: {
+      submit: async (content) => {
+        submitted.push(content)
+
+        return 'unexpected'
+      },
+      reset: async () => {},
+    },
+    log: () => {},
+  })
+
+  await handler.handle(
+    { ...message, mentionsBot: false, messageId: 'empty-message', content: '   ' },
+    async (content) => {
+      replies.push(content)
+    },
+  )
+  await handler.handle(
+    { ...message, messageId: 'mention-only-message', content: '<@12345678901234567>' },
+    async (content) => {
+      replies.push(content)
+    },
+  )
+
+  assert.deepEqual(submitted, [])
+  assert.deepEqual(replies, ['メッセージを入力してください。'])
 })
 
 test('discord chat: reset command は Pi session を reset し model には送らない', async () => {
@@ -147,7 +185,7 @@ test('discord chat: reset command は Pi session を reset し model には送�
     },
     log: () => {},
   }).handle(
-    { ...message, messageId: '92345678901234567', content: '<@12345678901234567> reset' },
+    { ...message, mentionsBot: false, messageId: '92345678901234567', content: 'reset' },
     async (content) => {
       replies.push(content)
     },

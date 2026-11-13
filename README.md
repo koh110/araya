@@ -145,9 +145,11 @@ ARAYA_DISCORD_ALLOWED_USER_IDS=<discord-user-id>
 
 `ARAYA_DISCORD_ALLOWED_USER_IDS` は許可する Discord user ID をカンマ区切りで指定します。例の `<...>` は実際の値に置き換えます。この `.env` は Discord 専用で、ここに示した5つ以外の設定名は受け付けません。Application/Guild/Channel/User ID は公開 ID ですが、Bot token は秘密として扱ってください。値の一部を `op://` 参照にする場合は、1Password の節も参照してください。設定後、slash command を登録して bot service を入れます。
 
-`ARAYA_DISCORD_CHANNEL_ID` は Task 通知の既定送信先であり、継続会話の入力先でもあります。会話を始めるときも続けるときも、許可した利用者がこの channel で Araya を mention してください（例: `@Araya 今日の状況をまとめて`）。許可 user であっても、mention の無い投稿や別 channel/guild の投稿、bot/webhook の投稿は会話に入りません。Discord の `Message Content` privileged intent は要求しません。
+`ARAYA_DISCORD_CHANNEL_ID` は Task 通知と継続会話の共通 channel です。ここは許可利用者だけが閲覧・投稿できる非公開の Araya 専用 channel にし、許可した利用者の通常 message は mention なしで会話に入ります。会話以外の投稿には別 channel を使ってください。別 guild/channel、許可されていない user、bot、webhook、system message は会話に入りません。本文のない投稿は無視し、Araya への mention だけの投稿には本文を入力するよう返信します。
 
-`@Araya reset` は会話の文脈をリセットしますが、保存済みの SQLite file を消去する操作ではありません。会話は `<ARAYA_DATA_DIR>/discord/chat.sqlite` に永続化され、Bot の再起動後も続きます。既知の secret は保存前に redaction しますが、会話の transcript には Araya の生成 reply も保存されます。credential や他の機密情報を会話に投稿しないでください。
+この動作には Discord の `Message Content` privileged intent が必要です。Discord Developer Portal の対象 application の Bot 設定で `Message Content Intent` を有効にしてください。この intent は `ARAYA_DISCORD_CHANNEL_ID` 単位ではなく application に付与されます。bot が見られる範囲を必要最小限にし、Araya は guild/channel/user の allowlist を通過した message 本文だけを会話へ渡します。message 本文はログへ出力しません。
+
+`reset`（または `@Araya reset`）は会話の文脈をリセットしますが、保存済みの SQLite file を消去する操作ではありません。会話は `<ARAYA_DATA_DIR>/discord/chat.sqlite` に永続化され、Bot の再起動後も続きます。既知の secret は保存前に redaction しますが、会話の transcript には Araya の生成 reply も保存されます。credential や他の機密情報を会話に投稿しないでください。
 
 実装を依頼するときは、`「この変更を実装してください」` のように明示してください。Araya は会話 agent から repository を直接変更せず、依頼を既存 Task runner に登録して Task ID を返します。実作業・検証・Draft PR は runner が行い、状態は既存の slash command と Task 通知で確認します。質問や設計相談だけでは Task を登録しません。
 

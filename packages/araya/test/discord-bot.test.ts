@@ -139,7 +139,7 @@ test('discord bot: crash 後に残った stale process lock を回収する', as
   }
 })
 
-test('discord bot: 指定 channel の mention を会話 session に渡し、終了時に close する', async () => {
+test('discord bot: 指定 channel の mention なし投稿を会話 session に渡し、終了時に close する', async () => {
   const dataDir = await fs.realpath(
     await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-chat-test-')),
   )
@@ -192,8 +192,9 @@ test('discord bot: 指定 channel の mention を会話 session に渡し、終�
                 userId: USER_ID,
                 isBot: false,
                 isWebhook: false,
-                mentionsBot: true,
-                content: '<@!998877665544332211> hello',
+                isSystem: false,
+                mentionsBot: false,
+                content: 'hello',
               },
               reply,
             )
@@ -205,8 +206,9 @@ test('discord bot: 指定 channel の mention を会話 session に渡し、終�
                 userId: USER_ID,
                 isBot: false,
                 isWebhook: false,
-                mentionsBot: true,
-                content: '<@998877665544332211> reset',
+                isSystem: false,
+                mentionsBot: false,
+                content: 'reset',
               },
               reply,
             )
@@ -276,8 +278,9 @@ test('discord bot: 会話 session 初期化に失敗しても既存 slash comman
                 userId: USER_ID,
                 isBot: false,
                 isWebhook: false,
-                mentionsBot: true,
-                content: '<@998877665544332211> hello',
+                isSystem: false,
+                mentionsBot: false,
+                content: 'hello',
               },
               captureChatReply,
             )
@@ -580,8 +583,9 @@ test('discord bot: shutdown は進行中の chat reply を送ってから gatewa
                   userId: USER_ID,
                   isBot: false,
                   isWebhook: false,
-                  mentionsBot: true,
-                  content: '<@998877665544332211> finish this reply',
+                  isSystem: false,
+                  mentionsBot: false,
+                  content: 'finish this reply',
                 },
                 async (content) => {
                   replyAfterGatewayClose = gatewayClosed

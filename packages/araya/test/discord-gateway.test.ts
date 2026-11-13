@@ -16,8 +16,11 @@ test('discord gateway: nonce payload は enforce_nonce を有効にする', () =
   })
 })
 
-test('discord gateway: free-text chat は Message Content privileged intent を要求しない', () => {
-  assert.deepEqual(discordGatewayIntents({ Guilds: 1, GuildMessages: 512 }), [1, 512])
+test('discord gateway: mention なしの会話は Message Content privileged intent を使う', () => {
+  assert.deepEqual(
+    discordGatewayIntents({ Guilds: 1, GuildMessages: 512, MessageContent: 32768 }),
+    [1, 512, 32768],
+  )
 })
 
 test('discord gateway: nested task group options reach the retry handler as leaf values', () => {
