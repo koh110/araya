@@ -3,7 +3,11 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import test from 'node:test'
 
+import { Harness, createRegistry } from '@earendil-works/pi-durable'
+import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node'
+
 import { openDiscordChatAgent } from '../src/discord/chat-agent.ts'
+import { GITHUB_REPOSITORY_LIST_TOOL_NAME } from '../src/discord/github-repositories.ts'
 import { createRedactor } from '../src/infrastructure/redaction.ts'
 import { openTaskLedger } from '../src/runner/ledger.ts'
 import { answer, createFauxModels, toolCall } from './support/faux-shiki.ts'
@@ -125,6 +129,105 @@ test('discord chat agent: 同じ reset message の再送で後続会話を消さ
     await session.reset('reset-message-1')
     const afterReplay = await session.submit('after replay', 'after-replay-1')
     assert.match(afterReplay, /after reset/u)
+  } finally {
+    await session.close?.()
+    ledger.close()
+    await removeRunnerFixture(fixture)
+  }
+})
+
+test('discord chat agent: existing root configuration is upgraded to expose GitHub tools', async () => {
+  const fixture = await createRunnerFixture()
+  const models = await createFauxModels(fixture)
+  const ledger = openTaskLedger(fixture.dataDir)
+  let originalSession: Awaited<ReturnType<typeof openDiscordChatAgent>> | undefined
+  let upgradedSession: Awaited<ReturnType<typeof openDiscordChatAgent>> | undefined
+
+  try {
+    const input = {
+      dataDir: fixture.dataDir,
+      ledger,
+      redactor: createRedactor([]),
+      models: models.runtime,
+      model: modelRef(models),
+      context: ctx,
+      github: {
+        env: {},
+        fetch: async () => new Response(JSON.stringify([
+          { name: 'README.md', path: 'README.md', type: 'file', size: 80 },
+        ]), { status: 200 }),
+      },
+    }
+
+    originalSession = await openDiscordChatAgent(input)
+    await originalSession.close?.()
+
+    const storagePath = path.join(fixture.dataDir, 'discord', 'chat.sqlite')
+    const storage = await openNodeSqliteStorage(storagePath)
+    const legacyHarness = await Harness.open(storage, {
+      models: models.runtime,
+      registry: createRegistry(),
+    }, ctx)
+
+    try {
+      const root = await legacyHarness.root(ctx)
+      await root.configure({
+        tools: [],
+        modelTools: [],
+        instructions: 'Legacy instructions without GitHub repository tools.',
+      }, ctx)
+    } finally {
+      await legacyHarness.close(ctx)
+    }
+
+    models.script((view) => {
+      if (view.toolResults.length === 0) {
+        return toolCall(GITHUB_REPOSITORY_LIST_TOOL_NAME, { owner: 'octo', repo: 'project' })
+      }
+
+      return answer(view.toolResults[0]?.text ?? 'GitHub result missing')
+    })
+    upgradedSession = await openDiscordChatAgent(input)
+    const reply = await upgradedSession.submit('octo/project を読む', 'message-github-upgrade-1')
+
+    assert.ok(reply.includes('README.md'))
+  } finally {
+    await upgradedSession?.close?.()
+    await originalSession?.close?.()
+    ledger.close()
+    await removeRunnerFixture(fixture)
+  }
+})
+
+test('discord chat agent: repository read-only tool を conversation に登録して実行する', async () => {
+  const fixture = await createRunnerFixture()
+  const models = await createFauxModels(fixture)
+  const ledger = openTaskLedger(fixture.dataDir)
+  const session = await openDiscordChatAgent({
+    dataDir: fixture.dataDir,
+    ledger,
+    redactor: createRedactor([]),
+    models: models.runtime,
+    model: modelRef(models),
+    context: ctx,
+    github: {
+      env: {},
+      fetch: async () => new Response(JSON.stringify([
+        { name: 'README.md', path: 'README.md', type: 'file', size: 80 },
+      ]), { status: 200 }),
+    },
+  })
+  models.script((view) => {
+    if (view.toolResults.length === 0) {
+      return toolCall(GITHUB_REPOSITORY_LIST_TOOL_NAME, { owner: 'octo', repo: 'project' })
+    }
+
+    return answer(view.toolResults[0]?.text ?? 'GitHub result missing')
+  })
+
+  try {
+    const reply = await session.submit('octo/project のファイル一覧を見て', 'message-github-1')
+    assert.match(reply, /README\.md/u)
   } finally {
     await session.close?.()
     ledger.close()
