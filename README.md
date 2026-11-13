@@ -145,7 +145,7 @@ ARAYA_DISCORD_ALLOWED_USER_IDS=<discord-user-id>
 
 `ARAYA_DISCORD_ALLOWED_USER_IDS` は許可する Discord user ID をカンマ区切りで指定します。例の `<...>` は実際の値に置き換えます。この `.env` は Discord 専用で、ここに示した5つ以外の設定名は受け付けません。Application/Guild/Channel/User ID は公開 ID ですが、Bot token は秘密として扱ってください。値の一部を `op://` 参照にする場合は、1Password の節も参照してください。設定後、slash command を登録して bot service を入れます。
 
-`ARAYA_DISCORD_CHANNEL_ID` は Task 通知と継続会話の共通 channel です。ここは許可利用者だけが閲覧・投稿できる非公開の Araya 専用 channel にし、許可した利用者の通常 message は mention なしで会話に入ります。会話以外の投稿には別 channel を使ってください。別 guild/channel、許可されていない user、bot、webhook、system message は会話に入りません。本文のない投稿は無視し、Araya への mention だけの投稿には本文を入力するよう返信します。
+`ARAYA_DISCORD_CHANNEL_ID` は Task 通知と継続会話の共通 channel です。ここは許可利用者だけが閲覧・投稿できる非公開の Araya 専用 channel にし、許可した利用者の通常 message は mention なしで会話に入ります。会話以外の投稿には別 channel を使ってください。別 guild/channel、許可されていない user、bot、webhook、system message は会話に入りません。本文のない投稿は無視し、Araya への mention だけの投稿には本文を入力するよう返信します。受理した投稿の応答処理中は typing indicator を更新し、処理完了後に更新を止めます。
 
 この動作には Discord の `Message Content` privileged intent が必要です。Discord Developer Portal の対象 application の Bot 設定で `Message Content Intent` を有効にしてください。この intent は `ARAYA_DISCORD_CHANNEL_ID` 単位ではなく application に付与されます。bot が見られる範囲を必要最小限にし、Araya は guild/channel/user の allowlist を通過した message 本文だけを会話へ渡します。message 本文はログへ出力しません。
 

@@ -1,7 +1,7 @@
 // discord.js との接続。型Importだけにして discord.js の実行時 import は関内に行う（CLI 起動や test で load しない）
 // gateway interface を関数にすることで bot.ts の loop を fake で test できる
 
-import type { ChatInputCommandInteraction } from 'discord.js'
+import type { ChatInputCommandInteraction, GuildTextBasedChannel } from 'discord.js'
 import { type DiscordConfig } from './config.ts'
 import {
   ARAYA_COMMAND_NAME,
@@ -28,6 +28,99 @@ export type DiscordGateway = {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
+}
+
+// Discord typing event は10秒で失効するため、少し余裕を持って更新する。
+const DISCORD_TYPING_REFRESH_INTERVAL_MS = 8_000
+
+type DiscordTypingChannel = Pick<GuildTextBasedChannel, 'sendTyping'>
+
+export function createDiscordTypingIndicator(onError: (message: string) => void) {
+  const activeRequests = new Set<symbol>()
+  let channel: DiscordTypingChannel | undefined
+  let interval: ReturnType<typeof setInterval> | undefined
+  let sending = false
+  let refreshPending = false
+
+  async function sendTyping(queueRefreshIfSending = false) {
+    if (activeRequests.size === 0 || channel === undefined) {
+      return
+    }
+
+    if (sending) {
+      if (queueRefreshIfSending) {
+        refreshPending = true
+      }
+
+      return
+    }
+
+    sending = true
+
+    try {
+      await channel.sendTyping()
+    } catch (error) {
+      // typing 表示の失敗で会話返信まで止めない。
+      try {
+        onError(`Discord typing indicator failed: ${errorMessage(error)}`)
+      } catch {
+        // error logger の失敗も会話処理へ伝播させない。
+      }
+    } finally {
+      sending = false
+
+      if (refreshPending) {
+        refreshPending = false
+        void sendTyping()
+      }
+    }
+  }
+
+  function stop() {
+    if (interval !== undefined) {
+      clearInterval(interval)
+    }
+
+    interval = undefined
+    channel = undefined
+    refreshPending = false
+  }
+
+  function release(request: symbol) {
+    if (!activeRequests.delete(request)) {
+      return
+    }
+
+    if (activeRequests.size === 0) {
+      stop()
+    }
+  }
+
+  return {
+    run: async <T>(target: DiscordTypingChannel, operation: () => Promise<T> | T) => {
+      const request = Symbol()
+      activeRequests.add(request)
+      channel = target
+
+      if (interval === undefined) {
+        interval = setInterval(() => {
+          void sendTyping(true)
+        }, DISCORD_TYPING_REFRESH_INTERVAL_MS)
+      }
+
+      void sendTyping()
+
+      try {
+        return await operation()
+      } finally {
+        release(request)
+      }
+    },
+    close: () => {
+      activeRequests.clear()
+      stop()
+    },
+  }
 }
 
 export function discordGatewayIntents(bits: {
@@ -82,6 +175,7 @@ export async function createDiscordGateway(
 ) {
   const discord = await import('discord.js')
   const client = new discord.Client({ intents: discordGatewayIntents(discord.GatewayIntentBits) })
+  const typingIndicator = createDiscordTypingIndicator(handlers.onError)
 
   // login() は ready を待つが、test の fake と揃えるため ready を待つ promise を明示する
   const readyCallbacks: { resolve?: () => void; reject?: (error: Error) => void } = {}
@@ -187,15 +281,21 @@ export async function createDiscordGateway(
       await message.reply(discordNotificationPayload(content, nonce))
     }
 
-    void Promise.resolve(
-      handlers.onMessage(
+    function onMessage() {
+      return handlers.onMessage(
         {
           ...metadata,
           messageId: message.id,
           content: message.content,
         },
         reply,
-      ),
+      )
+    }
+
+    void (
+      message.inGuild() && message.channel.isTextBased()
+        ? typingIndicator.run(message.channel, onMessage)
+        : Promise.resolve().then(onMessage)
     ).catch((error: unknown) => {
       handlers.onError(errorMessage(error))
     })
@@ -217,6 +317,7 @@ export async function createDiscordGateway(
       await channel.send(discordNotificationPayload(content, nonce))
     },
     close: async () => {
+      typingIndicator.close()
       await client.destroy()
     },
   } satisfies DiscordGateway

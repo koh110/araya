@@ -13,6 +13,8 @@
 - bot mention が含まれていれば本文から取り除き、残った本文を投稿者の user ID とともに会話へ送る。本文が空の投稿、添付ファイル・embed・音声だけの投稿は無視し、mention だけの投稿には入力を促す。
 - `reset`（または `@Araya reset`）はこの channel の会話を reset し、以後の会話を新しい文脈で始める。
 - 出力: channel に通常 message として返信する。Discord の message 上限に合わせて分割し、全返信で `allowedMentions` を無効にする。
+- 許可された投稿の処理中は Discord typing indicator を更新し、処理が成功・失敗のいずれかで完了したら更新を止める。Pi の `running` 状態は問い合わせず、Gateway handler の未完了 Promise を処理中の基準にする。複数投稿が順番待ち・処理中の場合は channel 単位の heartbeat を共有する。
+- Discord typing indicator は10秒で失効するため、処理中は8秒間隔で更新する。typing APIの送信中に更新時刻をまたいだ場合は1回だけ保留し、送信完了後にすぐ再送して同時送信を避ける。typing API または error logger の失敗は会話処理を妨げない。
 
 ## Data Model
 
@@ -72,6 +74,7 @@
 - [x] 会話で通常回答する場合は Task を作らず、Task tool の結果には Task ID が含まれ、agent へその ID を伝えるよう指示する。
 - [x] user input と Task fields は既知の秘密を保存前に redaction し、Discord へ送る assistant reply も redaction する。bot log は本文・model 出力・Task goal を含まない。
 - [x] 返信は Discord の上限以下に分割され、mention parsing を行わない。
+- [x] 許可された入力の処理中は typing indicator を共有 heartbeat で更新し、すべての処理 Promise が完了した後に更新を止める。typing 表示失敗は会話の返信を妨げない。
 - [x] Gateway は `MessageContent` privileged intent を要求し、README は Developer Portal の設定要件を説明し、unit test は intent と mention なしの動作を検証する。
 - [x] shutdown は chat の新規受付を止め、Gateway 接続中に受理済み turn と reply を drain してから close する。
 
