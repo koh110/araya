@@ -11,6 +11,12 @@ import { dataDirHash, discordUnitName, runnerUnitName } from '../infrastructure/
 import { openTaskLedger, type TaskLedger } from '../runner/ledger.ts'
 import { loadDiscordConfig, type DiscordConfig } from './config.ts'
 import {
+  createDiscordChatHandler,
+  type DiscordChatHandler,
+  type DiscordChatSession,
+} from './chat.ts'
+import { createDefaultDiscordChatSession } from './chat-agent.ts'
+import {
   createDiscordGateway,
   type DiscordGateway,
   type DiscordGatewayHandlers,
@@ -26,7 +32,7 @@ type ProperLockfile = {
   ): Promise<() => Promise<void>>
 }
 
-const properLockfile = createRequire(import.meta.url)('proper-lockfile') as ProperLockfile
+const properLockfile: ProperLockfile = createRequire(import.meta.url)('proper-lockfile')
 const DISCORD_PROCESS_LOCK_STALE_MS = 30_000
 const DISCORD_PROCESS_LOCK_UPDATE_MS = 10_000
 
@@ -44,6 +50,7 @@ export type DiscordBotDependencies = {
     config: DiscordConfig,
     handlers: DiscordGatewayHandlers,
   ) => Promise<DiscordGateway>
+  createChatSession?: typeof createDefaultDiscordChatSession
   log?: (entry: Record<string, unknown>) => void
 }
 
@@ -244,8 +251,38 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     return 1
   }
 
+  let chatSession: DiscordChatSession | null = null
+
+  async function closeChatSession() {
+    try {
+      await chatSession?.close?.()
+    } catch (error) {
+      logError('discord_chat_close_failed', error)
+    }
+  }
+
+  try {
+    chatSession = await (deps.createChatSession ?? createDefaultDiscordChatSession)({
+      dataDir,
+      env: deps.env,
+      ledger,
+      redactor,
+    })
+    logSafe({ type: 'discord_chat_ready' })
+  } catch (error) {
+    logError('discord_chat_unavailable', error)
+  }
+
+  const chatHandlerRef: { current: DiscordChatHandler | null } = { current: null }
   const handlers: DiscordGatewayHandlers = {
-    onReady: () => {
+    onReady: (botUserId) => {
+      chatHandlerRef.current = createDiscordChatHandler({
+        config,
+        botUserId: botUserId ?? '',
+        session: chatSession,
+        redactor,
+        log: logSafe,
+      })
       state.unit = unit
       state.readyId = readyId
       state.lastReadyAt = new Date(nowMs()).toISOString()
@@ -272,18 +309,21 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
         await reply(item.content)
       }
     },
+    onMessage: async (message, reply) => {
+      await chatHandlerRef.current?.handle(message, reply)
+    },
     onError: (message) => {
       logSafe({ type: 'discord_error', message: redactor.redact(message).slice(0, 500) })
     },
   }
 
-  const createGateway = deps.createGateway ?? createDiscordGateway
   let gateway: DiscordGateway
 
   try {
-    gateway = await createGateway(config, handlers)
+    gateway = await (deps.createGateway ?? createDiscordGateway)(config, handlers)
   } catch (error) {
     logError('discord_gateway_failed', error)
+    await closeChatSession()
     ledger.close()
 
     return 1
@@ -331,12 +371,16 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
       }
     }
   } finally {
+    chatHandlerRef.current?.stopAccepting()
+    await chatHandlerRef.current?.drain()
+
     try {
       await gateway.close()
     } catch {
       // close の失敗は終了処理の邪魔をしない
     }
 
+    await closeChatSession()
     ledger.close()
     logSafe({ type: 'discord_stopped' })
   }

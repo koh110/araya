@@ -18,6 +18,16 @@ const GUILD_ID = '22345678901234567'
 const CHANNEL_ID = '32345678901234567'
 const USER_ID = '42345678901234567'
 
+async function createInertChatSession() {
+  return {
+    async submit() {
+      return ''
+    },
+    async reset() {},
+    async close() {},
+  }
+}
+
 test('discord bot: 別 process が同じ dataDir を使用中なら2つ目は起動しない', async () => {
   const dataDir = await fs.realpath(
     await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-lock-test-')),
@@ -46,6 +56,7 @@ test('discord bot: 別 process が同じ dataDir を使用中なら2つ目は起
       },
       stopSignal: stopController.signal,
       verifyUnit: false,
+      createChatSession: createInertChatSession,
       createGateway: async (_config, handlers) => {
         gatewayCreations += 1
 
@@ -106,6 +117,7 @@ test('discord bot: crash 後に残った stale process lock を回収する', as
       },
       stopSignal: stopController.signal,
       verifyUnit: false,
+      createChatSession: createInertChatSession,
       createGateway: async (_config, handlers) => {
         return {
           connect: async () => {
@@ -121,6 +133,194 @@ test('discord bot: crash 後に残った stale process lock を回収する', as
 
     assert.equal(exitCode, 0)
     await assert.rejects(fs.access(lockPath), { code: 'ENOENT' })
+  } finally {
+    stopController.abort()
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('discord bot: 指定 channel の mention なし投稿を会話 session に渡し、終了時に close する', async () => {
+  const dataDir = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-chat-test-')),
+  )
+  const stopController = new AbortController()
+  const submissions: Array<{ content: string; requestId: string }> = []
+  const replies: string[] = []
+  let resetCount = 0
+  let closeCount = 0
+
+  try {
+    const exitCode = await runDiscordBot({
+      dataDir,
+      env: {
+        ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
+        ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
+        ARAYA_DISCORD_GUILD_ID: GUILD_ID,
+        ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
+        ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
+      },
+      stopSignal: stopController.signal,
+      verifyUnit: false,
+      createChatSession: async function createChatSession() {
+        return {
+          async submit(content, requestId) {
+            submissions.push({ content, requestId })
+
+            return '会話を続けています。'
+          },
+          async reset() {
+            resetCount += 1
+          },
+          async close() {
+            closeCount += 1
+          },
+        }
+      },
+      createGateway: async function createGateway(_config, handlers) {
+        return {
+          async connect() {
+            async function reply(content: string) {
+              replies.push(content)
+            }
+
+            await handlers.onReady('998877665544332211')
+            await handlers.onMessage(
+              {
+                messageId: 'chat-message-1',
+                guildId: GUILD_ID,
+                channelId: CHANNEL_ID,
+                userId: USER_ID,
+                isBot: false,
+                isWebhook: false,
+                isSystem: false,
+                mentionsBot: false,
+                content: 'hello',
+              },
+              reply,
+            )
+            await handlers.onMessage(
+              {
+                messageId: 'chat-message-2',
+                guildId: GUILD_ID,
+                channelId: CHANNEL_ID,
+                userId: USER_ID,
+                isBot: false,
+                isWebhook: false,
+                isSystem: false,
+                mentionsBot: false,
+                content: 'reset',
+              },
+              reply,
+            )
+            stopController.abort()
+          },
+          async sendText() {},
+          async close() {},
+        }
+      },
+      log: () => {},
+    })
+
+    assert.equal(exitCode, 0)
+    assert.deepEqual(submissions, [
+      { content: `Discord user ${USER_ID} said:\nhello`, requestId: 'chat-message-1' },
+    ])
+    assert.deepEqual(replies, ['会話を続けています。', 'この channel の会話をリセットしました'])
+    assert.equal(resetCount, 1)
+    assert.equal(closeCount, 1)
+  } finally {
+    stopController.abort()
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('discord bot: 会話 session 初期化に失敗しても既存 slash command は利用できる', async () => {
+  const dataDir = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-chat-unavailable-test-')),
+  )
+  const stopController = new AbortController()
+  const chatReplies: string[] = []
+  const commandReplies: string[] = []
+  const logs: Record<string, unknown>[] = []
+
+  try {
+    const exitCode = await runDiscordBot({
+      dataDir,
+      env: {
+        ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
+        ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
+        ARAYA_DISCORD_GUILD_ID: GUILD_ID,
+        ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
+        ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
+      },
+      stopSignal: stopController.signal,
+      verifyUnit: false,
+      createChatSession: async function createChatSession() {
+        throw new Error(`synthetic chat error: ${BOT_TOKEN}`)
+      },
+      createGateway: async function createGateway(_config, handlers) {
+        return {
+          async connect() {
+            async function captureChatReply(content: string) {
+              chatReplies.push(content)
+            }
+
+            async function captureCommandReply(content: string) {
+              commandReplies.push(content)
+            }
+
+            await handlers.onReady('998877665544332211')
+            await handlers.onMessage(
+              {
+                messageId: 'chat-unavailable-message',
+                guildId: GUILD_ID,
+                channelId: CHANNEL_ID,
+                userId: USER_ID,
+                isBot: false,
+                isWebhook: false,
+                isSystem: false,
+                mentionsBot: false,
+                content: 'hello',
+              },
+              captureChatReply,
+            )
+            await handlers.onInteraction(
+              {
+                interactionId: 'chat-unavailable-list',
+                userId: USER_ID,
+                guildId: GUILD_ID,
+                channelId: CHANNEL_ID,
+                subcommandGroup: 'task',
+                subcommand: 'list',
+                options: {},
+              },
+              captureCommandReply,
+            )
+            stopController.abort()
+          },
+          async sendText() {},
+          async close() {},
+        }
+      },
+      log(entry) {
+        logs.push(entry)
+      },
+    })
+
+    assert.equal(exitCode, 0)
+    assert.ok(
+      chatReplies.some((content) => {
+        return content.includes('利用できません')
+      }),
+      '会話機能の利用不可を返信する',
+    )
+    assert.ok(commandReplies.length > 0, '既存 command に返信する')
+    assert.ok(
+      logs.some((entry) => {
+        return entry.type === 'discord_chat_unavailable'
+      }),
+    )
+    assert.equal(JSON.stringify(logs).includes(BOT_TOKEN), false)
   } finally {
     stopController.abort()
     await fs.rm(dataDir, { recursive: true, force: true })
@@ -146,6 +346,7 @@ test('discord bot: Task 操作の返信では Discord unit でなく runner unit
       },
       stopSignal: stopController.signal,
       verifyUnit: false,
+      createChatSession: createInertChatSession,
       createGateway: async (_config, handlers) => {
         return {
           connect: async () => {
@@ -222,6 +423,7 @@ test('discord bot: 1Passwordで解決したbot tokenを task・retry note・repl
       stopSignal: stopController.signal,
       verifyUnit: false,
       sleep: async () => {},
+      createChatSession: createInertChatSession,
       createGateway: async (_config, handlers) => {
         return {
           connect: async () => {
@@ -325,6 +527,95 @@ test('discord bot: 1Passwordで解決したbot tokenを task・retry note・repl
       ledger.close()
     }
   } finally {
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('discord bot: shutdown は進行中の chat reply を送ってから gateway を閉じる', async () => {
+  const dataDir = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-chat-drain-test-')),
+  )
+  const stopController = new AbortController()
+  let releaseSubmit: ((content: string) => void) | undefined
+  let signalSubmitStarted: (() => void) | undefined
+  const submitStarted = new Promise<void>((resolve) => {
+    signalSubmitStarted = resolve
+  })
+  let messageDone = Promise.resolve()
+  let gatewayClosed = false
+  let replyAfterGatewayClose = false
+  const replies: string[] = []
+
+  try {
+    const exitCode = await runDiscordBot({
+      dataDir,
+      env: {
+        ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
+        ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
+        ARAYA_DISCORD_GUILD_ID: GUILD_ID,
+        ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
+        ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
+      },
+      stopSignal: stopController.signal,
+      verifyUnit: false,
+      createChatSession: async function createChatSession() {
+        return {
+          async submit() {
+            return await new Promise<string>((resolve) => {
+              releaseSubmit = resolve
+              signalSubmitStarted?.()
+            })
+          },
+          async reset() {},
+          async close() {},
+        }
+      },
+      createGateway: async function createGateway(_config, handlers) {
+        return {
+          async connect() {
+            await handlers.onReady('998877665544332211')
+            messageDone = Promise.resolve(
+              handlers.onMessage(
+                {
+                  messageId: 'chat-drain-message',
+                  guildId: GUILD_ID,
+                  channelId: CHANNEL_ID,
+                  userId: USER_ID,
+                  isBot: false,
+                  isWebhook: false,
+                  isSystem: false,
+                  mentionsBot: false,
+                  content: 'finish this reply',
+                },
+                async (content) => {
+                  replyAfterGatewayClose = gatewayClosed
+                  replies.push(content)
+                },
+              ),
+            )
+            await submitStarted
+            stopController.abort()
+            setImmediate(() => {
+              releaseSubmit?.('reply while connected')
+            })
+          },
+          async sendText() {},
+          async close() {
+            gatewayClosed = true
+          },
+        }
+      },
+      log: () => {},
+    })
+
+    await messageDone
+    assert.equal(exitCode, 0)
+    assert.deepEqual(replies, ['reply while connected'])
+    assert.equal(replyAfterGatewayClose, false)
+    assert.equal(gatewayClosed, true)
+  } finally {
+    releaseSubmit?.('cleanup')
+    stopController.abort()
     await fs.rm(dataDir, { recursive: true, force: true })
   }
 })

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// systemd LoadCredential から .env を読み、Discord bot には設定値だけを渡す。
+// systemd LoadCredential から .env を読み、検証済み Discord 設定と allowlist 済み runtime environment だけを bot に渡す。
 
 import { spawn } from 'node:child_process'
 import fs from 'node:fs/promises'

@@ -124,7 +124,7 @@ test('discord-env-runner: malformed token を含む launcher error に token 値
   }
 })
 
-test('discord-env-runner: botにはDiscord設定だけを渡し、systemdと1Password credentialを除く', () => {
+test('discord-env-runner: bot は Discord 設定と gh CLI config selector を渡し、token とほかの systemd/1Password credentials を除く', () => {
   const settings = {
     botToken: BOT_TOKEN,
     applicationId: APPLICATION_ID,
@@ -146,6 +146,12 @@ test('discord-env-runner: botにはDiscord設定だけを渡し、systemdと1Pas
     OP_ACCOUNT: 'private-account',
     AWS_SECRET_ACCESS_KEY: 'aws-secret',
     GITHUB_TOKEN: 'github-secret',
+    GITHUB_ENTERPRISE_TOKEN: 'github-enterprise-secret',
+    GH_TOKEN: 'github-cli-token',
+    GH_ENTERPRISE_TOKEN: 'github-cli-enterprise-secret',
+    GH_HOST: 'github.com',
+    GH_CONFIG_DIR: '/home/araya/.config/gh',
+    XDG_CONFIG_HOME: '/home/araya/.config',
     ARAYA_DISCORD_BOT_TOKEN: 'inherited-token',
     ARAYA_DISCORD_APPLICATION_ID: '111111111111111111',
     OTHER_VALUE: 'preserved',
@@ -161,6 +167,12 @@ test('discord-env-runner: botにはDiscord設定だけを渡し、systemdと1Pas
   assert.equal(environment.OTHER_VALUE, undefined)
   assert.equal(environment.AWS_SECRET_ACCESS_KEY, undefined)
   assert.equal(environment.GITHUB_TOKEN, undefined)
+  assert.equal(environment.GITHUB_ENTERPRISE_TOKEN, undefined)
+  assert.equal(environment.GH_TOKEN, undefined)
+  assert.equal(environment.GH_ENTERPRISE_TOKEN, undefined)
+  assert.equal(environment.GH_HOST, 'github.com')
+  assert.equal(environment.GH_CONFIG_DIR, '/home/araya/.config/gh')
+  assert.equal(environment.XDG_CONFIG_HOME, '/home/araya/.config')
   assert.equal(environment.CREDENTIALS_DIRECTORY, undefined)
   assert.equal(environment[OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME], undefined)
   assert.equal(environment.OP_CONNECT_HOST, undefined)

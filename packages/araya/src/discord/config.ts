@@ -46,7 +46,7 @@ export type DiscordConfig = {
 
 export type DiscordAuthMode = 'env-file' | '1password'
 
-// Discord bot に継承する systemd/runtime 環境の allowlist。Discord 設定は検証後に別途追加する。
+// Discord bot に継承する systemd/runtime 環境の allowlist。gh CLI の host/config path は通すが、token は継承しない。
 export const DISCORD_BOT_RUNTIME_ENVIRONMENT_NAMES = [
   'HOME',
   'PATH',
@@ -67,6 +67,9 @@ export const DISCORD_BOT_RUNTIME_ENVIRONMENT_NAMES = [
   'LC_PAPER',
   'LC_TELEPHONE',
   'LC_TIME',
+  'XDG_CONFIG_HOME',
+  'GH_CONFIG_DIR',
+  'GH_HOST',
 ] as const
 
 export function discordRuntimeEnvironment(sourceEnv: Readonly<Record<string, string | undefined>>) {
