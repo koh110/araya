@@ -33,6 +33,7 @@ import {
 import type { ThinkingLevel } from '../config/model.ts'
 import { readDecision } from '../development/worktrees.ts'
 import { createRedactor, type Redactor } from '../infrastructure/redaction.ts'
+import { sendProgressWake } from '../infrastructure/progress-socket.ts'
 import {
   buildShikiInstructions,
   buildTaskBody,
@@ -139,6 +140,8 @@ export type AttemptDependencies = {
   draftPrDelivery: boolean
   // 秘密とみなす環境変数の値（evidence と evidence.json に書く前に置き換える）
   secretValues: readonly string[]
+  // ledger に tool event を記録した後の best-effort wake。通常は data directory 内の Unix socket
+  notifyProgress?: () => Promise<unknown> | unknown
   log(entry: Record<string, unknown>): void
   // 省略時は Pi の SettingsManager（agentDir と状態 directory で作る）
   createPiSettings?: (stateDir: string, agentDir: string) => PiModelSettings | Promise<PiModelSettings>
@@ -682,7 +685,15 @@ export function createShikiExtension(deps: AttemptDependencies) {
         return
       }
 
-      deps.ledger.appendToolEvent(taskKey, type, toolEventData(call, result, eventRedactor))
+      const appendResult = deps.ledger.appendToolEvent(taskKey, type, toolEventData(call, result, eventRedactor))
+
+      if (appendResult === 'written') {
+        try {
+          await (deps.notifyProgress ?? (() => sendProgressWake(deps.dataDir)))()
+        } catch {
+          // socket/IPC は best-effort。ledger commit と tool の実行を優先し、失敗の本文は記録しない
+        }
+      }
     } catch (error) {
       deps.log({ type: 'tool_event_failed', ...(taskKey === undefined ? {} : { taskKey }), message: describeError(error) })
     }
