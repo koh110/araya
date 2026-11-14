@@ -145,3 +145,114 @@ test('progress socket: socket path に通常 file があれば削除せず fail 
     await fs.rm(dataDir, { recursive: true, force: true })
   }
 })
+
+test('progress socket: close は socket path の file replacement を保持する', async () => {
+  const dataDir = await makeDataDir()
+  const server = await startProgressSocketServer(dataDir, () => {})
+  const content = 'replacement file must survive listener close'
+
+  try {
+    await fs.unlink(server.path)
+    await fs.writeFile(server.path, content)
+    await server.close()
+
+    assert.equal(await fs.readFile(server.path, 'utf8'), content)
+  } finally {
+    await server.close()
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('progress socket: close は socket path の directory replacement を保持する', async () => {
+  const dataDir = await makeDataDir()
+  const server = await startProgressSocketServer(dataDir, () => {})
+  const content = 'replacement directory contents must survive listener close'
+
+  try {
+    await fs.unlink(server.path)
+    await fs.mkdir(server.path, { mode: 0o700 })
+    await fs.writeFile(path.join(server.path, 'marker'), content)
+    await server.close()
+
+    assert.equal(await fs.readFile(path.join(server.path, 'marker'), 'utf8'), content)
+  } finally {
+    await server.close()
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('progress socket: close は同じ path に bind された replacement socket を保持する', async () => {
+  const dataDir = await makeDataDir()
+  const original = await startProgressSocketServer(dataDir, () => {})
+  let replacement: Awaited<ReturnType<typeof startProgressSocketServer>> | undefined
+
+  try {
+    await fs.unlink(original.path)
+    replacement = await startProgressSocketServer(dataDir, () => {})
+
+    await original.close()
+
+    assert.equal((await fs.lstat(original.path)).isSocket(), true)
+    assert.equal(await sendProgressWake(dataDir), true)
+  } finally {
+    await replacement?.close()
+    await original.close()
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('progress socket: close は runtime directory replacement 内の entry を削除しない', async () => {
+  const dataDir = await makeDataDir()
+  const server = await startProgressSocketServer(dataDir, () => {})
+  const runtimeDir = path.dirname(server.path)
+  const displacedRuntimeDir = path.join(dataDir, 'runtime-before-replacement')
+  const content = 'replacement runtime directory entry must survive listener close'
+
+  try {
+    await fs.rename(runtimeDir, displacedRuntimeDir)
+    await fs.mkdir(runtimeDir, { mode: 0o700 })
+    await fs.writeFile(server.path, content)
+
+    await server.close()
+
+    assert.equal(await fs.readFile(server.path, 'utf8'), content)
+  } finally {
+    await server.close()
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('progress socket: startup failure cleanup は replacement entry を保持する', async () => {
+  const dataDir = await makeDataDir()
+  const socketPath = progressSocketPath(dataDir)
+  const content = 'replacement entry must survive failed listener startup'
+  const originalChmod = fs.chmod
+  let replaced = false
+
+  try {
+    fs.chmod = async (target, mode) => {
+      if (!replaced && String(target).endsWith('/progress.sock')) {
+        replaced = true
+        await fs.unlink(String(target))
+        await fs.writeFile(String(target), content)
+      }
+
+      return await originalChmod(target, mode)
+    }
+
+    await assert.rejects(
+      startProgressSocketServer(dataDir, () => {}),
+      (error: unknown) => {
+        assert.ok(error instanceof Error)
+        assert.ok('code' in error)
+        assert.equal(error.code, 'progress_socket_unsafe_path')
+        return true
+      },
+    )
+    assert.equal(replaced, true)
+    assert.equal(await fs.readFile(socketPath, 'utf8'), content)
+  } finally {
+    fs.chmod = originalChmod
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
