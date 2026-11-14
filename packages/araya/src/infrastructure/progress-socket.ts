@@ -1,4 +1,6 @@
-import fs from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { constants as fsConstants } from 'node:fs'
+import fs, { type FileHandle } from 'node:fs/promises'
 import net, { type Server, type Socket } from 'node:net'
 import path from 'node:path'
 
@@ -13,6 +15,11 @@ const PROBE_TIMEOUT_MS = 250
 
 type SocketIdentity = { dev: number; ino: number; uid: number }
 type DirectoryIdentity = { dev: number; ino: number; uid: number }
+type RetainedListener = { server: Server; directoryHandle: FileHandle }
+
+// Keep failed-cleanup listeners and their directory descriptors alive so a later
+// libuv cleanup cannot follow a recycled descriptor to a different directory.
+const retainedListeners = new Set<RetainedListener>()
 
 function progressSocketError(code: string, message: string) {
   return Object.assign(new Error(`${code}: ${message}`), { code })
@@ -30,6 +37,34 @@ function currentUid() {
   }
 
   return uid
+}
+
+async function openPinnedRuntimeDirectory(runtimeDir: string, identity: DirectoryIdentity) {
+  if (process.platform !== 'linux' && process.platform !== 'darwin') {
+    throw progressSocketError('progress_socket_unsupported', 'descriptor-relative Unix socket paths are unavailable')
+  }
+
+  const directoryHandle = await fs.open(
+    runtimeDir,
+    fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+  )
+
+  try {
+    const opened = await directoryHandle.stat()
+
+    if (!sameDirectoryIdentity(opened, identity) || !(await runtimeDirectoryMatches(runtimeDir, identity))) {
+      throw progressSocketError('progress_socket_unsafe_path', 'runtime directory changed while opening its descriptor')
+    }
+
+    const descriptorDirectory = process.platform === 'linux'
+      ? `/proc/self/fd/${directoryHandle.fd}`
+      : `/dev/fd/${directoryHandle.fd}`
+
+    return { directoryHandle, descriptorDirectory }
+  } catch (error) {
+    await directoryHandle.close()
+    throw error
+  }
 }
 
 export function progressSocketPath(dataDir: string) {
@@ -197,6 +232,116 @@ async function removeStaleSocket(
   await fs.unlink(socketPath)
 }
 
+// Node/libuv unlinks the path passed to listen() during close(), without
+// checking which inode currently occupies that name. Pin the parent directory
+// and temporarily replace the name with a directory guard so close() cannot
+// remove a replacement file, socket, or directory.
+async function closeListenerSafely(
+  server: Server,
+  boundSocketPath: string,
+  identity: SocketIdentity | null,
+) {
+  const cleanupDir = path.join(path.dirname(boundSocketPath), `.progress-socket-close-${randomUUID()}`)
+  await fs.mkdir(cleanupDir, { mode: DIRECTORY_MODE })
+
+  const detachedPath = path.join(cleanupDir, 'entry')
+  let detached = false
+  let guardIdentity: DirectoryIdentity | null = null
+  let listenerClosed = false
+
+  const restoreDetached = async () => {
+    if (!detached) {
+      return
+    }
+
+    // fs.rename has no atomic RENAME_NOREPLACE option. runtime/ is an owner-only
+    // service directory; same-UID concurrent mutation is outside this contract.
+    // If a destination is already occupied, retain the staged entry and fail.
+    if (await socketStatOrNull(boundSocketPath) !== null) {
+      throw progressSocketError(
+        'progress_socket_recovery_required',
+        `replacement entry is preserved at ${detachedPath}; socket path is occupied`,
+      )
+    }
+
+    await fs.rename(detachedPath, boundSocketPath)
+    detached = false
+  }
+
+  try {
+    if (await socketStatOrNull(boundSocketPath) !== null) {
+      await fs.rename(boundSocketPath, detachedPath)
+      detached = true
+    }
+
+    await fs.mkdir(boundSocketPath, { mode: DIRECTORY_MODE })
+    const guard = await fs.lstat(boundSocketPath)
+
+    if (!guard.isDirectory() || guard.uid !== currentUid() || (Number(guard.mode) & 0o777) !== DIRECTORY_MODE) {
+      throw progressSocketError('progress_socket_unsafe_path', 'could not establish a private shutdown guard')
+    }
+
+    guardIdentity = { dev: guard.dev, ino: guard.ino, uid: guard.uid }
+
+    await new Promise<void>((resolve, reject) => {
+      try {
+        server.close(() => resolve())
+      } catch (error) {
+        reject(error)
+      }
+    })
+    listenerClosed = true
+
+    const currentGuard = await socketStatOrNull(boundSocketPath)
+
+    if (currentGuard === null || !sameDirectoryIdentity(currentGuard, guardIdentity)) {
+      throw progressSocketError(
+        'progress_socket_cleanup_conflict',
+        `shutdown guard changed; recovery data is preserved in ${cleanupDir}`,
+      )
+    }
+
+    await fs.rmdir(boundSocketPath)
+    guardIdentity = null
+
+    if (detached) {
+      const displaced = await fs.lstat(detachedPath)
+
+      if (identity !== null && sameSocketIdentity(displaced, identity)) {
+        await fs.unlink(detachedPath)
+        detached = false
+      } else {
+        await restoreDetached()
+      }
+    }
+
+    await fs.rmdir(cleanupDir)
+  } catch (error) {
+    if (!listenerClosed && guardIdentity !== null) {
+      const currentGuard = await socketStatOrNull(boundSocketPath).catch(() => null)
+
+      if (currentGuard !== null && sameDirectoryIdentity(currentGuard, guardIdentity)) {
+        await fs.rmdir(boundSocketPath).catch(() => {})
+      }
+    }
+
+    try {
+      await restoreDetached()
+    } catch (recoveryError) {
+      throw new AggregateError(
+        [error, recoveryError],
+        `progress_socket_recovery_required: preserved entry is in ${cleanupDir}`,
+      )
+    }
+
+    if (!detached) {
+      await fs.rmdir(cleanupDir).catch(() => {})
+    }
+
+    throw error
+  }
+}
+
 function parseWakeLine(line: string) {
   if (Buffer.byteLength(line, 'utf8') > MAX_WAKE_BYTES) {
     return false
@@ -264,27 +409,41 @@ export type ProgressSocketServer = {
 // Discord bot 側で wake-only の NDJSON socket を listen する。既存 path は socket identity を確かめてから stale file のみ削除
 export async function startProgressSocketServer(dataDir: string, onWake: () => void): Promise<ProgressSocketServer> {
   const { runtimeDir, socketPath, uid, directoryIdentity } = await ensurePrivateRuntimeDirectory(dataDir)
-  await removeStaleSocket(runtimeDir, directoryIdentity, socketPath, uid)
+  const { directoryHandle, descriptorDirectory } = await openPinnedRuntimeDirectory(runtimeDir, directoryIdentity)
+  const boundSocketPath = path.join(descriptorDirectory, SOCKET_FILE)
+
+  try {
+    await removeStaleSocket(runtimeDir, directoryIdentity, boundSocketPath, uid)
+  } catch (error) {
+    await directoryHandle.close()
+    throw error
+  }
+
   const clients = new Set<Socket>()
   const server: Server = net.createServer((socket) => {
     handleSocket(socket, onWake, clients)
   })
 
-  await new Promise<void>((resolve, reject) => {
-    function onError(error: Error) {
-      server.off('listening', onListening)
-      reject(error)
-    }
+  try {
+    await new Promise<void>((resolve, reject) => {
+      function onError(error: Error) {
+        server.off('listening', onListening)
+        reject(error)
+      }
 
-    function onListening() {
-      server.off('error', onError)
-      resolve()
-    }
+      function onListening() {
+        server.off('error', onError)
+        resolve()
+      }
 
-    server.once('error', onError)
-    server.once('listening', onListening)
-    server.listen(socketPath)
-  })
+      server.once('error', onError)
+      server.once('listening', onListening)
+      server.listen(boundSocketPath)
+    })
+  } catch (error) {
+    await directoryHandle.close()
+    throw error
+  }
 
   let identity: SocketIdentity | null = null
 
@@ -293,15 +452,15 @@ export async function startProgressSocketServer(dataDir: string, onWake: () => v
       throw progressSocketError('progress_socket_unsafe_path', 'runtime directory changed while starting the listener')
     }
 
-    const created = await fs.lstat(socketPath)
-    identity = { dev: created.dev, ino: created.ino, uid: created.uid }
+    const created = await fs.lstat(boundSocketPath)
 
     if (!created.isSocket() || created.uid !== uid) {
       throw progressSocketError('progress_socket_unsafe_path', 'listener did not create an owned Unix socket')
     }
 
-    await fs.chmod(socketPath, SOCKET_MODE)
-    const secured = await fs.lstat(socketPath)
+    identity = { dev: created.dev, ino: created.ino, uid: created.uid }
+    await fs.chmod(boundSocketPath, SOCKET_MODE)
+    const secured = await fs.lstat(boundSocketPath)
 
     if (!sameSocketIdentity(secured, identity) || (Number(secured.mode) & 0o777) !== SOCKET_MODE) {
       throw progressSocketError('progress_socket_unsafe_path', 'listener socket permissions or identity are invalid')
@@ -310,22 +469,26 @@ export async function startProgressSocketServer(dataDir: string, onWake: () => v
     for (const client of clients) {
       client.destroy()
     }
-    await new Promise<void>((resolve) => server.close(() => resolve()))
-    const current = await socketStatOrNull(socketPath)
 
-    if (
-      identity !== null &&
-      current !== null &&
-      sameSocketIdentity(current, identity) &&
-      await runtimeDirectoryMatches(runtimeDir, directoryIdentity)
-    ) {
-      await fs.unlink(socketPath).catch(() => {})
+    try {
+      await closeListenerSafely(server, boundSocketPath, identity)
+    } catch (cleanupError) {
+      if (server.listening) {
+        retainedListeners.add({ server, directoryHandle })
+      } else {
+        await directoryHandle.close()
+      }
+
+      throw new AggregateError([error, cleanupError], 'progress_socket_startup_cleanup_failed')
     }
 
+    await directoryHandle.close()
     throw error
   }
 
   let closed = false
+  let closePromise: Promise<void> | null = null
+  const retainedListener = { server, directoryHandle }
 
   return {
     path: socketPath,
@@ -334,20 +497,38 @@ export async function startProgressSocketServer(dataDir: string, onWake: () => v
         return
       }
 
-      closed = true
-      for (const client of clients) {
-        client.destroy()
+      if (closePromise !== null) {
+        return await closePromise
       }
-      await new Promise<void>((resolve) => server.close(() => resolve()))
-      const current = await socketStatOrNull(socketPath)
 
-      if (
-        identity !== null &&
-        current !== null &&
-        sameSocketIdentity(current, identity) &&
-        await runtimeDirectoryMatches(runtimeDir, directoryIdentity)
-      ) {
-        await fs.unlink(socketPath)
+      closePromise = (async () => {
+        for (const client of clients) {
+          client.destroy()
+        }
+
+        try {
+          await closeListenerSafely(server, boundSocketPath, identity)
+        } catch (error) {
+          if (server.listening) {
+            retainedListeners.add(retainedListener)
+          }
+
+          throw error
+        } finally {
+          if (!server.listening) {
+            closed = true
+            retainedListeners.delete(retainedListener)
+            await directoryHandle.close()
+          }
+        }
+      })()
+
+      try {
+        await closePromise
+      } finally {
+        if (!closed) {
+          closePromise = null
+        }
       }
     },
   }
