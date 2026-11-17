@@ -161,7 +161,7 @@ slash command の受付 channel は従来どおり Discord 側の利用許可に
 
 ここに新しい per-Discord-user GitHub link や権限モデルはありません。`ARAYA_DISCORD_ALLOWED_USER_IDS` の利用者は bot の OS user が `gh` で読める repository に同じ範囲でアクセスできます。bot の `gh` identity には、その channel の利用者に見せてよい repository だけを許可してください。GitHub tool は GET のみで、repository の変更、shell、git 操作はできません。
 
-会話 transcript と GitHub tool result は `<ARAYA_DATA_DIR>/discord/chat.sqlite` に保存され、private repository の読み取り内容も残り得ます。既知の secrets は redaction しますが、すべての機密情報を検出できる保証はありません。必要な範囲だけ読み、秘密情報を channel に投稿・引用しないでください。
+会話 transcript と GitHub / Task lookup tool result は `<ARAYA_DATA_DIR>/discord/chat.sqlite` に保存され、private repository の読み取り内容や Task の結果も残り得ます。Task の session 参照は最大24件・各2,000文字・全体12,000文字までの user / assistant 可視テキスト excerpt に限り、tool の引数・出力は含めません。既知の secrets は上限で切り詰める前に redaction しますが、すべての機密情報を検出できる保証はありません。必要な範囲だけ読み、秘密情報を channel に投稿・引用しないでください。
 
 ```sh
 araya discord register
@@ -169,6 +169,8 @@ araya discord install
 ```
 
 Task 操作の slash command は CLI と同じ階層です。`/araya task list`・`/araya task show`・`/araya task submit`・`/araya task cancel`・`/araya task retry` を使います。command 定義を変更した後は `araya discord register` を再実行して Discord 側を更新します。
+
+会話では「Task #1 の状態と判断待ちの内容を見せて」のように尋ねると、Araya が Task ledger から状態・判断質問・保存済みの安全な session excerpt を読み取って回答できます。Task 内容の読み取りは read-only で、作成・中止・再実行はしません。
 
 `.env` の値を後から変更した場合は、既存の Discord unit を再起動して読み直します。`araya discord install` を再実行すれば、設定を再検証して unit の再起動まで行います。
 

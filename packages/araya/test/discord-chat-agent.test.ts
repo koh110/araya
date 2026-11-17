@@ -6,12 +6,22 @@ import test from 'node:test'
 import { Harness, createRegistry } from '@earendil-works/pi-durable'
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node'
 
-import { openDiscordChatAgent } from '../src/discord/chat-agent.ts'
+import {
+  DISCORD_CHAT_TASK_LIST_TOOL_NAME,
+  DISCORD_CHAT_TASK_SHOW_TOOL_NAME,
+  openDiscordChatAgent,
+} from '../src/discord/chat-agent.ts'
 import { GITHUB_REPOSITORY_LIST_TOOL_NAME } from '../src/discord/github-repositories.ts'
 import { createRedactor } from '../src/infrastructure/redaction.ts'
-import { openTaskLedger } from '../src/runner/ledger.ts'
+import { openTaskLedger, type AttemptResult } from '../src/runner/ledger.ts'
 import { answer, createFauxModels, toolCall } from './support/faux-shiki.ts'
-import { createRunnerFixture, ctx, removeRunnerFixture } from './support/runner-fixture.ts'
+import {
+  createRunnerFixture,
+  ctx,
+  defaultSettings,
+  removeRunnerFixture,
+  taskInput,
+} from './support/runner-fixture.ts'
 
 function modelRef(models: Awaited<ReturnType<typeof createFauxModels>>) {
   return {
@@ -104,6 +114,125 @@ test('discord chat agent: araya_submit_task だけが既存 ledger に Task を�
   }
 })
 
+test('discord chat agent: read-only Task tools から判断質問と redacted session excerpt を参照する', async () => {
+  const fixture = await createRunnerFixture()
+  const models = await createFauxModels(fixture)
+  const ledger = openTaskLedger(fixture.dataDir)
+  const secret = 'session-private-value-12345'
+  const created = ledger.createTask(taskInput({ title: 'Task1', goal: `Task goal with ${secret}` }))
+  const claimed = ledger.claimNextAttempt(1, defaultSettings(fixture, null))
+  assert.ok(claimed)
+  const result: AttemptResult = {
+    status: 'blocked',
+    failureReason: null,
+    failureDetail: null,
+    summary: '変更方針を提示しました。',
+    decisionQuestion: 'どちらの API を使いますか？',
+    model: null,
+    evidence: {
+      outcome: 'blocked',
+      sessionExcerpt: {
+        contentScope: 'user-assistant-text',
+        truncated: false,
+        messages: [
+          { role: 'user', text: `Task #1: ${secret} を使う実装を検討してください` },
+          { role: 'assistant', text: 'A案とB案を比較しました。どちらを採用しますか？' },
+        ],
+      },
+    },
+  }
+  assert.deepEqual(
+    ledger.recordResult(claimed.taskKey, result, { taskKey: claimed.taskKey, addMs: 10 }),
+    {
+      recorded: true,
+      status: 'blocked',
+      failureReason: null,
+    },
+  )
+
+  const session = await openDiscordChatAgent({
+    dataDir: fixture.dataDir,
+    ledger,
+    redactor: createRedactor([secret]),
+    models: models.runtime,
+    model: modelRef(models),
+    context: ctx,
+  })
+  let listResult = ''
+  let invalidIdResult = ''
+  models.script((view) => {
+    if (view.toolResults.length === 0) {
+      return toolCall(DISCORD_CHAT_TASK_LIST_TOOL_NAME, {})
+    }
+
+    if (view.toolResults.length === 1) {
+      listResult = view.toolResults[0]?.text ?? ''
+      const list: { tasks: { id: number; title: string | null }[] } = JSON.parse(listResult)
+      const matchingTask = list.tasks.find((task) => {
+        return task.title === 'Task1'
+      })
+
+      return toolCall(DISCORD_CHAT_TASK_SHOW_TOOL_NAME, {
+        taskId: matchingTask === undefined ? '' : String(matchingTask.id),
+      })
+    }
+
+    if (view.toolResults.length === 2) {
+      return toolCall(DISCORD_CHAT_TASK_SHOW_TOOL_NAME, { taskId: 'Task1' })
+    }
+
+    invalidIdResult = view.toolResults.at(-1)?.text ?? ''
+    return answer(view.toolResults[1]?.text ?? 'Task result missing')
+  })
+
+  try {
+    const reply = await session.submit('Task1 の判断待ち内容を確認して', 'message-task-read-1')
+    const listed: {
+      tasks: { id: number; status: string; decisionQuestion: string | null }[]
+    } = JSON.parse(listResult)
+    const detail: {
+      task: { id: number; status: string; goal: string; goalTruncated: boolean }
+      selectedAttempt: {
+        decisionQuestion: string
+        sessionExcerpt: {
+          contentScope: string
+          truncated: boolean
+          messages: { role: string; text: string }[]
+        }
+      }
+    } = JSON.parse(reply)
+
+    assert.deepEqual(
+      listed.tasks.map(({ id, status, decisionQuestion }) => {
+        return { id, status, decisionQuestion }
+      }),
+      [{ id: created.task.id, status: 'blocked', decisionQuestion: 'どちらの API を使いますか？' }],
+    )
+    assert.equal(invalidIdResult.includes('taskId は正の整数、#1、Task 1 の形式'), true)
+    assert.equal(ledger.getTask(created.task.id).status, 'blocked')
+    assert.equal(detail.task.id, created.task.id)
+    assert.equal(detail.task.status, 'blocked')
+    assert.equal(detail.task.goal.includes(secret), false)
+    assert.equal(detail.task.goal.includes('[REDACTED]'), true)
+    assert.equal(detail.task.goalTruncated, false)
+    assert.equal(detail.selectedAttempt.decisionQuestion, 'どちらの API を使いますか？')
+    assert.equal(detail.selectedAttempt.sessionExcerpt.contentScope, 'user-assistant-text')
+    assert.equal(detail.selectedAttempt.sessionExcerpt.truncated, false)
+    assert.deepEqual(
+      detail.selectedAttempt.sessionExcerpt.messages.map(({ role }) => {
+        return role
+      }),
+      ['user', 'assistant'],
+    )
+    assert.equal(reply.includes(secret), false)
+    assert.equal(ledger.listTasks({ limit: 10 }).length, 1)
+  } finally {
+    await session.close?.()
+    ledger.close()
+    await removeRunnerFixture(fixture)
+  }
+})
+
 test('discord chat agent: 同じ reset message の再送で後続会話を消さない', async () => {
   const fixture = await createRunnerFixture()
   const models = await createFauxModels(fixture)
@@ -153,9 +282,12 @@ test('discord chat agent: existing root configuration is upgraded to expose GitH
       context: ctx,
       github: {
         env: {},
-        fetch: async () => new Response(JSON.stringify([
-          { name: 'README.md', path: 'README.md', type: 'file', size: 80 },
-        ]), { status: 200 }),
+        fetch: async () => {
+          return new Response(
+            JSON.stringify([{ name: 'README.md', path: 'README.md', type: 'file', size: 80 }]),
+            { status: 200 },
+          )
+        },
       },
     }
 
@@ -164,18 +296,25 @@ test('discord chat agent: existing root configuration is upgraded to expose GitH
 
     const storagePath = path.join(fixture.dataDir, 'discord', 'chat.sqlite')
     const storage = await openNodeSqliteStorage(storagePath)
-    const legacyHarness = await Harness.open(storage, {
-      models: models.runtime,
-      registry: createRegistry(),
-    }, ctx)
+    const legacyHarness = await Harness.open(
+      storage,
+      {
+        models: models.runtime,
+        registry: createRegistry(),
+      },
+      ctx,
+    )
 
     try {
       const root = await legacyHarness.root(ctx)
-      await root.configure({
-        tools: [],
-        modelTools: [],
-        instructions: 'Legacy instructions without GitHub repository tools.',
-      }, ctx)
+      await root.configure(
+        {
+          tools: [],
+          modelTools: [],
+          instructions: 'Legacy instructions without GitHub repository tools.',
+        },
+        ctx,
+      )
     } finally {
       await legacyHarness.close(ctx)
     }
@@ -212,9 +351,12 @@ test('discord chat agent: repository read-only tool を conversation に登録�
     context: ctx,
     github: {
       env: {},
-      fetch: async () => new Response(JSON.stringify([
-        { name: 'README.md', path: 'README.md', type: 'file', size: 80 },
-      ]), { status: 200 }),
+      fetch: async () => {
+        return new Response(
+          JSON.stringify([{ name: 'README.md', path: 'README.md', type: 'file', size: 80 }]),
+          { status: 200 },
+        )
+      },
     },
   })
   models.script((view) => {
