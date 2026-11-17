@@ -790,8 +790,21 @@ test('attempt: 状態 directory の attempt.json が別の taskKey のものな�
   }
 })
 
-test('attempt: 途中経過は決まった key だけで記録し、bash のコマンドと tool の結果の秘密を写さない', async () => {
-  const secret = 'progress-secret-value-5678'
+test('attempt: 途中経過には secret を隠した bash command preview だけを記録し、tool の結果は含めない', async () => {
+  const secret = 'PZ8mQ4xN9vL2'
+  const inlineApiKey = 'pI7X'
+  const inlinePassword = 'pW9X'
+  const bearerToken = 'bR4X'
+  const cookieValue = 'cK8X'
+  const escapedCookieSuffix = 'eC5X'
+  const escapedAssignmentSuffix = 'aE7Q'
+  const escapedOptionSuffix = 'oE7Q'
+  const githubToken = ["gh", "p_", "a".repeat(40)].join("")
+  const escapedQuote = `${String.fromCharCode(92)}"`
+  const commandPrefix = `echo ${secret}; # ARAYA_TEST_TOKEN=${secret} --api-key='${inlineApiKey}' --password="${inlinePassword}" ARAYA_SECRET="p${escapedQuote}${escapedAssignmentSuffix}" --api-token="p${escapedQuote}${escapedOptionSuffix}" Authorization: Bearer ${bearerToken} ${["https://", "u", ":", "p", String.fromCharCode(64), "e.invalid"].join("")} ${githubToken} --header "Cookie: ${cookieValue}; n=escaped${String.fromCharCode(92)}"${escapedCookieSuffix}" `
+  const boundaryPadding = Math.max(0, 300 - Array.from(commandPrefix).length - 4)
+  assert.ok(boundaryPadding > 0)
+  const bashCommand = `${commandPrefix}${'x'.repeat(boundaryPadding)}${secret}${'y'.repeat(300)}`
   const value = await setup({ ARAYA_TEST_TOKEN: secret })
   const { fixture, models, systemd } = value
   const published: { type: string; tool: unknown }[] = []
@@ -816,7 +829,7 @@ test('attempt: 途中経過は決まった key だけで記録し、bash のコ�
         case 0:
           return toolCall('araya_create_worktree', { repository: 'repo', base: 'HEAD' })
         case 1:
-          return toolCall('bash', { command: `echo ${secret}; echo $ARAYA_TEST_TOKEN` })
+          return toolCall('bash', { command: bashCommand })
         case 2:
           return toolCall('write', {
             path: `${worktreePathFrom(results[0])}/notes.txt`,
@@ -878,7 +891,16 @@ test('attempt: 途中経過は決まった key だけで記録し、bash のコ�
       base: 'HEAD',
       isError: false,
     })
-    assert.deepEqual(events[2]?.data, { tool: 'bash' })
+    const bashEventData: unknown = events[2]?.data
+    assert.ok(isRecord(bashEventData))
+    assert.equal(bashEventData.tool, 'bash')
+    const commandPreview = bashEventData.commandPreview
+    assert.ok(typeof commandPreview === 'string')
+    assert.ok(commandPreview.startsWith(`echo [REDACTED]; # ARAYA_TEST_TOKEN=[REDACTED] --api-key='[REDACTED]' --password="[REDACTED]" ARAYA_SECRET="[REDACTED]" --api-token="[REDACTED]" Authorization: Bearer [REDACTED] https://[REDACTED]@e.invalid [REDACTED] --header "[REDACTED]" `))
+    assert.ok(Array.from(commandPreview).length <= 300)
+    assert.ok(commandPreview.endsWith('…'))
+    assert.equal(commandPreview.includes(secret.slice(0, 6)), false)
+    assert.deepEqual(Object.keys(events[2]?.data ?? {}).sort(), ['commandPreview', 'tool'])
     assert.deepEqual(events[3]?.data, { tool: 'bash', isError: false })
     assert.deepEqual(events[4]?.data, { tool: 'write', path: `${worktreePath}/notes.txt` })
     assert.deepEqual(events[8]?.data, {
@@ -889,11 +911,72 @@ test('attempt: 途中経過は決まった key だけで記録し、bash のコ�
     // path は先頭 300 文字まで。読めない file の read は isError
     assert.deepEqual(events[10]?.data, { tool: 'read', path: 'x'.repeat(300) })
     assert.deepEqual(events[11]?.data, { tool: 'read', path: 'x'.repeat(300), isError: true })
-    assert.equal(dumpLedger(fixture).includes(secret), false)
+    const ledgerText = dumpLedger(fixture)
+    for (const hidden of [secret, inlineApiKey, inlinePassword, bearerToken, cookieValue, escapedCookieSuffix, escapedAssignmentSuffix, escapedOptionSuffix, 'u:p', githubToken]) {
+      assert.equal(ledgerText.includes(hidden), false)
+    }
     assert.deepEqual(attempt.logs, [])
   } finally {
     await teardown(value, attempt)
   }
+})
+
+async function captureBashCommandPreview(command: string) {
+  const value = await setup()
+  const { fixture, models, systemd } = value
+  const attempt = await openAttemptHarness(fixture, {
+    models: models.runtime,
+    systemd: systemd.ops,
+    notifyProgress: async () => {}
+  })
+
+  try {
+    await createRepository(fixture, 'repo')
+    models.script((view) => {
+      switch (view.toolResults.length) {
+        case 0:
+          return toolCall('araya_create_worktree', { repository: 'repo', base: 'HEAD' })
+        case 1:
+          return toolCall('bash', { command })
+        default:
+          return answer('done')
+      }
+    })
+    await attempt.runAttempt(taskInput(), defaultSettings(fixture, models.model))
+    const event = readEvents(fixture).find((candidate) => {
+      return candidate.type === 'tool.started' && isRecord(candidate.data) && candidate.data.tool === 'bash'
+    })
+
+    assert.ok(event && isRecord(event.data) && typeof event.data.commandPreview === 'string')
+    return event.data.commandPreview
+  } finally {
+    await teardown(value, attempt)
+  }
+}
+
+test('attempt: 次のoptionを値として消費せず、--user のcredentialを隠す', async () => {
+  const preview = await captureBashCommandPreview("printf '%s\\n' --silent --user alice:opaquePass https://example.invalid")
+
+  assert.equal(preview.includes('opaquePass'), false)
+  assert.equal(preview.includes('--user [REDACTED]'), true)
+})
+
+test('attempt: header optionに続く引用値のcredentialを隠す', async () => {
+  const preview = await captureBashCommandPreview("printf '%s\\n' --header='Cookie: opaqueCookie' -H'X-Auth: opaqueHeaderToken'")
+
+  assert.equal(preview.includes('opaqueCookie'), false)
+  assert.equal(preview.includes('opaqueHeaderToken'), false)
+  assert.equal(preview.includes('--header'), true)
+  assert.equal(preview.includes('-H'), true)
+})
+
+test('attempt: assignmentとoptionの連結shell word全体からcredentialを隠す', async () => {
+  const preview = await captureBashCommandPreview('PASSWORD="quotedPrefix"opaqueAssignmentSuffix printf \'%s\\n\' --password="quotedPrefix"opaqueOptionSuffix')
+
+  assert.equal(preview.includes('opaqueAssignmentSuffix'), false)
+  assert.equal(preview.includes('opaqueOptionSuffix'), false)
+  assert.equal(preview.includes('PASSWORD=[REDACTED]'), true)
+  assert.equal(preview.includes('--password=[REDACTED]'), true)
 })
 
 test('attempt: 途中経過の path は秘密を置き換えてから 300 文字で切り、URL の userinfo と秘密の値が境界をまたいでも一部も残らない', async () => {

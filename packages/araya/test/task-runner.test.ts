@@ -519,7 +519,7 @@ function attemptEvidence(output: unknown) {
   return isRecord(attempt?.evidence) ? attempt.evidence : {}
 }
 
-test('runner: bash のコマンドと tool の結果の秘密が task_events と log に出ない', async () => {
+test('runner: Bash command preview は秘密を置き換え、tool の結果は task_events と log に出ない', async () => {
   const setup = await setupWithRepository({ env: { ARAYA_TEST_TOKEN: SECRET } })
   setup.models.script((view) => {
     const results = view.toolResults
@@ -553,21 +553,33 @@ test('runner: bash のコマンドと tool の結果の秘密が task_events と
       'read',
       'araya_register_verification'
     ])
-    const allowed = new Set(['tool', 'path', 'repository', 'base', 'cwd', 'isError'])
+    const allowed = new Set(['tool', 'path', 'repository', 'base', 'cwd', 'isError', 'commandPreview'])
 
     for (const event of toolEvents) {
       assert.ok(isRecord(event.data))
       assert.deepEqual(Object.keys(event.data).filter((key) => !allowed.has(key)), [], JSON.stringify(event))
+
+      if (event.type === 'tool.started' && event.data.tool === 'bash') {
+        assert.ok(typeof event.data.commandPreview === 'string')
+        assert.ok(event.data.commandPreview.startsWith('echo [REDACTED] https://'))
+        assert.ok(event.data.commandPreview.includes('@example.invalid/repo.git;'))
+        assert.ok(event.data.commandPreview.includes('$ARAYA_TEST_TOKEN'))
+      } else {
+        assert.equal('commandPreview' in event.data, false)
+      }
     }
 
     const events = JSON.stringify(readEvents(setup.fixture))
     const log = await readRunnerLog(setup.fixture)
     assert.ok(log.length > 0)
+    assert.ok(events.includes('commandPreview'))
+    assert.ok(events.includes('echo [REDACTED]'))
+    assert.equal(log.includes('echo '), false)
 
     for (const text of [events, log]) {
       assert.equal(text.includes(SECRET), false)
       assert.equal(text.includes('hunter2pass'), false)
-      assert.equal(text.includes('echo '), false)
+      assert.equal(text.includes(USERINFO_URL), false)
     }
   } finally {
     await finish(setup, runner)

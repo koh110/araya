@@ -561,15 +561,16 @@ SHIKI の system prompt（`development/shiki.ts` の `buildSystemPrompt`）を `
   - `read`・`edit`・`write`: 引数の `path` が文字列なら `path`（先頭 300 文字）
   - `araya_create_worktree`: 引数の `repository` と `base`（文字列なら、それぞれ先頭 300 文字）
   - `araya_register_verification`: 引数の `repository` と `cwd`（同上）
+  - `bash` の `tool.started`: command の1行 preview を `commandPreview` に最大 300 文字で記録する。環境変数にある秘密の値、URL の userinfo、credential と判定できる assignment・option の shell word 全体（引用・非引用片の連結や escape を含む）、値を取らない option の次にある credential option、`--header` / `-H` に渡す header 値、Authorization/Cookie など既知の credential header、Bearer/Basic token と既知形式の token を置き換えてから切り詰める。
   - `tool.finished` のとき: `isError`（結果の `isError` が `true` なら `true`、それ以外は `false`）
-- bash のコマンド、tool の結果、model の応答は書かない。台帳と log に秘密を写さないため。
+- Bash の raw command、tool の結果、model の応答は progress event に書かない。`commandPreview` は表示用のbest-effortな置き換えであり、形式から識別できない任意の値まで秘密でないと保証するものではない。
 - 1件は `data_json` の UTF-8 で 2 KiB まで（超える値は短くする）。1試行で 2,000 件まで。超えたら `events.truncated` を1件書き、それ以降は書かない。件数は台帳の event の数で数える（runner が起動し直しても続きから数える）。
 - 台帳に書けなかったときは、log に書いて、tool はそのまま進める。
 - 再開した会話では、途中で止まった tool の `tool.finished` は書かれない。
 - `tool.started` / `tool.finished` を台帳へ commit した後、runner は `<dataDir>/runtime/progress.sock` に `{"type":"wake"}\n` を送る。wake は固定 payload で event 内容・command・tool output を含まず、接続待ちは短い上限を設ける。送信失敗・timeout は無視し、task と tool はそのまま進める。
 - Discord bot は同じ socket を listen し、wake を受けると既存の notification cursor から未配信 event を直列に drain する。polling fallback と cursor/retry の復旧動作は残し、socket wake は永続 event ではなく best-effort hint とする。
 - socket は `<dataDir>/runtime` の mode 0700 directory に作り、socket file は mode 0600 とする。stale socket の削除前に directory・socket の type, owner, identity を確認する。
-- Discord の tool progress 表示は Task ID、attempt、許可 pattern に一致する tool 名、開始/完了/失敗 status に限定し、command や tool output を含めない。Discord bot は runner と別 service/process のまま稼働する。
+- Discord の tool progress 表示は Task ID、attempt、許可 pattern に一致する tool 名、開始/完了/失敗 status を表示する。`bash` の開始通知と Task 詳細の event 履歴には `commandPreview` の最大 100 文字を code 表示するが、raw command、tool output、model response は含めない。Discord bot は runner と別 service/process のまま稼働する。
 
 ## 結果の判定と記録
 

@@ -32,7 +32,7 @@ import {
 } from '../development/result.ts'
 import type { ThinkingLevel } from '../config/model.ts'
 import { readDecision } from '../development/worktrees.ts'
-import { createRedactor, type Redactor } from '../infrastructure/redaction.ts'
+import { createRedactor, REDACTED, type Redactor } from '../infrastructure/redaction.ts'
 import { sendProgressWake } from '../infrastructure/progress-socket.ts'
 import {
   buildShikiInstructions,
@@ -75,6 +75,17 @@ export const SHIKI_EXTENSION_NAME = 'araya-shiki'
 const MAX_TASK_BODY_CHARS = 80_000
 const MAX_DETAIL_CHARS = 2_000
 const MAX_EVENT_TEXT_CHARS = 300
+const SENSITIVE_COMMAND_NAME_PATTERN = /(?:token|secret|password|passwd|api[-_]?key|private[-_]?key|credential|authorization|authentication|cookie)/iu
+const SENSITIVE_AUTH_NAME_PATTERN = /(?:^|[_-])auth(?:$|[_-])/iu
+const SHELL_WORD_PATTERN = String.raw`(?:(?:\\(?:\r\n|[\r\n]|[^\r\n])|"(?:\\[\s\S]|[^"\\])*"|'[^']*'|[^\s;&|"'\\]))+`
+const SHELL_OPTION_VALUE_PATTERN = String.raw`(?!-)(?:${SHELL_WORD_PATTERN})`
+const COMMAND_ASSIGNMENT_PATTERN = new RegExp(String.raw`(^|[\s;&|])(?:(export)\s+)?([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(${SHELL_WORD_PATTERN})`, 'giu')
+const COMMAND_OPTION_PATTERN = new RegExp(String.raw`(^|[\s;&|])(--?(?:[A-Za-z0-9_-]*(?:token|secret|password|passwd|api[-_]?key|private[-_]?key|credential|authorization|authentication|cookie)[A-Za-z0-9_-]*|auth(?:[-_][A-Za-z0-9_-]+)?|[A-Za-z0-9_-]+[-_]auth(?:[-_][A-Za-z0-9_-]+)?|user|u))(?:=(${SHELL_WORD_PATTERN})|\s+(${SHELL_OPTION_VALUE_PATTERN}))`, 'giu')
+const HEADER_OPTION_PATTERN = new RegExp(String.raw`(^|[\s;&|])(--header|-H)(?==|\s|"|')(?:(=)(${SHELL_WORD_PATTERN})|(\s+)(${SHELL_OPTION_VALUE_PATTERN})|(${SHELL_WORD_PATTERN}))`, 'giu')
+const QUOTED_SECRET_HEADER_PATTERN = /(^|[\s])(["'])(authorization|proxy-authorization|cookie|set-cookie|x-[A-Za-z0-9-]*(?:token|secret|key|auth|credential))\s*:\s*(?:(?!\2|\\)[\s\S]|\\[\s\S])*\2/giu
+const UNQUOTED_SECRET_HEADER_PATTERN = /(^|[\s])((?:cookie|set-cookie|x-[A-Za-z0-9-]*(?:token|secret|key|auth|credential))\s*:\s*)[^\s;&|]+/giu
+const BEARER_CREDENTIAL_PATTERN = /\b(Bearer|Basic)\s+[^'"\s;&|]+/giu
+const COMMON_TOKEN_PATTERN = /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}|(?:AKIA|ASIA)[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/giu
 const ATTEMPT_FILE = 'attempt.json'
 const EVIDENCE_FILE = 'evidence.json'
 // thinking level が設定ファイルにも Pi の設定にも無いときの値。Pi の DEFAULT_THINKING_LEVEL（core/defaults.js。
@@ -510,9 +521,81 @@ async function prepareStateDir(dataDir: string, taskKey: string) {
   return { ok: true as const, stateDir }
 }
 
+function isSensitiveCommandName(name: string) {
+  return SENSITIVE_COMMAND_NAME_PATTERN.test(name) || SENSITIVE_AUTH_NAME_PATTERN.test(name)
+}
+
+function redactShellValue(value: string) {
+  const quote = value[0]
+
+  if ((quote === '"' || quote === "'") && value.at(-1) === quote) {
+    return `${quote}${REDACTED}${quote}`
+  }
+
+  return REDACTED
+}
+
+// 実行前の Bash 入力から、表示用の1行 preview を作る。分かる credential 値を置換してから切り詰める
+function buildBashCommandPreview(command: unknown, redactor: Redactor) {
+  if (typeof command !== 'string' || command.trim() === '') {
+    return undefined
+  }
+
+  let preview = redactor.redact(command)
+  preview = preview.replace(HEADER_OPTION_PATTERN, (match, separator: string, option: string, equals: string | undefined, equalValue: string | undefined, spacing: string | undefined, spacedValue: string | undefined, adjacentValue: string | undefined) => {
+    const value = equalValue ?? spacedValue ?? adjacentValue
+
+    if (value === undefined) {
+      return match
+    }
+
+    return `${separator}${option}${equals ?? spacing ?? ' '}${redactShellValue(value)}`
+  })
+  preview = preview.replace(COMMAND_ASSIGNMENT_PATTERN, (match, separator: string, exported: string | undefined, name: string, assignment: string, value: string) => {
+    if (!isSensitiveCommandName(name)) {
+      return match
+    }
+
+    return `${separator}${exported === undefined ? '' : `${exported} `}${name}${assignment}${redactShellValue(value)}`
+  })
+  preview = preview.replace(COMMAND_OPTION_PATTERN, (match, separator: string, option: string, equalValue: string | undefined, spacedValue: string | undefined) => {
+    const value = equalValue ?? spacedValue
+
+    if (value === undefined) {
+      return match
+    }
+
+    return `${separator}${option}${equalValue === undefined ? ' ' : '='}${redactShellValue(value)}`
+  })
+  preview = preview.replace(QUOTED_SECRET_HEADER_PATTERN, (_match, separator: string, quote: string, name: string) => {
+    return `${separator}${quote}${name}: ${REDACTED}${quote}`
+  })
+  preview = preview.replace(UNQUOTED_SECRET_HEADER_PATTERN, (_match, separator: string, header: string) => {
+    return `${separator}${header}${REDACTED}`
+  })
+  preview = preview.replace(BEARER_CREDENTIAL_PATTERN, (_match, scheme: string) => {
+    return `${scheme} ${REDACTED}`
+  })
+  preview = preview.replace(COMMON_TOKEN_PATTERN, REDACTED)
+  preview = preview.replace(/\p{Cc}/gu, ' ').replace(/\s+/gu, ' ').trim()
+
+  if (preview === '') {
+    return undefined
+  }
+
+  const characters = Array.from(preview)
+
+  if (characters.length <= MAX_EVENT_TEXT_CHARS) {
+    return preview
+  }
+
+  return `${characters.slice(0, MAX_EVENT_TEXT_CHARS - 1).join('')}…`
+}
+
 // 途中経過の data。決まった key だけを入れ、bash のコマンドと tool の結果は入れない。
 // 切り詰めで秘密の一部や URL の @ が境界の外に出ないように、置き換えてから切り詰める
 function toolEventData(
+  type: ToolEventType,
   call: ToolHookCall,
   result: ToolExecutionResult | undefined,
   redactor: Redactor,
@@ -541,6 +624,14 @@ function toolEventData(
       pick('repository')
       pick('cwd')
       break
+  }
+
+  if (type === 'tool.started' && call.name === 'bash') {
+    const commandPreview = buildBashCommandPreview(call.arguments.command, redactor)
+
+    if (commandPreview !== undefined) {
+      data.commandPreview = commandPreview
+    }
   }
 
   if (result !== undefined) {
@@ -794,7 +885,7 @@ export function createShikiExtension(deps: AttemptDependencies) {
         return
       }
 
-      const appendResult = deps.ledger.appendToolEvent(taskKey, type, toolEventData(call, result, eventRedactor))
+      const appendResult = deps.ledger.appendToolEvent(taskKey, type, toolEventData(type, call, result, eventRedactor))
 
       if (appendResult === 'written') {
         try {

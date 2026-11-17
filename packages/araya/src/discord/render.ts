@@ -30,6 +30,7 @@ const MESSAGE_CHUNK_CHARS = 1_900
 const MAX_TITLE_CHARS = 80
 const MAX_SUMMARY_CHARS = 1_200
 const MAX_ITEM_CHARS = 200
+const MAX_COMMAND_PREVIEW_CHARS = 100
 const MAX_ATTEMPT_ROWS = 5
 const MAX_EVENT_ROWS = 8
 
@@ -52,6 +53,14 @@ function clipBody(text: string, maxChars: number) {
   }
 
   return `${trimmed.slice(0, maxChars - 1)}\n…（本文が長いのでここから先は表示していません）`
+}
+
+function inlineCode(text: string) {
+  const delimiter = '`'.repeat(Array.from(text.matchAll(/`+/gu)).reduce((longest, match) => {
+    return Math.max(longest, match[0].length)
+  }, 0) + 1)
+
+  return `${delimiter}${text.startsWith('`') || text.endsWith('`') ? ` ${text} ` : text}${delimiter}`
 }
 
 const STATUS_LABELS: Record<string, string> = {
@@ -119,8 +128,17 @@ export function renderNotification(event: NotificationEvent) {
         : event.data.isError === true
           ? `${tool} が失敗しました`
           : `${tool} を完了しました`
+      const base = `Task #${event.taskId}（${attemptLabel(event.attempt)}）: ${action}`
 
-      return `Task #${event.taskId}（${attemptLabel(event.attempt)}）: ${action}`
+      if (event.type === 'tool.started' && tool === 'bash' && typeof event.data.commandPreview === 'string') {
+        const commandPreview = clip(event.data.commandPreview, MAX_COMMAND_PREVIEW_CHARS)
+
+        if (commandPreview !== '') {
+          return `${base}\nコマンド: ${inlineCode(commandPreview)}`
+        }
+      }
+
+      return base
     }
     default:
       return null
@@ -177,12 +195,24 @@ function attemptLine(attempt: AttemptView) {
 
 function eventLine(event: EventView) {
   const detail = Object.entries(event.data)
+    .filter(([key]) => {
+      return ['tool', 'path', 'repository', 'base', 'cwd', 'isError'].includes(key)
+    })
     .map(([key, value]) => {
       return `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`
     })
     .join(' ')
+  const base = `${event.at} ${event.type}${detail === '' ? '' : ` ${clip(detail, MAX_ITEM_CHARS)}`}`
 
-  return `${event.at} ${event.type}${detail === '' ? '' : ` ${clip(detail, MAX_ITEM_CHARS)}`}`
+  if (event.type === 'tool.started' && event.data.tool === 'bash' && typeof event.data.commandPreview === 'string') {
+    const commandPreview = clip(event.data.commandPreview, MAX_COMMAND_PREVIEW_CHARS)
+
+    if (commandPreview !== '') {
+      return `${base} commandPreview=${inlineCode(commandPreview)}`
+    }
+  }
+
+  return base
 }
 
 // Task 詳細の文章。Discord の 1 通に収まらないときは続きの通数に分ける
