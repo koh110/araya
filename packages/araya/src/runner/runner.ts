@@ -784,6 +784,7 @@ async function runWithLedger(context: RunnerContext) {
         } else if (
           attempt.agentFinishedAt === null &&
           attempt.settings !== null &&
+          attempt.settings.timeoutMs !== null &&
           attempt.activeMs >= attempt.settings.timeoutMs
         ) {
           await beginAttemptStop(attempt.taskKey, 'agent_timeout', null)
@@ -811,7 +812,10 @@ async function runWithLedger(context: RunnerContext) {
           continue
         }
 
-        if (activeMsOf(attempt, at) >= attempt.settings.timeoutMs) {
+        if (
+          attempt.settings.timeoutMs !== null &&
+          activeMsOf(attempt, at) >= attempt.settings.timeoutMs
+        ) {
           await beginAttemptStop(attempt.taskKey, 'agent_timeout', null)
         }
       }

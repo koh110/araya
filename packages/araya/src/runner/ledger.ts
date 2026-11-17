@@ -202,7 +202,7 @@ export type AttemptSettings = {
   devRoot: string
   agentDir: string
   model: DevelopmentModel | null
-  timeoutMs: number
+  timeoutMs: number | null
   verificationTimeoutMs: number
 }
 
@@ -690,7 +690,7 @@ function parseSettings(value: unknown) {
     devRoot: asText(parsed.devRoot),
     agentDir: asText(parsed.agentDir),
     model: settingsModel,
-    timeoutMs: asNumber(parsed.timeoutMs),
+    timeoutMs: parsed.timeoutMs === null ? null : asNumber(parsed.timeoutMs),
     verificationTimeoutMs: asNumber(parsed.verificationTimeoutMs),
   }
 

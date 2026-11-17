@@ -273,7 +273,7 @@ pi-durable は `resume()`（と `waitForTask()` など）で task を動かし�
 3. 台帳で `running` の試行のうち、次に当たるものを中止する（上から順に、最初に当たったもの。「中止を始める」）。
    - `stop_reason` が書かれている（前の process が中止を始めた後に落ちた）: `abortTask` だけをもう一度呼ぶ。
    - `cancel_requested_at` がある: 理由 `cancelled`。
-   - 期限を過ぎている（`agent_finished_at` が空で、`active_ms` が `settings_json.timeoutMs` 以上）: 理由 `agent_timeout`。
+   - 明示された期限を過ぎている（`settings_json.timeoutMs` が数値、`agent_finished_at` が空で、`active_ms` がその値以上）: 理由 `agent_timeout`。
 
 `abortTask` は `resume()` の前でも中止を記録でき、`resume()` の後に試行の task の `abort` が動く（「技術調査結果」）。
 
@@ -282,7 +282,7 @@ pi-durable は `resume()`（と `waitForTask()` など）で task を動かし�
 runner は、止めるように求められるまで、次を 2 秒ごとに（待っている試行の task が終わったときはすぐに）くり返す。
 
 1. heartbeat: 前の heartbeat から 10 秒以上たっていれば、`BEGIN IMMEDIATE` の中で、`runner.heartbeat_at` を今の時刻にし、動かしている試行すべての稼働時間を精算する（「期限」）。
-2. 期限: 期限を過ぎた試行を中止する（理由 `agent_timeout`。「期限」）。
+2. 明示されたhard deadline: `timeoutMs` が数値で期限を過ぎた試行だけを中止する（理由 `agent_timeout`。「期限」）。
 3. 中止の求め: `cancel_requested_at` があり、`stop_reason` が空の `running` の試行を中止する（理由 `cancelled`）。
 4. task の作り直し: 台帳で `running` なのに、この process がまだ試行の task を待っていない試行（前の loop で task を作れなかった）の task を作り、待ち始める（「取り込み」の手順 3・4）。
 5. 取り込み（「取り込み」）。
@@ -305,7 +305,7 @@ runner は、止めるように求められるまで、次を 2 秒ごとに（�
   "devRoot": "/home/user/dev",
   "agentDir": "/home/user/.araya/pi",
   "model": { "provider": "anthropic", "id": "example-model", "thinkingLevel": "high" },
-  "timeoutMs": 1200000,
+  "timeoutMs": null,
   "verificationTimeoutMs": 300000
 }
 ```
@@ -429,15 +429,16 @@ phase は次のとおり。
 
 ## 期限
 
-- `ARAYA_DEVELOPMENT_TIMEOUT_MS` は `timeoutMs`（SHIKI の会話）を、`ARAYA_VERIFICATION_TIMEOUT_MS` は `verificationTimeoutMs`（検証 command）を設定する。既定値はそれぞれ 1,200,000 ms と 300,000 ms。値が未設定・空・有限数に変換できない場合は既定値を使い、有限数は整数に切り捨てて 1,000〜3,600,000 ms に収める。
-- SHIKI の会話（`start` と `agent` の phase）には、`settings_json.timeoutMs` の期限がある。期限は、試行の稼働時間（runner がその試行を動かしていた時間）で数える。待ちの間、runner が止まっていた間、落ちてから起動し直すまでの間は数えない（一時停止しても期限は減らない）。
+- `ARAYA_DEVELOPMENT_TIMEOUT_MS` はSHIKI全体の任意のhard deadline、`ARAYA_VERIFICATION_TIMEOUT_MS` は検証commandの有限timeoutを設定する。SHIKIのhard deadlineは既定で無効（`settings_json.timeoutMs: null`）。`ARAYA_DEVELOPMENT_TIMEOUT_MS=0` でも無効にできる。正の有限数は整数に切り捨てて1,000〜3,600,000 msに収める。未設定・空・有限数に変換できない値は既定（無効）を使う。検証timeoutの既定値は300,000 msで、既存どおり1,000〜3,600,000 msに収める。
+- `settings_json.timeoutMs` が数値なら、SHIKI の会話（`start` と `agent` のphase）を試行の稼働時間で制限し、期限到達時は `agent_timeout` で中止する。`null` なら会話全体のhard deadlineを設けず、明示的なcancelまたは別の障害処理が発生するまで継続する。検証commandの有限timeoutなど、会話全体とは別のoperation-level timeoutはこの設定で変更しない。hard deadlineは明示的な運用設定でのみ有効にする。
+- 数値のhard deadlineは、試行の稼働時間（runner がその試行を動かしていた時間）で数える。待ちの間、runner が止まっていた間、落ちてから起動し直すまでの間は数えない（一時停止しても期限は減らない）。
 - 稼働時間の数え方:
   - runner は、動かしている試行ごとに、起点（monotonic な時計の値）を memory に持つ。起点は、この process がその試行を取り込んだ時点（「取り込み」の手順 2 の commit の後）か、起動して `resume()` を呼んだ時点（「起動」の手順 7）。
   - 試行の稼働時間は、`runs.active_ms` と、未加算の時間（今の monotonic な時計の値と起点の差）の和。
   - 精算: `BEGIN IMMEDIATE` の中で未加算の時間を `active_ms` に足し、起点を、その時間を測った時点の値に進める。runner は、heartbeat（「loop」の 1）と結果の記録（「結果の判定と記録」の手順 3）では今の時点まで、止めるとき（「止めるとき」の 4）は止めるように求められた時点まで、Harness が失敗で閉じたとき（その手順 4）は閉じ始めた時点まで、`abortTask` が失敗して終わるとき（「中止を始める」の 2）は今の時点まで精算する。heartbeat の間に終わった試行や、短い一時停止をくり返した試行の時間も、これで数えられる。
   - 時計は monotonic なもの（`process.hrtime.bigint()` など）を使い、test では差し替えられるようにする。
-- runner は loop ごとに、`agent_finished_at` と `stop_reason` が空の `running` の試行について、稼働時間が `timeoutMs` 以上なら、理由 `agent_timeout` で中止する（「中止を始める」）。起動したときは、`resume()` の前に `active_ms` だけで判定する（「開き直したときの確認」）。
-- SHIKI の終わりの記録（`agent_finished_at`）と、期限による中止（`stop_reason`）は、どちらも台帳の `BEGIN IMMEDIATE` の中で、もう一方が空のときだけ書く。先に書かれた方だけが効く。SHIKI が期限の直前に終わったときは検証まで進み、期限が先なら `agent_timeout` になる（`agent` の phase は、`stop_reason` が先に書かれていれば `evidence` へ進まない。「試行の task」）。
+- runner は loop ごとに、`agent_finished_at` と `stop_reason` が空で、`timeoutMs` が数値の `running` の試行について、稼働時間が `timeoutMs` 以上なら、理由 `agent_timeout` で中止する（「中止を始める」）。期限が `null` の試行は、中止せず継続する。起動したときも、`timeoutMs` が数値の場合だけ `resume()` の前に `active_ms` で判定する（「開き直したときの確認」）。
+- SHIKI の終わりの記録（`agent_finished_at`）と、明示された期限による中止（`stop_reason`）は、どちらも台帳の `BEGIN IMMEDIATE` の中で、もう一方が空のときだけ書く。先に書かれた方だけが効く。SHIKI が期限の直前に終わったときは検証まで進み、期限が先なら `agent_timeout` になる（`agent` のphaseは、`stop_reason` が先に書かれていれば `evidence` へ進まない。「試行の task」）。
 - SHIKI の終わりが記録された後（`evidence` の phase）は、期限は使わない（検証のコマンドには既存の `verificationTimeoutMs` の timeout がある）。
 - runner が落ちると、最後に精算してからの時間（heartbeat の間隔の 10 秒まで）は数えられない。
 
@@ -757,9 +758,10 @@ test は実際の Pi auth や model API を使わない。model は pi-ai の fa
 - [ ] SHIKI の bash の実行中に runner を SIGKILL し、同じ引数で起動し直すと（test 用の entrypoint）、会話が続きから進んで試行が終わる。途中だった bash は model に `interrupted` の誤りとして返り、完了していた tool は再実行されない。`run.resumed` event が1件残り、evidence の `resumes` が 1 になる。
 - [ ] SHIKI の bash の実行中に runner に SIGTERM を送ると、runner は試行を中止せずに終了 code 0 で終わり、試行は `running` のまま、`runner.state` は `stopped` になる。起動し直すと会話が続きから進んで試行が終わり、試行の task の `restarts`（`inspect()`）は増えない。止まっている間に登録した Task と求めた中止は、起動し直した後に行われる（中止は `resume()` の前）。
 - [ ] 検証のコマンドの実行中に runner に SIGTERM を送ると、検証のコマンドは止まり、runner は 30 秒以内に終わる。起動し直すと `evidence` の phase がやり直され、試行は終わる。
-- [ ] SHIKI が、runner が動いている時間で `timeoutMs` を過ぎても終わらないと、試行は `failed`（`agent_timeout`）になり、差分が集められ、登録された検証は `not_run` になる。実行中だった bash の process group は止まる。runner を `timeoutMs` より長く止めてから起動し直しても、それだけでは期限で中止されない。`active_ms` が `timeoutMs` 以上の試行がある状態で runner を起動すると、`resume()` の前に中止を始め、その試行の model は呼ばれない。
-- [ ] SHIKI の終わりの記録と期限による中止が重なったとき（test で順番を固定する）、先に台帳に書かれた方だけが効く。SHIKI の終わりが先なら検証まで進み、期限が先なら `agent_timeout` になる。どちらでも `run.finished` は1件。
-- [ ] 試行の稼働時間は、その試行を取り込んだ時点から数える（時計を差し替えた test）。heartbeat の 8 秒後に `timeoutMs` 5,000 の試行を取り込んでも、取り込んでから 5 秒たつまでは期限で中止されない。heartbeat の間に終わった試行の `activeMs` は、取り込みから記録までの時間になる。heartbeat の間隔（10 秒）より短い間隔で runner の一時停止と起動をくり返しても、稼働時間は足され続け、`timeoutMs` に達すると `agent_timeout` で中止される。
+- [ ] `ARAYA_DEVELOPMENT_TIMEOUT_MS` 未設定または `0` の試行は、1時間を超えるactive time後も `running` のまま進行し、runner停止・再起動後も `resume()` して完了できる。正数を明示した試行だけは設定期限到達時に `failed`（`agent_timeout`）になり、差分を集め、検証を `not_run` とし、実行中のbash process groupを止める。
+- [ ] 明示したhard deadlineで、runner停止中に時間が経過しても、それだけでは期限で中止されない。`active_ms` が明示期限以上の試行をrunner起動時に検出した場合は、`resume()` 前に中止し、その試行のmodelを呼ばない。
+- [ ] SHIKI の終わりの記録と明示期限による中止が重なったとき（test で順番を固定する）、先に台帳に書かれた方だけが効く。SHIKI の終わりが先なら検証まで進み、期限が先なら `agent_timeout` になる。どちらでも `run.finished` は1件。
+- [ ] 明示hard deadlineの稼働時間は、その試行を取り込んだ時点から数える（時計を差し替えたtest）。heartbeatの間に終わった試行の`activeMs`は、取り込みから記録までの時間になる。heartbeat間隔より短い間隔でrunnerの一時停止と起動をくり返しても、稼働時間は足され続け、明示期限に達すると `agent_timeout` で中止される。
 - [ ] 試行の task が pi-durable 1.5.0 の `restartLimit` に達すると（test では `restartLimit` を小さくする）、`task_faulted` report と終端 outcome の `error.detail.reason: restart_limit` が記録される。台帳の結果を記録する前に runner を止めて再起動しても、再送されない report ではなく永続化された outcome から `blocked`（`restart_limit`）として記録し、待っていた次の試行を取り込む。task の phase が想定外の例外を投げて `faulted` で終わったときは `failed`（`attempt_error`）になり、`failure_detail` に outcome の status が入る。
 - [ ] pi-durable の storage の commit を1回だけ失敗させると（storage を包んだ test。試行の task の phase の commit と、取り込みの後の `createTask` の commit のそれぞれ）、runner は取り込みと結果の記録をやめ、scope を止めて、終了 code 1 で終わる。試行は `running` のままで、`attempt_error` にならない。同じ dataDir で起動し直すと、試行の task が続きから進み（`createTask` が失敗したときは、試行の task が1つだけ作られ）、試行は終わる。
 - [ ] `araya task cancel` は、`queued` の試行をその場で `failed`（`cancelled`）にし、その試行は取り込まれない。`running` の試行には中止を求め、runner は次の loop で中止を始め、試行は `failed`（`cancelled`）になる。実行中だった bash は止まり、差分の収集と検証は行われない。`completed`・`failed`・`blocked` の Task は `task_not_cancellable` で拒否する。

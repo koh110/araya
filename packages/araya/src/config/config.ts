@@ -26,6 +26,30 @@ function numberFromEnv(
   return Math.min(options.maximum ?? Number.MAX_SAFE_INTEGER, bounded)
 }
 
+function optionalTimeoutFromEnv(
+  value: string | undefined,
+  fallback: number | null,
+  options: { minimum: number; maximum: number },
+) {
+  if (value === undefined || value === '') {
+    return fallback
+  }
+
+  const parsed = Number(value)
+
+  if (!Number.isFinite(parsed)) {
+    return fallback
+  }
+
+  if (parsed === 0) {
+    return null
+  }
+
+  const bounded = Math.max(options.minimum, Math.floor(parsed))
+
+  return Math.min(options.maximum, bounded)
+}
+
 // SDK は process.env を実行時と import 時の両方で読む。最初の import 前に Araya 用の環境変数を設定する。
 let piEnvironmentActive = false
 let piSdkModule: Promise<typeof import('@earendil-works/pi-coding-agent')> | undefined
@@ -97,7 +121,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     configPath: path.join(dataDir, 'config.json'),
     devRoot: path.resolve(env.ARAYA_DEV_ROOT || path.join(os.homedir(), 'dev')),
     piAgentDir: path.join(dataDir, 'pi'),
-    developmentTimeoutMs: numberFromEnv(env.ARAYA_DEVELOPMENT_TIMEOUT_MS, 20 * 60 * 1000, {
+    developmentTimeoutMs: optionalTimeoutFromEnv(env.ARAYA_DEVELOPMENT_TIMEOUT_MS, null, {
       minimum: 1000,
       maximum: 60 * 60 * 1000,
     }),
