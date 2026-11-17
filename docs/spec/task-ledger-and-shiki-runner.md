@@ -582,6 +582,7 @@ SHIKI の system prompt（`development/shiki.ts` の `buildSystemPrompt`）を `
   - `agent`: SHIKI の終了状態（SHIKI の終わりが決まった試行だけ）。model が決まった場合の `model` と、失敗時の `error`・`errorMessage` を格納します。
   - `timeoutMs` と `tools`（SHIKI に渡した tool の名前）: 実行環境を明示するため
   - `decisionQuestion`
+  - `sessionExcerpt`: transcript の最新256 entry までを調べて得た、最大24件・各2,000文字・全体12,000文字までの user / assistant 可視テキスト。Pi Durable の `pi.user` / `pi.assistant` entry だけを対象とし、model role が user の合成 compaction summary も除外する。tool の引数・出力、非テキスト、hidden reasoning は含めず、既知の秘密を置き換えた後で上限を適用する。取得できた excerpt には切り詰めの有無を記録し、取得失敗時は保存せず、全文ではないことを明示する。
   - `redactions`、`bodiesStored`、`bodiesSha256`（「秘密情報の扱い」）
   - `previousAttempt`（再実行のとき、前回の試行番号と、前回の `worktrees` の path と branch）
   - `resumes`（その試行の `run.resumed` event の数）と `activeMs`（手順 3 で精算した後の `runs.active_ms`）: runner が台帳に記録するときに足す（`evidence.json` には入らない）
@@ -602,6 +603,7 @@ Issue #1 の「Secrets を通常ログや Task 台帳に複製しない」のた
 - 利用者が書いた Task の入力（`title`、`goal`、`constraints`、`targets`、`permissions`）と `note` は置き換えない。
 - runner の unit file に書く環境変数は「unit の名前と file」の一覧だけにする。systemd は値を unit の定義として持ち、`systemctl --user show` で表示する（「技術調査結果」）。unit file の mode は 0600 にする。
 - pi-durable の storage（`<dataDir>/runner/durable.sqlite`）には、すべての試行の会話（課題の本文、model の応答、tool の引数と出力）が残る。mode 0700 の directory の中に置くので、利用者以外は読めない。台帳を読む command は、この file を開かない。runner の umask は変えない（SHIKI が worktree に作る file の mode を、利用者の通常の作業と同じにするため）。
+- Task の読み取り用に、runner は自身の試行中に `sessionExcerpt` を evidence に複製する。transcript の最新256 entry までを調べ、`pi.user` / `pi.assistant` entry の可視テキストのみを既知の秘密の置換後に最大24件・各2,000文字・全体12,000文字へ切り詰める。role が user の合成 compaction summary を含む他種 entry、tool の引数・出力、hidden reasoning、非テキスト内容は含めない。取得できた excerpt には切り詰めの有無を記録し、取得に失敗した場合は保存しない。台帳を読む Discord chat / CLI は引き続き `runner/durable.sqlite` を開かず、`tasks.sqlite` の evidence だけを読む。既存試行に `sessionExcerpt` が無い場合は、台帳の summary・decision question などだけを返し、全文を読めたとは扱わない。
 - 途中経過には bash のコマンドと tool の結果を書かない（「途中経過」）。
 - SHIKI には、system prompt の規則（「認証情報や秘密情報（token、鍵、.env、auth.json など）を読み出したり、出力したりしないでください」）を与えます。
 
