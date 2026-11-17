@@ -95,6 +95,46 @@ async function readEvidenceFile(stateDir: string | null) {
   return isRecord(value) ? value : {}
 }
 
+test('runner: 既定で期限のない試行は1時間を超えても止まらず、runner再起動後に続く', async () => {
+  const setup = await setupWithRepository()
+  const pidFile = path.join(setup.fixture.root, 'bash.pid')
+  setup.models.script((view) => {
+    return hangingStep(view, pidFile)
+  })
+  const [taskId = 0] = createTasks(setup, 1)
+  const loops = createLoopCounter()
+  const firstRunner = startRunner(setup, { faults: loops })
+  let secondRunner: StartedRunner | undefined
+
+  try {
+    const bashPid = await readPid(pidFile)
+    setup.clock.advance(60 * 60 * 1000 + 1000)
+    await loops.waitForLoops(1)
+
+    const beforeRestart = firstAttempt(setup, taskId)
+    assert.equal(beforeRestart.status, 'running')
+    assert.equal(beforeRestart.stopReason, null)
+    assert.ok(beforeRestart.activeMs > 60 * 60 * 1000)
+    assert.equal(isAlive(bashPid), true)
+    assert.deepEqual(eventsOf(setup, taskId, 'run.stopping'), [])
+
+    assert.equal(await firstRunner.stop(), 0)
+    assert.ok(readActiveMs(setup.fixture, beforeRestart.taskKey) > 60 * 60 * 1000)
+
+    secondRunner = startRunner(setup)
+    const shown = await waitForTaskStatus(setup, taskId, FINAL_STATUSES)
+    const attempt = shown.attempts[0]
+
+    assert.equal(shown.task.status, 'completed')
+    assert.equal(attempt?.stopReason, null)
+    assert.equal(attempt?.failureReason, null)
+    assert.equal(attempt?.evidence?.resumes, 1)
+    assert.deepEqual(eventsOf(setup, taskId, 'run.stopping'), [])
+  } finally {
+    await teardownRunner(setup, secondRunner ?? firstRunner)
+  }
+})
+
 test('runner: 稼働時間で timeoutMs を過ぎると agent_timeout になり、差分を集め、検証は not_run、bash の process group は止まる', async () => {
   const setup = await setupWithTimeout()
   const pidFile = path.join(setup.fixture.root, 'bash.pid')
