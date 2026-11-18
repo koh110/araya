@@ -570,7 +570,7 @@ SHIKI の system prompt（`development/shiki.ts` の `buildSystemPrompt`）を `
 - `tool.started` / `tool.finished` を台帳へ commit した後、runner は `<dataDir>/runtime/progress.sock` に `{"type":"wake"}\n` を送る。wake は固定 payload で event 内容・command・tool output を含まず、接続待ちは短い上限を設ける。送信失敗・timeout は無視し、task と tool はそのまま進める。
 - Discord bot は同じ socket を listen し、wake を受けると既存の notification cursor から未配信 event を直列に drain する。polling fallback と cursor/retry の復旧動作は残し、socket wake は永続 event ではなく best-effort hint とする。
 - socket は `<dataDir>/runtime` の mode 0700 directory に作り、socket file は mode 0600 とする。stale socket の削除前に directory・socket の type, owner, identity を確認する。
-- Discord の tool progress 表示は Task ID、attempt、許可 pattern に一致する tool 名、開始/完了/失敗 status を表示する。`bash` の開始通知と Task 詳細の event 履歴には `commandPreview` の最大 100 文字を code 表示するが、raw command、tool output、model response は含めない。Discord bot は runner と別 service/process のまま稼働する。
+- Discord の tool progress 表示は Task ID、attempt、許可 pattern に一致する tool 名、開始/完了/失敗 status を表示する。ただし `bash` の `tool.finished` が成功の場合は通知を省略し、失敗は通知する。`bash` の開始通知と Task 詳細の event 履歴には `commandPreview` の最大 100 文字を code 表示するが、raw command、tool output、model response は含めない。Discord bot は runner と別 service/process のまま稼働する。
 
 ## 結果の判定と記録
 

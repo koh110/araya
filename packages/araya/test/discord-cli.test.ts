@@ -1266,6 +1266,7 @@ test('discord register: 設定（.env か環境変数）から slash command を
       'task submit',
       'task cancel',
       'task retry',
+      'task continue',
     ])
     assert.deepEqual(registered, {
       botToken: BOT_TOKEN,

@@ -31,7 +31,12 @@ import {
   type DevelopmentResult,
 } from '../development/result.ts'
 import type { ThinkingLevel } from '../config/model.ts'
-import { readDecision } from '../development/worktrees.ts'
+import {
+  prepareContinuedWorktrees,
+  readDecision,
+  validateCurrentContinuedWorktrees,
+  type WorktreeRecord,
+} from '../development/worktrees.ts'
 import { createRedactor, REDACTED, type Redactor } from '../infrastructure/redaction.ts'
 import { sendProgressWake } from '../infrastructure/progress-socket.ts'
 import {
@@ -49,6 +54,7 @@ import {
   deliveryScopeUnit,
   gitScopeUnit,
   scopePattern,
+  taskScopePattern,
   verifyScopeUnit,
   type SystemdOps,
 } from '../infrastructure/systemd.ts'
@@ -59,6 +65,7 @@ import type {
   TaskLedger,
   ToolEventType,
   WorktreeLocation,
+  WorkspaceWorktreeIdentity,
 } from './ledger.ts'
 import {
   createSessionExcerpt,
@@ -95,7 +102,7 @@ const DEFAULT_THINKING_LEVEL: ThinkingLevel = 'medium'
 // taskKey と試行の task の id、会話の id と taskKey の対応。runner と tool が会話や task から試行を引く
 export type AttemptsState = {
   byTaskKey: { [taskKey: string]: { taskId: TaskId<AttemptResult> } }
-  byConversation: { [conversationId: string]: { taskKey: string; devRoot: string } }
+  byConversation: { [conversationId: string]: { taskKey: string; devRoot: string; workspaceTaskKey?: string } }
 }
 
 export const AttemptsDoc = defineDoc<AttemptsState>({
@@ -113,13 +120,72 @@ export const AttemptsDoc = defineDoc<AttemptsState>({
 // 試行の task の input。取り込みのときに runner が台帳の値から作る
 export type AttemptInput = {
   taskKey: string
+  workspaceTaskKey: string
+  workspaceStateTaskKey: string | null
   taskId: number
   attempt: number
   title: string
   // 課題の本文（「課題の本文」）
   body: string
   settings: AttemptSettings
-  previousAttempt: { attempt: number; worktrees: WorktreeLocation[] } | null
+  previousAttempt: { attempt: number; taskKey: string; worktrees: WorktreeLocation[] } | null
+}
+
+type PersistedAttemptInput = Omit<
+  AttemptInput,
+  'workspaceTaskKey' | 'workspaceStateTaskKey' | 'previousAttempt'
+> & Partial<Pick<AttemptInput, 'workspaceTaskKey' | 'workspaceStateTaskKey' | 'previousAttempt'>>
+
+function normalizeAttemptInput(value: PersistedAttemptInput) {
+  const workspaceTaskKey = value.workspaceTaskKey
+  const workspaceStateTaskKey = value.workspaceStateTaskKey
+  const previousAttempt = value.previousAttempt
+
+  if (workspaceTaskKey === undefined) {
+    if (workspaceStateTaskKey !== undefined || previousAttempt !== undefined) {
+      throw new Error('a legacy attempt input has incomplete continuation metadata')
+    }
+
+    return {
+      ...value,
+      workspaceTaskKey: value.taskKey,
+      workspaceStateTaskKey: null,
+      previousAttempt: null,
+    }
+  }
+
+  if (
+    typeof workspaceTaskKey !== 'string' ||
+    (typeof workspaceStateTaskKey !== 'string' && workspaceStateTaskKey !== null) ||
+    (typeof previousAttempt !== 'object' && previousAttempt !== null)
+  ) {
+    throw new Error('the attempt input has invalid continuation metadata')
+  }
+
+  return {
+    ...value,
+    workspaceTaskKey,
+    workspaceStateTaskKey,
+    previousAttempt,
+  }
+}
+
+function workspaceWorktreeIdentities(worktrees: readonly WorktreeRecord[]) {
+  return worktrees.map((worktree) => {
+    if (typeof worktree.worktreeIdentity !== 'string') {
+      throw new Error(`${worktree.worktreePath} has no recorded worktree identity`)
+    }
+
+    return {
+      repository: worktree.repository,
+      worktreePath: worktree.worktreePath,
+      branch: worktree.branch,
+      base: worktree.base,
+      baseSha: worktree.baseSha,
+      excludeAdded: worktree.excludeAdded,
+      worktreeIdentity: worktree.worktreeIdentity,
+    } satisfies WorkspaceWorktreeIdentity
+  })
 }
 
 type AttemptCheckpoint =
@@ -135,7 +201,12 @@ type AttemptCheckpoint =
 
 export type AttemptLedgerPort = Pick<
   TaskLedger,
-  'recordStateDir' | 'recordAgentFinished' | 'readStop' | 'appendToolEvent'
+  | 'recordStateDir'
+  | 'recordWorkspaceWorktrees'
+  | 'verifyWorkspaceWorktrees'
+  | 'recordAgentFinished'
+  | 'readStop'
+  | 'appendToolEvent'
 >
 
 export type ModelLookup = Pick<
@@ -188,6 +259,39 @@ export type AttemptDependencies = {
   ) => PiModelSettings | Promise<PiModelSettings>
   now?: () => Date
   faults?: AttemptFaults
+}
+
+export async function validateContinuationWorkspace(
+  input: Pick<
+    AttemptInput,
+    'taskKey' | 'workspaceTaskKey' | 'workspaceStateTaskKey' | 'settings' | 'previousAttempt'
+  >,
+  deps: Pick<AttemptDependencies, 'dataDir' | 'hash' | 'ledger' | 'systemd' | 'env'>,
+) {
+  if (input.workspaceTaskKey === input.taskKey) {
+    return null
+  }
+
+  if (input.previousAttempt === null || input.workspaceStateTaskKey === null) {
+    throw new Error('the previous attempt needed to validate the continued workspace is missing')
+  }
+
+  const stateDir = getStateDir(deps.dataDir, input.taskKey)
+  const validated = await validateCurrentContinuedWorktrees({
+    devRoot: input.settings.devRoot,
+    stateDir,
+    taskKey: input.taskKey,
+    workspaceTaskKey: input.workspaceTaskKey,
+    expectedWorktrees: input.previousAttempt.worktrees,
+    env: deps.env,
+    runGit: createScopedRunner(deps.systemd, () => gitScopeUnit(deps.hash, input.taskKey)),
+  })
+
+  if (!deps.ledger.verifyWorkspaceWorktrees(input.taskKey, workspaceWorktreeIdentities(validated.worktrees))) {
+    throw new Error('the current worktree list does not match its ledger snapshot')
+  }
+
+  return validated
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -256,8 +360,14 @@ export async function findAttemptByConversation(
 // 取り込んだ試行から、試行の task の input を作る
 export function buildAttemptInput(claimed: ClaimedAttempt) {
   const previous = claimed.previous
+  if (previous !== null && claimed.previousTaskKey === null) {
+    throw new Error(`previous attempt taskKey is missing for Task ${claimed.taskId}`)
+  }
+
   const input: AttemptInput = {
     taskKey: claimed.taskKey,
+    workspaceTaskKey: claimed.workspaceTaskKey,
+    workspaceStateTaskKey: claimed.workspaceStateTaskKey,
     taskId: claimed.taskId,
     attempt: claimed.attempt,
     title: claimed.title,
@@ -267,11 +377,18 @@ export function buildAttemptInput(claimed: ClaimedAttempt) {
       targets: claimed.targets,
       permissions: claimed.permissions,
       note: claimed.note,
+      continueWorkspace: claimed.workspaceTaskKey !== claimed.taskKey,
       previous,
     }),
     settings: claimed.settings,
     previousAttempt:
-      previous === null ? null : { attempt: previous.attempt, worktrees: previous.worktrees },
+      previous === null || claimed.previousTaskKey === null
+        ? null
+        : {
+            attempt: previous.attempt,
+            taskKey: claimed.previousTaskKey,
+            worktrees: previous.worktrees,
+          },
   }
 
   return input
@@ -646,6 +763,7 @@ function toolEventData(
 export async function buildAttemptErrorResult(input: {
   dataDir: string
   taskKey: string
+  workspaceTaskKey?: string
   settings: AttemptSettings | null
   detail: string | null
   secretValues: readonly string[]
@@ -659,6 +777,7 @@ export async function buildAttemptErrorResult(input: {
   const stateDir = (await existingDirectory(candidate)) ? candidate : null
   const built = await buildWorktreeOnlyEvidence({
     taskKey: input.taskKey,
+    workspaceTaskKey: input.workspaceTaskKey,
     devRoot: input.settings?.devRoot ?? '',
     stateDir,
     redact: redactor.redact,
@@ -723,6 +842,9 @@ export function createShikiExtension(deps: AttemptDependencies) {
     systemd: deps.systemd,
     env: deps.env,
     now,
+    recordWorkspaceWorktrees: (taskKey, worktrees) => {
+      deps.ledger.recordWorkspaceWorktrees(taskKey, workspaceWorktreeIdentities(worktrees))
+    },
     resolveAttempt: async (conversationId, reader, context) => {
       return findAttemptByConversation(reader, conversationId, context)
     },
@@ -751,6 +873,7 @@ export function createShikiExtension(deps: AttemptDependencies) {
   ) {
     const built = await buildWorktreeOnlyEvidence({
       taskKey: base.input.taskKey,
+      workspaceTaskKey: base.input.workspaceTaskKey,
       devRoot: base.input.settings.devRoot,
       stateDir: outcome.stateDir,
       redact: base.redactor.redact,
@@ -827,6 +950,7 @@ export function createShikiExtension(deps: AttemptDependencies) {
     return collectDevelopmentResult(
       {
         taskKey: input.taskKey,
+        workspaceTaskKey: input.workspaceTaskKey,
         title: input.title,
         draftPrDelivery: deps.draftPrDelivery,
         devRoot: input.settings.devRoot,
@@ -837,6 +961,9 @@ export function createShikiExtension(deps: AttemptDependencies) {
         signal,
         redact: redactor.redact,
         redactTruncated: redactor.redactTruncated,
+        validateWorkspace: async () => {
+          await validateContinuationWorkspace(input, deps)
+        },
       },
       {
         runGit: createScopedRunner(deps.systemd, () => {
@@ -889,7 +1016,9 @@ export function createShikiExtension(deps: AttemptDependencies) {
 
       if (appendResult === 'written') {
         try {
-          await (deps.notifyProgress ?? (() => sendProgressWake(deps.dataDir)))()
+          await (deps.notifyProgress ?? (() => {
+            return sendProgressWake(deps.dataDir)
+          }))()
         } catch {
           // socket/IPC は best-effort。ledger commit と tool の実行を優先し、失敗の本文は記録しない
         }
@@ -924,7 +1053,7 @@ export function createShikiExtension(deps: AttemptDependencies) {
     },
     phases: {
       start: async (task, runtime, context) => {
-        const input = task.input
+        const input = normalizeAttemptInput(task.input)
         const { taskKey, settings } = input
         const redactor = createRedactor(deps.secretValues)
         const base: ResultBase = {
@@ -971,6 +1100,58 @@ export function createShikiExtension(deps: AttemptDependencies) {
             }),
           )
           return
+        }
+
+        if (input.workspaceTaskKey !== taskKey) {
+          const previous = input.previousAttempt
+          const workspaceStateTaskKey = input.workspaceStateTaskKey
+
+          if (previous === null || workspaceStateTaskKey === null) {
+            await finish(await worktreeOnlyResult(base, {
+              status: 'failed',
+              failureReason: 'continuation_workspace_invalid',
+              stateDir,
+              detail: 'the previous attempt needed to validate the continued workspace is missing'
+            }))
+            return
+          }
+
+          const stopped = await deps.systemd.stopScopes(taskScopePattern(deps.hash, input.taskId))
+
+          if (!stopped.ok) {
+            await finish(await worktreeOnlyResult(base, {
+              status: 'failed',
+              failureReason: 'termination_unconfirmed',
+              stateDir,
+              detail: `the previous attempt still has active scopes: ${stopped.remaining.join(', ')}`
+            }))
+            return
+          }
+
+          try {
+            const continued = await prepareContinuedWorktrees({
+              dataDir: deps.dataDir,
+              devRoot: settings.devRoot,
+              taskKey,
+              previousTaskKey: previous.taskKey,
+              sourceTaskKey: workspaceStateTaskKey,
+              workspaceTaskKey: input.workspaceTaskKey,
+              expectedWorktrees: previous.worktrees,
+              env: deps.env,
+              runGit: createScopedRunner(deps.systemd, () => {
+                return gitScopeUnit(deps.hash, taskKey)
+              })
+            })
+            deps.ledger.recordWorkspaceWorktrees(taskKey, workspaceWorktreeIdentities(continued.worktrees))
+          } catch (error) {
+            await finish(await worktreeOnlyResult(base, {
+              status: 'failed',
+              failureReason: 'continuation_workspace_invalid',
+              stateDir,
+              detail: describeError(error)
+            }))
+            return
+          }
         }
 
         if (input.body.length > MAX_TASK_BODY_CHARS) {
@@ -1020,11 +1201,20 @@ export function createShikiExtension(deps: AttemptDependencies) {
             thinkingLevel: model.thinkingLevel,
             extensions: [extension],
             tools,
-            instructions: buildShikiInstructions({ devRoot: settings.devRoot, taskKey }),
+            instructions: buildShikiInstructions({
+              devRoot: settings.devRoot,
+              taskKey,
+              workspaceTaskKey: input.workspaceTaskKey,
+              continueWorkspace: input.workspaceTaskKey !== taskKey,
+            }),
             cwd: settings.devRoot,
           })
           const attempts = await tx.doc(AttemptsDoc)
-          attempts.byConversation[String(conversation.id)] = { taskKey, devRoot: settings.devRoot }
+          attempts.byConversation[String(conversation.id)] = {
+            taskKey,
+            devRoot: settings.devRoot,
+            workspaceTaskKey: input.workspaceTaskKey
+          }
 
           return {
             status: 'running',
@@ -1033,9 +1223,51 @@ export function createShikiExtension(deps: AttemptDependencies) {
         }, context)
       },
       agent: async (task, runtime, context) => {
-        const input = task.input
+        const input = normalizeAttemptInput(task.input)
         const { taskKey, settings } = input
         const { conversationId, model } = task.state.checkpoint
+
+        if (input.workspaceTaskKey !== taskKey) {
+          const stateDir = getStateDir(deps.dataDir, taskKey)
+          const base: ResultBase = {
+            input,
+            redactor: createRedactor(deps.secretValues),
+            agent: null,
+            model,
+            sessionExcerpt: null,
+            sessionRedactions: 0,
+          }
+
+          async function failBeforeResume(failureReason: string, detail: string) {
+            const result = await worktreeOnlyResult(base, {
+              status: 'failed',
+              failureReason,
+              stateDir,
+              detail,
+            })
+            await runtime.commit(() => {
+              return { status: 'terminal', outcome: { status: 'completed', result } }
+            }, context)
+          }
+
+          const stopped = await deps.systemd.stopScopes(taskScopePattern(deps.hash, input.taskId))
+
+          if (!stopped.ok) {
+            await failBeforeResume(
+              'termination_unconfirmed',
+              `continued attempt scopes remain active: ${stopped.remaining.join(', ')}`,
+            )
+            return
+          }
+
+          try {
+            await validateContinuationWorkspace(input, deps)
+          } catch (error) {
+            await failBeforeResume('continuation_workspace_invalid', describeError(error))
+            return
+          }
+        }
+
         const conversation = await runtime.conversation(conversationId, context)
 
         if (conversation === undefined) {
@@ -1048,6 +1280,8 @@ export function createShikiExtension(deps: AttemptDependencies) {
             content: buildTaskPrompt({
               devRoot: settings.devRoot,
               taskKey,
+              workspaceTaskKey: input.workspaceTaskKey,
+              continueWorkspace: input.workspaceTaskKey !== taskKey,
               title: input.title,
               task: input.body,
             }),
@@ -1105,7 +1339,7 @@ export function createShikiExtension(deps: AttemptDependencies) {
         }, context)
       },
       evidence: async (task, runtime, context) => {
-        const input = task.input
+        const input = normalizeAttemptInput(task.input)
         const redactor = createRedactor(deps.secretValues)
         const agent = redactAgent(task.state.checkpoint.agent, redactor)
         const base: ResultBase = {
@@ -1129,10 +1363,28 @@ export function createShikiExtension(deps: AttemptDependencies) {
             detail: stopped.error,
           })
         } else {
-          const development = await collect(input, stateDir, agent, redactor, runtime.signal)
-          // 中止された検証の結果は記録しない（abort に移るか、開き直したときにやり直す）
-          throwIfAborted(runtime.signal)
-          result = await developmentResult(base, stateDir, development)
+          let continuationValid = true
+
+          if (input.workspaceTaskKey !== input.taskKey) {
+            try {
+              await validateContinuationWorkspace(input, deps)
+            } catch (error) {
+              continuationValid = false
+              result = await worktreeOnlyResult(base, {
+                status: 'failed',
+                failureReason: 'continuation_workspace_invalid',
+                stateDir,
+                detail: describeError(error),
+              })
+            }
+          }
+
+          if (continuationValid) {
+            const development = await collect(input, stateDir, agent, redactor, runtime.signal)
+            // 中止された検証の結果は記録しない（abort に移るか、開き直したときにやり直す）
+            throwIfAborted(runtime.signal)
+            result = await developmentResult(base, stateDir, development)
+          }
         }
 
         await deps.faults?.beforePhaseCommit?.('evidence', input.taskKey)
@@ -1142,7 +1394,7 @@ export function createShikiExtension(deps: AttemptDependencies) {
       },
     },
     abort: async (task, runtime, context) => {
-      const input = task.input
+      const input = normalizeAttemptInput(task.input)
       const checkpoint = task.state.checkpoint
       const redactor = createRedactor(deps.secretValues)
       const agent = checkpoint.phase === 'evidence' ? redactAgent(checkpoint.agent, redactor) : null

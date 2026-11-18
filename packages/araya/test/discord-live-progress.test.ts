@@ -6,10 +6,8 @@ import test from 'node:test'
 
 import { runDiscordBot } from '../src/discord/bot.ts'
 import { renderNotification, renderTaskDetail } from '../src/discord/render.ts'
-import {
-  progressSocketPath,
-  sendProgressWake,
-} from '../src/infrastructure/progress-socket.ts'
+import { readDiscordBotState } from '../src/discord/state.ts'
+import { progressSocketPath, sendProgressWake } from '../src/infrastructure/progress-socket.ts'
 import { openTaskLedger } from '../src/runner/ledger.ts'
 
 const BOT_TOKEN = 'synthetic-live-progress-token'
@@ -35,7 +33,7 @@ async function makeDataDir() {
 async function waitUntil(condition: () => boolean | Promise<boolean>, message: string) {
   const deadline = Date.now() + 2_000
 
-  while (!await condition()) {
+  while (!(await condition())) {
     if (Date.now() >= deadline) {
       assert.fail(message)
     }
@@ -132,18 +130,28 @@ test('discord live progress: wake は poll interval を待たずに通知し、�
 
     const progress = notifications.filter((content) => content.includes('bash を開始しました'))
     assert.equal(progress.length, 1, notifications.join('\n'))
-    assert.equal(progress[0], `Task #1（試行 1）: bash を開始しました\nコマンド: \`git status --short\``)
+    assert.equal(
+      progress[0],
+      `Task #1（試行 1）: bash を開始しました\nコマンド: \`git status --short\``,
+    )
     assert.equal(notifications.join('\n').includes('hidden-command'), false)
     assert.equal(notifications.join('\n').includes('hidden-tool-output'), false)
     assert.equal(notifications.join('\n').includes('hidden-model-response'), false)
     assert.equal(notifications.join('\n').includes(BOT_TOKEN), false)
     const detail = ledger.showTask(1, { events: 1 })
-    const detailText = renderTaskDetail({ task: detail.task, attempts: detail.attempts, events: detail.events }).join(String.fromCharCode(10))
+    const detailText = renderTaskDetail({
+      task: detail.task,
+      attempts: detail.attempts,
+      events: detail.events,
+    }).join(String.fromCharCode(10))
     assert.ok(detailText.includes('commandPreview=`git status --short`'))
     assert.equal(detailText.includes('hidden-command'), false)
     assert.equal(detailText.includes('hidden-tool-output'), false)
     assert.equal(detailText.includes('hidden-model-response'), false)
-    assert.equal(ledger.listEventsSince(0, 50).some((event) => event.type === 'tool.started'), true)
+    assert.equal(
+      ledger.listEventsSince(0, 50).some((event) => event.type === 'tool.started'),
+      true,
+    )
   } finally {
     ledger.close()
     bot.stop.abort()
@@ -152,48 +160,148 @@ test('discord live progress: wake は poll interval を待たずに通知し、�
   }
 })
 
-test('discord live progress: bash command preview を code として表示し、finished / 別 tool では表示しない', () => {
+test('discord live progress: Bash 成功の完了通知は省略し、失敗時は通知して cursor を進める', async () => {
+  const dataDir = await makeDataDir()
+  const notifications: string[] = []
+  const bot = await launchBot(dataDir, 30_000, notifications)
+  const ledger = openTaskLedger(dataDir, { secretValues: [BOT_TOKEN] })
+
+  try {
+    const claimed = createRunningAttempt(ledger)
+    assert.equal(await sendProgressWake(dataDir), true)
+    await waitUntil(
+      () => {
+        return notifications.some((content) => {
+          return content.includes('の実行を始めました')
+        })
+      },
+      'run.started 通知が届かなかった',
+    )
+    const baselineCount = notifications.length
+
+    ledger.appendToolEvent(claimed.taskKey, 'tool.finished', { tool: 'bash', isError: false })
+    const successEvent = ledger.listEventsSince(0, 50).at(-1)
+    assert.ok(successEvent)
+    assert.equal(await sendProgressWake(dataDir), true)
+    await waitUntil(
+      () => {
+        return readDiscordBotState(dataDir)?.cursor === successEvent.seq
+      },
+      'Bash 成功完了 event が通知 cursor を通過しなかった',
+    )
+    assert.deepEqual(notifications.slice(baselineCount), [])
+
+    ledger.appendToolEvent(claimed.taskKey, 'tool.finished', { tool: 'bash', isError: true })
+    const failureEvent = ledger.listEventsSince(0, 50).at(-1)
+    assert.ok(failureEvent)
+    assert.equal(await sendProgressWake(dataDir), true)
+    const failureNotification = 'Task #1（試行 1）: bash が失敗しました'
+    await waitUntil(
+      () => {
+        return notifications.slice(baselineCount).includes(failureNotification)
+      },
+      'Bash 失敗通知が届かなかった',
+    )
+    assert.deepEqual(notifications.slice(baselineCount), [failureNotification])
+    assert.equal(readDiscordBotState(dataDir)?.cursor, failureEvent.seq)
+  } finally {
+    ledger.close()
+    bot.stop.abort()
+    assert.equal(await bot.running, 0)
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('discord live progress: bash 開始 preview は code 表示し、成功完了は省略して失敗を表示する', () => {
   const tick = String.fromCharCode(96)
   const preview = `printf ${tick}date${tick}`
-  assert.equal(renderNotification({
-    seq: 1,
-    attempt: 1,
-    at: '2026-11-17T00:00:00.000Z',
-    type: 'tool.started',
-    data: { tool: 'bash', commandPreview: preview },
-    taskId: 7,
-    taskTitle: 'progress',
-  }), [
-    'Task #7（試行 1）: bash を開始しました',
-    `コマンド: ${tick}${tick} ${preview} ${tick}${tick}`,
-  ].join(String.fromCharCode(10)))
-  assert.equal(renderNotification({
-    seq: 2,
-    attempt: 1,
-    at: '2026-11-17T00:00:01.000Z',
-    type: 'tool.finished',
-    data: { tool: 'bash', commandPreview: preview, isError: false },
-    taskId: 7,
-    taskTitle: 'progress',
-  }), 'Task #7（試行 1）: bash を完了しました')
-  assert.equal(renderNotification({
-    seq: 3,
-    attempt: 1,
-    at: '2026-11-17T00:00:02.000Z',
-    type: 'tool.started',
-    data: { tool: 'read', commandPreview: preview },
-    taskId: 7,
-    taskTitle: 'progress',
-  }), 'Task #7（試行 1）: read を開始しました')
-  assert.equal(renderNotification({
-    seq: 4,
-    attempt: 1,
-    at: '2026-11-17T00:00:03.000Z',
-    type: 'tool.started',
-    data: { tool: 'bash', commandPreview: 'x'.repeat(150) },
-    taskId: 7,
-    taskTitle: 'progress',
-  }), `Task #7（試行 1）: bash を開始しました\nコマンド: ${tick}${'x'.repeat(99)}…${tick}`)
+  assert.equal(
+    renderNotification({
+      seq: 1,
+      attempt: 1,
+      at: '2026-11-17T00:00:00.000Z',
+      type: 'tool.started',
+      data: { tool: 'bash', commandPreview: preview },
+      taskId: 7,
+      taskTitle: 'progress',
+    }),
+    [
+      'Task #7（試行 1）: bash を開始しました',
+      `コマンド: ${tick}${tick} ${preview} ${tick}${tick}`,
+    ].join(String.fromCharCode(10)),
+  )
+  assert.equal(
+    renderNotification({
+      seq: 2,
+      attempt: 1,
+      at: '2026-11-17T00:00:01.000Z',
+      type: 'tool.finished',
+      data: { tool: 'bash', commandPreview: preview, isError: false },
+      taskId: 7,
+      taskTitle: 'progress',
+    }),
+    null,
+  )
+  assert.equal(
+    renderNotification({
+      seq: 3,
+      attempt: 1,
+      at: '2026-11-17T00:00:02.000Z',
+      type: 'tool.finished',
+      data: { tool: 'bash', isError: true },
+      taskId: 7,
+      taskTitle: 'progress',
+    }),
+    'Task #7（試行 1）: bash が失敗しました',
+  )
+  assert.equal(
+    renderNotification({
+      seq: 4,
+      attempt: 1,
+      at: '2026-11-17T00:00:03.000Z',
+      type: 'tool.started',
+      data: { tool: 'read', commandPreview: preview },
+      taskId: 7,
+      taskTitle: 'progress',
+    }),
+    'Task #7（試行 1）: read を開始しました',
+  )
+  assert.equal(
+    renderNotification({
+      seq: 5,
+      attempt: 1,
+      at: '2026-11-17T00:00:04.000Z',
+      type: 'tool.finished',
+      data: { tool: 'read', isError: false },
+      taskId: 7,
+      taskTitle: 'progress',
+    }),
+    'Task #7（試行 1）: read を完了しました',
+  )
+  assert.equal(
+    renderNotification({
+      seq: 6,
+      attempt: 1,
+      at: '2026-11-17T00:00:05.000Z',
+      type: 'run.finished',
+      data: { status: 'completed', failureReason: null },
+      taskId: 7,
+      taskTitle: 'progress',
+    }),
+    'Task #7（試行 1）は完了で終わりました',
+  )
+  assert.equal(
+    renderNotification({
+      seq: 7,
+      attempt: 1,
+      at: '2026-11-17T00:00:06.000Z',
+      type: 'tool.started',
+      data: { tool: 'bash', commandPreview: 'x'.repeat(150) },
+      taskId: 7,
+      taskTitle: 'progress',
+    }),
+    `Task #7（試行 1）: bash を開始しました\nコマンド: ${tick}${'x'.repeat(99)}…${tick}`,
+  )
 })
 
 test('discord live progress: shutdown waits for an in-flight notification before releasing the process lock', async () => {
@@ -237,7 +345,11 @@ test('discord live progress: shutdown waits for an in-flight notification before
 
     releaseSend()
     assert.equal(await firstResult, 0)
-    assert.equal(stoppedBeforeDrain, false, 'shutdown must wait for the notification tick to settle')
+    assert.equal(
+      stoppedBeforeDrain,
+      false,
+      'shutdown must wait for the notification tick to settle',
+    )
   } finally {
     releaseSend()
     first.stop.abort()
@@ -308,7 +420,10 @@ test('discord live progress: bot 停止中のevent はledgerに残り、再起�
     assert.equal(await sendProgressWake(dataDir), false)
 
     ledger.appendToolEvent(claimed.taskKey, 'tool.finished', { tool: 'read', isError: false })
-    assert.equal(ledger.listEventsSince(0, 50).some((event) => event.type === 'tool.finished'), true)
+    assert.equal(
+      ledger.listEventsSince(0, 50).some((event) => event.type === 'tool.finished'),
+      true,
+    )
 
     const replayed: string[] = []
     const restarted = await launchBot(dataDir, 30_000, replayed)

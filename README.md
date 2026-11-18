@@ -99,16 +99,21 @@ SHIKI の変更は試行ごとの worktree `<repository>/.worktree/araya-<taskKe
 
 ## 詰まったときは
 
-`blocked` は次のどちらかです。SHIKI が `araya_request_decision` で人の判断を求めた（質問は `decisionQuestion`）、または runner が落ち続けて試行が止められた（`restart_limit`）。どちらの場合も、決めてから再実行します。
+`blocked` は次のどちらかです。SHIKI が `araya_request_decision` で人の判断を求めた（質問は `decisionQuestion`）、または runner が落ち続けて試行が止められた（`restart_limit`）。失敗した Task も含め、既存の作業を引き継ぐなら `continue`、新しい作業環境でやり直すなら `retry` を使います。
 
 ```sh
+# 前回の worktree・branch の変更を引き継ぐ
+araya task continue <taskId> --note "B 方案を使う"
+
+# 新しい worktree・branch でやり直す
 araya task retry <taskId> --note "B 方案を使う"
 ```
 
-- 再実行できるのは `failed` と `blocked` の Task だけです。
-- 新しい試行は新しい taskKey を使い、worktree と branch も前回とは別になります。前回の worktree は残ります（前回の変更は持ち込みません）。
+- 再開・再実行できるのは `failed` と `blocked` の Task だけです。
+- `continue` は新しい試行・会話で、前回の worktree と branch を引き継ぎます。既存の未commit変更も残ります。worktree の記録・Git 登録・identity を検証できない場合は開始せず、必要なら `retry` を選べます。
+- `retry` は新しい試行・worktree・branch を使います。前回の worktree は残りますが、その変更は持ち込みません。
 - SHIKI が判断を求めたときは、質問への答えを `--note` に書きます（長い文字列は `--note-file`）。
-- 前回の試行が中断された場合、または Draft PR 配送で remote branch / PR が作成・更新されたか確認できない場合は、`--confirm-side-effects` が必要です。前回の worktree と GitHub の状態を確かめてから付けてください。
+- 前回の試行が中断された場合、または Draft PR 配送で remote branch / PR が作成・更新されたか確認できない場合は、どちらの操作にも `--confirm-side-effects` が必要です。前回の worktree と GitHub の状態を確かめてから付けてください。
 - `araya task cancel <taskId>` は、待機中の試行をその場で中止し、動いている試行には中止を求めます。自動の再実行はありません。
 
 ## runner を管理する
@@ -147,6 +152,8 @@ ARAYA_DISCORD_ALLOWED_USER_IDS=<discord-user-id>
 
 `ARAYA_DISCORD_CHANNEL_ID` は Task 通知と継続会話の共通 channel です。ここは許可利用者だけが閲覧・投稿できる非公開の Araya 専用 channel にし、許可した利用者の通常 message は mention なしで会話に入ります。会話以外の投稿には別 channel を使ってください。別 guild/channel、許可されていない user、bot、webhook、system message は会話に入りません。本文のない投稿は無視し、Araya への mention だけの投稿には本文を入力するよう返信します。受理した投稿の応答処理中は typing indicator を更新し、処理完了後に更新を止めます。
 
+Bash の進捗通知では、開始時に秘密を伏せた command preview を表示し、成功時の完了通知は省略します。Bash の失敗通知と Task 全体の結果通知は引き続き行います。
+
 この動作には Discord の `Message Content` privileged intent が必要です。Discord Developer Portal の対象 application の Bot 設定で `Message Content Intent` を有効にしてください。この intent は `ARAYA_DISCORD_CHANNEL_ID` 単位ではなく application に付与されます。bot が見られる範囲を必要最小限にし、Araya は guild/channel/user の allowlist を通過した message 本文だけを会話へ渡します。message 本文はログへ出力しません。
 
 `reset`（または `@Araya reset`）は会話の文脈をリセットしますが、保存済みの SQLite file を消去する操作ではありません。会話は `<ARAYA_DATA_DIR>/discord/chat.sqlite` に永続化され、Bot の再起動後も続きます。既知の secret は保存前に redaction しますが、会話の transcript には Araya の生成 reply も保存されます。credential や他の機密情報を会話に投稿しないでください。
@@ -168,7 +175,7 @@ araya discord register
 araya discord install
 ```
 
-Task 操作の slash command は CLI と同じ階層です。`/araya task list`・`/araya task show`・`/araya task submit`・`/araya task cancel`・`/araya task retry` を使います。command 定義を変更した後は `araya discord register` を再実行して Discord 側を更新します。
+Task 操作の slash command は CLI と同じ階層です。`/araya task list`・`/araya task show`・`/araya task submit`・`/araya task cancel`・`/araya task retry`・`/araya task continue` を使います。command 定義を変更した後は `araya discord register` を再実行して Discord 側を更新します。
 
 会話では「Task #1 の状態と判断待ちの内容を見せて」のように尋ねると、Araya が Task ledger から状態・判断質問・保存済みの安全な session excerpt を読み取って回答できます。Task 内容の読み取りは read-only で、作成・中止・再実行はしません。
 

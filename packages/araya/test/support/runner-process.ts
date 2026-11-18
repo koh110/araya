@@ -1,3 +1,4 @@
+import { appendFileSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import fs from 'node:fs/promises'
 import path from 'node:path'
@@ -7,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { shellQuote } from '../../src/infrastructure/systemd.ts'
 import { answer, toolCall, worktreePathFrom, type FauxView } from './faux-shiki.ts'
 import { readRunnerLog, teardownRunner, withTimeout, type RunnerSetup } from './runner-loop.ts'
-import { completingStep, isRecord, PASS_COMMAND } from './runner-scenarios.ts'
+import { completingStep, FAIL_COMMAND, isRecord, PASS_COMMAND } from './runner-scenarios.ts'
 
 // process をまたぐ test（runner の SIGKILL・SIGTERM と再開）の support。test 用の entrypoint（task-runner-entry.ts）を子 process で起動し、
 // 待ち、signal を送り、後始末をする。SHIKI の応答（processStep）は entrypoint の process の中で動くので、
@@ -18,7 +19,14 @@ const EXIT_TIMEOUT_MS = 30_000
 const RECORD_FILE = 'fake-systemd.jsonl'
 
 // bash_setsid は bash_sleep と同じ流れで、1回目の bash が setsid で切り離した process も残す（本物の systemd の test）
-export type ProcessScript = 'complete' | 'bash_sleep' | 'bash_setsid' | 'verify_sleep'
+export type ProcessScript =
+  | 'complete'
+  | 'bash_sleep'
+  | 'bash_setsid'
+  | 'verify_sleep'
+  | 'continue_pending'
+  | 'continue_generation'
+  | 'continue_evidence'
 // kill_before_agent_commit は、起動のたびに agent の phase の commit の前に落ちる（restartLimit まで落ち続ける試行）
 export type ProcessFault = 'kill_after_claim' | 'kill_after_evidence_file' | 'kill_before_agent_commit'
 
@@ -37,7 +45,8 @@ export function processFiles(workDir: string, taskKey: string) {
     bashPid: path.join(workDir, `${taskKey}.bash.pid`),
     interrupted: path.join(workDir, `${taskKey}.interrupted`),
     setsidPid: path.join(workDir, `${taskKey}.setsid.pid`),
-    verifyPid: path.join(workDir, `${taskKey}.verify.pid`)
+    verifyPid: path.join(workDir, `${taskKey}.verify.pid`),
+    continuationCalls: path.join(workDir, `${taskKey}.continuation-calls`)
   }
 }
 
@@ -57,6 +66,38 @@ export function processStep(view: FauxView, workDir: string) {
   const script = /script=([a-z_]+)/u.exec(view.prompt)?.[1] ?? 'complete'
   const files = processFiles(workDir, view.taskKey)
   const results = view.toolResults
+  const attempt = Number(/^task-[1-9][0-9]*-([1-9][0-9]*)-/u.exec(view.taskKey)?.[1] ?? '1')
+
+  if (script === 'continue_pending') {
+    if (attempt === 1) {
+      return completingStep(view, { command: [...FAIL_COMMAND] })
+    }
+
+    return toolCall('bash', {
+      command: `printf 'called\\n' >> ${shellQuote(files.continuationCalls)}; sleep 300`
+    })
+  }
+
+  if (script === 'continue_generation') {
+    if (attempt === 1) {
+      return completingStep(view, { command: [...FAIL_COMMAND] })
+    }
+
+    appendFileSync(files.continuationCalls, 'model', 'utf8')
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300_000)
+
+    return answer(`${view.taskKey} generation fixture`)
+  }
+
+  if (script === 'continue_evidence') {
+    if (attempt === 1) {
+      return completingStep(view, { command: [...FAIL_COMMAND] })
+    }
+
+    return results.length === 0
+      ? toolCall('araya_register_verification', { repository: 'repo', command: [...PASS_COMMAND] })
+      : answer(`${view.taskKey} evidence fixture`)
+  }
 
   if (script === 'verify_sleep') {
     return completingStep(view, { command: sleepOnceVerification(files.verifyPid) })

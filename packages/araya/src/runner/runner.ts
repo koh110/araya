@@ -32,6 +32,7 @@ import {
   buildAttemptInput,
   createShikiExtension,
   isAttemptResult,
+  validateContinuationWorkspace,
   type AttemptFaults,
   type PiModelSettings,
 } from './attempt.ts'
@@ -116,6 +117,10 @@ type SettledItem =
 
 function describeError(error: unknown) {
   return error instanceof Error ? error.message : String(error)
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function defaultMonotonicNow() {
@@ -664,6 +669,232 @@ async function runWithLedger(context: RunnerContext) {
       await abortAttemptTask(taskKey)
     }
 
+    // scheduler を有効にする前に、invalid な継続先の会話 task と queued input を止める。
+    // Conversation.abort() は内部で resume() を呼ぶため使わず、Harness の個別 abort API だけを使う。
+    async function abortContinuationWork(conversationIds: readonly string[]) {
+      const ids = new Set(conversationIds)
+
+      if (ids.size === 0) {
+        throw new Error('the continued conversation identity is unavailable')
+      }
+
+      let inspection = await harness.inspect(ctx)
+
+      for (const submission of inspection.submissions) {
+        if (submission.status !== 'queued' || !ids.has(String(submission.conversationId))) {
+          continue
+        }
+
+        const result = await harness.abortSubmission(submission.id, ctx, submission.conversationId)
+
+        if (result === 'not_found') {
+          throw new Error(
+            `queued submission ${String(submission.id)} disappeared before it could be withdrawn`,
+          )
+        }
+      }
+
+      inspection = await harness.inspect(ctx)
+
+      if (
+        inspection.submissions.some((submission) => {
+          return submission.status === 'queued' && ids.has(String(submission.conversationId))
+        })
+      ) {
+        throw new Error(
+          'a queued input for the invalid continued conversation could not be withdrawn',
+        )
+      }
+
+      for (const item of inspection.tasks) {
+        if (!ids.has(String(item.record.conversationId))) {
+          continue
+        }
+
+        await harness.abortTask(item.record.id, ctx)
+      }
+
+      const remaining = await harness.inspect(ctx)
+      const unmarked = remaining.tasks.find((item) => {
+        return ids.has(String(item.record.conversationId)) && !item.record.abortRequested
+      })
+
+      if (unmarked !== undefined) {
+        throw new Error(
+          `continued conversation task ${String(unmarked.record.id)} remains runnable`,
+        )
+      }
+    }
+
+    // persisted continuation の workspace 検査は harness.resume() より前に行う。
+    // pi-durable は同じ Harness 内の会話 descendant も独立に予約するため、親 attempt の agent phase だけに
+    // 検査を置くと、前の process が残した model/tool task が検査を追い越して実行される。
+    async function preflightContinuedAttempts() {
+      const attempts = await harness.snapshot(AttemptsDoc, ctx)
+
+      for (const attempt of ledger.listRunningAttempts()) {
+        if (shouldExit()) {
+          return
+        }
+
+        if (attempt.workspaceTaskKey === attempt.taskKey || attempt.stopReason !== null) {
+          continue
+        }
+
+        const mappedConversationIds = Object.entries(attempts?.byConversation ?? {})
+          .filter(([, entry]) => {
+            return entry.taskKey === attempt.taskKey
+          })
+          .map(([conversationId]) => {
+            return conversationId
+          })
+        const taskId = taskIds.get(attempt.taskKey) ?? attempts?.byTaskKey[attempt.taskKey]?.taskId
+        let phase: unknown
+        let checkpointConversationId: string | null = null
+        let failure: unknown
+
+        try {
+          if (taskId === undefined) {
+            throw new Error('the durable attempt task is missing before scheduler resume')
+          }
+
+          const record = await harness.getTask(taskId, ctx)
+
+          if (record === undefined || record.kind !== 'araya.attempt') {
+            throw new Error('the durable attempt task record is missing or has an unexpected kind')
+          }
+
+          if (
+            !isRecord(record.input) ||
+            record.input.taskKey !== attempt.taskKey ||
+            record.input.workspaceTaskKey !== attempt.workspaceTaskKey
+          ) {
+            throw new Error('the durable attempt task identity does not match the task ledger')
+          }
+
+          const state = isRecord(record.state) ? record.state : null
+          const checkpoint = state !== null && isRecord(state.checkpoint) ? state.checkpoint : null
+          phase = checkpoint?.phase
+          if (
+            typeof checkpoint?.conversationId === 'string' ||
+            typeof checkpoint?.conversationId === 'number'
+          ) {
+            checkpointConversationId = String(checkpoint.conversationId)
+          }
+
+          const conversationIds = [
+            ...new Set([
+              ...mappedConversationIds,
+              ...(checkpointConversationId === null ? [] : [checkpointConversationId]),
+            ]),
+          ]
+
+          if (phase === 'start') {
+            if (conversationIds.length !== 0) {
+              throw new Error(
+                'a start-phase continuation unexpectedly has a persisted conversation',
+              )
+            }
+
+            continue
+          }
+
+          if (phase !== 'agent' && phase !== 'evidence') {
+            throw new Error('the durable continuation checkpoint has an unknown phase')
+          }
+
+          if (
+            conversationIds.length !== 1 ||
+            (checkpointConversationId !== null &&
+              !mappedConversationIds.includes(checkpointConversationId))
+          ) {
+            throw new Error(
+              'the durable continued conversation identity is missing or inconsistent',
+            )
+          }
+
+          const claimed = ledger.readClaimedAttempt(attempt.taskKey)
+
+          if (
+            claimed === null ||
+            claimed.workspaceTaskKey !== attempt.workspaceTaskKey ||
+            claimed.workspaceStateTaskKey === null ||
+            claimed.previous === null
+          ) {
+            throw new Error(
+              'the task ledger has no complete workspace evidence for this continuation',
+            )
+          }
+
+          const validated = await validateContinuationWorkspace(buildAttemptInput(claimed), {
+            dataDir,
+            hash,
+            ledger,
+            systemd,
+            env: config.env,
+          })
+
+          if (validated === null) {
+            throw new Error('the task ledger no longer identifies this attempt as a continuation')
+          }
+
+          log({
+            type: 'continuation_preflight_passed',
+            taskKey: attempt.taskKey,
+            phase,
+            worktrees: validated.worktrees.length,
+          })
+        } catch (error) {
+          failure = error
+        }
+
+        if (failure === undefined) {
+          continue
+        }
+
+        const conversationIds = [
+          ...new Set([
+            ...mappedConversationIds,
+            ...(checkpointConversationId === null ? [] : [checkpointConversationId]),
+          ]),
+        ]
+        const detail = reportRedactor.redact(describeError(failure)).slice(0, MAX_LOG_DETAIL_CHARS)
+
+        log({
+          type: 'continuation_preflight_failed',
+          taskKey: attempt.taskKey,
+          phase,
+          message: detail,
+        })
+
+        if (!ledger.beginStop(attempt.taskKey, 'attempt_error', detail)) {
+          const current = ledger.listRunningAttempts().find((item) => {
+            return item.taskKey === attempt.taskKey
+          })
+
+          if (current?.stopReason === null) {
+            abortFailed = true
+            log({ type: 'continuation_preflight_stop_record_failed', taskKey: attempt.taskKey })
+          }
+        } else {
+          log({ type: 'attempt_stopping', taskKey: attempt.taskKey, reason: 'attempt_error' })
+        }
+
+        try {
+          await abortContinuationWork(conversationIds)
+        } catch (error) {
+          abortFailed = true
+          log({
+            type: 'continuation_descendant_abort_failed',
+            taskKey: attempt.taskKey,
+            message: reportRedactor.redact(describeError(error)).slice(0, MAX_LOG_DETAIL_CHARS),
+          })
+        }
+
+        await abortAttemptTask(attempt.taskKey)
+      }
+    }
+
     // 開き直したときの確認（resume() の前）。ここでは waitForTask を呼ばない
     async function reconcile() {
       const running = ledger.listRunningAttempts()
@@ -784,6 +1015,7 @@ async function runWithLedger(context: RunnerContext) {
         } else if (
           attempt.agentFinishedAt === null &&
           attempt.settings !== null &&
+          attempt.settings.timeoutMs !== null &&
           attempt.activeMs >= attempt.settings.timeoutMs
         ) {
           await beginAttemptStop(attempt.taskKey, 'agent_timeout', null)
@@ -806,7 +1038,8 @@ async function runWithLedger(context: RunnerContext) {
           !taskIds.has(attempt.taskKey) ||
           attempt.stopReason !== null ||
           attempt.agentFinishedAt !== null ||
-          attempt.settings === null
+          attempt.settings === null ||
+          attempt.settings.timeoutMs === null
         ) {
           continue
         }
@@ -965,6 +1198,7 @@ async function runWithLedger(context: RunnerContext) {
         return buildAttemptErrorResult({
           dataDir,
           taskKey: item.taskKey,
+          workspaceTaskKey: attempt?.workspaceTaskKey,
           settings: attempt?.settings ?? null,
           detail: failureReason === 'restart_limit' ? null : (attempt?.stopDetail ?? null),
           secretValues,
@@ -976,6 +1210,7 @@ async function runWithLedger(context: RunnerContext) {
       return buildAttemptErrorResult({
         dataDir,
         taskKey: item.taskKey,
+        workspaceTaskKey: attempt?.workspaceTaskKey,
         settings: attempt?.settings ?? null,
         detail,
         secretValues,
@@ -1173,6 +1408,10 @@ async function runWithLedger(context: RunnerContext) {
 
       if (reconciliationDeferred && !shouldExit()) {
         return finishStop()
+      }
+
+      if (!shouldExit()) {
+        await preflightContinuedAttempts()
       }
 
       if (!shouldExit()) {

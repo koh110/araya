@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { Readable } from 'node:stream'
 import test from 'node:test'
 
@@ -12,7 +13,7 @@ import { runCli } from '../src/cli/main.ts'
 import { scopePattern } from '../src/infrastructure/systemd.ts'
 import { AttemptsDoc, ATTEMPT_TASK_NAME } from '../src/runner/attempt.ts'
 import { findMarkedProcesses } from './support/fake-systemd.ts'
-import { ctx, taskInput, waitUntil } from './support/runner-fixture.ts'
+import { ctx, git, taskInput, waitUntil } from './support/runner-fixture.ts'
 import { openLedger, parseLogLines, readRunnerLog, waitForTaskStatus, type RunnerSetup } from './support/runner-loop.ts'
 import {
   processFiles,
@@ -36,6 +37,16 @@ function createScriptTask(setup: RunnerSetup, script: ProcessScript, title: stri
 
   try {
     return ledger.createTask(taskInput({ title, goal: scriptGoal(script) })).task.id
+  } finally {
+    ledger.close()
+  }
+}
+
+function continueScriptTask(setup: RunnerSetup, taskId: number) {
+  const ledger = openLedger(setup)
+
+  try {
+    return ledger.continueTask(taskId, { note: null, confirmSideEffects: false })
   } finally {
     ledger.close()
   }
@@ -187,6 +198,65 @@ test('runner process: 取り込みの後、試行の task を作る前に落ち�
   })
 })
 
+test('runner process: legacy persisted attempt input and worktree state resume as a normal attempt after restart', async (t) => {
+  const setup = await setupWithRepository()
+  const taskId = createScriptTask(setup, 'complete', 'Task 1')
+
+  await withRunnerProcesses(t, setup, async (runners) => {
+    const first = await startRunnerProcess(setup, { run: 1, fault: 'kill_before_agent_commit' })
+    runners.push(first)
+    assert.deepEqual(await waitForExit(first), { code: null, signal: 'SIGKILL' })
+
+    const task = showTask(setup, taskId)
+    const taskKey = task.attempts[0]?.taskKey
+    assert.ok(taskKey)
+    const stateFile = path.join(setup.fixture.dataDir, 'development', taskKey, 'worktrees.jsonl')
+    const stateRecords = (await fs.readFile(stateFile, 'utf8')).trim().split('\n').map((line) => {
+      const value: unknown = JSON.parse(line)
+      assert.ok(isRecord(value))
+      delete value.worktreeIdentity
+      return value
+    })
+    assert.equal(stateRecords.length, 1)
+    await fs.writeFile(stateFile, `${stateRecords.map((record) => JSON.stringify(record)).join('\n')}\n`, 'utf8')
+
+    const database = new DatabaseSync(path.join(setup.fixture.dataDir, 'runner', 'durable.sqlite'))
+
+    try {
+      const row = database.prepare('SELECT id, record FROM tasks').all().find((candidate) => {
+        const record: unknown = JSON.parse(String(candidate.record))
+        return isRecord(record) && record.kind === ATTEMPT_TASK_NAME
+      })
+      assert.ok(row)
+      const record: unknown = JSON.parse(String(row.record))
+      assert.ok(isRecord(record) && isRecord(record.input))
+      assert.equal(record.input.taskKey, taskKey)
+      assert.equal(record.input.workspaceTaskKey, taskKey)
+      delete record.input.workspaceTaskKey
+      delete record.input.workspaceStateTaskKey
+      delete record.input.previousAttempt
+      database.prepare('UPDATE tasks SET record = ? WHERE id = ?').run(JSON.stringify(record), Number(row.id))
+    } finally {
+      database.close()
+    }
+
+    const second = await startRunnerProcess(setup, { run: 2 })
+    runners.push(second)
+    const shown = await waitForTaskStatus(setup, taskId, FINAL_STATUSES)
+    assert.deepEqual(await stopRunnerProcess(second), { code: 0, signal: null })
+
+    assert.equal(shown.task.status, 'completed')
+    const worktrees = shown.attempts[0]?.evidence?.worktrees
+    assert.ok(Array.isArray(worktrees) && worktrees.length === 1)
+    assert.equal(isRecord(worktrees[0]) && 'worktreeIdentity' in worktrees[0], false)
+    assert.equal((await fs.readFile(stateFile, 'utf8')).includes('worktreeIdentity'), false)
+    assert.equal((await readLog(setup)).some((entry) => {
+      return entry.type === 'continuation_preflight_failed' && entry.taskKey === taskKey
+    }), false)
+    assert.equal(eventsOf(setup, taskId, 'run.finished').length, 1)
+  })
+})
+
 test('runner process: bash の実行中に SIGKILL しても、起動し直すと会話が続きから進み、bash は interrupted で返り、完了していた tool は再実行されない', async (t) => {
   const setup = await setupWithRepository()
   const taskId = createScriptTask(setup, 'bash_sleep', 'Task 1')
@@ -254,6 +324,23 @@ test('runner process: bash の実行中の SIGTERM は試行を中止せずに 0
     const tasks = await inspectTasks(setup)
     assert.equal(tasks.filter((item) => item.record.kind === ATTEMPT_TASK_NAME).length, 1)
     assert.deepEqual(tasks.map((item) => item.record.restarts ?? 0).filter((restarts) => restarts !== 0), [])
+
+    // 旧 version の保存済み settings に、正の active_ms と timeoutMs:null がある状態で再開する
+    const db = new DatabaseSync(path.join(setup.fixture.dataDir, 'tasks.sqlite'))
+
+    try {
+      const row = db.prepare('SELECT settings_json FROM runs WHERE task_id = ? AND attempt = 1').get(taskId)
+      assert.ok(row)
+      const persistedSettings: Record<string, unknown> = JSON.parse(String(row.settings_json))
+      assert.equal(typeof persistedSettings.timeoutMs, 'number')
+      persistedSettings.timeoutMs = null
+      db.prepare('UPDATE runs SET settings_json = ?, active_ms = 1 WHERE task_id = ? AND attempt = 1').run(
+        JSON.stringify(persistedSettings),
+        taskId,
+      )
+    } finally {
+      db.close()
+    }
 
     const second = await startRunnerProcess(setup, { run: 2 })
     runners.push(second)
@@ -346,7 +433,9 @@ test('runner process: 検証の実行中の SIGTERM で検証のコマンドは�
     assert.equal(shown.task.status, 'completed')
     assert.equal(records(records(evidence.worktrees)[0]?.verifications)[0]?.status, 'passed')
     // 検証のコマンドは、止める前と起動し直した後の2回、同じ scope の名前で起動された
-    const verifications = (await launchesOf(setup, taskKey)).filter((launch) => launch.unit.endsWith('-verify-0.scope'))
+    const verifications = (await launchesOf(setup, taskKey)).filter((launch) => {
+      return launch.unit.endsWith('-verify-0.scope')
+    })
     assert.equal(verifications.length, 2)
     assert.equal(evidence.resumes, 1)
     assert.equal(eventsOf(setup, taskId, 'run.finished').length, 1)
@@ -393,5 +482,207 @@ test('runner process: evidence.json を書いた後、outcome の commit の前�
     const mismatched = await runTaskShow(setup, [String(taskId), '--full'])
     assert.equal(mismatched.attempt.fullEvidenceError, 'digest_mismatch')
     assert.equal('diff' in (records(mismatched.evidence.worktrees)[0] ?? {}), false)
+  })
+})
+
+test('runner process: valid continuation resumes model generation after runner restart', async (t) => {
+  const setup = await setupWithRepository()
+  const taskId = createScriptTask(setup, 'continue_generation', 'Task 1')
+
+  await withRunnerProcesses(t, setup, async (runners) => {
+    const first = await startRunnerProcess(setup, { run: 1 })
+    runners.push(first)
+    const failed = await waitForTaskStatus(setup, taskId, ['failed'])
+    assert.deepEqual(await stopRunnerProcess(first), { code: 0, signal: null })
+    assert.equal(failed.task.status, 'failed')
+
+    continueScriptTask(setup, taskId)
+    const second = await startRunnerProcess(setup, { run: 2 })
+    runners.push(second)
+    const taskKey = await waitForTaskKey(setup, taskId)
+    const modelCalls = processFiles(setup.fixture.root, taskKey).continuationCalls
+
+    await waitUntil(async () => {
+      return (await fs.readFile(modelCalls, 'utf8').catch(() => {
+        return ''
+      })) !== ''
+    }, 'continued model generation starts before the first stop')
+    assert.equal(await fs.readFile(modelCalls, 'utf8'), 'model')
+    second.signal('SIGKILL')
+    assert.deepEqual(await waitForExit(second), { code: null, signal: 'SIGKILL' })
+
+    const third = await startRunnerProcess(setup, { run: 3 })
+    runners.push(third)
+    await waitUntil(async () => {
+      const calls = await fs.readFile(modelCalls, 'utf8').catch(() => {
+        return ''
+      })
+      const failedPreflight = (await readLog(setup)).some((entry) => {
+        return entry.type === 'continuation_preflight_failed' && entry.taskKey === taskKey
+      })
+
+      return calls.startsWith('modelmodel') || failedPreflight
+    }, 'continued model generation resumes or preflight reports a failure')
+
+    assert.equal(await fs.readFile(modelCalls, 'utf8'), 'modelmodel')
+    assert.equal((await readLog(setup)).some((entry) => {
+      return entry.type === 'continuation_preflight_failed' && entry.taskKey === taskKey
+    }), false)
+    third.signal('SIGKILL')
+    assert.deepEqual(await waitForExit(third), { code: null, signal: 'SIGKILL' })
+  })
+})
+
+test('runner process: continued-workspace preflight precedes resumed model generation', async (t) => {
+  const setup = await setupWithRepository()
+  const taskId = createScriptTask(setup, 'continue_generation', 'Task 1')
+
+  await withRunnerProcesses(t, setup, async (runners) => {
+    const first = await startRunnerProcess(setup, { run: 1 })
+    runners.push(first)
+    const failed = await waitForTaskStatus(setup, taskId, ['failed'])
+    assert.deepEqual(await stopRunnerProcess(first), { code: 0, signal: null })
+    assert.equal(failed.task.status, 'failed')
+
+    continueScriptTask(setup, taskId)
+    const second = await startRunnerProcess(setup, { run: 2 })
+    runners.push(second)
+    const taskKey = await waitForTaskKey(setup, taskId)
+    const modelCalls = processFiles(setup.fixture.root, taskKey).continuationCalls
+
+    await waitUntil(async () => {
+      return (await fs.readFile(modelCalls, 'utf8').catch(() => {
+        return ''
+      })) !== ''
+    }, 'continued model generation starts')
+    assert.equal(await fs.readFile(modelCalls, 'utf8'), 'model')
+    second.signal('SIGKILL')
+    assert.deepEqual(await waitForExit(second), { code: null, signal: 'SIGKILL' })
+
+    const firstWorktree = records(failed.attempts[0]?.evidence?.worktrees)[0]
+    const worktreePath = String(firstWorktree?.worktreePath ?? '')
+    assert.notEqual(worktreePath, '')
+    git(setup.fixture, worktreePath, 'switch', '-c', 'changed-while-runner-stopped')
+
+    const third = await startRunnerProcess(setup, { run: 3 })
+    runners.push(third)
+    const stopped = await waitForTaskStatus(setup, taskId, FINAL_STATUSES)
+    assert.deepEqual(await stopRunnerProcess(third), { code: 0, signal: null })
+
+    assert.equal(stopped.task.status, 'failed')
+    assert.equal(stopped.attempts.at(-1)?.stopReason, 'attempt_error')
+    assert.equal(stopped.attempts.at(-1)?.failureReason, 'attempt_error')
+    assert.equal(await fs.readFile(modelCalls, 'utf8'), 'model')
+    assert.equal((await readLog(setup)).some((entry) => {
+      return entry.type === 'continuation_preflight_failed' &&
+        entry.taskKey === taskKey && entry.phase === 'agent'
+    }), true)
+  })
+})
+
+test('runner process: invalid continuation aborts a persisted write-capable tool call before scheduler resume', async (t) => {
+  const setup = await setupWithRepository()
+  const taskId = createScriptTask(setup, 'continue_pending', 'Task 1')
+
+  await withRunnerProcesses(t, setup, async (runners) => {
+    const first = await startRunnerProcess(setup, { run: 1 })
+    runners.push(first)
+    const failed = await waitForTaskStatus(setup, taskId, ['failed'])
+    assert.deepEqual(await stopRunnerProcess(first), { code: 0, signal: null })
+
+    continueScriptTask(setup, taskId)
+    const second = await startRunnerProcess(setup, { run: 2 })
+    runners.push(second)
+    const taskKey = await waitForTaskKey(setup, taskId)
+    const toolCalls = processFiles(setup.fixture.root, taskKey).continuationCalls
+
+    await waitUntil(async () => {
+      return (await fs.readFile(toolCalls, 'utf8').catch(() => {
+        return ''
+      })) !== ''
+    }, 'continued write-capable tool call starts')
+    assert.equal((await fs.readFile(toolCalls, 'utf8')).trim().split('\n').length, 1)
+    second.signal('SIGKILL')
+    assert.deepEqual(await waitForExit(second), { code: null, signal: 'SIGKILL' })
+
+    const firstWorktree = records(failed.attempts[0]?.evidence?.worktrees)[0]
+    const worktreePath = String(firstWorktree?.worktreePath ?? '')
+    assert.notEqual(worktreePath, '')
+    git(setup.fixture, worktreePath, 'switch', '-c', 'changed-before-tool-resume')
+
+    const third = await startRunnerProcess(setup, { run: 3 })
+    runners.push(third)
+    const stopped = await waitForTaskStatus(setup, taskId, FINAL_STATUSES)
+    assert.deepEqual(await stopRunnerProcess(third), { code: 0, signal: null })
+
+    assert.equal(stopped.task.status, 'failed')
+    assert.equal(stopped.attempts.at(-1)?.failureReason, 'attempt_error')
+    assert.equal((await fs.readFile(toolCalls, 'utf8')).trim().split('\n').length, 1)
+    assert.equal((await readLog(setup)).some((entry) => {
+      return entry.type === 'continuation_preflight_failed' &&
+        entry.taskKey === taskKey && entry.phase === 'agent'
+    }), true)
+  })
+})
+
+test('runner process: evidence-phase continuation restart rejects a same-path same-branch worktree replacement before re-verification', async (t) => {
+  const setup = await setupWithRepository()
+  const taskId = createScriptTask(setup, 'continue_evidence', 'Task 1')
+
+  await withRunnerProcesses(t, setup, async (runners) => {
+    const first = await startRunnerProcess(setup, { run: 1 })
+    runners.push(first)
+    const failed = await waitForTaskStatus(setup, taskId, ['failed'])
+    assert.deepEqual(await stopRunnerProcess(first), { code: 0, signal: null })
+
+    continueScriptTask(setup, taskId)
+    const second = await startRunnerProcess(setup, { run: 2, fault: 'kill_after_evidence_file' })
+    runners.push(second)
+    const taskKey = await waitForTaskKey(setup, taskId)
+    assert.deepEqual(await waitForExit(second), { code: null, signal: 'SIGKILL' })
+
+    const pending = showTask(setup, taskId)
+    const attempt = pending.attempts.at(-1)
+    const stateDir = String(attempt?.stateDir ?? '')
+    assert.equal(pending.task.status, 'running')
+    assert.equal((await fs.stat(path.join(stateDir, 'evidence.json'))).isFile(), true)
+    const durableTaskId = (await readAttemptsDoc(setup))?.byTaskKey[taskKey]?.taskId
+    const durableTask = (await inspectTasks(setup)).find((item) => {
+      return String(item.record.id) === String(durableTaskId)
+    })
+    const recordState: unknown = durableTask?.record.state
+    const checkpointValue = isRecord(recordState) ? recordState.checkpoint : undefined
+    const checkpointPhase = isRecord(checkpointValue) ? checkpointValue.phase : undefined
+    assert.equal(checkpointPhase, 'evidence')
+
+    const firstWorktree = records(failed.attempts[0]?.evidence?.worktrees)[0]
+    const worktreePath = String(firstWorktree?.worktreePath ?? '')
+    const branch = String(firstWorktree?.branch ?? '')
+    assert.notEqual(worktreePath, '')
+    assert.notEqual(branch, '')
+    const repoRoot = path.join(setup.fixture.devRoot, 'repo')
+    git(setup.fixture, repoRoot, 'worktree', 'remove', '--force', worktreePath)
+    git(setup.fixture, repoRoot, 'worktree', 'add', '--quiet', worktreePath, branch)
+    await fs.writeFile(path.join(worktreePath, 'replacement.txt'), 'replacement checkout\n', 'utf8')
+
+    const verifyCountBeforeRestart = (await launchesOf(setup, taskKey)).filter((launch) => {
+      return launch.unit.endsWith('-verify-0.scope')
+    }).length
+    assert.equal(verifyCountBeforeRestart, 1)
+
+    const third = await startRunnerProcess(setup, { run: 3 })
+    runners.push(third)
+    const stopped = await waitForTaskStatus(setup, taskId, FINAL_STATUSES)
+    assert.deepEqual(await stopRunnerProcess(third), { code: 0, signal: null })
+
+    assert.equal(stopped.task.status, 'failed')
+    assert.equal(stopped.attempts.at(-1)?.failureReason, 'attempt_error')
+    assert.equal((await launchesOf(setup, taskKey)).filter((launch) => {
+      return launch.unit.endsWith('-verify-0.scope')
+    }).length, verifyCountBeforeRestart)
+    assert.equal((await readLog(setup)).some((entry) => {
+      return entry.type === 'continuation_preflight_failed' &&
+        entry.taskKey === taskKey && entry.phase === 'evidence'
+    }), true)
   })
 })

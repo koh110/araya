@@ -10,6 +10,7 @@ import {
   buildShikiInstructions,
   buildSystemPrompt,
   buildTaskBody,
+  buildTaskPrompt,
   createShikiTools,
   SHIKI_TOOL_NAMES
 } from '../src/development/shiki.ts'
@@ -103,6 +104,38 @@ test('shiki: instructions は既存の system prompt に判断の依頼と tool 
     '人の判断が無いと進められないときは、推測で進めずに araya_request_decision で質問し、作業を終えてください',
     'grep・find・ls の tool はありません。必要なら bash で実行してください'
   ].join('\n'))
+})
+
+test('shiki: continue prompt は workspace key の branch を示し、前回の worktree を編集可能な同じ作業場所として説明する', () => {
+  const input = {
+    devRoot: '/home/araya/dev',
+    taskKey: 'task-1-2-bcdefg',
+    workspaceTaskKey: 'task-1-1-abcdef',
+    continueWorkspace: true,
+    title: '続行する',
+    task: '前回の変更を完成させる'
+  }
+  const system = buildSystemPrompt(input)
+  const prompt = buildTaskPrompt(input)
+
+  assert.match(system, /araya\/task-1-1-abcdef/u)
+  assert.match(system, /既存 clone の main checkout は編集しない/u)
+  assert.match(system, /既存 worktree の変更を保持し、reset・clean・再作成をしない/u)
+  assert.match(prompt, /<repository>\/.worktree\/araya-task-1-1-abcdef/u)
+  assert.match(prompt, /同じ作業場所で続けてください/u)
+  assert.match(buildTaskBody({
+    ...EMPTY_BODY,
+    continueWorkspace: true,
+    previous: {
+      attempt: 1,
+      status: 'failed',
+      failureReason: 'verification_failed',
+      summary: null,
+      decisionQuestion: null,
+      worktrees: [{ worktreePath: '/dev/araya/.worktree/araya-task-1-1-abcdef', branch: 'araya/task-1-1-abcdef' }],
+      interrupted: false
+    }
+  }), /引き継いだ worktree（同じ作業場所。変更を保持し、続けて編集してよい）/u)
 })
 
 test('shiki: tool は read・edit・write・bash と araya の3つの7種類', () => {

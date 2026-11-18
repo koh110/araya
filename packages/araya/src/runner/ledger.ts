@@ -150,6 +150,7 @@ export type LedgerErrorCode =
   | 'idempotency_conflict'
   | 'task_not_cancellable'
   | 'task_not_retryable'
+  | 'task_not_continuable'
   | 'side_effects_unconfirmed'
   | 'ledger_unsupported_version'
 
@@ -160,11 +161,30 @@ const LEDGER_ERROR_CODES: readonly LedgerErrorCode[] = [
   'idempotency_conflict',
   'task_not_cancellable',
   'task_not_retryable',
+  'task_not_continuable',
   'side_effects_unconfirmed',
   'ledger_unsupported_version',
 ]
 
-export type WorktreeLocation = { worktreePath: string; branch: string }
+export type WorktreeLocation = {
+  worktreePath: string
+  branch: string
+  repository?: string
+  base?: string
+  baseSha?: string
+  excludeAdded?: boolean
+  worktreeIdentity?: string
+}
+
+export type WorkspaceWorktreeIdentity = {
+  repository: string
+  worktreePath: string
+  branch: string
+  base: string
+  baseSha: string
+  excludeAdded: boolean
+  worktreeIdentity: string
+}
 
 export type LedgerError = Error & { code: LedgerErrorCode; previousWorktrees?: WorktreeLocation[] }
 
@@ -202,7 +222,7 @@ export type AttemptSettings = {
   devRoot: string
   agentDir: string
   model: DevelopmentModel | null
-  timeoutMs: number
+  timeoutMs: number | null // 旧 version では未設定が null で保存されることがある
   verificationTimeoutMs: number
 }
 
@@ -289,6 +309,7 @@ export type RunningAttempt = {
   taskId: number
   attempt: number
   taskKey: string
+  workspaceTaskKey: string
   settings: AttemptSettings | null
   activeMs: number
   startedAt: string | null
@@ -313,6 +334,9 @@ export type ClaimedAttempt = {
   taskId: number
   attempt: number
   taskKey: string
+  workspaceTaskKey: string
+  previousTaskKey: string | null
+  workspaceStateTaskKey: string | null
   title: string
   goal: string
   constraints: string[]
@@ -570,11 +594,48 @@ export function worktreesFromEvidence(evidence: Record<string, unknown> | null) 
       typeof worktree.worktreePath === 'string' &&
       typeof worktree.branch === 'string'
     ) {
-      locations.push({ worktreePath: worktree.worktreePath, branch: worktree.branch })
+      locations.push({
+        worktreePath: worktree.worktreePath,
+        branch: worktree.branch,
+        ...(typeof worktree.repository === 'string' ? { repository: worktree.repository } : {}),
+        ...(typeof worktree.base === 'string' ? { base: worktree.base } : {}),
+        ...(typeof worktree.baseSha === 'string' ? { baseSha: worktree.baseSha } : {}),
+        ...(typeof worktree.excludeAdded === 'boolean'
+          ? { excludeAdded: worktree.excludeAdded }
+          : {}),
+        ...(typeof worktree.worktreeIdentity === 'string'
+          ? { worktreeIdentity: worktree.worktreeIdentity }
+          : {}),
+      })
     }
   }
 
   return locations
+}
+
+function hasCompleteWorktreeIdentity(
+  worktrees: readonly WorktreeLocation[],
+): worktrees is readonly (WorktreeLocation & WorkspaceWorktreeIdentity)[] {
+  return (
+    worktrees.length > 0 &&
+    worktrees.every((worktree) => {
+      return (
+        worktree.worktreePath !== '' &&
+        worktree.branch !== '' &&
+        typeof worktree.repository === 'string' &&
+        worktree.repository !== '' &&
+        typeof worktree.base === 'string' &&
+        worktree.base !== '' &&
+        typeof worktree.baseSha === 'string' &&
+        /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(worktree.baseSha) &&
+        typeof worktree.excludeAdded === 'boolean' &&
+        typeof worktree.worktreeIdentity === 'string' &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(
+          worktree.worktreeIdentity,
+        )
+      )
+    })
+  )
 }
 
 function asText(value: unknown) {
@@ -690,7 +751,7 @@ function parseSettings(value: unknown) {
     devRoot: asText(parsed.devRoot),
     agentDir: asText(parsed.agentDir),
     model: settingsModel,
-    timeoutMs: asNumber(parsed.timeoutMs),
+    timeoutMs: asNullableNumber(parsed.timeoutMs),
     verificationTimeoutMs: asNumber(parsed.verificationTimeoutMs),
   }
 
@@ -1139,6 +1200,81 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
     return row === undefined ? undefined : toRunRow(row)
   }
 
+  function workspaceWorktreeHash(worktrees: readonly WorkspaceWorktreeIdentity[]) {
+    const identities = worktrees.map((worktree) => {
+      return {
+        repository: worktree.repository,
+        worktreePath: worktree.worktreePath,
+        branch: worktree.branch,
+        base: worktree.base,
+        baseSha: worktree.baseSha,
+        excludeAdded: worktree.excludeAdded,
+        worktreeIdentity: worktree.worktreeIdentity,
+      }
+    })
+
+    return createHash('sha256').update(JSON.stringify(identities)).digest('hex')
+  }
+
+  function readWorkspaceSnapshot(run: RunRow) {
+    const row = db
+      .prepare(`
+      SELECT data_json FROM task_events
+      WHERE task_id = ? AND attempt = ? AND type = 'workspace.worktrees'
+      ORDER BY seq DESC LIMIT 1
+    `)
+      .get(run.taskId, run.attempt)
+
+    if (row === undefined) {
+      return null
+    }
+
+    const data = parseNullableObject(row.data_json)
+
+    if (
+      data === null ||
+      typeof data.count !== 'number' ||
+      !Number.isSafeInteger(data.count) ||
+      data.count < 1 ||
+      typeof data.sha256 !== 'string' ||
+      !/^[0-9a-f]{64}$/u.test(data.sha256)
+    ) {
+      throw new Error(
+        `attempt ${run.attempt} of Task ${run.taskId} has an invalid workspace snapshot`,
+      )
+    }
+
+    return { count: data.count, sha256: data.sha256 }
+  }
+
+  function matchesWorkspaceSnapshot(
+    snapshot: { count: number; sha256: string },
+    worktrees: readonly WorktreeLocation[],
+  ) {
+    return (
+      hasCompleteWorktreeIdentity(worktrees) &&
+      snapshot.count === worktrees.length &&
+      snapshot.sha256 === workspaceWorktreeHash(worktrees)
+    )
+  }
+
+  function hasWorktreeStateFile(stateDir: string | null) {
+    if (stateDir === null) {
+      return false
+    }
+
+    try {
+      fs.lstatSync(path.join(stateDir, 'worktrees.jsonl'))
+      return true
+    } catch (error) {
+      if (isErrno(error, 'ENOENT')) {
+        return false
+      }
+
+      throw error
+    }
+  }
+
   function insertRun(taskId: number, attempt: number, note: string | null, at: string) {
     const taskKey = createTaskKey(taskId, attempt, randomBytes)
     db.prepare(
@@ -1180,13 +1316,108 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
     return previous
   }
 
+  function workspaceTaskKeyForRun(run: RunRow) {
+    const rows = db
+      .prepare(`
+        SELECT data_json FROM task_events
+        WHERE task_id = ? AND attempt = ? AND type = 'task.continued'
+        ORDER BY seq ASC LIMIT 2
+      `)
+      .all(run.taskId, run.attempt)
+
+    if (rows.length === 0) {
+      return run.taskKey
+    }
+
+    if (rows.length !== 1) {
+      throw new Error(
+        `attempt ${run.attempt} of Task ${run.taskId} has duplicate task.continued events`,
+      )
+    }
+
+    const workspaceTaskKey = parseNullableObject(rows[0]?.data_json)?.workspaceTaskKey
+    const match =
+      typeof workspaceTaskKey === 'string'
+        ? /^task-([1-9][0-9]{0,15})-([1-9][0-9]{0,15})-[a-z2-7]{6}$/u.exec(workspaceTaskKey)
+        : null
+    const workspaceTaskId = match === null ? Number.NaN : Number(match[1])
+    const workspaceAttempt = match === null ? Number.NaN : Number(match[2])
+
+    if (
+      typeof workspaceTaskKey !== 'string' ||
+      match === null ||
+      !Number.isSafeInteger(workspaceTaskId) ||
+      workspaceTaskId !== run.taskId ||
+      !Number.isSafeInteger(workspaceAttempt) ||
+      workspaceAttempt >= run.attempt ||
+      (Number.isSafeInteger(workspaceAttempt) ? readRun(run.taskId, workspaceAttempt) : undefined)
+        ?.taskKey !== workspaceTaskKey
+    ) {
+      throw new Error(
+        `attempt ${run.attempt} of Task ${run.taskId} has an invalid continued workspace key`,
+      )
+    }
+
+    return workspaceTaskKey
+  }
+
+  function workspaceStateRunForRun(run: RunRow) {
+    const workspaceTaskKey = workspaceTaskKeyForRun(run)
+
+    for (let attempt = run.attempt; attempt > 0; attempt -= 1) {
+      const candidate = readRun(run.taskId, attempt)
+
+      if (candidate === undefined || workspaceTaskKeyForRun(candidate) !== workspaceTaskKey) {
+        break
+      }
+
+      if (
+        candidate.taskKey === run.taskKey &&
+        candidate.status === 'running' &&
+        candidate.evidence === null
+      ) {
+        // A resumed continuation has a current ledger snapshot but no final evidence yet.
+        // Resolve historical worktree records from the previous completed attempt; the
+        // current records and snapshot are validated separately before scheduler resume.
+        continue
+      }
+
+      const worktrees = worktreesFromEvidence(candidate.evidence)
+      const snapshot = readWorkspaceSnapshot(candidate)
+
+      if (snapshot !== null) {
+        if (candidate.stateDir === null || !matchesWorkspaceSnapshot(snapshot, worktrees)) {
+          return undefined
+        }
+
+        return candidate
+      }
+
+      if (hasWorktreeStateFile(candidate.stateDir) || worktrees.length > 0) {
+        // A state file without a matching ledger snapshot may contain repositories
+        // added by this attempt. Never fall back to an older, incomplete worktree list.
+        return undefined
+      }
+    }
+
+    return undefined
+  }
+
   function toClaimedAttempt(run: RunRow, settings: AttemptSettings) {
     const task = readTaskView(run.taskId)
     const previousRun = run.attempt > 1 ? readRun(run.taskId, run.attempt - 1) : undefined
+    const workspaceTaskKey = workspaceTaskKeyForRun(run)
+    const continuingWorkspace = workspaceTaskKey !== run.taskKey
+    const workspaceStateRun = continuingWorkspace ? workspaceStateRunForRun(run) : undefined
+    const previous = previousRun === undefined ? null : toPreviousAttempt(previousRun)
+
     const claimed: ClaimedAttempt = {
       taskId: run.taskId,
       attempt: run.attempt,
       taskKey: run.taskKey,
+      workspaceTaskKey,
+      previousTaskKey: previousRun?.taskKey ?? null,
+      workspaceStateTaskKey: workspaceStateRun?.taskKey ?? null,
       title: task.title,
       goal: task.goal,
       constraints: task.constraints,
@@ -1194,7 +1425,10 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
       permissions: task.permissions,
       note: run.note,
       settings,
-      previous: previousRun === undefined ? null : toPreviousAttempt(previousRun),
+      previous:
+        previous === null || !continuingWorkspace || workspaceStateRun === undefined
+          ? previous
+          : { ...previous, worktrees: worktreesFromEvidence(workspaceStateRun.evidence) },
     }
 
     return claimed
@@ -1443,6 +1677,92 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
       })
     },
 
+    continueTask(
+      taskId: number,
+      options: { note: string | null; confirmSideEffects: boolean; idempotencyKey?: string },
+    ) {
+      return transaction(db, () => {
+        // mutation_receipts predates continue and constrains operation to 'retry'. Include the
+        // semantic operation in the hash so a retry receipt can never be mistaken for continue.
+        const requestHash = mutationRequestHash({
+          operation: 'continue',
+          note: options.note,
+          confirmSideEffects: options.confirmSideEffects,
+        })
+        const receipt = readMutationReceipt(options.idempotencyKey, 'retry', taskId, requestHash)
+
+        if (receipt !== null) {
+          const previousAttempt = Number(receipt)
+
+          if (!Number.isSafeInteger(previousAttempt) || previousAttempt < 1) {
+            throw new Error('the continue mutation receipt has an invalid attempt number')
+          }
+
+          const current = readTaskView(taskId)
+
+          if (current.attempt < previousAttempt) {
+            throw new Error('the continue mutation receipt points to a future attempt')
+          }
+
+          return current
+        }
+
+        const task = readTaskView(taskId)
+
+        if (task.status !== 'failed' && task.status !== 'blocked') {
+          throw ledgerError(
+            'task_not_continuable',
+            `Task ${taskId} is ${task.status}; only failed and blocked Tasks can be continued`,
+          )
+        }
+
+        const latest = readRun(taskId, task.attempt)
+
+        if (latest === undefined) {
+          throw new Error(`the latest attempt of Task ${taskId} is missing from the task ledger`)
+        }
+
+        const workspaceStateRun = workspaceStateRunForRun(latest)
+
+        if (workspaceStateRun === undefined) {
+          throw ledgerError(
+            'task_not_continuable',
+            `Task ${taskId} has no recorded worktree to continue; use retry to start with a new workspace`,
+          )
+        }
+
+        if (isInterruptedAttempt(latest) && !options.confirmSideEffects) {
+          throw ledgerError(
+            'side_effects_unconfirmed',
+            'the previous attempt may have changed an external branch or pull request; confirm the previous worktree and remote state before continuing',
+            { previousWorktrees: worktreesFromEvidence(workspaceStateRun.evidence) },
+          )
+        }
+
+        const at = nowIso()
+        const attempt = task.attempt + 1
+        insertRun(taskId, attempt, options.note, at)
+        db.prepare(
+          "UPDATE tasks SET current_attempt = ?, status = 'queued', updated_at = ? WHERE id = ?",
+        ).run(attempt, at, taskId)
+        appendEvent(
+          taskId,
+          attempt,
+          'task.continued',
+          {
+            hasNote: options.note !== null,
+            confirmedSideEffects: options.confirmSideEffects,
+            workspaceTaskKey: workspaceTaskKeyForRun(latest),
+          },
+          at,
+        )
+
+        writeMutationReceipt(options.idempotencyKey, 'retry', taskId, requestHash, String(attempt))
+
+        return readTaskView(taskId)
+      })
+    },
+
     cancelTask(taskId: number, options: { idempotencyKey?: string } = {}) {
       return transaction(db, () => {
         const requestHash = mutationRequestHash({})
@@ -1623,6 +1943,7 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
             taskId: run.taskId,
             attempt: run.attempt,
             taskKey: run.taskKey,
+            workspaceTaskKey: workspaceTaskKeyForRun(run),
             settings: run.settings,
             activeMs: run.activeMs,
             startedAt: run.startedAt,
@@ -1729,6 +2050,46 @@ export function openTaskLedger(dataDir: string, options: TaskLedgerOptions = {})
           taskKey,
         )
       })
+    },
+
+    // worktrees.jsonl と同じ順序の identity hash を台帳へ記録し、途中終了後の省略を検出する
+    recordWorkspaceWorktrees(taskKey: string, worktrees: readonly WorkspaceWorktreeIdentity[]) {
+      if (
+        !Array.isArray(worktrees) ||
+        worktrees.length < 1 ||
+        worktrees.length > 16 ||
+        !hasCompleteWorktreeIdentity(worktrees)
+      ) {
+        throw new Error('workspace worktree snapshot is incomplete')
+      }
+
+      const snapshot = { count: worktrees.length, sha256: workspaceWorktreeHash(worktrees) }
+
+      transaction(db, () => {
+        const run = readRunByKey(taskKey)
+
+        if (run === undefined || run.status !== 'running') {
+          throw new Error(`attempt ${taskKey} is not running while recording its workspace`)
+        }
+
+        appendEvent(run.taskId, run.attempt, 'workspace.worktrees', snapshot)
+      })
+    },
+
+    verifyWorkspaceWorktrees(taskKey: string, worktrees: readonly WorkspaceWorktreeIdentity[]) {
+      const run = readRunByKey(taskKey)
+
+      if (run === undefined) {
+        return false
+      }
+
+      const snapshot = readWorkspaceSnapshot(run)
+
+      return (
+        snapshot !== null &&
+        worktrees.length === snapshot.count &&
+        workspaceWorktreeHash(worktrees) === snapshot.sha256
+      )
     },
 
     // SHIKI の終わりを記録する。中止が先に始まっていれば記録しない

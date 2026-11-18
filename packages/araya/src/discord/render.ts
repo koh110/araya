@@ -15,6 +15,7 @@ import {
 export const NOTIFICATION_EVENT_TYPES = [
   'task.created',
   'task.retried',
+  'task.continued',
   'task.cancel_requested',
   'run.started',
   'run.resumed',
@@ -56,9 +57,11 @@ function clipBody(text: string, maxChars: number) {
 }
 
 function inlineCode(text: string) {
-  const delimiter = '`'.repeat(Array.from(text.matchAll(/`+/gu)).reduce((longest, match) => {
-    return Math.max(longest, match[0].length)
-  }, 0) + 1)
+  const delimiter = '`'.repeat(
+    Array.from(text.matchAll(/`+/gu)).reduce((longest, match) => {
+      return Math.max(longest, match[0].length)
+    }, 0) + 1,
+  )
 
   return `${delimiter}${text.startsWith('`') || text.endsWith('`') ? ` ${text} ` : text}${delimiter}`
 }
@@ -78,11 +81,19 @@ const FAILURE_REASON_LABELS: Record<string, string> = {
   attempt_error: '試行の誤り',
 }
 
-function statusLabel(status: string) {
+function statusLabel(status: string, failureReason: string | null = null) {
+  if (status === 'failed' && failureReason === 'no_changes') {
+    return '結果未確認'
+  }
+
   return STATUS_LABELS[status] ?? status
 }
 
 function failureReasonLabel(reason: string) {
+  if (reason === 'no_changes') {
+    return 'worktree差分なし'
+  }
+
   return FAILURE_REASON_LABELS[reason] ?? reason
 }
 
@@ -99,6 +110,9 @@ export function renderNotification(event: NotificationEvent) {
       const notePart = event.data.hasNote === true ? '、指示付き' : ''
       return `Task #${event.taskId} の再実行を受け付けました（${attemptLabel(event.attempt)}${notePart}）`
     }
+    case 'task.continued': {
+      return `Task #${event.taskId} の続行を受け付けました（${attemptLabel(event.attempt)}、前回の worktree を引き継ぎ${event.data.hasNote === true ? '、指示付き' : ''}）`
+    }
     case 'task.cancel_requested':
       return `Task #${event.taskId} の中止を受け付けました（${event.data.while === 'running' ? '実行中' : '待ち'}）`
     case 'run.started':
@@ -110,27 +124,40 @@ export function renderNotification(event: NotificationEvent) {
     case 'run.finished': {
       const status = String(event.data.status ?? '')
       const failureReason = event.data.failureReason
-      const base = `Task #${event.taskId}（${attemptLabel(event.attempt)}）は${statusLabel(status)}で終わりました`
+      const base = `Task #${event.taskId}（${attemptLabel(event.attempt)}）は${statusLabel(status, typeof failureReason === 'string' ? failureReason : null)}で終わりました`
 
       if (typeof failureReason === 'string' && failureReason !== '') {
-        return `${base}（理由: ${failureReasonLabel(failureReason)}）`
+        const reasonLabel = failureReasonLabel(failureReason)
+        return failureReason === 'no_changes'
+          ? `${base}（${reasonLabel}）`
+          : `${base}（理由: ${reasonLabel}）`
       }
 
       return base
     }
     case 'tool.started':
     case 'tool.finished': {
-      const tool = typeof event.data.tool === 'string' && /^[A-Za-z0-9_-]{1,80}$/u.test(event.data.tool)
-        ? event.data.tool
-        : 'tool'
-      const action = event.type === 'tool.started'
-        ? `${tool} を開始しました`
-        : event.data.isError === true
-          ? `${tool} が失敗しました`
-          : `${tool} を完了しました`
+      const tool =
+        typeof event.data.tool === 'string' && /^[A-Za-z0-9_-]{1,80}$/u.test(event.data.tool)
+          ? event.data.tool
+          : 'tool'
+      if (event.type === 'tool.finished' && tool === 'bash' && event.data.isError === false) {
+        return null
+      }
+
+      const action =
+        event.type === 'tool.started'
+          ? `${tool} を開始しました`
+          : event.data.isError === true
+            ? `${tool} が失敗しました`
+            : `${tool} を完了しました`
       const base = `Task #${event.taskId}（${attemptLabel(event.attempt)}）: ${action}`
 
-      if (event.type === 'tool.started' && tool === 'bash' && typeof event.data.commandPreview === 'string') {
+      if (
+        event.type === 'tool.started' &&
+        tool === 'bash' &&
+        typeof event.data.commandPreview === 'string'
+      ) {
         const commandPreview = clip(event.data.commandPreview, MAX_COMMAND_PREVIEW_CHARS)
 
         if (commandPreview !== '') {
@@ -176,10 +203,14 @@ export function renderTaskList(input: {
 
   for (const task of input.tasks) {
     const reasonPart =
-      task.failureReason === null ? '' : `（理由: ${failureReasonLabel(task.failureReason)}）`
+      task.failureReason === null
+        ? ''
+        : task.failureReason === 'no_changes'
+          ? `（${failureReasonLabel(task.failureReason)}）`
+          : `（理由: ${failureReasonLabel(task.failureReason)}）`
     const questionPart = task.decisionQuestion === null ? '' : '（SHIKI の質問あり）'
     lines.push(
-      `#${task.id} ${statusLabel(task.status)}（${attemptLabel(task.attempt)}）${questionPart}${reasonPart} ${clip(task.title, MAX_TITLE_CHARS)}`,
+      `#${task.id} ${statusLabel(task.status, task.failureReason)}（${attemptLabel(task.attempt)}）${questionPart}${reasonPart} ${clip(task.title, MAX_TITLE_CHARS)}`,
     )
   }
 
@@ -189,8 +220,12 @@ export function renderTaskList(input: {
 function attemptLine(attempt: AttemptView) {
   const finish = attempt.finishedAt ?? '未完了'
   const reasonPart =
-    attempt.failureReason === null ? '' : `（理由: ${failureReasonLabel(attempt.failureReason)}）`
-  return `試行 ${attempt.attempt}: ${statusLabel(attempt.status)}、開始 ${attempt.startedAt ?? 'なし'}、終わり ${finish}${reasonPart}`
+    attempt.failureReason === null
+      ? ''
+      : attempt.failureReason === 'no_changes'
+        ? `（${failureReasonLabel(attempt.failureReason)}）`
+        : `（理由: ${failureReasonLabel(attempt.failureReason)}）`
+  return `試行 ${attempt.attempt}: ${statusLabel(attempt.status, attempt.failureReason)}、開始 ${attempt.startedAt ?? 'なし'}、終わり ${finish}${reasonPart}`
 }
 
 function eventLine(event: EventView) {
@@ -204,7 +239,11 @@ function eventLine(event: EventView) {
     .join(' ')
   const base = `${event.at} ${event.type}${detail === '' ? '' : ` ${clip(detail, MAX_ITEM_CHARS)}`}`
 
-  if (event.type === 'tool.started' && event.data.tool === 'bash' && typeof event.data.commandPreview === 'string') {
+  if (
+    event.type === 'tool.started' &&
+    event.data.tool === 'bash' &&
+    typeof event.data.commandPreview === 'string'
+  ) {
     const commandPreview = clip(event.data.commandPreview, MAX_COMMAND_PREVIEW_CHARS)
 
     if (commandPreview !== '') {
@@ -224,11 +263,15 @@ export function renderTaskDetail(input: {
   const task = input.task
   const lines: string[] = [
     `Task #${task.id}: ${clip(task.title, MAX_ITEM_CHARS)}`,
-    `状態: ${statusLabel(task.status)}（${attemptLabel(task.attempt)}）、登録 ${task.createdAt}、更新 ${task.updatedAt}`,
+    `状態: ${statusLabel(task.status, task.failureReason)}（${attemptLabel(task.attempt)}）、登録 ${task.createdAt}、更新 ${task.updatedAt}`,
   ]
 
   if (task.failureReason !== null) {
-    lines.push(`理由: ${failureReasonLabel(task.failureReason)}`)
+    lines.push(
+      task.failureReason === 'no_changes'
+        ? '結果判定: worktree差分なし（タスク全体や外部操作の成否は未確認）'
+        : `理由: ${failureReasonLabel(task.failureReason)}`,
+    )
   }
 
   if (task.cancelRequested) {
@@ -308,7 +351,11 @@ export function chunkMessage(text: string) {
 }
 
 // 台帳の誤りは message が英語なので、Discord に出す文章はこの関数で日本語に置き換える（値は出さない）
-export function describeLedgerError(error: unknown, taskId?: number) {
+export function describeLedgerError(
+  error: unknown,
+  taskId?: number,
+  action: 'retry' | 'continue' = 'retry',
+) {
   if (!isLedgerError(error)) {
     return '台帳の操作に失敗しました'
   }
@@ -325,14 +372,16 @@ export function describeLedgerError(error: unknown, taskId?: number) {
     case 'task_not_cancellable':
       return 'その Task は既に終わっているため、中止できません'
     case 'task_not_retryable':
-      return '失敗・判断待ちの Task だけが再実行できます'
+      return '失敗・判断待ちの Task だけが新しい作業場所で再実行できます'
+    case 'task_not_continuable':
+      return '失敗・判断待ちで、前回の作業場所が記録されている Task だけが続行できます'
     case 'side_effects_unconfirmed': {
       const worktrees = error.previousWorktrees
       const worktreeCount = worktrees === undefined ? '不明' : String(worktrees.length)
       const taskReference = taskId === undefined ? 'Task' : `Task #${taskId}`
       const taskOption = taskId === undefined ? 'task を指定' : `task=${taskId}`
-
-      return `${taskReference} の前回の試行では外部変更の可能性があるため、再実行を止めました（記録された worktree: ${worktreeCount} 件）。GitHub の branch/PR 状態も確認してください。問題がなければ Discord の /araya task retry で ${taskOption} と confirm_side_effects=true を指定して再実行してください。`
+      const actionLabel = action === 'continue' ? '続行' : '再実行'
+      return `${taskReference} の前回の試行では外部変更の可能性があるため、${actionLabel}を止めました（記録された worktree: ${worktreeCount} 件）。GitHub の branch/PR 状態も確認してください。問題がなければ Discord の /araya task ${action === 'continue' ? 'continue' : 'retry'} で ${taskOption} と confirm_side_effects=true を指定して${actionLabel}してください。`
     }
     case 'ledger_unsupported_version':
       return '台帳の version がこの bot より新しいです。Araya を更新してください'

@@ -389,6 +389,42 @@ test('ledger: Task と queued の1回目の試行を作り、taskKey は task-<i
   }
 })
 
+test('ledger: showTask reads a persisted attempt with a nullable timeout', async () => {
+  const { root, dataDir } = await makeDataDir()
+  const ledger = openTaskLedger(dataDir)
+
+  try {
+    const created = ledger.createTask(taskInput())
+    const claimed = ledger.claimNextAttempt(1, settings())
+    assert.ok(claimed)
+
+    const db = new DatabaseSync(ledger.path)
+
+    try {
+      db.prepare('UPDATE runs SET settings_json = ? WHERE task_id = ? AND attempt = ?').run(
+        JSON.stringify({ ...settings(), timeoutMs: null }),
+        created.task.id,
+        claimed.attempt,
+      )
+    } finally {
+      db.close()
+    }
+
+    const shown = ledger.showTask(created.task.id, { events: 50 })
+    assert.equal(shown.task.status, 'running')
+    assert.equal(shown.attempts.length, 1)
+    assert.equal(
+      ledger.listRunningAttempts().find((attempt) => {
+        return attempt.taskId === created.task.id
+      })?.settings?.timeoutMs,
+      null,
+    )
+  } finally {
+    ledger.close()
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
 test('ledger: createTaskKey は暗号学的乱数の byte を a-z2-7 に写す', () => {
   assert.equal(
     createTaskKey(12, 1, () => {
@@ -497,11 +533,14 @@ test('ledger: 取り込みは空きがあるときだけ最も古い queued を 
     assert.ok(claimed)
     assert.equal(claimed.taskId, first.id)
     assert.deepEqual(
-      { ...claimed, taskKey: '' },
+      { ...claimed, taskKey: '', workspaceTaskKey: '' },
       {
         taskId: first.id,
         attempt: 1,
         taskKey: '',
+        workspaceTaskKey: '',
+        previousTaskKey: null,
+        workspaceStateTaskKey: null,
         title: 'first',
         goal: first.goal,
         constraints: ['c'],
@@ -841,6 +880,277 @@ test('ledger: failed と blocked だけ再実行でき、新しい taskKey の q
     assert.throws(() => {
       return ledger.retryTask(999, { note: null, confirmSideEffects: false })
     }, assertLedgerError('task_not_found'))
+  } finally {
+    ledger.close()
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('ledger: continue は attempt を新しくしつつ、同じ workspace key を連続して引き継ぐ', async () => {
+  const { root, dataDir } = await makeDataDir()
+  const ledger = openTaskLedger(dataDir)
+
+  try {
+    const task = ledger.createTask(taskInput()).task
+    const first = ledger.claimNextAttempt(1, settings())
+    assert.ok(first)
+    const worktree = {
+      repository: 'repo',
+      worktreePath: '/dev/repo/.worktree/araya-task-1-1-abcdef',
+      branch: 'araya/task-1-1-abcdef',
+      base: 'main',
+      baseSha: 'a'.repeat(40),
+      excludeAdded: false,
+      worktreeIdentity: '00000000-0000-4000-8000-000000000001',
+    }
+    ledger.recordStateDir(first.taskKey, path.join(dataDir, 'development', first.taskKey))
+    ledger.recordWorkspaceWorktrees(first.taskKey, [worktree])
+    ledger.recordResult(
+      first.taskKey,
+      result({
+        status: 'failed',
+        failureReason: 'verification_failed',
+        evidence: { worktrees: [{ ...worktree, diff: 'first snapshot' }] },
+      }),
+      { taskKey: first.taskKey, addMs: 0 },
+    )
+
+    const continueTask = Reflect.get(ledger, 'continueTask')
+    if (typeof continueTask !== 'function') {
+      assert.fail('continueTask is missing')
+    }
+    const continued = Reflect.apply(continueTask, ledger, [
+      task.id,
+      {
+        note: '前回の変更を引き継ぐ',
+        confirmSideEffects: false,
+      },
+    ])
+    assert.equal(continued.status, 'queued')
+    assert.equal(continued.attempt, 2)
+
+    const second = ledger.claimNextAttempt(1, settings())
+    assert.ok(second)
+    assert.notEqual(second.taskKey, first.taskKey)
+    assert.equal(Reflect.get(second, 'workspaceTaskKey'), first.taskKey)
+    assert.equal(Reflect.get(second, 'previousTaskKey'), first.taskKey)
+    assert.equal(Reflect.get(second, 'workspaceStateTaskKey'), first.taskKey)
+    assert.equal(second.note, '前回の変更を引き継ぐ')
+
+    const continuedEvent = ledger.showTask(task.id, { events: 20 }).events.find((event) => {
+      return event.type === 'task.continued'
+    })
+    assert.equal(continuedEvent?.type, 'task.continued')
+    assert.deepEqual(continuedEvent?.data, {
+      hasNote: true,
+      confirmedSideEffects: false,
+      workspaceTaskKey: first.taskKey,
+    })
+
+    ledger.recordStateDir(second.taskKey, path.join(dataDir, 'development', second.taskKey))
+    ledger.recordWorkspaceWorktrees(second.taskKey, [worktree])
+    ledger.recordResult(
+      second.taskKey,
+      result({
+        status: 'failed',
+        failureReason: 'verification_failed',
+        evidence: { worktrees: [{ ...worktree, diff: 'second snapshot' }] },
+      }),
+      { taskKey: second.taskKey, addMs: 0 },
+    )
+
+    assert.equal(
+      Reflect.apply(continueTask, ledger, [
+        task.id,
+        {
+          note: null,
+          confirmSideEffects: false,
+        },
+      ]).attempt,
+      3,
+    )
+    const third = ledger.claimNextAttempt(1, settings())
+    assert.ok(third)
+    assert.notEqual(third.taskKey, second.taskKey)
+    assert.equal(Reflect.get(third, 'workspaceTaskKey'), first.taskKey)
+    assert.equal(Reflect.get(third, 'previousTaskKey'), second.taskKey)
+    assert.equal(Reflect.get(third, 'workspaceStateTaskKey'), second.taskKey)
+  } finally {
+    ledger.close()
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('ledger: workspace 初期化に失敗した continue の後も、同じ workspace の記録元を探して続行できる', async () => {
+  const { root, dataDir } = await makeDataDir()
+  const ledger = openTaskLedger(dataDir)
+
+  try {
+    const task = ledger.createTask(taskInput()).task
+    const first = ledger.claimNextAttempt(1, settings())
+    assert.ok(first)
+    const worktree = {
+      repository: 'repo',
+      worktreePath: '/dev/repo/.worktree/araya-task-1-1-abcdef',
+      branch: 'araya/task-1-1-abcdef',
+      base: 'main',
+      baseSha: 'a'.repeat(40),
+      excludeAdded: false,
+      worktreeIdentity: '00000000-0000-4000-8000-000000000001',
+    }
+    ledger.recordStateDir(first.taskKey, path.join(dataDir, 'development', first.taskKey))
+    ledger.recordWorkspaceWorktrees(first.taskKey, [worktree])
+    ledger.recordResult(
+      first.taskKey,
+      result({
+        status: 'failed',
+        failureReason: 'verification_failed',
+        evidence: { worktrees: [worktree] },
+      }),
+      { taskKey: first.taskKey, addMs: 0 },
+    )
+
+    const continueTask = Reflect.get(ledger, 'continueTask')
+    if (typeof continueTask !== 'function') {
+      assert.fail('continueTask is missing')
+    }
+    Reflect.apply(continueTask, ledger, [task.id, { note: null, confirmSideEffects: false }])
+
+    const second = ledger.claimNextAttempt(1, settings())
+    assert.ok(second)
+    assert.equal(Reflect.get(second, 'workspaceStateTaskKey'), first.taskKey)
+    ledger.recordStateDir(second.taskKey, path.join(dataDir, 'development', second.taskKey))
+    ledger.recordResult(
+      second.taskKey,
+      result({
+        status: 'failed',
+        failureReason: 'termination_unconfirmed',
+        evidence: { worktrees: [] },
+      }),
+      { taskKey: second.taskKey, addMs: 0 },
+    )
+
+    Reflect.apply(continueTask, ledger, [task.id, { note: null, confirmSideEffects: true }])
+    const third = ledger.claimNextAttempt(1, settings())
+    assert.ok(third)
+    assert.equal(Reflect.get(third, 'workspaceTaskKey'), first.taskKey)
+    assert.equal(Reflect.get(third, 'previousTaskKey'), second.taskKey)
+    assert.equal(Reflect.get(third, 'workspaceStateTaskKey'), first.taskKey)
+    assert.deepEqual(third.previous?.worktrees, [worktree])
+  } finally {
+    ledger.close()
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('ledger: 続行中に増えた worktree が最終 evidence から欠けたら古い workspace へ fallback しない', async () => {
+  const { root, dataDir } = await makeDataDir()
+  const ledger = openTaskLedger(dataDir)
+
+  try {
+    const task = ledger.createTask(taskInput()).task
+    const first = ledger.claimNextAttempt(1, settings())
+    assert.ok(first)
+    const worktreeA = {
+      repository: 'repo-a',
+      worktreePath: '/dev/repo-a/.worktree/araya-task-1-1-abcdef',
+      branch: 'araya/task-1-1-abcdef',
+      base: 'main',
+      baseSha: 'a'.repeat(40),
+      excludeAdded: false,
+      worktreeIdentity: '00000000-0000-4000-8000-000000000001',
+    }
+    const worktreeB = {
+      repository: 'repo-b',
+      worktreePath: '/dev/repo-b/.worktree/araya-task-1-1-abcdef',
+      branch: 'araya/task-1-1-abcdef',
+      base: 'main',
+      baseSha: 'b'.repeat(40),
+      excludeAdded: false,
+      worktreeIdentity: '00000000-0000-4000-8000-000000000002',
+    }
+    ledger.recordStateDir(first.taskKey, path.join(dataDir, 'development', first.taskKey))
+    const recordWorkspaceWorktrees = Reflect.get(ledger, 'recordWorkspaceWorktrees')
+    assert.equal(typeof recordWorkspaceWorktrees, 'function')
+    Reflect.apply(recordWorkspaceWorktrees, ledger, [first.taskKey, [worktreeA]])
+    ledger.recordResult(
+      first.taskKey,
+      result({
+        status: 'failed',
+        failureReason: 'verification_failed',
+        evidence: { worktrees: [worktreeA] },
+      }),
+      { taskKey: first.taskKey, addMs: 0 },
+    )
+
+    const continueTask = Reflect.get(ledger, 'continueTask')
+    assert.equal(typeof continueTask, 'function')
+    Reflect.apply(continueTask, ledger, [task.id, { note: null, confirmSideEffects: false }])
+    const second = ledger.claimNextAttempt(1, settings())
+    assert.ok(second)
+    ledger.recordStateDir(second.taskKey, path.join(dataDir, 'development', second.taskKey))
+    Reflect.apply(recordWorkspaceWorktrees, ledger, [second.taskKey, [worktreeA, worktreeB]])
+    ledger.recordResult(
+      second.taskKey,
+      result({
+        status: 'failed',
+        failureReason: 'verification_failed',
+        evidence: { worktrees: [worktreeA] },
+      }),
+      { taskKey: second.taskKey, addMs: 0 },
+    )
+
+    assert.throws(() => {
+      return Reflect.apply(continueTask, ledger, [
+        task.id,
+        { note: null, confirmSideEffects: false },
+      ])
+    }, /task_not_continuable/u)
+    assert.equal(ledger.getTask(task.id).attempt, 2)
+  } finally {
+    ledger.close()
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('ledger: worktree identity が不足する古い evidence からは continue を受け付けない', async () => {
+  const { root, dataDir } = await makeDataDir()
+  const ledger = openTaskLedger(dataDir)
+
+  try {
+    const task = ledger.createTask(taskInput()).task
+    const first = ledger.claimNextAttempt(1, settings())
+    assert.ok(first)
+    ledger.recordStateDir(first.taskKey, path.join(dataDir, 'development', first.taskKey))
+    ledger.recordResult(
+      first.taskKey,
+      result({
+        status: 'failed',
+        failureReason: 'verification_failed',
+        evidence: {
+          worktrees: [
+            {
+              worktreePath: '/dev/repo/.worktree/araya-task-1-1-abcdef',
+              branch: 'araya/task-1-1-abcdef',
+            },
+          ],
+        },
+      }),
+      { taskKey: first.taskKey, addMs: 0 },
+    )
+
+    const continueTask = Reflect.get(ledger, 'continueTask')
+    assert.equal(typeof continueTask, 'function')
+    assert.throws(() => {
+      return Reflect.apply(continueTask, ledger, [
+        task.id,
+        {
+          note: null,
+          confirmSideEffects: false,
+        },
+      ])
+    }, /task_not_continuable/u)
+    assert.equal(ledger.getTask(task.id).attempt, 1)
   } finally {
     ledger.close()
     await fs.rm(root, { recursive: true, force: true })

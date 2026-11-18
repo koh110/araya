@@ -112,7 +112,14 @@ async function registerDiscord(config: RunnerCommandConfig, deps: DiscordCommand
     applicationId: source.config.applicationId,
     guildId: source.config.guildId,
     command: 'araya',
-    subcommands: ['task list', 'task show', 'task submit', 'task cancel', 'task retry'],
+    subcommands: [
+      'task list',
+      'task show',
+      'task submit',
+      'task cancel',
+      'task retry',
+      'task continue',
+    ],
   }
 }
 

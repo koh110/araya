@@ -183,7 +183,22 @@ export function discordCommandDefinitionJson() {
             {
               type: 1,
               name: 'retry',
-              description: '終わった Task の再実行を求める',
+              description: '終わった Task を新しい作業場所でやり直す',
+              options: [
+                { type: 4, name: 'task', description: 'Task ID', required: true },
+                { type: 3, name: 'note', description: '次の試行に渡す指示', required: false },
+                {
+                  type: 5,
+                  name: 'confirm_side_effects',
+                  description: '前の試行が外部に変更を残した可能性を確認した',
+                  required: false,
+                },
+              ],
+            },
+            {
+              type: 1,
+              name: 'continue',
+              description: '前回の作業場所を引き継いで続ける',
               options: [
                 { type: 4, name: 'task', description: 'Task ID', required: true },
                 { type: 3, name: 'note', description: '次の試行に渡す指示', required: false },
@@ -372,6 +387,23 @@ function retryTask(request: DiscordCommandRequest, deps: CommandHandlerDeps) {
   ]
 }
 
+function continueTask(request: DiscordCommandRequest, deps: CommandHandlerDeps) {
+  const taskId = requireTaskId(request.options)
+  const noteValue = request.options.note
+  const parsedNote = typeof noteValue === 'string' ? parseRetryNote(noteValue) : null
+  const task = deps.ledger.continueTask(taskId, {
+    note: parsedNote === null ? null : deps.redactor.redact(parsedNote),
+    confirmSideEffects: request.options.confirm_side_effects === true,
+    idempotencyKey: `discord:${request.interactionId}`,
+  })
+
+  return [
+    {
+      content: `Task #${task.id} の続行を受け付けました（試行 ${task.attempt}、前回の作業場所を引き継ぎます）。次は ${deps.unit} の unit で実行します`,
+    },
+  ]
+}
+
 function redactReplies(replies: CommandReply[], redactor: Redactor) {
   return replies.map((reply) => {
     return { ...reply, content: redactor.redact(reply.content) }
@@ -392,7 +424,12 @@ export function handleDiscordCommand(request: DiscordCommandRequest, deps: Comma
   try {
     if (request.subcommandGroup !== 'task') {
       return redactReplies(
-        [{ content: '知らない command です（/araya task list・show・submit・cancel・retry）' }],
+        [
+          {
+            content:
+              '知らない command です（/araya task list・show・submit・cancel・retry・continue）',
+          },
+        ],
         deps.redactor,
       )
     }
@@ -408,9 +445,16 @@ export function handleDiscordCommand(request: DiscordCommandRequest, deps: Comma
         return redactReplies(cancelTask(request, deps), deps.redactor)
       case 'retry':
         return redactReplies(retryTask(request, deps), deps.redactor)
+      case 'continue':
+        return redactReplies(continueTask(request, deps), deps.redactor)
       default:
         return redactReplies(
-          [{ content: '知らない command です（/araya task list・show・submit・cancel・retry）' }],
+          [
+            {
+              content:
+                '知らない command です（/araya task list・show・submit・cancel・retry・continue）',
+            },
+          ],
           deps.redactor,
         )
     }
@@ -419,15 +463,23 @@ export function handleDiscordCommand(request: DiscordCommandRequest, deps: Comma
       return redactReplies([{ content: error.message }], deps.redactor)
     }
 
-    const taskId =
-      request.subcommandGroup === 'task' &&
-      request.subcommand === 'retry' &&
-      typeof request.options.task === 'number' &&
-      Number.isSafeInteger(request.options.task) &&
-      request.options.task > 0
-        ? request.options.task
-        : undefined
-
-    return redactReplies([{ content: describeLedgerError(error, taskId) }], deps.redactor)
+    return redactReplies(
+      [
+        {
+          content: describeLedgerError(
+            error,
+            request.subcommandGroup === 'task' &&
+              (request.subcommand === 'retry' || request.subcommand === 'continue') &&
+              typeof request.options.task === 'number' &&
+              Number.isSafeInteger(request.options.task) &&
+              request.options.task > 0
+              ? request.options.task
+              : undefined,
+            request.subcommand === 'continue' ? 'continue' : 'retry',
+          ),
+        },
+      ],
+      deps.redactor,
+    )
   }
 }

@@ -67,6 +67,9 @@ export type DevelopmentResult = {
 
 export type DevelopmentResultInput = {
   taskKey: string
+  workspaceTaskKey?: string
+  // continue 中の collection・verification・delivery の境界で authoritative な worktree identity を再検証する
+  validateWorkspace?: () => Promise<void>
   title: string
   draftPrDelivery: boolean
   // 開発 root の実 path（呼び出し側で解決済み）
@@ -105,6 +108,7 @@ type FailureReason =
   | 'no_changes'
   | 'verification_missing'
   | 'verification_failed'
+  | 'continuation_workspace_invalid'
   | 'draft_pr_failed'
 
 type GitContext = {
@@ -606,6 +610,7 @@ function toWorktreeEvidence(record: WorktreeRecord, diff: DiffEvidence, verifica
     headSha: diff.headSha,
     headMoved: diff.headMoved,
     excludeAdded: record.excludeAdded,
+    worktreeIdentity: record.worktreeIdentity,
     changedFiles: diff.changedFiles,
     diffStat: diff.diffStat,
     diff: diff.diff,
@@ -621,7 +626,8 @@ function toWorktreeLocation(record: WorktreeRecord) {
     branch: record.branch,
     base: record.base,
     baseSha: record.baseSha,
-    excludeAdded: record.excludeAdded
+    excludeAdded: record.excludeAdded,
+    worktreeIdentity: record.worktreeIdentity,
   }
 }
 
@@ -640,38 +646,25 @@ export function agentEvidence(agent: AgentOutcome) {
   }
 }
 
-// 差分の収集と検証を行わずに作る evidence（worktree だけの evidence）。状態 directory の worktrees.jsonl から
-// worktree の path と branch だけを残す。読めなければ worktree を空にし、その理由を detail に返す
+// 差分の収集と検証を行わずに作る evidence。継続時に state record の改変を見分けられる情報を残す。
 export async function buildWorktreeOnlyEvidence(input: {
   taskKey: string
+  workspaceTaskKey?: string
   devRoot: string
   stateDir: string | null
   redact: (text: string) => string
 }) {
-  const worktrees: { worktreePath: string; branch: string }[] = []
+  const worktrees: ReturnType<typeof toWorktreeLocation>[] = []
   let detail: string | null = null
 
   if (input.stateDir !== null) {
     try {
-      const content = await fs.readFile(path.join(input.stateDir, 'worktrees.jsonl'), 'utf8')
-
-      for (const line of content.split('\n')) {
-        if (line === '') {
-          continue
-        }
-
-        const value: unknown = JSON.parse(line)
-
-        if (
-          typeof value !== 'object' || value === null || Array.isArray(value) ||
-          !('worktreePath' in value) || typeof value.worktreePath !== 'string' ||
-          !('branch' in value) || typeof value.branch !== 'string'
-        ) {
-          throw new Error('a record does not have worktreePath and branch')
-        }
-
-        worktrees.push({ worktreePath: value.worktreePath, branch: value.branch })
-      }
+      worktrees.push(...(await readTaskState({
+        devRoot: input.devRoot,
+        stateDir: input.stateDir,
+        taskKey: input.taskKey,
+        workspaceTaskKey: input.workspaceTaskKey ?? input.taskKey
+      })).worktrees.map(toWorktreeLocation))
     } catch (error) {
       if (!isErrno(error, 'ENOENT')) {
         worktrees.length = 0
@@ -681,7 +674,14 @@ export async function buildWorktreeOnlyEvidence(input: {
   }
 
   return {
-    evidence: { taskKey: input.taskKey, devRoot: input.devRoot, stateDir: input.stateDir, worktrees, bodiesStored: false },
+    evidence: {
+      taskKey: input.taskKey,
+      workspaceTaskKey: input.workspaceTaskKey ?? input.taskKey,
+      devRoot: input.devRoot,
+      stateDir: input.stateDir,
+      worktrees,
+      bodiesStored: false
+    },
     detail
   }
 }
@@ -692,6 +692,7 @@ export async function collectDevelopmentResult(
 ): Promise<DevelopmentResult> {
   validateTimeout(input.verificationTimeoutMs, 'verificationTimeoutMs')
   const { taskKey, devRoot, stateDir, agent, verificationTimeoutMs, redact, redactTruncated } = input
+  const workspaceTaskKey = input.workspaceTaskKey ?? taskKey
 
   let decision: DecisionRecord | null = null
 
@@ -699,7 +700,7 @@ export async function collectDevelopmentResult(
     const decisionQuestion = decision?.question ?? null
     const developmentResult: DevelopmentResult = {
       status: 'failed',
-      evidence: { taskKey, devRoot, outcome: 'failed', failureReason, worktrees: [], decisionQuestion, ...extra },
+      evidence: { taskKey, workspaceTaskKey, devRoot, outcome: 'failed', failureReason, worktrees: [], decisionQuestion, ...extra },
       decisionQuestion,
       collected
     }
@@ -707,10 +708,38 @@ export async function collectDevelopmentResult(
     return developmentResult
   }
 
+  const isContinuation = workspaceTaskKey !== taskKey
+
+  async function continuationWorkspaceFailure() {
+    if (!isContinuation) {
+      return null
+    }
+
+    if (input.validateWorkspace === undefined) {
+      return 'the authoritative continuation workspace validator is missing'
+    }
+
+    try {
+      await input.validateWorkspace()
+      return null
+    } catch (error) {
+      return describeError(error, redact)
+    }
+  }
+
+  const initialWorkspaceFailure = await continuationWorkspaceFailure()
+
+  if (initialWorkspaceFailure !== null) {
+    return fail('continuation_workspace_invalid', false, {
+      ...agentEvidence(agent),
+      failureDetail: initialWorkspaceFailure,
+    })
+  }
+
   let state: Awaited<ReturnType<typeof readTaskState>>
 
   try {
-    state = await readTaskState({ devRoot, stateDir, taskKey })
+    state = await readTaskState({ devRoot, stateDir, taskKey, workspaceTaskKey })
     decision = await readDecision(stateDir)
   } catch (error) {
     decision = null
@@ -757,6 +786,14 @@ export async function collectDevelopmentResult(
   let verificationUnconfirmed = false
   const worktrees: ReturnType<typeof toWorktreeEvidence>[] = []
 
+  function failContinuationWorkspace(detail: string, current?: ReturnType<typeof toWorktreeEvidence>) {
+    return fail('continuation_workspace_invalid', true, {
+      ...agentEvidence(agent),
+      worktrees: current === undefined ? worktrees : [...worktrees, current],
+      failureDetail: detail,
+    })
+  }
+
   for (const [index, record] of state.worktrees.entries()) {
     const diff = diffs[index]
 
@@ -798,6 +835,15 @@ export async function collectDevelopmentResult(
         continue
       }
 
+      const beforeVerificationFailure = await continuationWorkspaceFailure()
+
+      if (beforeVerificationFailure !== null) {
+        return failContinuationWorkspace(
+          beforeVerificationFailure,
+          toWorktreeEvidence(record, diff, verifications),
+        )
+      }
+
       let result: VerificationCommandResult
 
       try {
@@ -811,6 +857,16 @@ export async function collectDevelopmentResult(
         })
       } catch (error) {
         verifications.push({ ...notRun(verification, 'verification_error'), status: 'failed', stderr: describeError(error, redact) })
+
+        const afterVerificationFailure = await continuationWorkspaceFailure()
+
+        if (afterVerificationFailure !== null) {
+          return failContinuationWorkspace(
+            afterVerificationFailure,
+            toWorktreeEvidence(record, diff, verifications),
+          )
+        }
+
         continue
       }
 
@@ -829,6 +885,15 @@ export async function collectDevelopmentResult(
         stderr: result.stderrBytes > VERIFICATION_OUTPUT_BYTES ? redactTruncated(result.stderr, 'start') : result.stderr,
         ...(result.reason === undefined ? {} : { reason: result.reason })
       })
+
+      const afterVerificationFailure = await continuationWorkspaceFailure()
+
+      if (afterVerificationFailure !== null) {
+        return failContinuationWorkspace(
+          afterVerificationFailure,
+          toWorktreeEvidence(record, diff, verifications),
+        )
+      }
     }
 
     worktrees.push(toWorktreeEvidence(record, diff, verifications))
@@ -840,6 +905,12 @@ export async function collectDevelopmentResult(
 
     try {
       for (const [index, record] of state.worktrees.entries()) {
+        const workspaceFailure = await continuationWorkspaceFailure()
+
+        if (workspaceFailure !== null) {
+          return failContinuationWorkspace(workspaceFailure)
+        }
+
         const verified = diffs[index]
         const current = await collectWorktreeDiff(snapshotGit, record, diffBudgets[index] ?? 0)
 
@@ -919,7 +990,7 @@ export async function collectDevelopmentResult(
   if (decisionRequested) {
     return {
       status: 'blocked',
-      evidence: { taskKey, devRoot, outcome: 'blocked', ...agentEvidence(agent), worktrees, decisionQuestion },
+      evidence: { taskKey, workspaceTaskKey, devRoot, outcome: 'blocked', ...agentEvidence(agent), worktrees, decisionQuestion },
       decisionQuestion,
       collected: true
     }
@@ -928,10 +999,16 @@ export async function collectDevelopmentResult(
   if (!input.draftPrDelivery) {
     return {
       status: 'completed',
-      evidence: { taskKey, devRoot, outcome: 'completed', ...agentEvidence(agent), worktrees, decisionQuestion: null },
+      evidence: { taskKey, workspaceTaskKey, devRoot, outcome: 'completed', ...agentEvidence(agent), worktrees, decisionQuestion: null },
       decisionQuestion: null,
       collected: true
     }
+  }
+
+  const beforeDeliveryFailure = await continuationWorkspaceFailure()
+
+  if (beforeDeliveryFailure !== null) {
+    return failContinuationWorkspace(beforeDeliveryFailure)
   }
 
   if (git === null || dependencies.runGitHub === undefined) {
@@ -946,6 +1023,12 @@ export async function collectDevelopmentResult(
 
   try {
     for (const [index, record] of state.worktrees.entries()) {
+      const workspaceFailure = await continuationWorkspaceFailure()
+
+      if (workspaceFailure !== null) {
+        return failContinuationWorkspace(workspaceFailure)
+      }
+
       const verified = diffs[index]
       const current = await collectWorktreeDiff(snapshotGit, record, diffBudgets[index] ?? 0)
 
@@ -985,7 +1068,12 @@ export async function collectDevelopmentResult(
       return { snapshotSha256: current.snapshotSha256, diffTruncated: current.diffTruncated }
     }
 
-    preflightSnapshotGuards.push({ record, snapshotSha256: diff.snapshotSha256, readSnapshot })
+    preflightSnapshotGuards.push({
+      record,
+      snapshotSha256: diff.snapshotSha256,
+      readSnapshot,
+      ...(input.validateWorkspace === undefined ? {} : { validateWorkspace: input.validateWorkspace }),
+    })
   }
 
   const deliveryWorktrees: DraftPrWorktreeInput[] = []
@@ -1014,12 +1102,14 @@ export async function collectDevelopmentResult(
       snapshotSha256: diff.snapshotSha256,
       snapshotDiffSha256: diff.snapshotDiffSha256,
       snapshotChangedFiles: [...diff.changedFiles].sort(),
-      readSnapshot: guard.readSnapshot
+      readSnapshot: guard.readSnapshot,
+      ...(input.validateWorkspace === undefined ? {} : { validateWorkspace: input.validateWorkspace }),
     })
   }
 
   const delivery = await deliverDraftPullRequests({
     taskKey,
+    workspaceTaskKey,
     title: input.title,
     worktrees: deliveryWorktrees,
     preflightSnapshotGuards,
@@ -1046,6 +1136,7 @@ export async function collectDevelopmentResult(
   })
   const evidence: Record<string, unknown> = {
     taskKey,
+    workspaceTaskKey,
     devRoot,
     outcome: delivery.status,
     ...agentEvidence(agent),

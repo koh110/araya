@@ -59,8 +59,12 @@ const UNIT_MISSING_PATTERN = /does not exist|not loaded|not found/iu
 // systemctl --user stop の、unit が読み込まれていないための失敗（systemd 259 では終了 code 5、stderr は Unit <unit> not loaded.）
 const UNIT_NOT_LOADED_PATTERN = /not loaded/iu
 
-const SIDE_EFFECTS_MESSAGE =
-  '前回の試行では外部の branch や Draft PR が作成・更新された可能性がある、または結果を確認できません。前回の worktree と GitHub の状態を確かめてから、--confirm-side-effects を付けて再実行してください'
+const SIDE_EFFECTS_MESSAGES = {
+  retry:
+    '前回の試行では外部の branch や Draft PR が作成・更新された可能性がある、または結果を確認できません。前回の worktree と GitHub の状態を確かめてから、--confirm-side-effects を付けて再実行してください',
+  continue:
+    '前回の試行では外部の branch や Draft PR が作成・更新された可能性がある、または結果を確認できません。前回の worktree と GitHub の状態を確かめてから、--confirm-side-effects を付けて continue を実行してください',
+} as const
 
 export type TaskCommandDependencies = {
   platform: NodeJS.Platform
@@ -375,7 +379,12 @@ async function showTask(args: string[], ledger: TaskLedger) {
   return { ...shown, attempts }
 }
 
-async function retryTask(args: string[], ledger: TaskLedger, deps: TaskCommandDependencies) {
+async function requeueTask(
+  action: 'retry' | 'continue',
+  args: string[],
+  ledger: TaskLedger,
+  deps: TaskCommandDependencies,
+) {
   const { values, positionals } = parseCommandArgs(() => {
     return parseArgs({
       args,
@@ -390,7 +399,7 @@ async function retryTask(args: string[], ledger: TaskLedger, deps: TaskCommandDe
   })
 
   if (positionals.length !== 1) {
-    throw commandError('invalid_arguments', 'task retry には taskId を1つ指定してください')
+    throw commandError('invalid_arguments', `task ${action} には taskId を1つ指定してください`)
   }
 
   const taskId = parseTaskId(positionals[0])
@@ -425,7 +434,9 @@ async function retryTask(args: string[], ledger: TaskLedger, deps: TaskCommandDe
   const confirmSideEffects = values['confirm-side-effects'] === true
 
   try {
-    return ledger.retryTask(taskId, { note, confirmSideEffects })
+    return action === 'retry'
+      ? ledger.retryTask(taskId, { note, confirmSideEffects })
+      : ledger.continueTask(taskId, { note, confirmSideEffects })
   } catch (error) {
     if (isLedgerError(error) && error.code === 'side_effects_unconfirmed') {
       const worktrees = error.previousWorktrees ?? []
@@ -440,7 +451,9 @@ async function retryTask(args: string[], ledger: TaskLedger, deps: TaskCommandDe
             ]
 
       throw Object.assign(
-        new Error([`side_effects_unconfirmed: ${SIDE_EFFECTS_MESSAGE}`, ...lines].join('\n')),
+        new Error(
+          [`side_effects_unconfirmed: ${SIDE_EFFECTS_MESSAGES[action]}`, ...lines].join('\n'),
+        ),
         {
           code: error.code,
         },
@@ -449,6 +462,14 @@ async function retryTask(args: string[], ledger: TaskLedger, deps: TaskCommandDe
 
     throw error
   }
+}
+
+async function retryTask(args: string[], ledger: TaskLedger, deps: TaskCommandDependencies) {
+  return requeueTask('retry', args, ledger, deps)
+}
+
+async function continueTask(args: string[], ledger: TaskLedger, deps: TaskCommandDependencies) {
+  return requeueTask('continue', args, ledger, deps)
 }
 
 function cancelTask(args: string[], ledger: TaskLedger) {
@@ -477,11 +498,12 @@ export async function runTaskCommand(
     subcommand !== 'list' &&
     subcommand !== 'show' &&
     subcommand !== 'retry' &&
+    subcommand !== 'continue' &&
     subcommand !== 'cancel'
   ) {
     throw commandError(
       'invalid_arguments',
-      `不明な task の command: ${subcommand ?? '（なし）'}。create・list・show・retry・cancel のどれかを指定してください`,
+      `不明な task の command: ${subcommand ?? '（なし）'}。create・list・show・retry・continue・cancel のどれかを指定してください`,
     )
   }
 
@@ -500,6 +522,8 @@ export async function runTaskCommand(
       body = await showTask(rest, ledger)
     } else if (subcommand === 'retry') {
       body = { task: await retryTask(rest, ledger, deps) }
+    } else if (subcommand === 'continue') {
+      body = { task: await continueTask(rest, ledger, deps) }
     } else {
       const { cancel, task } = cancelTask(rest, ledger)
       body = { task, cancel }

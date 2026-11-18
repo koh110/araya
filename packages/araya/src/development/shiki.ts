@@ -6,7 +6,7 @@ import { defineTool, type DocumentReader, type ToolExecutionResult } from '@eare
 import { createBashTool, createEditTool, createReadTool, createWriteTool } from '@earendil-works/pi-durable/tools'
 
 import { formatModel } from '../config/model.ts'
-import { createWorktreeService, recordDecision } from './worktrees.ts'
+import { createWorktreeService, recordDecision, type WorktreeRecord } from './worktrees.ts'
 import { bashScopeUnit, createScopedRunner, gitScopeUnit, type SystemdOps } from '../infrastructure/systemd.ts'
 
 // SHIKI に渡す文（system prompt、課題の prompt、課題の本文、model が使えないときの message、tool の説明）と、
@@ -15,6 +15,8 @@ import { bashScopeUnit, createScopedRunner, gitScopeUnit, type SystemdOps } from
 export type ShikiPromptInput = {
   devRoot: string
   taskKey: string
+  workspaceTaskKey?: string
+  continueWorkspace?: boolean
 }
 
 export type ShikiTaskPromptInput = ShikiPromptInput & {
@@ -91,18 +93,21 @@ export const SHIKI_TOOL_NAMES = [
 const MAX_TASK_BODY_SUMMARY_CHARS = 4000
 const INTERRUPTED_NOTICE = '- 注意: 前回の試行では外部の branch や Draft PR が作成・更新された可能性がある、または結果を確認できません。同じ操作をくり返す前に、前回の worktree と GitHub の状態を確かめてください。'
 
-export function getWorktreePattern(input: { taskKey: string }) {
-  return `<repository>/.worktree/araya-${input.taskKey}`
+export function getWorktreePattern(input: { taskKey: string; workspaceTaskKey?: string }) {
+  return `<repository>/.worktree/araya-${input.workspaceTaskKey ?? input.taskKey}`
 }
 
 export function buildSystemPrompt(input: ShikiPromptInput) {
+  const workspaceTaskKey = input.workspaceTaskKey ?? input.taskKey
   return [
     'あなたは、人が書いた開発課題を1件実装する coding agent です。',
     `作業の起点は開発 root（${input.devRoot}）です。開発 root の直下などに、各 repository の clone があります。`,
     '',
     '必ず次の手順と制約に従ってください。',
     '1. 課題に必要な repository を判断してください。複数でも構いません。repository は開発 root 配下の clone を使います。必要な repository が無ければ、開発 root 配下に clone して構いません。',
-    `2. 既存の clone の作業 tree（main checkout）は編集しないでください。変更する repository ごとに araya_create_worktree で worktree を作り、その中だけを編集してください。worktree は ${getWorktreePattern(input)} に、branch araya/${input.taskKey} で作られます。git worktree add などの git コマンドで直接 worktree を作らないでください。`,
+    input.continueWorkspace === true
+      ? `2. 前回の試行から引き継いだ worktree は同じ作業場所です。既存 clone の main checkout は編集しないでください。該当 repository では araya_create_worktree を呼び、既存 worktree を使って続けてください。既存 worktree の変更を保持し、reset・clean・再作成をしないでください。新しい repository は ${getWorktreePattern({ taskKey: input.taskKey, workspaceTaskKey })} に branch araya/${workspaceTaskKey} で作られます。git worktree add などの git コマンドで直接 worktree を作らないでください。`
+      : `2. 既存の clone の作業 tree（main checkout）は編集しないでください。変更する repository ごとに araya_create_worktree で worktree を作り、その中だけを編集してください。worktree は ${getWorktreePattern({ taskKey: input.taskKey, workspaceTaskKey })} に、branch araya/${workspaceTaskKey} で作られます。git worktree add などの git コマンドで直接 worktree を作らないでください。`,
     '3. worktree の base には、通常は remote の既定 branch を git fetch してから、その ref（例: origin/main）を指定してください。',
     '4. repository に AGENTS.md や CLAUDE.md などの開発ガイドがあれば、読んで従ってください。',
     '5. commit、push、PR の作成、merge、deploy、publish はしないでください。変更は worktree に未 commit のまま残してください。',
@@ -130,6 +135,7 @@ export type TaskBodyInput = {
   targets: readonly string[]
   permissions: readonly string[]
   note: string | null
+  continueWorkspace?: boolean
   // 再実行のときの直前の試行
   previous: {
     attempt: number
@@ -185,7 +191,9 @@ export function buildTaskBody(input: TaskBodyInput) {
     }
 
     if (previous.worktrees.length > 0) {
-      lines.push('- 前回の worktree（編集しない。必要なら読んでよい）:')
+      lines.push(input.continueWorkspace === true
+        ? '- 引き継いだ worktree（同じ作業場所。変更を保持し、続けて編集してよい）:'
+        : '- 前回の worktree（編集しない。必要なら読んでよい）:')
 
       for (const worktree of previous.worktrees) {
         lines.push(`  - ${worktree.worktreePath}（branch ${worktree.branch}）`)
@@ -222,7 +230,9 @@ export function buildTaskPrompt(input: ShikiTaskPromptInput) {
     '</task>',
     '',
     '進め方:',
-    '- 必要な repository を判断し、変更する repository ごとに araya_create_worktree で worktree を作ってから、その worktree の中だけを編集してください。',
+    input.continueWorkspace === true
+      ? '- 既存 clone の main checkout は編集せず、引き継いだ repository では araya_create_worktree で既存 worktree を取得し、同じ作業場所で続けてください。未 commit の変更を保持し、reset・clean・再作成しないでください。'
+      : '- 必要な repository を判断し、変更する repository ごとに araya_create_worktree で worktree を作ってから、その worktree の中だけを編集してください。',
     '- commit や push はしないでください。変更は未 commit のまま残してください。',
     '- 終了前に、変更した worktree ごとに araya_register_verification で検証コマンドを登録してください。Araya が終了後に実行して完了を判定します。',
     '- 最後に、repository ごとの変更内容と実行した確認を日本語で簡潔にまとめてください。'
@@ -245,6 +255,7 @@ export function describeModelUnavailable(reason: ModelUnavailableReason) {
 // SHIKI の tool が使う、会話に対応する試行
 export type ShikiAttempt = {
   taskKey: string
+  workspaceTaskKey?: string
   // 開発 root の実 path
   devRoot: string
 }
@@ -258,6 +269,7 @@ export type ShikiToolDependencies = {
   systemd: Pick<SystemdOps, 'launchInScope' | 'bashScopeCommand'>
   // git に渡す環境変数（runner の環境変数）
   env: Readonly<Record<string, string | undefined>>
+  recordWorkspaceWorktrees?: (taskKey: string, worktrees: readonly WorktreeRecord[]) => void | Promise<void>
   now?: () => Date
 }
 
@@ -309,10 +321,14 @@ export function createShikiTools(deps: ShikiToolDependencies) {
       devRoot: attempt.devRoot,
       stateDir: getStateDir(deps.dataDir, attempt.taskKey),
       taskKey: attempt.taskKey,
+      workspaceTaskKey: attempt.workspaceTaskKey ?? attempt.taskKey,
       env: deps.env,
       runGit: createScopedRunner(deps.systemd, () => {
         return gitScopeUnit(deps.hash, attempt.taskKey)
       }),
+      onWorktreesChanged: (worktrees) => {
+        return deps.recordWorkspaceWorktrees?.(attempt.taskKey, worktrees)
+      },
       now
     })
     services.set(attempt.taskKey, service)

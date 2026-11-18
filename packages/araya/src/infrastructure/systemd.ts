@@ -108,6 +108,15 @@ export function scopePattern(hash: string, taskKey?: string) {
   return taskKey === undefined ? `araya-${hash}-*.scope` : `araya-${hash}-${taskKey}-*.scope`
 }
 
+// 1 Task の全試行の scope。continue 前に古い試行の orphan process が残っていないことを確認する
+export function taskScopePattern(hash: string, taskId: number) {
+  if (!Number.isSafeInteger(taskId) || taskId < 1) {
+    throw new RangeError('taskId must be a positive safe integer')
+  }
+
+  return `araya-${hash}-task-${taskId}-*.scope`
+}
+
 // SHIKI の bash の scope。<c> は tool の呼び出しの id の SHA-256 の16進表記の先頭12文字
 export function bashScopeUnit(hash: string, taskKey: string, callId: string) {
   const callHash = createHash('sha256')

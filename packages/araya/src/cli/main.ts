@@ -51,8 +51,12 @@ function printHelp() {
     Task と試行、途中経過を出す。--full は evidence.json の差分と検証の出力の本文も出す。
 
   araya task retry <taskId> [--note <text> | --note-file <path|->] [--confirm-side-effects]
-    failed と blocked の Task を再実行する。--note は追加の指示。SHIKI が判断を求めて blocked になった Task では、
+    failed と blocked の Task を新しい作業場所で再実行する。--note は追加の指示。SHIKI が判断を求めて blocked になった Task では、
     質問（decisionQuestion）への答えを書く。
+    外部 branch や Draft PR が作成・更新された可能性がある試行の後は --confirm-side-effects が必要。
+
+  araya task continue <taskId> [--note <text> | --note-file <path|->] [--confirm-side-effects]
+    failed と blocked の Task を前回の worktree と branch で続ける。前回の検証は引き継がず、今回の変更を再検証する。
     外部 branch や Draft PR が作成・更新された可能性がある試行の後は --confirm-side-effects が必要。
 
   araya task cancel <taskId>
@@ -73,7 +77,7 @@ function printHelp() {
   araya discord init
     <ARAYA_DATA_DIR>/.env（既定: ~/.araya/.env）を mode 0600 で作る。既存 file は上書きしない。
   araya discord register
-    slash command（/araya task list・show・submit・cancel・retry）を Discord の guild に登録する。.env または環境変数の設定が必要。
+    slash command（/araya task list・show・submit・cancel・retry・continue）を Discord の guild に登録する。.env または環境変数の設定が必要。
     1Password の op:// 参照を使う場合は、op run で解決してから実行する（README参照）。
   araya discord install [--auth-mode env-file|1password]
     Discord bot を常駐の process（araya-discord-<hash>.service）として入れる。unit file を書き、有効にして起動し直す。
@@ -95,8 +99,9 @@ function printHelp() {
 
   /araya task list: Task 一覧と runner の状態。/araya task show <task>: Task の詳細（SHIKI の要約と途中経過）。
   /araya task submit <title> <goal> [targets] [constraints] [permissions]: Task を登録する（targets・constraints・permissions はカンマ区切り）。
-  /araya task cancel <task>: 中止を求める。/araya task retry <task> [note] [confirm_side_effects]: 終わった Task の再実行を求める。
-  外部 branch・Draft PR が作成された可能性がある Task の retry は、confirm_side_effects を認めてから実行する。
+  /araya task cancel <task>: 中止を求める。/araya task retry <task> [note] [confirm_side_effects]: 新しい作業場所でやり直す。
+  /araya task continue <task> [note] [confirm_side_effects]: 前回の worktree と branch を引き継いで続ける。
+  外部 branch・Draft PR が作成された可能性がある Task の retry/continue は、confirm_side_effects を認めてから実行する。
   通知は Task 登録・再実行・中止・実行の開始・再開・終了と、SHIKI tool の開始・完了だけ ARAYA_DISCORD_CHANNEL_ID の既定送信先に出す。tool 通知に command や出力は含めない。
   slash command の受付 channel は絞らない。設定した Guild 内で、Discord 側が許可する channel から実行できる。
 

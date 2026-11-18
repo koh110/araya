@@ -53,12 +53,18 @@ export type DraftPrWorktreeInput = {
   snapshotDiffSha256: string
   snapshotChangedFiles: string[]
   readSnapshot: () => Promise<{ snapshotSha256: string; diffTruncated: boolean }>
+  validateWorkspace?: () => Promise<void>
 }
 
-export type DraftPrSnapshotGuard = Pick<DraftPrWorktreeInput, 'record' | 'snapshotSha256' | 'readSnapshot'>
+export type DraftPrSnapshotGuard = Pick<
+  DraftPrWorktreeInput,
+  'record' | 'snapshotSha256' | 'readSnapshot' | 'validateWorkspace'
+>
 
 export type DraftPrDeliveryInput = {
   taskKey: string
+  // continue attempt では元の worktree/branch identity を使う。省略時は taskKey と同じ
+  workspaceTaskKey?: string
   title: string
   worktrees: DraftPrWorktreeInput[]
   preflightSnapshotGuards: DraftPrSnapshotGuard[]
@@ -113,6 +119,37 @@ function isDeliveryFailure(error: unknown): error is DeliveryFailure {
     'status' in error && (error.status === 'blocked' || error.status === 'failed') &&
     'failureReason' in error && typeof error.failureReason === 'string' &&
     'stage' in error && typeof error.stage === 'string'
+}
+
+async function validateContinuationWorkspace(
+  input: Pick<DraftPrDeliveryInput, 'taskKey' | 'workspaceTaskKey'>,
+  worktree: Pick<DraftPrWorktreeInput, 'validateWorkspace'>,
+) {
+  const continuingWorkspace = (input.workspaceTaskKey ?? input.taskKey) !== input.taskKey
+
+  if (worktree.validateWorkspace === undefined) {
+    if (continuingWorkspace) {
+      throw createFailure(
+        'failed',
+        'continuation_workspace_invalid',
+        'workspace_validation',
+        'the authoritative continuation workspace validator is missing',
+      )
+    }
+
+    return
+  }
+
+  try {
+    await worktree.validateWorkspace()
+  } catch {
+    throw createFailure(
+      'failed',
+      'continuation_workspace_invalid',
+      'workspace_validation',
+      'the continued worktree identity could not be revalidated',
+    )
+  }
 }
 
 function safeEnvironment(env: Readonly<Record<string, string | undefined>>) {
@@ -492,12 +529,62 @@ async function verifyCommitSnapshot(
   }
 }
 
+async function verifyArayaCommitHistory(
+  input: DraftPrDeliveryInput,
+  dependencies: DraftPrDeliveryDependencies,
+  worktreePath: string,
+  baseSha: string,
+  headSha: string,
+  workspaceTaskKey: string
+) {
+  const failure = {
+    status: 'failed' as const,
+    failureReason: 'draft_pr_failed',
+    stage: 'commit_verify',
+    message: 'the existing branch history is not an Araya-managed linear history for this workspace'
+  }
+  const history = await requireGitOutput(input, dependencies, worktreePath, [
+    'rev-list', '--reverse', '--parents', `${baseSha}..${headSha}`
+  ], failure)
+  let expectedParent = baseSha
+  let count = 0
+
+  for (const line of history.split('\n')) {
+    if (line === '') {
+      continue
+    }
+
+    const [commitSha, ...parents] = line.trim().split(/\s+/u)
+
+    if (commitSha === undefined || parents.length !== 1 || parents[0] !== expectedParent) {
+      throw createFailure(failure.status, failure.failureReason, failure.stage, failure.message)
+    }
+
+    if (!(await requireGitOutput(input, dependencies, worktreePath, [
+      'log', '-1', '--format=%B', commitSha
+    ], failure)).split('\n').some((part) => {
+      return part.trim() === `Araya-Task: ${workspaceTaskKey}`
+    })) {
+      throw createFailure(failure.status, failure.failureReason, failure.stage, failure.message)
+    }
+
+    expectedParent = commitSha
+    count += 1
+  }
+
+  if (count === 0 || expectedParent !== headSha) {
+    throw createFailure(failure.status, failure.failureReason, failure.stage, failure.message)
+  }
+}
+
 async function commitWorktree(
   input: DraftPrDeliveryInput,
   dependencies: DraftPrDeliveryDependencies,
   worktree: PreparedWorktree
 ) {
   const record = worktree.input.record
+  const workspaceTaskKey = input.workspaceTaskKey ?? input.taskKey
+  await validateContinuationWorkspace(input, worktree.input)
   const currentBranch = await requireGitOutput(input, dependencies, record.worktreePath, ['rev-parse', '--abbrev-ref', 'HEAD'], {
     status: 'failed', failureReason: 'draft_pr_failed', stage: 'branch', message: 'the worktree branch changed after verification'
   })
@@ -512,6 +599,7 @@ async function commitWorktree(
   const status = await requireGitOutput(input, dependencies, record.worktreePath, ['status', '--porcelain=v1', '--untracked-files=all'], {
     status: 'failed', failureReason: 'draft_pr_failed', stage: 'status', message: 'the worktree status could not be checked'
   })
+  await validateContinuationWorkspace(input, worktree.input)
   const currentSnapshot = await worktree.input.readSnapshot()
 
   if (currentSnapshot.diffTruncated || currentSnapshot.snapshotSha256 !== worktree.input.snapshotSha256) {
@@ -519,29 +607,19 @@ async function commitWorktree(
   }
 
   if (currentHead !== record.baseSha) {
-    const parentSha = await requireGitOutput(input, dependencies, record.worktreePath, ['rev-parse', '--verify', 'HEAD^'], {
-      status: 'failed', failureReason: 'draft_pr_failed', stage: 'commit_verify', message: 'the existing commit parent could not be verified'
-    })
-    const commitMessage = await requireGitOutput(input, dependencies, record.worktreePath, ['log', '-1', '--format=%B'], {
-      status: 'failed', failureReason: 'draft_pr_failed', stage: 'commit_verify', message: 'the existing commit message could not be verified'
-    })
-    const arayaCommit = parentSha === record.baseSha && commitMessage.split('\n').some((line) => {
-      return line.trim() === `Araya-Task: ${input.taskKey}`
-    })
+    await verifyArayaCommitHistory(input, dependencies, record.worktreePath, record.baseSha, currentHead, workspaceTaskKey)
 
-    if (!arayaCommit || status !== '') {
-      throw createFailure('failed', 'draft_pr_failed', 'commit_verify', 'the worktree contains a commit not created by Araya for this Task')
+    if (status === '') {
+      await verifyCommitSnapshot(input, dependencies, worktree, currentHead)
+      return currentHead
     }
-
-    await verifyCommitSnapshot(input, dependencies, worktree, currentHead)
-
-    return currentHead
   }
 
   if (status === '') {
     throw createFailure('failed', 'draft_pr_failed', 'stage', 'the verified diff is no longer present in the worktree')
   }
 
+  await validateContinuationWorkspace(input, worktree.input)
   const added = await runGit(input, dependencies, record.worktreePath, ['add', '--all'])
 
   if (added.exitCode !== 0) {
@@ -566,12 +644,13 @@ async function commitWorktree(
     throw createFailure('failed', 'draft_pr_failed', 'stage', 'the staged tree does not match the verified snapshot')
   }
 
+  await validateContinuationWorkspace(input, worktree.input)
   const commit = await runGit(input, dependencies, record.worktreePath, [
     '-c', `user.name=${worktree.userName}`,
     '-c', `user.email=${worktree.userEmail}`,
     'commit',
     '-m', `Araya: ${input.taskKey}`,
-    '-m', `Araya-Task: ${input.taskKey}`
+    '-m', `Araya-Task: ${workspaceTaskKey}`
   ])
 
   if (commit.exitCode !== 0) {
@@ -588,10 +667,10 @@ async function commitWorktree(
     status: 'failed', failureReason: 'draft_pr_failed', stage: 'commit_verify', message: 'the commit message could not be verified'
   })
 
-  if (parentSha !== record.baseSha || !commitMessage.split('\n').some((line) => {
-    return line.trim() === `Araya-Task: ${input.taskKey}`
+  if (parentSha !== currentHead || !commitMessage.split('\n').some((line) => {
+    return line.trim() === `Araya-Task: ${workspaceTaskKey}`
   })) {
-    throw createFailure('failed', 'draft_pr_failed', 'commit_verify', 'the commit does not match the expected Task and base revision')
+    throw createFailure('failed', 'draft_pr_failed', 'commit_verify', 'the commit does not match the expected Task workspace and base revision')
   }
 
   await verifyCommitSnapshot(input, dependencies, worktree, commitSha)
@@ -615,6 +694,18 @@ export async function deliverDraftPullRequests(
 
   if (input.worktrees.length === 0) {
     return makeResult('completed', null, null, null, evidence)
+  }
+
+  try {
+    for (const worktree of input.worktrees) {
+      await validateContinuationWorkspace(input, worktree)
+    }
+  } catch (error) {
+    const failure = isDeliveryFailure(error)
+      ? error
+      : createFailure('failed', 'continuation_workspace_invalid', 'workspace_validation', 'the continued worktree identity could not be revalidated')
+
+    return makeResult('failed', failure.failureReason, `${failure.stage}: ${failure.message}`, null, evidence)
   }
 
   const env = safeEnvironment(input.env)
@@ -642,7 +733,7 @@ export async function deliverDraftPullRequests(
     for (const worktree of input.worktrees) {
       const { record } = worktree
 
-      if (record.branch !== `araya/${input.taskKey}` || !validBranchName(record.branch)) {
+      if (record.branch !== `araya/${input.workspaceTaskKey ?? input.taskKey}` || !validBranchName(record.branch)) {
         throw createFailure('blocked', 'github_remote_unsupported', 'branch', 'the worktree branch does not match this Task attempt')
       }
 
@@ -758,14 +849,19 @@ export async function deliverDraftPullRequests(
 
   try {
     for (const guard of input.preflightSnapshotGuards) {
+      await validateContinuationWorkspace(input, guard)
       const current = await guard.readSnapshot()
 
       if (current.diffTruncated || current.snapshotSha256 !== guard.snapshotSha256) {
         return makeResult('failed', 'draft_pr_failed', 'verification_snapshot: a worktree changed after GitHub preflight; delivery was skipped', null, evidence)
       }
     }
-  } catch {
-    return makeResult('failed', 'draft_pr_failed', 'verification_snapshot: a worktree could not be revalidated after GitHub preflight; delivery was skipped', null, evidence)
+  } catch (error) {
+    const failure = isDeliveryFailure(error)
+      ? error
+      : createFailure('failed', 'draft_pr_failed', 'verification_snapshot', 'a worktree could not be revalidated after GitHub preflight')
+
+    return makeResult('failed', failure.failureReason, `${failure.stage}: ${failure.message}; delivery was skipped`, null, evidence)
   }
 
   for (const worktree of prepared) {
@@ -777,6 +873,7 @@ export async function deliverDraftPullRequests(
     }
 
     try {
+      await validateContinuationWorkspace(input, worktree.input)
       const commitSha = await commitWorktree(input, dependencies, worktree)
       targetEvidence.commitSha = commitSha
       targetEvidence.baseBranch = worktree.baseBranch
@@ -787,12 +884,13 @@ export async function deliverDraftPullRequests(
         : createFailure('failed', 'draft_pr_failed', 'commit', 'commit preparation failed')
 
       targetEvidence.draftPrStatus = 'failed'
-      return makeResult('failed', 'draft_pr_failed', `${failure.stage}: ${failure.message}`, null, evidence)
+      return makeResult('failed', failure.failureReason, `${failure.stage}: ${failure.message}`, null, evidence)
     }
   }
 
   try {
     for (const guard of input.preflightSnapshotGuards) {
+      await validateContinuationWorkspace(input, guard)
       const record = guard.record
       const committedEvidence = evidence.find((entry) => entry.worktreePath === record.worktreePath)
 
@@ -828,8 +926,12 @@ export async function deliverDraftPullRequests(
 
       await verifyCommitSnapshot(input, dependencies, committedWorktree, committedEvidence.commitSha)
     }
-  } catch {
-    return makeResult('failed', 'draft_pr_failed', 'verification_snapshot: a worktree could not be revalidated before remote delivery; remote delivery was skipped', null, evidence)
+  } catch (error) {
+    const failure = isDeliveryFailure(error)
+      ? error
+      : createFailure('failed', 'draft_pr_failed', 'verification_snapshot', 'a worktree could not be revalidated before remote delivery')
+
+    return makeResult('failed', failure.failureReason, `${failure.stage}: ${failure.message}; remote delivery was skipped`, null, evidence)
   }
 
   for (const worktree of prepared) {
@@ -841,6 +943,7 @@ export async function deliverDraftPullRequests(
     }
 
     try {
+      await validateContinuationWorkspace(input, worktree.input)
       targetEvidence.remoteSideEffectsUnconfirmed = true
       const pushed = await dependencies.runGit(dependencies.gitExecutable ?? '/usr/bin/git', [
         '-C', record.worktreePath,
@@ -855,6 +958,7 @@ export async function deliverDraftPullRequests(
 
       targetEvidence.remoteSideEffectsUnconfirmed = false
       targetEvidence.draftPrStatus = 'pushed'
+      await validateContinuationWorkspace(input, worktree.input)
       const afterPush = await listPullRequests(input, dependencies, ghExecutable, worktree, {
         status: 'failed',
         failureReason: 'draft_pr_failed',
@@ -878,6 +982,7 @@ export async function deliverDraftPullRequests(
         `Task: \`${input.taskKey}\``,
         `Registered verifications passed: ${worktree.input.verificationCount}.`
       ].join('\n')
+      await validateContinuationWorkspace(input, worktree.input)
       const created = await runGh(input, dependencies, ghExecutable, record.worktreePath, [
         'pr', 'create',
         '--repo', worktree.repositoryArgument,
@@ -912,7 +1017,7 @@ export async function deliverDraftPullRequests(
         targetEvidence.draftPrStatus = 'failed'
       }
 
-      return makeResult('failed', 'draft_pr_failed', `${failure.stage}: ${failure.message}`, null, evidence)
+      return makeResult('failed', failure.failureReason, `${failure.stage}: ${failure.message}`, null, evidence)
     }
   }
 

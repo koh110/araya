@@ -48,7 +48,7 @@ test('discord command definition: Task operations are nested under /araya task',
     taskGroup.options.map((option) => {
       return option.name
     }),
-    ['list', 'show', 'submit', 'cancel', 'retry'],
+    ['list', 'show', 'submit', 'cancel', 'retry', 'continue'],
   )
 })
 
@@ -131,7 +131,7 @@ test('discord-interactions: 設定した guild・user の外は reply しない'
     assert.deepEqual(replies('list', {}, { guildId: '99999999999999999' }), [boundary])
     assert.deepEqual(replies('list', {}, { userId: '99999999999999999' }), [boundary])
     assert.deepEqual(replies('unknown'), [
-      '知らない command です（/araya task list・show・submit・cancel・retry）',
+      '知らない command です（/araya task list・show・submit・cancel・retry・continue）',
     ])
   })
 })
@@ -139,7 +139,7 @@ test('discord-interactions: 設定した guild・user の外は reply しない'
 test('discord-interactions: Task commands require the task slash-command group', async () => {
   await withEnv(({ replies }) => {
     assert.deepEqual(replies('list', {}, { subcommandGroup: null }), [
-      '知らない command です（/araya task list・show・submit・cancel・retry）',
+      '知らない command です（/araya task list・show・submit・cancel・retry・continue）',
     ])
     assert.match(replyAt(replies('list'), 0), /^runner:/u)
   })
@@ -399,17 +399,20 @@ test('discord-interactions: cancel と retry。実行前の Task は取り消し
   })
 })
 
-test('discord-interactions: retry は開始後に中断した試行の side effects 確認を求める', async () => {
+test('discord-interactions: retry と continue は開始後に中断した試行の side effects 確認を求める', async () => {
   const dataDir = await fs.realpath(
     await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-interactions-side-effects-')),
   )
   let ledger = openTaskLedger(dataDir)
+  let callSequence = 0
 
   try {
     function call(subcommand: string, options: DiscordCommandRequest['options']) {
+      callSequence += 1
+
       return handleDiscordCommand(
         {
-          interactionId: `side-effects-${subcommand}-${Object.keys(options).length}`,
+          interactionId: `side-effects-${callSequence}-${subcommand}-${Object.keys(options).length}`,
           userId: USER_ID,
           guildId: GUILD_ID,
           channelId: CHANNEL_ID,
@@ -469,6 +472,77 @@ test('discord-interactions: retry は開始後に中断した試行の side effe
     assert.deepEqual(call('retry', { task: 1, confirm_side_effects: true }), [
       `Task #1 の再実行を受け付けました（試行 2）。次は ${UNIT} の unit で実行します`,
     ])
+
+    call('submit', { title: '引き継ぐ', goal: 'goal' })
+    const settings = {
+      devRoot: '/tmp/araya-dev-root',
+      agentDir: '/tmp/araya-agent-dir',
+      model: { provider: 'faux', id: 'faux-1', thinkingLevel: null },
+      timeoutMs: 1_200_000,
+      verificationTimeoutMs: 300_000,
+    }
+    const retryClaimed = ledger.claimNextAttempt(1, settings)
+    assert.ok(retryClaimed)
+    ledger.recordResult(
+      retryClaimed.taskKey,
+      {
+        status: 'completed',
+        failureReason: null,
+        failureDetail: null,
+        summary: '報告',
+        decisionQuestion: null,
+        model: { provider: 'faux', id: 'faux-1', thinkingLevel: 'medium', source: 'araya-config' },
+        evidence: { taskKey: retryClaimed.taskKey, outcome: 'completed', worktrees: [] },
+      },
+      { taskKey: retryClaimed.taskKey, addMs: 0 },
+    )
+    const continueClaimed = ledger.claimNextAttempt(1, settings)
+    assert.ok(continueClaimed)
+    assert.equal(continueClaimed.taskId, 2)
+    const continueWorktree = {
+      repository: 'repo',
+      worktreePath: '/tmp/araya/.worktree/continued',
+      branch: 'araya/task-2-1-bbbbbb',
+      base: 'main',
+      baseSha: 'a'.repeat(40),
+      excludeAdded: false,
+      worktreeIdentity: '00000000-0000-4000-8000-000000000001',
+    }
+    ledger.recordStateDir(continueClaimed.taskKey, '/tmp/araya/state/continued')
+    ledger.recordWorkspaceWorktrees(continueClaimed.taskKey, [continueWorktree])
+    ledger.recordResult(
+      continueClaimed.taskKey,
+      {
+        status: 'failed',
+        failureReason: 'agent_timeout',
+        failureDetail: null,
+        summary: '報告',
+        decisionQuestion: null,
+        model: { provider: 'faux', id: 'faux-1', thinkingLevel: 'medium', source: 'araya-config' },
+        evidence: {
+          taskKey: continueClaimed.taskKey,
+          outcome: 'failed',
+          worktrees: [continueWorktree],
+        },
+      },
+      { taskKey: continueClaimed.taskKey, addMs: 0 },
+    )
+
+    const recordedContinueTask = ledger.showTask(2, { events: 20 })
+    assert.equal(recordedContinueTask.task.status, 'failed')
+    assert.deepEqual(recordedContinueTask.attempts[0]?.evidence?.worktrees, [continueWorktree])
+    assert.equal(ledger.verifyWorkspaceWorktrees(continueClaimed.taskKey, [continueWorktree]), true)
+    const continueWithoutConfirm = call('continue', { task: 2 })[0] ?? ''
+
+    assert.match(continueWithoutConfirm, /Task #2/u, continueWithoutConfirm)
+    assert.match(continueWithoutConfirm, /\/araya task continue/u, continueWithoutConfirm)
+    assert.match(continueWithoutConfirm, /confirm_side_effects=true/u, continueWithoutConfirm)
+    assert.equal(ledger.showTask(2, { events: 0 }).attempts.length, 1)
+
+    assert.deepEqual(call('continue', { task: 2, confirm_side_effects: true }), [
+      `Task #2 の続行を受け付けました（試行 2、前回の作業場所を引き継ぎます）。次は ${UNIT} の unit で実行します`,
+    ])
+    assert.equal(ledger.getTask(2).attempt, 2)
   } finally {
     ledger.close()
     await fs.rm(dataDir, { recursive: true, force: true })

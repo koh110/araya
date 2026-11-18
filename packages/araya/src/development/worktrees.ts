@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
@@ -29,8 +30,11 @@ const GIT_REPOSITORY_ENV_KEYS = [
 const WORKTREE_DIRECTORY = '.worktree'
 const EXCLUDE_LINE = '/.worktree/'
 const TASK_KEY_PATTERN = /^task-[1-9][0-9]{0,15}-[1-9][0-9]{0,15}-[a-z2-7]{6}$/u
+const TASK_KEY_IDENTITY_PATTERN = /^task-([1-9][0-9]{0,15})-([1-9][0-9]{0,15})-[a-z2-7]{6}$/u
 const SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u
-const WORKTREE_RECORD_KEYS = [
+const WORKTREE_IDENTITY_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
+const WORKTREE_IDENTITY_FILE = 'araya-worktree-identity'
+const LEGACY_WORKTREE_RECORD_KEYS = [
   'base',
   'baseSha',
   'branch',
@@ -38,13 +42,24 @@ const WORKTREE_RECORD_KEYS = [
   'excludeAdded',
   'repository',
   'repositoryRoot',
-  'worktreePath'
+  'worktreePath',
 ] as const
+const WORKTREE_RECORD_KEYS = [...LEGACY_WORKTREE_RECORD_KEYS, 'worktreeIdentity'] as const
 const VERIFICATION_RECORD_KEYS = ['command', 'cwd', 'registeredAt', 'repository'] as const
 const DECISION_FILE = 'decision.json'
 const DECISION_RECORD_KEYS = ['question', 'requestedAt'] as const
 const MAX_DECISION_QUESTION_LENGTH = 2000
 const MAX_DECISION_FILE_BYTES = 64 * 1024
+
+export type WorktreeIdentityEvidence = {
+  worktreePath: string
+  branch: string
+  repository?: string
+  base?: string
+  baseSha?: string
+  excludeAdded?: boolean
+  worktreeIdentity?: string
+}
 
 export type WorktreeRecord = {
   repository: string
@@ -54,6 +69,7 @@ export type WorktreeRecord = {
   base: string
   baseSha: string
   excludeAdded: boolean
+  worktreeIdentity?: string
   createdAt: string
 }
 
@@ -512,11 +528,15 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]) {
 function parseWorktreeRecord(value: unknown, devRootReal: string, taskKey: string, line: number) {
   const where = `worktrees.jsonl line ${line}`
 
-  if (!isRecord(value) || !hasExactKeys(value, WORKTREE_RECORD_KEYS)) {
+  if (
+    !isRecord(value) ||
+    (!hasExactKeys(value, WORKTREE_RECORD_KEYS) && !hasExactKeys(value, LEGACY_WORKTREE_RECORD_KEYS))
+  ) {
     throw createError('task_state_invalid', `${where} does not have the worktree record keys`)
   }
 
   const { repository, repositoryRoot, worktreePath, branch, base, baseSha, excludeAdded, createdAt } = value
+  const worktreeIdentity = value.worktreeIdentity
 
   if (
     typeof repository !== 'string' ||
@@ -526,6 +546,7 @@ function parseWorktreeRecord(value: unknown, devRootReal: string, taskKey: strin
     typeof base !== 'string' ||
     typeof baseSha !== 'string' ||
     typeof excludeAdded !== 'boolean' ||
+    (worktreeIdentity !== undefined && typeof worktreeIdentity !== 'string') ||
     typeof createdAt !== 'string'
   ) {
     throw createError('task_state_invalid', `${where} has a value of the wrong type`)
@@ -555,6 +576,13 @@ function parseWorktreeRecord(value: unknown, devRootReal: string, taskKey: strin
     throw createError('task_state_invalid', `${where} baseSha is not a commit SHA`)
   }
 
+  if (
+    worktreeIdentity !== undefined &&
+    !WORKTREE_IDENTITY_PATTERN.test(worktreeIdentity)
+  ) {
+    throw createError('task_state_invalid', `${where} worktreeIdentity is invalid`)
+  }
+
   const record: WorktreeRecord = {
     repository,
     repositoryRoot,
@@ -563,6 +591,7 @@ function parseWorktreeRecord(value: unknown, devRootReal: string, taskKey: strin
     base,
     baseSha,
     excludeAdded,
+    ...(worktreeIdentity === undefined ? {} : { worktreeIdentity }),
     createdAt
   }
 
@@ -691,10 +720,466 @@ async function readValidatedState(devRootReal: string, stateDir: string, taskKey
   return { worktrees, verifications }
 }
 
-export async function readTaskState(options: { devRoot: string; stateDir: string; taskKey: string }) {
-  validateTaskKey(options.taskKey)
+function taskKeyParts(taskKey: string) {
+  const match = TASK_KEY_IDENTITY_PATTERN.exec(taskKey)
 
-  return readValidatedState(await resolveDevRoot(options.devRoot), options.stateDir, options.taskKey)
+  if (match === null) {
+    throw createError('task_key_invalid', 'taskKey has an invalid format')
+  }
+
+  return { taskId: Number(match[1]), attempt: Number(match[2]) }
+}
+
+async function requireRealStateDirectory(target: string, where: string) {
+  let stat
+
+  try {
+    stat = await fs.lstat(target)
+  } catch (error) {
+    throw createError('continuation_state_invalid', `${where} ${target} cannot be inspected (${error instanceof Error ? error.message : String(error)})`)
+  }
+
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw createError('continuation_state_invalid', `${where} ${target} is not a regular directory`)
+  }
+
+  if ((stat.mode & 0o077) !== 0) {
+    throw createError('continuation_state_invalid', `${where} ${target} is accessible by group or other users`)
+  }
+
+  const real = await fs.realpath(target)
+
+  if (real !== target) {
+    throw createError('continuation_state_invalid', `${where} ${target} resolves to ${real}`)
+  }
+}
+
+async function readContinuationWorktrees(
+  devRootReal: string,
+  stateDir: string,
+  workspaceTaskKey: string,
+) {
+  await requireRealStateDirectory(stateDir, 'attempt state directory')
+  const filePath = path.join(stateDir, 'worktrees.jsonl')
+  let stat
+
+  try {
+    stat = await fs.lstat(filePath)
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) {
+      return []
+    }
+
+    throw error
+  }
+
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw createError('continuation_state_invalid', `${filePath} is not a regular file`)
+  }
+
+  const records: WorktreeRecord[] = []
+  const repositoryRoots = new Set<string>()
+
+  for (const [index, value] of (await readJsonLines(filePath)).entries()) {
+    const record = parseWorktreeRecord(value, devRootReal, workspaceTaskKey, index + 1)
+
+    if (repositoryRoots.has(record.repositoryRoot)) {
+      throw createError('continuation_state_invalid', `worktrees.jsonl line ${index + 1} duplicates repositoryRoot`)
+    }
+
+    await verifyRecordedPath(record.repositoryRoot, `worktrees.jsonl line ${index + 1} repositoryRoot`)
+    await verifyRecordedPath(record.worktreePath, `worktrees.jsonl line ${index + 1} worktreePath`)
+    repositoryRoots.add(record.repositoryRoot)
+    records.push(record)
+  }
+
+  if (records.length > MAX_WORKTREES_PER_TASK) {
+    throw createError('continuation_state_invalid', `worktrees.jsonl has more than ${MAX_WORKTREES_PER_TASK} records`)
+  }
+
+  return records
+}
+
+function parseRegisteredWorktrees(output: string) {
+  const entries: { path: string; branch: string | null; prunable: boolean }[] = []
+  let current: { path: string; branch: string | null; prunable: boolean } | null = null
+
+  for (const field of output.split('\0')) {
+    if (field === '') {
+      if (current !== null) {
+        entries.push(current)
+        current = null
+      }
+      continue
+    }
+
+    if (field.startsWith('worktree ')) {
+      if (current !== null) {
+        entries.push(current)
+      }
+      current = { path: field.slice('worktree '.length), branch: null, prunable: false }
+    } else if (field.startsWith('branch ') && current !== null) {
+      current.branch = field.slice('branch '.length)
+    } else if (field === 'prunable' || field.startsWith('prunable ') || field.startsWith('prunable:')) {
+      if (current !== null) {
+        current.prunable = true
+      }
+    }
+  }
+
+  if (current !== null) {
+    entries.push(current)
+  }
+
+  return entries
+}
+
+async function verifyContinuationWorktree(git: GitContext, record: WorktreeRecord) {
+  if (typeof record.worktreeIdentity !== 'string') {
+    throw createError('continuation_worktree_invalid', `${record.worktreePath} has no recorded worktree identity`)
+  }
+
+  const stat = await fs.lstat(record.worktreePath)
+
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw createError('continuation_worktree_invalid', `${record.worktreePath} is not a regular directory`)
+  }
+
+  const worktreeReal = await fs.realpath(record.worktreePath)
+
+  if (worktreeReal !== record.worktreePath) {
+    throw createError('continuation_worktree_invalid', `${record.worktreePath} resolves to ${worktreeReal}`)
+  }
+
+  await verifyMainWorkingTree(git, record.repository, record.repositoryRoot)
+  const expectedBranch = `refs/heads/${record.branch}`
+  if (!parseRegisteredWorktrees((await runGit(git, record.repositoryRoot, ['worktree', 'list', '--porcelain', '-z'])).stdout).some((entry) => {
+    return entry.path === record.worktreePath && entry.branch === expectedBranch && !entry.prunable
+  })) {
+    throw createError('continuation_worktree_invalid', `${record.worktreePath} and ${record.branch} are not the registered worktree`)
+  }
+
+  const repositoryCommonDir = await fs.realpath(path.resolve(record.repositoryRoot, (await runGit(git, record.repositoryRoot, ['rev-parse', '--git-common-dir'])).stdout.trim()))
+  if (await fs.realpath(path.resolve(record.worktreePath, (await runGit(git, record.worktreePath, ['rev-parse', '--git-common-dir'])).stdout.trim())) !== repositoryCommonDir) {
+    throw createError('continuation_worktree_invalid', `${record.worktreePath} is not attached to the recorded repository`)
+  }
+
+  const worktreeGitFile = path.join(record.worktreePath, '.git')
+  const worktreeGitFileStat = await fs.lstat(worktreeGitFile)
+
+  if (!worktreeGitFileStat.isFile() || worktreeGitFileStat.isSymbolicLink()) {
+    throw createError('continuation_worktree_invalid', `${worktreeGitFile} is not a regular Git worktree link`)
+  }
+
+  const worktreeGitDir = await fs.realpath(path.resolve(record.worktreePath, (await runGit(git, record.worktreePath, ['rev-parse', '--git-dir'])).stdout.trim()))
+  const dotGitMatch = /^gitdir:\s*(.+?)\s*$/u.exec(await fs.readFile(worktreeGitFile, 'utf8'))
+
+  if (dotGitMatch === null) {
+    throw createError('continuation_worktree_invalid', `${worktreeGitFile} does not identify its Git administration directory`)
+  }
+
+  if (
+    await fs.realpath(path.dirname(worktreeGitDir)) !== path.join(repositoryCommonDir, 'worktrees') ||
+    await fs.realpath(path.resolve(record.worktreePath, dotGitMatch[1] ?? '')) !== worktreeGitDir ||
+    await fs.realpath(path.resolve(worktreeGitDir, (await fs.readFile(path.join(worktreeGitDir, 'gitdir'), 'utf8')).trim())) !== worktreeGitFile
+  ) {
+    throw createError('continuation_worktree_invalid', `${record.worktreePath} is not attached to its recorded Git worktree registration`)
+  }
+
+  const identityPath = path.join(worktreeGitDir, WORKTREE_IDENTITY_FILE)
+  let identityStat
+
+  try {
+    identityStat = await fs.lstat(identityPath)
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) {
+      throw createError('continuation_worktree_invalid', `${record.worktreePath} is missing its recorded worktree identity`)
+    }
+
+    throw error
+  }
+
+  if (!identityStat.isFile() || identityStat.isSymbolicLink() || identityStat.size > 128) {
+    throw createError('continuation_worktree_invalid', `${identityPath} is not a regular identity marker`)
+  }
+
+  if ((await fs.readFile(identityPath, 'utf8')) !== `${record.worktreeIdentity}\n`) {
+    throw createError('continuation_worktree_invalid', `${record.worktreePath} does not match its recorded worktree identity`)
+  }
+
+  if (await fs.realpath((await runGit(git, record.worktreePath, ['rev-parse', '--show-toplevel'])).stdout.trim()) !== record.worktreePath) {
+    throw createError('continuation_worktree_invalid', `${record.worktreePath} is not its own Git worktree root`)
+  }
+
+  if ((await runGit(git, record.worktreePath, ['symbolic-ref', '--quiet', '--short', 'HEAD'])).stdout.trim() !== record.branch) {
+    throw createError('continuation_worktree_invalid', `${record.worktreePath} is checked out on a different branch`)
+  }
+}
+
+function sameWorktreeRecords(left: readonly WorktreeRecord[], right: readonly WorktreeRecord[]) {
+  return left.length === right.length && left.every((record, index) => {
+    return JSON.stringify(record) === JSON.stringify(right[index])
+  })
+}
+
+function matchesWorktreeIdentity(record: WorktreeRecord, evidence: WorktreeIdentityEvidence) {
+  return record.repository === evidence.repository &&
+    record.worktreePath === evidence.worktreePath &&
+    record.branch === evidence.branch &&
+    record.base === evidence.base &&
+    record.baseSha === evidence.baseSha &&
+    record.excludeAdded === evidence.excludeAdded &&
+    record.worktreeIdentity === evidence.worktreeIdentity
+}
+
+async function createWorktreeIdentity(git: GitContext, repositoryRoot: string, worktreePath: string) {
+  const repositoryCommonDir = await fs.realpath(path.resolve(
+    repositoryRoot,
+    (await runGit(git, repositoryRoot, ['rev-parse', '--git-common-dir'])).stdout.trim(),
+  ))
+  const worktreeGitDir = await fs.realpath(path.resolve(
+    worktreePath,
+    (await runGit(git, worktreePath, ['rev-parse', '--git-dir'])).stdout.trim(),
+  ))
+
+  if (await fs.realpath(path.dirname(worktreeGitDir)) !== path.join(repositoryCommonDir, 'worktrees')) {
+    throw createError('worktree_registration_invalid', `${worktreePath} is not attached to the expected Git worktree administration directory`)
+  }
+
+  const identity = randomUUID()
+  await fs.writeFile(path.join(worktreeGitDir, WORKTREE_IDENTITY_FILE), `${identity}\n`, {
+    encoding: 'utf8',
+    mode: 0o600,
+    flag: 'wx',
+  })
+
+  return identity
+}
+
+async function writeContinuedWorktrees(
+  devRootReal: string,
+  stateDir: string,
+  workspaceTaskKey: string,
+  records: readonly WorktreeRecord[],
+) {
+  const target = path.join(stateDir, 'worktrees.jsonl')
+  const existing = await readContinuationWorktreesForCurrent(
+    target,
+    devRootReal,
+    stateDir,
+    workspaceTaskKey,
+  )
+
+  if (existing !== null) {
+    if (!sameWorktreeRecords(existing, records)) {
+      throw createError('continuation_state_invalid', 'the current attempt already has a different worktree list')
+    }
+    return
+  }
+
+  const temporary = path.join(stateDir, `.worktrees.${randomUUID()}.tmp`)
+  await fs.writeFile(temporary, `${records.map((record) => {
+    return JSON.stringify(record)
+  }).join('\n')}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+
+  try {
+    await fs.link(temporary, target)
+  } catch (error) {
+    if (!isErrno(error, 'EEXIST')) {
+      throw error
+    }
+
+    const raced = await readContinuationWorktreesForCurrent(
+      target,
+      devRootReal,
+      stateDir,
+      workspaceTaskKey,
+    )
+
+    if (raced === null || !sameWorktreeRecords(raced, records)) {
+      throw createError('continuation_state_invalid', 'the current attempt worktree list changed while it was being initialized')
+    }
+  } finally {
+    await fs.rm(temporary, { force: true })
+  }
+}
+
+async function readContinuationWorktreesForCurrent(
+  target: string,
+  devRootReal: string,
+  stateDir: string,
+  workspaceTaskKey: string,
+) {
+  let stat
+
+  try {
+    stat = await fs.lstat(target)
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) {
+      return null
+    }
+    throw error
+  }
+
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw createError('continuation_state_invalid', `${target} is not a regular file`)
+  }
+
+  return readContinuationWorktrees(devRootReal, stateDir, workspaceTaskKey)
+}
+
+export async function prepareContinuedWorktrees(options: {
+  dataDir: string
+  devRoot: string
+  taskKey: string
+  previousTaskKey: string
+  sourceTaskKey: string
+  workspaceTaskKey: string
+  expectedWorktrees: readonly WorktreeIdentityEvidence[]
+  env: Readonly<Record<string, string | undefined>>
+  runGit: GitCommandRunner
+}) {
+  validateTaskKey(options.taskKey)
+  validateTaskKey(options.previousTaskKey)
+  validateTaskKey(options.sourceTaskKey)
+  validateTaskKey(options.workspaceTaskKey)
+
+  const currentParts = taskKeyParts(options.taskKey)
+  const previousParts = taskKeyParts(options.previousTaskKey)
+  const sourceParts = taskKeyParts(options.sourceTaskKey)
+  const workspaceParts = taskKeyParts(options.workspaceTaskKey)
+
+  if (
+    currentParts.taskId !== previousParts.taskId ||
+    currentParts.attempt !== previousParts.attempt + 1 ||
+    sourceParts.taskId !== currentParts.taskId ||
+    sourceParts.attempt > previousParts.attempt ||
+    workspaceParts.taskId !== currentParts.taskId ||
+    workspaceParts.attempt > sourceParts.attempt
+  ) {
+    throw createError('continuation_key_invalid', 'continued attempt and workspace keys do not belong to the same Task history')
+  }
+
+  const developmentDir = path.resolve(options.dataDir, 'development')
+  const currentStateDir = path.join(developmentDir, options.taskKey)
+  const devRootReal = await resolveDevRoot(options.devRoot)
+  const previousWorktrees = await readContinuationWorktrees(
+    devRootReal,
+    path.join(developmentDir, options.sourceTaskKey),
+    options.workspaceTaskKey,
+  )
+
+  if (previousWorktrees.length === 0) {
+    throw createError('continuation_workspace_missing', 'the previous attempt has no recorded worktree to continue')
+  }
+
+  if (
+    !Array.isArray(options.expectedWorktrees) ||
+    options.expectedWorktrees.length !== previousWorktrees.length ||
+    options.expectedWorktrees.some((evidence, index) => {
+      const record = previousWorktrees[index]
+      return record === undefined || !matchesWorktreeIdentity(record, evidence)
+    })
+  ) {
+    throw createError('continuation_state_invalid', 'the source worktree records differ from the attempt evidence')
+  }
+
+  await requireRealStateDirectory(currentStateDir, 'current attempt state directory')
+  const git: GitContext = {
+    executable: await findGitExecutable(),
+    env: createGitEnv(options.env),
+    run: options.runGit,
+  }
+
+  for (const record of previousWorktrees) {
+    await verifyContinuationWorktree(git, record)
+  }
+
+  await writeContinuedWorktrees(
+    devRootReal,
+    currentStateDir,
+    options.workspaceTaskKey,
+    previousWorktrees,
+  )
+
+  return { worktrees: previousWorktrees }
+}
+
+// 再開時は直前 attempt の evidence ではなく、現在の attempt が保持する全 worktree を検証する。
+export async function validateCurrentContinuedWorktrees(options: {
+  devRoot: string
+  stateDir: string
+  taskKey: string
+  workspaceTaskKey: string
+  expectedWorktrees: readonly WorktreeIdentityEvidence[]
+  env: Readonly<Record<string, string | undefined>>
+  runGit: GitCommandRunner
+}) {
+  validateTaskKey(options.taskKey)
+  validateTaskKey(options.workspaceTaskKey)
+  const currentParts = taskKeyParts(options.taskKey)
+  const workspaceParts = taskKeyParts(options.workspaceTaskKey)
+
+  if (currentParts.taskId !== workspaceParts.taskId || currentParts.attempt <= workspaceParts.attempt) {
+    throw createError('continuation_key_invalid', 'the current attempt and workspace keys do not belong to the same continued Task')
+  }
+
+  const devRootReal = await resolveDevRoot(options.devRoot)
+  const filePath = path.join(options.stateDir, 'worktrees.jsonl')
+  let stat
+
+  try {
+    stat = await fs.lstat(filePath)
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) {
+      throw createError('continuation_state_invalid', `${filePath} is missing from the continued attempt`)
+    }
+
+    throw error
+  }
+
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw createError('continuation_state_invalid', `${filePath} is not a regular file`)
+  }
+
+  const worktrees = await readContinuationWorktrees(devRootReal, options.stateDir, options.workspaceTaskKey)
+
+  if (
+    !Array.isArray(options.expectedWorktrees) ||
+    options.expectedWorktrees.length > worktrees.length ||
+    options.expectedWorktrees.some((evidence) => {
+      return !worktrees.some((record) => {
+        return matchesWorktreeIdentity(record, evidence)
+      })
+    })
+  ) {
+    throw createError('continuation_state_invalid', 'the current worktree list does not contain every inherited worktree identity')
+  }
+
+  const git: GitContext = {
+    executable: await findGitExecutable(),
+    env: createGitEnv(options.env),
+    run: options.runGit,
+  }
+
+  for (const record of worktrees) {
+    await verifyContinuationWorktree(git, record)
+  }
+
+  return { worktrees }
+}
+
+export async function readTaskState(options: {
+  devRoot: string
+  stateDir: string
+  taskKey: string
+  workspaceTaskKey?: string
+}) {
+  validateTaskKey(options.taskKey)
+  const workspaceTaskKey = options.workspaceTaskKey ?? options.taskKey
+  validateTaskKey(workspaceTaskKey)
+
+  return readValidatedState(await resolveDevRoot(options.devRoot), options.stateDir, workspaceTaskKey)
 }
 
 export function validateDecisionQuestion(question: unknown) {
@@ -787,14 +1272,18 @@ export function createWorktreeService(options: {
   devRoot: string
   stateDir: string
   taskKey: string
+  workspaceTaskKey?: string
   env: Readonly<Record<string, string | undefined>>
   // git を起動する関数。runner は試行の scope の中で起動する関数を渡す
   runGit: GitCommandRunner
   now?: () => Date
+  onWorktreesChanged?: (worktrees: readonly WorktreeRecord[]) => void | Promise<void>
 }) {
   validateTaskKey(options.taskKey)
+  const taskKey = options.workspaceTaskKey ?? options.taskKey
+  validateTaskKey(taskKey)
 
-  const { stateDir, taskKey } = options
+  const { stateDir } = options
   const now = options.now ?? (() => {
     return new Date()
   })
@@ -891,6 +1380,8 @@ export function createWorktreeService(options: {
       timeoutMs: GIT_WORKTREE_ADD_TIMEOUT_MS
     })
 
+    const worktreeIdentity = await createWorktreeIdentity(git, repositoryReal, worktreePath)
+
     const record: WorktreeRecord = {
       repository: relative,
       repositoryRoot: repositoryReal,
@@ -899,9 +1390,11 @@ export function createWorktreeService(options: {
       base,
       baseSha,
       excludeAdded,
+      worktreeIdentity,
       createdAt: now().toISOString()
     }
     await appendRecord(path.join(stateDir, 'worktrees.jsonl'), record)
+    await options.onWorktreesChanged?.([...state.worktrees, record])
 
     return record
   }

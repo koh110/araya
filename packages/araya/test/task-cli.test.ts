@@ -316,7 +316,7 @@ test('task: Linux 以外では unsupported_platform で何もしない', async (
   try {
     const inputPath = await writeInput(taskEnv, { title: 't', goal: 'g' })
 
-    for (const args of [['create', '--file', inputPath], ['list'], ['show', '1'], ['retry', '1'], ['cancel', '1']]) {
+    for (const args of [['create', '--file', inputPath], ['list'], ['show', '1'], ['retry', '1'], ['continue', '1'], ['cancel', '1']]) {
       await rejectsWithCode(taskEnv, args, 'unsupported_platform', { platform: 'darwin' })
     }
 
@@ -532,11 +532,15 @@ test('task retry: 外部変更の可能性がある試行は --confirm-side-effe
     const ledger = openTaskLedger(taskEnv.dataDir)
 
     try {
-      finishNext(ledger, result({
+      const claimed = ledger.claimNextAttempt(1, settings())
+      assert.ok(claimed)
+      ledger.recordStateDir(claimed.taskKey, path.join(taskEnv.dataDir, 'development', claimed.taskKey))
+      const worktree = { repository: 'repo', worktreePath: '/home/u/dev/repo/.worktree/araya-task-1-1-aaaaaa', branch: 'araya/task-1-1-aaaaaa', base: 'main', baseSha: 'a'.repeat(40), excludeAdded: false, worktreeIdentity: '00000000-0000-4000-8000-000000000001' }
+      ledger.recordResult(claimed.taskKey, result({
         status: 'failed',
         failureReason: 'agent_timeout',
-        evidence: { outcome: 'failed', worktrees: [{ worktreePath: '/home/u/dev/repo/.worktree/araya-task-1-1-aaaaaa', branch: 'araya/task-1-1-aaaaaa' }] }
-      }))
+        evidence: { outcome: 'failed', worktrees: [worktree] }
+      }), { taskKey: claimed.taskKey, addMs: 0 })
     } finally {
       ledger.close()
     }
@@ -576,12 +580,67 @@ test('task retry: 外部変更の可能性がある試行は --confirm-side-effe
   }
 })
 
-test('task retry: 追加の指示は --note・--note-file・stdin から読み、同時指定と 10,000 文字超と NUL を拒否する', async () => {
+test('task continue: 外部変更の可能性を確認し、同じ workspace を引き継ぐ再試行として登録する', async () => {
   const taskEnv = await makeTaskEnv()
 
   try {
     const inputPath = await writeInput(taskEnv, { title: 't', goal: 'g' })
     await runTask(taskEnv, ['create', '--file', inputPath])
+    const ledger = openTaskLedger(taskEnv.dataDir)
+
+    try {
+      const claimed = ledger.claimNextAttempt(1, settings())
+      assert.ok(claimed)
+      ledger.recordStateDir(claimed.taskKey, path.join(taskEnv.dataDir, 'development', claimed.taskKey))
+      const worktree = { repository: 'repo', worktreePath: '/home/u/dev/repo/.worktree/araya-task-1-1-aaaaaa', branch: 'araya/task-1-1-aaaaaa', base: 'main', baseSha: 'a'.repeat(40), excludeAdded: false, worktreeIdentity: '00000000-0000-4000-8000-000000000001' }
+      ledger.recordWorkspaceWorktrees(claimed.taskKey, [worktree])
+      ledger.recordResult(claimed.taskKey, result({
+        status: 'failed',
+        failureReason: 'agent_timeout',
+        evidence: { outcome: 'failed', worktrees: [worktree] }
+      }), { taskKey: claimed.taskKey, addMs: 0 })
+    } finally {
+      ledger.close()
+    }
+
+    await assert.rejects(runTask(taskEnv, ['continue', '1']), (error: unknown) => {
+      assert.ok(error instanceof Error)
+      assert.equal(error.message, [
+        'side_effects_unconfirmed: 前回の試行では外部の branch や Draft PR が作成・更新された可能性がある、または結果を確認できません。前回の worktree と GitHub の状態を確かめてから、--confirm-side-effects を付けて continue を実行してください',
+        '前回の worktree:',
+        '  - /home/u/dev/repo/.worktree/araya-task-1-1-aaaaaa（branch araya/task-1-1-aaaaaa）'
+      ].join('\n'))
+
+      return true
+    })
+
+    assert.equal(readArray((await runTask(taskEnv, ['show', '1'])).output, 'attempts').length, 1)
+
+    const continued = await runTask(taskEnv, ['continue', '1', '--confirm-side-effects', '--note', '前回の作業場所を確認した'])
+    assert.equal(readJsonField(continued.output, 'task', 'status'), 'queued')
+    assert.equal(readJsonField(continued.output, 'task', 'attempt'), 2)
+
+    const shown = await runTask(taskEnv, ['show', '1'])
+    assert.equal(readJsonField(shown.output, 'attempts', 1, 'note'), '前回の作業場所を確認した')
+    assert.equal(readJsonField(shown.output, 'events', 4, 'type'), 'task.continued')
+    assert.equal(readJsonField(shown.output, 'events', 4, 'data', 'confirmedSideEffects'), true)
+    assert.equal(
+      readJsonField(shown.output, 'events', 4, 'data', 'workspaceTaskKey'),
+      readJsonField(shown.output, 'attempts', 0, 'taskKey')
+    )
+
+    await rejectsWithCode(taskEnv, ['continue', '1'], 'task_not_continuable')
+    await rejectsWithCode(taskEnv, ['continue', '99'], 'task_not_found')
+  } finally {
+    await fs.rm(taskEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('task retry: 追加の指示は --note・--note-file・stdin から読み、同時指定と 10,000 文字超と NUL を拒否する', async () => {
+  const taskEnv = await makeTaskEnv()
+
+  try {
+    await runTask(taskEnv, ['create', '--file', await writeInput(taskEnv, { title: 't', goal: 'g' })])
     const ledger = openTaskLedger(taskEnv.dataDir)
 
     function failLatest() {

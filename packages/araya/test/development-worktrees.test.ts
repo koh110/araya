@@ -11,7 +11,9 @@ import {
   MAX_WORKTREES_PER_TASK,
   createTaskState,
   createWorktreeService,
-  readTaskState
+  prepareContinuedWorktrees,
+  readTaskState,
+  validateCurrentContinuedWorktrees,
 } from '../src/development/worktrees.ts'
 import type { VerificationRecord, WorktreeRecord } from '../src/development/worktrees.ts'
 
@@ -24,11 +26,12 @@ async function createFixture() {
   const home = path.join(root, 'home')
   const gitConfig = path.join(home, 'gitconfig')
   const devRoot = path.join(root, 'dev')
+  const dataDir = path.join(root, 'data')
   const taskKey = 'task-1-1-abcdef'
   await fs.mkdir(home)
   await fs.mkdir(devRoot)
   await fs.writeFile(gitConfig, '', 'utf8')
-  const stateDir = await createTaskState(path.join(root, 'data'), taskKey)
+  const stateDir = await createTaskState(dataDir, taskKey)
   const env = {
     PATH: process.env.PATH,
     HOME: home,
@@ -41,7 +44,7 @@ async function createFixture() {
     GIT_COMMITTER_EMAIL: 'araya-test@example.invalid'
   }
 
-  return { root, devRoot, stateDir, taskKey, gitConfig, env }
+  return { root, devRoot, dataDir, stateDir, taskKey, gitConfig, env }
 }
 
 async function removeFixture(fixture: Fixture) {
@@ -74,11 +77,15 @@ async function createRepository(fixture: Fixture, directory: string, files: Reco
   return repositoryPath
 }
 
-function createService(fixture: Fixture, overrides: { taskKey?: string; stateDir?: string } = {}) {
+function createService(
+  fixture: Fixture,
+  overrides: { taskKey?: string; workspaceTaskKey?: string; stateDir?: string } = {},
+) {
   return createWorktreeService({
     devRoot: fixture.devRoot,
     stateDir: overrides.stateDir ?? fixture.stateDir,
     taskKey: overrides.taskKey ?? fixture.taskKey,
+    ...(overrides.workspaceTaskKey === undefined ? {} : { workspaceTaskKey: overrides.workspaceTaskKey }),
     env: fixture.env,
     runGit: runBoundedCommand,
     now: () => {
@@ -143,8 +150,14 @@ test('createWorktree appends /.worktree/ to info/exclude when the directory is n
       base: 'HEAD',
       baseSha: head,
       excludeAdded: true,
+      worktreeIdentity: record.worktreeIdentity,
       createdAt: FIXED_NOW.toISOString()
     })
+    const identity = record.worktreeIdentity
+    assert.ok(identity)
+    assert.match(identity, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u)
+    const gitDir = path.resolve(worktreePath, git(fixture, worktreePath, 'rev-parse', '--git-dir'))
+    assert.equal(await fs.readFile(path.join(gitDir, 'araya-worktree-identity'), 'utf8'), `${identity}\n`)
     assert.equal(await fs.readFile(excludePath(repositoryPath), 'utf8'), '# existing\n*.log\n/.worktree/\n')
     assert.equal(git(fixture, repositoryPath, 'rev-parse', '--verify', `refs/heads/araya/${fixture.taskKey}`), head)
     assert.equal(git(fixture, worktreePath, 'rev-parse', 'HEAD'), head)
@@ -522,6 +535,7 @@ function createValidRecords(fixture: Fixture) {
     base: 'origin/main',
     baseSha: 'a'.repeat(40),
     excludeAdded: true,
+    worktreeIdentity: '00000000-0000-4000-8000-000000000001',
     createdAt: FIXED_NOW.toISOString()
   }
   const verification: VerificationRecord = {
@@ -560,6 +574,11 @@ test('readTaskState reads valid records and rejects tampered records', async () 
     }
     await writeState(fixture.stateDir, [worktree, sha256Worktree], [verification])
     assert.deepEqual(await readTaskState(options), { worktrees: [worktree, sha256Worktree], verifications: [verification] })
+
+    const legacyWorktree = { ...worktree }
+    delete legacyWorktree.worktreeIdentity
+    await writeState(fixture.stateDir, [legacyWorktree], [verification])
+    assert.deepEqual(await readTaskState(options), { worktrees: [legacyWorktree], verifications: [verification] })
 
     const outsideRoot = path.join(fixture.root, 'outside')
     const { repository: _repository, ...withoutRepository } = worktree
@@ -609,6 +628,334 @@ test('readTaskState reads valid records and rejects tampered records', async () 
       return { ...verification, command: ['echo', String(index)] }
     }))
     await assert.rejects(readTaskState(options), errorCode('task_state_invalid'))
+  } finally {
+    await removeFixture(fixture)
+  }
+})
+
+test('continue imports validated worktrees, not old verifications, and reuses the same branch', async () => {
+  const fixture = await createFixture()
+
+  try {
+    const repositoryPath = await createRepository(fixture, 'app')
+    const first = await createService(fixture).createWorktree({ repository: path.basename(repositoryPath) })
+    const partialChange = path.join(first.worktreePath, 'partial-change.txt')
+    await fs.writeFile(partialChange, 'keep this change across continue\n', 'utf8')
+    await createService(fixture).registerVerification({
+      repository: 'app',
+      command: ['node', '--version'],
+    })
+
+    const nextTaskKey = 'task-1-2-bcdefg'
+    const nextStateDir = await createTaskState(fixture.dataDir, nextTaskKey)
+    assert.deepEqual((await prepareContinuedWorktrees({
+      dataDir: fixture.dataDir,
+      devRoot: fixture.devRoot,
+      taskKey: nextTaskKey,
+      previousTaskKey: fixture.taskKey,
+      sourceTaskKey: fixture.taskKey,
+      workspaceTaskKey: fixture.taskKey,
+      expectedWorktrees: [first],
+      env: fixture.env,
+      runGit: runBoundedCommand,
+    })).worktrees, [first])
+    const state = await readTaskState({
+      devRoot: fixture.devRoot,
+      stateDir: nextStateDir,
+      taskKey: nextTaskKey,
+      workspaceTaskKey: fixture.taskKey,
+    })
+    assert.deepEqual(state.worktrees, [first])
+    assert.deepEqual(state.verifications, [])
+    assert.equal(await fs.readFile(partialChange, 'utf8'), 'keep this change across continue\n')
+
+    assert.deepEqual(await createService(fixture, {
+      taskKey: nextTaskKey,
+      workspaceTaskKey: fixture.taskKey,
+      stateDir: nextStateDir,
+    }).createWorktree({ repository: 'app' }), first)
+    assert.equal(countWorktrees(fixture, repositoryPath), 2)
+  } finally {
+    await removeFixture(fixture)
+  }
+})
+
+test('continue refuses legacy worktree records without an identity and leaves the workspace unchanged', async () => {
+  const fixture = await createFixture()
+
+  try {
+    const repositoryPath = await createRepository(fixture, 'app')
+    const first = await createService(fixture).createWorktree({ repository: 'app' })
+    const legacy = { ...first }
+    delete legacy.worktreeIdentity
+    const previousStateFile = path.join(fixture.stateDir, 'worktrees.jsonl')
+    await fs.writeFile(previousStateFile, `${JSON.stringify(legacy)}\n`, 'utf8')
+    const previousStateBefore = await fs.readFile(previousStateFile, 'utf8')
+    const nextTaskKey = 'task-1-2-bcdefg'
+    await createTaskState(fixture.dataDir, nextTaskKey)
+
+    await assert.rejects(prepareContinuedWorktrees({
+      dataDir: fixture.dataDir,
+      devRoot: fixture.devRoot,
+      taskKey: nextTaskKey,
+      previousTaskKey: fixture.taskKey,
+      sourceTaskKey: fixture.taskKey,
+      workspaceTaskKey: fixture.taskKey,
+      expectedWorktrees: [legacy],
+      env: fixture.env,
+      runGit: runBoundedCommand,
+    }), errorCode('continuation_worktree_invalid'))
+
+    assert.equal(await fs.readFile(previousStateFile, 'utf8'), previousStateBefore)
+    assert.equal(git(fixture, first.worktreePath, 'branch', '--show-current'), first.branch)
+    assert.equal(countWorktrees(fixture, repositoryPath), 2)
+    await assert.rejects(fs.access(path.join(fixture.dataDir, 'development', nextTaskKey, 'worktrees.jsonl')))
+  } finally {
+    await removeFixture(fixture)
+  }
+})
+
+test('resume validation checks every worktree added during the current continued attempt', async () => {
+  const fixture = await createFixture()
+
+  try {
+    await createRepository(fixture, 'app-a')
+    const repositoryB = await createRepository(fixture, 'app-b')
+    const first = await createService(fixture).createWorktree({ repository: 'app-a' })
+    const nextTaskKey = 'task-1-2-bcdefg'
+    const nextStateDir = await createTaskState(fixture.dataDir, nextTaskKey)
+
+    await prepareContinuedWorktrees({
+      dataDir: fixture.dataDir,
+      devRoot: fixture.devRoot,
+      taskKey: nextTaskKey,
+      previousTaskKey: fixture.taskKey,
+      sourceTaskKey: fixture.taskKey,
+      workspaceTaskKey: fixture.taskKey,
+      expectedWorktrees: [first],
+      env: fixture.env,
+      runGit: runBoundedCommand,
+    })
+    const second = await createService(fixture, {
+      taskKey: nextTaskKey,
+      workspaceTaskKey: fixture.taskKey,
+      stateDir: nextStateDir,
+    }).createWorktree({ repository: 'app-b' })
+
+    const options = {
+      devRoot: fixture.devRoot,
+      stateDir: nextStateDir,
+      taskKey: nextTaskKey,
+      workspaceTaskKey: fixture.taskKey,
+      expectedWorktrees: [first],
+      env: fixture.env,
+      runGit: runBoundedCommand,
+    }
+    assert.deepEqual((await validateCurrentContinuedWorktrees(options)).worktrees, [first, second])
+
+    git(fixture, repositoryB, 'worktree', 'remove', '--force', second.worktreePath)
+    git(fixture, repositoryB, 'worktree', 'add', second.worktreePath, second.branch)
+    await assert.rejects(
+      validateCurrentContinuedWorktrees(options),
+      errorCode('continuation_worktree_invalid'),
+    )
+  } finally {
+    await removeFixture(fixture)
+  }
+})
+
+test('continue refuses a worktree whose registered branch changed without modifying it', async () => {
+  const fixture = await createFixture()
+
+  try {
+    const repositoryPath = await createRepository(fixture, 'app')
+    const first = await createService(fixture).createWorktree({ repository: path.basename(repositoryPath) })
+    git(fixture, first.worktreePath, 'switch', '-c', 'manual-change')
+
+    const nextTaskKey = 'task-1-2-bcdefg'
+    await createTaskState(fixture.dataDir, nextTaskKey)
+    await assert.rejects(prepareContinuedWorktrees({
+      dataDir: fixture.dataDir,
+      devRoot: fixture.devRoot,
+      taskKey: nextTaskKey,
+      previousTaskKey: fixture.taskKey,
+      sourceTaskKey: fixture.taskKey,
+      workspaceTaskKey: fixture.taskKey,
+      expectedWorktrees: [first],
+      env: fixture.env,
+      runGit: runBoundedCommand,
+    }), errorCode('continuation_worktree_invalid'))
+
+    assert.equal(git(fixture, first.worktreePath, 'branch', '--show-current'), 'manual-change')
+    assert.equal(await exists(path.join(fixture.dataDir, 'development', nextTaskKey, 'worktrees.jsonl')), false)
+    assert.equal(countWorktrees(fixture, repositoryPath), 2)
+  } finally {
+    await removeFixture(fixture)
+  }
+})
+
+test('continue rejects a recreated worktree in the same repository at the same path and branch', async () => {
+  const fixture = await createFixture()
+
+  try {
+    const repositoryPath = await createRepository(fixture, 'app')
+    const first = await createService(fixture).createWorktree({ repository: 'app' })
+    const nextTaskKey = 'task-1-2-bcdefg'
+    const nextStateDir = await createTaskState(fixture.dataDir, nextTaskKey)
+
+    git(fixture, repositoryPath, 'worktree', 'remove', '--force', first.worktreePath)
+    git(fixture, repositoryPath, 'worktree', 'add', first.worktreePath, first.branch)
+    assert.equal(git(fixture, first.worktreePath, 'branch', '--show-current'), first.branch)
+    assert.equal(
+      path.resolve(first.worktreePath, git(fixture, first.worktreePath, 'rev-parse', '--git-common-dir')),
+      path.resolve(repositoryPath, git(fixture, repositoryPath, 'rev-parse', '--git-common-dir')),
+    )
+
+    await assert.rejects(prepareContinuedWorktrees({
+      dataDir: fixture.dataDir,
+      devRoot: fixture.devRoot,
+      taskKey: nextTaskKey,
+      previousTaskKey: fixture.taskKey,
+      sourceTaskKey: fixture.taskKey,
+      workspaceTaskKey: fixture.taskKey,
+      expectedWorktrees: [first],
+      env: fixture.env,
+      runGit: runBoundedCommand,
+    }), errorCode('continuation_worktree_invalid'))
+    assert.equal(await exists(path.join(nextStateDir, 'worktrees.jsonl')), false)
+  } finally {
+    await removeFixture(fixture)
+  }
+})
+
+test('continue rejects prunable registrations and an independent repository replaced at a registered path', async () => {
+  const fixture = await createFixture()
+
+  try {
+    await createRepository(fixture, 'app')
+    const first = await createService(fixture).createWorktree({ repository: 'app' })
+    const nextTaskKey = 'task-1-2-bcdefg'
+    const nextStateDir = await createTaskState(fixture.dataDir, nextTaskKey)
+    const options = {
+      dataDir: fixture.dataDir,
+      devRoot: fixture.devRoot,
+      taskKey: nextTaskKey,
+      previousTaskKey: fixture.taskKey,
+      sourceTaskKey: fixture.taskKey,
+      workspaceTaskKey: fixture.taskKey,
+      expectedWorktrees: [first],
+      env: fixture.env,
+    }
+
+    async function reportPrunable(command: string, args: readonly string[], runOptions: Parameters<typeof runBoundedCommand>[2]) {
+      const result = await runBoundedCommand(command, args, runOptions)
+
+      if (args.includes('worktree') && args.includes('list')) {
+        const branchField = `branch refs/heads/${first.branch}\0`
+        return { ...result, stdout: result.stdout.replace(branchField, `${branchField}prunable: injected by test\0`) }
+      }
+
+      return result
+    }
+
+    await assert.rejects(prepareContinuedWorktrees({
+      ...options,
+      runGit: reportPrunable,
+    }), errorCode('continuation_worktree_invalid'))
+    assert.equal(await exists(path.join(nextStateDir, 'worktrees.jsonl')), false)
+
+    await fs.rm(first.worktreePath, { recursive: true, force: true })
+    await createRepository(fixture, first.worktreePath)
+    git(fixture, first.worktreePath, 'branch', '--move', first.branch)
+    async function ignorePrunable(command: string, args: readonly string[], runOptions: Parameters<typeof runBoundedCommand>[2]) {
+      const result = await runBoundedCommand(command, args, runOptions)
+
+      if (args.includes('worktree') && args.includes('list')) {
+        return { ...result, stdout: result.stdout.replace(/prunable[^\0]*/gu, '') }
+      }
+
+      return result
+    }
+
+    await assert.rejects(prepareContinuedWorktrees({
+      ...options,
+      runGit: ignorePrunable,
+    }), errorCode('continuation_worktree_invalid'))
+    assert.equal(await exists(path.join(nextStateDir, 'worktrees.jsonl')), false)
+  } finally {
+    await removeFixture(fixture)
+  }
+})
+
+test('continue rejects omitted or changed source worktree records before importing them', async () => {
+  const fixture = await createFixture()
+
+  try {
+    await createRepository(fixture, 'app-a')
+    await createRepository(fixture, 'app-b')
+    const firstA = await createService(fixture).createWorktree({ repository: 'app-a' })
+    const firstB = await createService(fixture).createWorktree({ repository: 'app-b' })
+    const nextTaskKey = 'task-1-2-bcdefg'
+    const nextStateDir = await createTaskState(fixture.dataDir, nextTaskKey)
+    const options = {
+      dataDir: fixture.dataDir,
+      devRoot: fixture.devRoot,
+      taskKey: nextTaskKey,
+      previousTaskKey: fixture.taskKey,
+      sourceTaskKey: fixture.taskKey,
+      workspaceTaskKey: fixture.taskKey,
+      expectedWorktrees: [firstA, firstB],
+      env: fixture.env,
+      runGit: runBoundedCommand,
+    }
+
+    await writeState(fixture.stateDir, [firstA], [])
+    await assert.rejects(prepareContinuedWorktrees(options), errorCode('continuation_state_invalid'))
+    assert.equal(await exists(path.join(nextStateDir, 'worktrees.jsonl')), false)
+
+    await fs.writeFile(path.join(firstA.worktreePath, 'untrusted.txt'), 'a new commit\n', 'utf8')
+    git(fixture, firstA.worktreePath, 'add', '--all')
+    git(fixture, firstA.worktreePath, 'commit', '-q', '-m', 'untrusted worktree commit')
+    await writeState(fixture.stateDir, [{
+      ...firstA,
+      baseSha: git(fixture, firstA.worktreePath, 'rev-parse', 'HEAD'),
+    }, firstB], [])
+
+    await assert.rejects(prepareContinuedWorktrees(options), errorCode('continuation_state_invalid'))
+    assert.equal(await exists(path.join(nextStateDir, 'worktrees.jsonl')), false)
+  } finally {
+    await removeFixture(fixture)
+  }
+})
+
+test('continue can source worktrees from the last attempt that initialized the workspace', async () => {
+  const fixture = await createFixture()
+
+  try {
+    await createRepository(fixture, 'app')
+    const first = await createService(fixture).createWorktree({ repository: 'app' })
+    const previousTaskKey = 'task-1-2-bcdefg'
+    const nextTaskKey = 'task-1-3-cdefgh'
+    await createTaskState(fixture.dataDir, previousTaskKey)
+    await createTaskState(fixture.dataDir, nextTaskKey)
+
+    assert.deepEqual((await prepareContinuedWorktrees({
+      dataDir: fixture.dataDir,
+      devRoot: fixture.devRoot,
+      taskKey: nextTaskKey,
+      previousTaskKey,
+      sourceTaskKey: fixture.taskKey,
+      workspaceTaskKey: fixture.taskKey,
+      expectedWorktrees: [first],
+      env: fixture.env,
+      runGit: runBoundedCommand,
+    })).worktrees, [first])
+    assert.deepEqual((await readTaskState({
+      devRoot: fixture.devRoot,
+      stateDir: path.join(fixture.dataDir, 'development', nextTaskKey),
+      taskKey: nextTaskKey,
+      workspaceTaskKey: fixture.taskKey,
+    })).worktrees, [first])
   } finally {
     await removeFixture(fixture)
   }

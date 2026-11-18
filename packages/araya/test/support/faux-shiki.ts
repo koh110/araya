@@ -27,6 +27,7 @@ export type FauxView = {
   // 最初の user message（課題の prompt）の text
   prompt: string
   toolResults: FauxToolResult[]
+  messages: readonly Message[]
 }
 
 export type FauxStep = (view: FauxView) => AssistantMessage
@@ -52,7 +53,7 @@ function viewOf(messages: readonly Message[]) {
       ? [{ toolName: message.toolName, isError: message.isError, text: textOf(message.content) }]
       : []
   })
-  const view: FauxView = { taskKey, prompt: promptText, toolResults }
+  const view: FauxView = { taskKey, prompt: promptText, toolResults, messages: [...messages] }
 
   return view
 }

@@ -31,6 +31,7 @@ import {
   runnerUnitName,
   runtimeTargetUnitName,
   scopePattern,
+  taskScopePattern,
   selectUnitEnvironment,
   shellQuote,
   unitFilePath,
@@ -74,6 +75,10 @@ test('systemd-units: unit と scope の名前は dataDir の実 path の hash �
   assert.equal(runnerUnitName(hash), `araya-runner-${hash}.service`)
   assert.equal(scopePattern(hash), `araya-${hash}-*.scope`)
   assert.equal(scopePattern(hash, TASK_KEY), `araya-${hash}-${TASK_KEY}-*.scope`)
+  assert.equal(taskScopePattern(hash, 7), `araya-${hash}-task-7-*.scope`)
+  assert.throws(() => {
+    return taskScopePattern(hash, 0)
+  }, RangeError)
   assert.equal(
     bashScopeUnit(hash, TASK_KEY, 'call-1'),
     `araya-${hash}-${TASK_KEY}-${createHash('sha256').update('call-1', 'utf8').digest('hex').slice(0, 12)}.scope`,

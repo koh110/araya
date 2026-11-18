@@ -17,14 +17,15 @@ import { deliverDraftPullRequests } from '../src/development/draft-pr/delivery.t
 import { hashGitDiffSnapshot, splitGitDiffSections } from '../src/development/draft-pr/snapshot.ts'
 import { readTaskState } from '../src/development/worktrees.ts'
 import { SHIKI_TOOL_NAMES } from '../src/development/shiki.ts'
-import { bashScopeUnit, deliveryScopeUnit, verifyScopeUnit } from '../src/infrastructure/systemd.ts'
+import { bashScopeUnit, deliveryScopeUnit, taskScopePattern, verifyScopeUnit } from '../src/infrastructure/systemd.ts'
 import {
   AttemptsDoc,
   buildAttemptInput,
+  isAttemptResult,
   resolveShikiModel,
   type PiModelSettings,
 } from '../src/runner/attempt.ts'
-import { openTaskLedger } from '../src/runner/ledger.ts'
+import { openTaskLedger, type ClaimedAttempt } from '../src/runner/ledger.ts'
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from '@earendil-works/pi-ai'
 
 import {
@@ -71,6 +72,32 @@ async function teardown(setupValue: Setup, attempt?: { close(): Promise<void> })
   } finally {
     await removeRunnerFixture(setupValue.fixture)
   }
+}
+
+async function runClaimedAttempt(
+  attempt: Awaited<ReturnType<typeof openAttemptHarness>>,
+  claimed: ClaimedAttempt,
+) {
+  const input = buildAttemptInput(claimed)
+  const outcome = (await attempt.harness.waitForTask(
+    await (await attempt.harness.root(ctx)).commit(async (tx) => {
+      const id = await tx.createTask(attempt.attemptTask, input, {
+        ownership: { kind: 'conversation' },
+        background: true
+      })
+      ;(await tx.doc(AttemptsDoc)).byTaskKey[claimed.taskKey] = { taskId: id }
+      return id
+    }, ctx),
+    ctx,
+  )).state.outcome
+
+  if ((outcome.status !== 'completed' && outcome.status !== 'aborted') || !isAttemptResult(outcome.result)) {
+    throw new Error(`attempt ${claimed.taskKey} did not produce a terminal AttemptResult`)
+  }
+
+  attempt.ledger.recordResult(claimed.taskKey, outcome.result, { taskKey: claimed.taskKey, addMs: 0 })
+
+  return { input, result: outcome.result }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -191,6 +218,148 @@ function completingScript(
   }
 }
 
+async function installFakeGh(fixture: RunnerFixture) {
+  const binDir = path.join(fixture.root, 'fake-bin')
+  const executable = path.join(binDir, 'gh')
+  const callsFile = path.join(fixture.root, 'fake-gh-calls.jsonl')
+  await fs.mkdir(binDir)
+  await fs.writeFile(executable, [
+    `#!${process.execPath}`,
+    "const fs = require('node:fs')",
+    "fs.appendFileSync(process.env.ARAYA_TEST_GH_LOG, JSON.stringify(process.argv.slice(2)) + '\\n')",
+    'process.exit(0)',
+    '',
+  ].join('\n'), 'utf8')
+  await fs.chmod(executable, 0o700)
+  fixture.env.PATH = `${binDir}${path.delimiter}${fixture.env.PATH ?? ''}`
+  fixture.env.ARAYA_TEST_GH_LOG = callsFile
+
+  return callsFile
+}
+
+async function runContinuationWithIdentityInvalidation(
+  boundary: 'after_first_verification' | 'during_final_snapshot',
+  commands: readonly (readonly string[])[],
+) {
+  const value = await setup()
+  const { fixture, models, systemd } = value
+  const fakeGhCalls = await installFakeGh(fixture)
+  let continuedTaskKey = ''
+  let identityMarker = ''
+  let identityRemoved = false
+  let continuedDiffCount = 0
+  const verificationIndexes: number[] = []
+  const ops: typeof systemd.ops = {
+    ...systemd.ops,
+    async launchInScope(unit, command, args, options) {
+      const result = await systemd.ops.launchInScope(unit, command, args, options)
+
+      if (continuedTaskKey !== '' && unit.startsWith(`araya-${fixture.hash}-${continuedTaskKey}-git-`) && args.includes('--binary')) {
+        continuedDiffCount += 1
+
+        if (boundary === 'during_final_snapshot' && continuedDiffCount === 2 && !identityRemoved) {
+          await fs.rm(identityMarker)
+          identityRemoved = true
+        }
+      }
+
+      for (let index = 0; index < commands.length; index += 1) {
+        if (continuedTaskKey !== '' && unit === verifyScopeUnit(fixture.hash, continuedTaskKey, index)) {
+          verificationIndexes.push(index)
+
+          if (boundary === 'after_first_verification' && index === 0 && !identityRemoved) {
+            await fs.rm(identityMarker)
+            identityRemoved = true
+          }
+        }
+      }
+
+      return result
+    },
+  }
+  const attempt = await openAttemptHarness(fixture, {
+    models: models.runtime,
+    systemd: ops,
+    draftPrDelivery: true,
+  })
+
+  try {
+    await createRepository(fixture, 'repo')
+    const settings = defaultSettings(fixture, models.model)
+    models.script(completingScript({ command: [process.execPath, '-e', 'process.exit(1)'] }))
+    const first = await attempt.runAttempt(taskInput(), settings)
+    assert.equal(first.result?.failureReason, 'verification_failed')
+
+    const previousWorktree = records(first.result?.evidence.worktrees)[0]
+    const worktreePath = String(previousWorktree?.worktreePath ?? '')
+    assert.notEqual(worktreePath, '')
+    const gitDir = path.resolve(worktreePath, git(fixture, worktreePath, 'rev-parse', '--git-dir'))
+    identityMarker = path.join(gitDir, 'araya-worktree-identity')
+    await fs.access(identityMarker)
+
+    const continueTask = Reflect.get(attempt.ledger, 'continueTask')
+    assert.equal(typeof continueTask, 'function')
+    Reflect.apply(continueTask, attempt.ledger, [first.ledgerTaskId, {
+      note: null,
+      confirmSideEffects: false,
+    }])
+    const claimed = attempt.ledger.claimNextAttempt(1, settings)
+    assert.ok(claimed)
+    continuedTaskKey = claimed.taskKey
+    models.script((view) => {
+      const index = view.toolResults.length
+
+      if (index < commands.length) {
+        return toolCall('araya_register_verification', {
+          repository: 'repo',
+          command: [...(commands[index] ?? [])],
+        })
+      }
+
+      return answer('continued')
+    })
+
+    const continued = await runClaimedAttempt(attempt, claimed)
+    const ghCalls = await fs.readFile(fakeGhCalls, 'utf8').catch(() => {
+      return ''
+    })
+
+    return {
+      failureReason: continued.result.failureReason,
+      verificationIndexes,
+      ghCalls,
+      identityRemoved,
+      continuedDiffCount,
+    }
+  } finally {
+    await teardown(value, attempt)
+  }
+}
+
+test('attempt: continuation revalidates worktree identity between verification commands', async () => {
+  const result = await runContinuationWithIdentityInvalidation('after_first_verification', [
+    [process.execPath, '-e', "console.log('first verification')"],
+    [process.execPath, '-e', "console.log('second verification')"],
+  ])
+
+  assert.equal(result.identityRemoved, true, JSON.stringify(result))
+  assert.deepEqual(result.verificationIndexes, [0])
+  assert.equal(result.failureReason, 'continuation_workspace_invalid')
+  assert.equal(result.ghCalls, '')
+})
+
+test('attempt: continuation revalidates worktree identity before Draft PR delivery', async () => {
+  const result = await runContinuationWithIdentityInvalidation('during_final_snapshot', [
+    [process.execPath, '-e', "console.log('verification')"],
+  ])
+
+  assert.equal(result.identityRemoved, true, JSON.stringify(result))
+  assert.deepEqual(result.verificationIndexes, [0])
+  assert.equal(result.continuedDiffCount, 2)
+  assert.equal(result.failureReason, 'continuation_workspace_invalid')
+  assert.equal(result.ghCalls, '')
+})
+
 test('attempt: worktree を作り、編集し、検証を登録すると completed で、summary・model・tools の7つの名前・timeoutMs が記録される', async () => {
   const value = await setup()
   const { fixture, models, systemd } = value
@@ -297,6 +466,224 @@ test('attempt: worktree を作り、編集し、検証を登録すると complet
       }),
       true,
     )
+  } finally {
+    await teardown(value, attempt)
+  }
+})
+
+test('attempt: continue は同じ worktree を使い、前 attempt の検証だけを捨てて登録し直す', async () => {
+  const value = await setup()
+  const { fixture, models, systemd } = value
+  const attempt = await openAttemptHarness(fixture, { models: models.runtime, systemd: systemd.ops })
+
+  try {
+    await createRepository(fixture, 'repo')
+    const settings = defaultSettings(fixture, models.model)
+    models.script(completingScript({ command: [process.execPath, '-e', 'process.exit(1)'] }))
+    const first = await attempt.runAttempt(taskInput(), settings)
+    assert.equal(first.result?.status, 'failed')
+    assert.equal(first.result?.failureReason, 'verification_failed')
+
+    const continueTask = Reflect.get(attempt.ledger, 'continueTask')
+    assert.equal(typeof continueTask, 'function')
+    Reflect.apply(continueTask, attempt.ledger, [first.ledgerTaskId, {
+      note: '同じ作業を引き継ぐ',
+      confirmSideEffects: false
+    }])
+    const claimed = attempt.ledger.claimNextAttempt(1, settings)
+    assert.ok(claimed)
+    assert.equal(claimed.workspaceTaskKey, first.taskKey)
+    assert.equal(claimed.workspaceStateTaskKey, first.taskKey)
+    models.script(completingScript({
+      bash: (worktreePath) => {
+        return `printf 'continued\\n' >> ${worktreePath}/README.md`
+      }
+    }))
+
+    const continued = await runClaimedAttempt(attempt, claimed)
+    assert.equal(continued.result.status, 'completed')
+    assert.equal(continued.input.workspaceTaskKey, first.taskKey)
+    assert.equal(continued.input.workspaceStateTaskKey, first.taskKey)
+    assert.equal(continued.result.evidence.taskKey, claimed.taskKey)
+    assert.equal(continued.result.evidence.workspaceTaskKey, first.taskKey)
+
+    const previousWorktree = records(first.result?.evidence.worktrees)[0]
+    const continuedWorktree = records(continued.result.evidence.worktrees)[0]
+    assert.equal(continuedWorktree?.worktreePath, previousWorktree?.worktreePath)
+    assert.equal(continuedWorktree?.branch, previousWorktree?.branch)
+    assert.equal(await fs.readFile(path.join(String(continuedWorktree?.worktreePath), 'README.md'), 'utf8'), '# fixture\nchanged\ncontinued\n')
+
+    assert.deepEqual((await readTaskState({
+      devRoot: fixture.devRoot,
+      stateDir: path.join(fixture.dataDir, 'development', claimed.taskKey),
+      taskKey: claimed.taskKey,
+      workspaceTaskKey: first.taskKey
+    })).verifications.map((item) => {
+      return item.command
+    }), [PASS_COMMAND])
+    assert.equal(systemd.records().some((entry) => {
+      return entry.type === 'stop' && entry.pattern === taskScopePattern(fixture.hash, first.ledgerTaskId)
+    }), true)
+    assert.equal(git(fixture, String(continuedWorktree?.worktreePath), 'status', '--porcelain').includes('README.md'), true)
+  } finally {
+    await teardown(value, attempt)
+  }
+})
+
+test('attempt: continue で worktree の branch が変わっていたら agent を起動せず fail-closed', async () => {
+  const value = await setup()
+  const { fixture, models, systemd } = value
+  const attempt = await openAttemptHarness(fixture, { models: models.runtime, systemd: systemd.ops })
+
+  try {
+    await createRepository(fixture, 'repo')
+    const settings = defaultSettings(fixture, models.model)
+    models.script(completingScript({ command: [process.execPath, '-e', 'process.exit(1)'] }))
+    const first = await attempt.runAttempt(taskInput(), settings)
+    assert.equal(first.result?.status, 'failed')
+    const worktreePath = String(records(first.result?.evidence.worktrees)[0]?.worktreePath)
+    git(fixture, worktreePath, 'switch', '-c', 'manual-change')
+
+    const continueTask = Reflect.get(attempt.ledger, 'continueTask')
+    assert.equal(typeof continueTask, 'function')
+    Reflect.apply(continueTask, attempt.ledger, [first.ledgerTaskId, {
+      note: null,
+      confirmSideEffects: false
+    }])
+    const claimed = attempt.ledger.claimNextAttempt(1, settings)
+    assert.ok(claimed)
+    const callsBefore = models.faux.state.callCount
+    assert.ok(callsBefore > 0)
+    models.script(() => {
+      return answer('この応答は使われない')
+    })
+
+    const continued = await runClaimedAttempt(attempt, claimed)
+    assert.equal(continued.result.status, 'failed')
+    assert.equal(continued.result.failureReason, 'continuation_workspace_invalid')
+    assert.equal(models.faux.state.callCount, callsBefore)
+    assert.equal(git(fixture, worktreePath, 'branch', '--show-current'), 'manual-change')
+    await assert.rejects(fs.access(path.join(fixture.dataDir, 'development', claimed.taskKey, 'worktrees.jsonl')))
+    assert.equal(systemd.launches().some((launch) => {
+      return launch.unit.includes(`${claimed.taskKey}-verify-`)
+    }), false)
+    assert.equal(systemd.launches().some((launch) => {
+      return launch.unit.includes(`${claimed.taskKey}-delivery-`)
+    }), false)
+  } finally {
+    await teardown(value, attempt)
+  }
+})
+
+test('attempt: agent phase に入る直前に workspace が置換されたら再検証して model を呼ばない', async () => {
+  const value = await setup()
+  const { fixture, models, systemd } = value
+  let continuedTaskKey: string | undefined
+  let worktreePath = ''
+  let branch = ''
+  let replaced = false
+  const attempt = await openAttemptHarness(fixture, {
+    models: models.runtime,
+    systemd: systemd.ops,
+    faults: {
+      beforePhaseCommit: async (phase, taskKey) => {
+        if (phase !== 'start' || taskKey !== continuedTaskKey || replaced) {
+          return
+        }
+
+        const repositoryPath = path.join(fixture.devRoot, 'repo')
+        git(fixture, repositoryPath, 'worktree', 'remove', '--force', worktreePath)
+        git(fixture, repositoryPath, 'worktree', 'add', worktreePath, branch)
+        replaced = true
+      },
+    },
+  })
+
+  try {
+    await createRepository(fixture, 'repo')
+    const settings = defaultSettings(fixture, models.model)
+    models.script(completingScript({ command: [process.execPath, '-e', 'process.exit(1)'] }))
+    const first = await attempt.runAttempt(taskInput(), settings)
+    assert.equal(first.result?.status, 'failed')
+    const previousWorktree = records(first.result?.evidence.worktrees)[0]
+    worktreePath = String(previousWorktree?.worktreePath)
+    branch = String(previousWorktree?.branch)
+
+    const continueTask = Reflect.get(attempt.ledger, 'continueTask')
+    assert.equal(typeof continueTask, 'function')
+    Reflect.apply(continueTask, attempt.ledger, [first.ledgerTaskId, {
+      note: null,
+      confirmSideEffects: false,
+    }])
+    const claimed = attempt.ledger.claimNextAttempt(1, settings)
+    assert.ok(claimed)
+    continuedTaskKey = claimed.taskKey
+    const callsBefore = models.faux.state.callCount
+    models.script(() => {
+      return answer('この応答は使われない')
+    })
+
+    const continued = await runClaimedAttempt(attempt, claimed)
+    assert.equal(replaced, true)
+    assert.equal(continued.result.status, 'failed')
+    assert.equal(continued.result.failureReason, 'continuation_workspace_invalid')
+    assert.equal(models.faux.state.callCount, callsBefore)
+    assert.equal(git(fixture, worktreePath, 'branch', '--show-current'), branch)
+  } finally {
+    await teardown(value, attempt)
+  }
+})
+
+test('attempt: continuation の evidence phase は検証前に現在の worktree identity を再確認する', async () => {
+  const value = await setup()
+  const { fixture, models, systemd } = value
+  let continuedTaskKey: string | undefined
+  let worktreePath = ''
+  const attempt = await openAttemptHarness(fixture, {
+    models: models.runtime,
+    systemd: systemd.ops,
+    faults: {
+      beforeRecordAgentFinished(taskKey) {
+        if (taskKey === continuedTaskKey) {
+          git(fixture, worktreePath, 'switch', '-c', 'changed-before-evidence')
+        }
+      },
+    },
+  })
+
+  try {
+    await createRepository(fixture, 'repo')
+    const settings = defaultSettings(fixture, models.model)
+    models.script(completingScript({ command: [process.execPath, '-e', 'process.exit(1)'] }))
+    const first = await attempt.runAttempt(taskInput(), settings)
+    assert.equal(first.result?.failureReason, 'verification_failed')
+    worktreePath = String(records(first.result?.evidence.worktrees)[0]?.worktreePath)
+
+    const continueTask = Reflect.get(attempt.ledger, 'continueTask')
+    assert.equal(typeof continueTask, 'function')
+    Reflect.apply(continueTask, attempt.ledger, [first.ledgerTaskId, {
+      note: null,
+      confirmSideEffects: false,
+    }])
+    const claimed = attempt.ledger.claimNextAttempt(1, settings)
+    assert.ok(claimed)
+    continuedTaskKey = claimed.taskKey
+    models.script((view) => {
+      return view.toolResults.length === 0
+        ? toolCall('araya_register_verification', { repository: 'repo', command: [...PASS_COMMAND] })
+        : answer('agent complete')
+    })
+
+    const continued = await runClaimedAttempt(attempt, claimed)
+    assert.equal(continued.result.status, 'failed')
+    assert.equal(continued.result.failureReason, 'continuation_workspace_invalid')
+    assert.equal(git(fixture, worktreePath, 'branch', '--show-current'), 'changed-before-evidence')
+    assert.equal(systemd.launches().some((launch) => {
+      return launch.unit.includes(`${claimed.taskKey}-verify-`)
+    }), false)
+    assert.equal(systemd.launches().some((launch) => {
+      return launch.unit.includes(`${claimed.taskKey}-delivery-`)
+    }), false)
   } finally {
     await teardown(value, attempt)
   }
@@ -1503,6 +1890,7 @@ test('attempt: 再実行の試行の input には、追加の指示・前回の�
   try {
     const settings = defaultSettings(fixture, null)
     const worktree = {
+      repository: 'repo',
       worktreePath: path.join(fixture.devRoot, 'repo', '.worktree', 'araya-task-1-1-abcdef'),
       branch: 'araya/task-1-1-abcdef',
     }
@@ -1556,8 +1944,10 @@ test('attempt: 再実行の試行の input には、追加の指示・前回の�
       const input = buildAttemptInput(second)
 
       assert.notEqual(input.taskKey, first.taskKey)
+      assert.equal(input.workspaceTaskKey, second.taskKey)
+      assert.equal(input.workspaceStateTaskKey, null)
       assert.equal(input.attempt, 2)
-      assert.deepEqual(input.previousAttempt, { attempt: 1, worktrees: [worktree] })
+      assert.deepEqual(input.previousAttempt, { attempt: 1, taskKey: first.taskKey, worktrees: [worktree] })
       assert.equal(
         input.body,
         [
@@ -1595,6 +1985,7 @@ test('attempt: 再実行の試行の input には、追加の指示・前回の�
         },
         { taskKey: second.taskKey, addMs: 0 },
       )
+
     }
   } finally {
     ledger.close()
@@ -1716,12 +2107,11 @@ test('attempt: 検証成功後に変更をcommit・pushし、Draft PR URLをevid
     assert.equal(done.outcome.status, 'completed')
     assert.equal(run?.status, 'completed')
     assert.equal(worktree?.draftPrUrl, 'https://github.com/example/repo/pull/123')
-    const state = await readTaskState({
+    const record = (await readTaskState({
       devRoot: fixture.devRoot,
       stateDir: path.join(fixture.dataDir, 'development', done.taskKey),
       taskKey: done.taskKey,
-    })
-    const record = state.worktrees[0]
+    })).worktrees[0]
     assert.ok(record)
     assert.equal(typeof worktree?.commitSha, 'string')
     assert.equal(
@@ -1874,6 +2264,50 @@ test('attempt: 検証成功後に変更をcommit・pushし、Draft PR URLをevid
       ),
       '1',
     )
+
+    await fs.appendFile(path.join(record.worktreePath, 'README.md'), 'continued\n')
+
+    const continuedPaths = git(fixture, record.worktreePath, 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--name-only', '-z', record.baseSha, '--').split('\0').filter((value) => {
+      return value !== ''
+    }).sort()
+    const continuedSections = splitGitDiffSections(git(
+      fixture,
+      record.worktreePath,
+      'diff',
+      '--no-ext-diff',
+      '--no-textconv',
+      '--no-color',
+      '--no-renames',
+      '--binary',
+      '--unified=3',
+      record.baseSha,
+      '--',
+    ))
+    const continuedDiffSha256 = continuedSections === null
+      ? null
+      : hashGitDiffSnapshot(continuedPaths, continuedSections)
+
+    assert.ok(continuedDiffSha256)
+    const continuedDelivery = await deliverDraftPullRequests({
+      ...retryInput,
+      taskKey: 'task-1-2-bcdefg',
+      workspaceTaskKey: done.taskKey,
+      worktrees: [{
+        ...retryInput.worktrees[0]!,
+        headSha: git(fixture, record.worktreePath, 'rev-parse', 'HEAD'),
+        snapshotDiffSha256: continuedDiffSha256,
+        snapshotChangedFiles: continuedPaths,
+        validateWorkspace: async () => {},
+      }]
+    }, retryDependencies)
+
+    assert.equal(continuedDelivery.status, 'completed', JSON.stringify(continuedDelivery))
+    assert.equal(continuedDelivery.worktrees[0]?.draftPrStatus, 'reused')
+    assert.equal(continuedDelivery.worktrees[0]?.draftPrUrl, 'https://github.com/example/repo/pull/123')
+    assert.notEqual(continuedDelivery.worktrees[0]?.commitSha, worktree?.commitSha)
+    assert.equal(retryPushCalls.length, 2)
+    assert.equal(git(fixture, record.worktreePath, 'rev-list', '--count', `${record.baseSha}..HEAD`), '2')
+    assert.equal(git(fixture, record.worktreePath, 'status', '--porcelain'), '')
     const calls: { args: string[]; input: string }[] = []
 
     for (const line of (await fs.readFile(fakeGhLog, 'utf8')).split(String.fromCharCode(10))) {
@@ -1899,8 +2333,19 @@ test('attempt: 検証成功後に変更をcommit・pushし、Draft PR URLをevid
     }
     assert.match(String(worktree?.commitSha), /^[0-9a-f]{40}$/u)
     assert.equal(
+      git(
+        fixture,
+        repo,
+        'merge-base',
+        '--is-ancestor',
+        String(worktree?.commitSha),
+        `refs/heads/araya/${done.taskKey}`,
+      ),
+      '',
+    )
+    assert.equal(
       git(fixture, repo, 'rev-parse', `refs/heads/araya/${done.taskKey}`),
-      worktree?.commitSha,
+      continuedDelivery.worktrees[0]?.commitSha,
     )
     assert.deepEqual(git(fixture, String(worktree?.worktreePath), 'status', '--porcelain'), '')
     assert.equal(pushCalls.length, 1)

@@ -345,7 +345,7 @@ test('runner: running の試行への中止は次の loop で始まり、bash �
     assert.equal(setup.systemd.launches().some((launch) => launch.unit.includes('-verify-')), false)
     const evidence = attempt?.evidence ?? {}
     assert.equal(evidence.bodiesStored, false)
-    assert.deepEqual(records(evidence.worktrees).map((worktree) => Object.keys(worktree).sort()), [['branch', 'worktreePath']])
+    assert.deepEqual(records(evidence.worktrees).map((worktree) => Object.keys(worktree).sort()), [['base', 'baseSha', 'branch', 'excludeAdded', 'repository', 'worktreeIdentity', 'worktreePath']])
     await assert.rejects(fs.access(path.join(attempt?.stateDir ?? '', 'evidence.json')))
     assert.deepEqual(shown.events.flatMap((event) => {
       return event.type === 'run.stopping' || event.type === 'run.finished' || event.type === 'task.cancel_requested' ? [[event.type, event.data]] : []
@@ -466,7 +466,16 @@ test('runner: 再実行は新しい状態 directory・会話・worktree・branch
     await fs.access(String(previousWorktree?.worktreePath))
     assert.deepEqual(retried?.evidence?.previousAttempt, {
       attempt: 1,
-      worktrees: [{ worktreePath: previousWorktree?.worktreePath, branch: previousWorktree?.branch }]
+      taskKey: previous?.taskKey,
+      worktrees: [{
+        repository: previousWorktree?.repository,
+        worktreePath: previousWorktree?.worktreePath,
+        branch: previousWorktree?.branch,
+        base: previousWorktree?.base,
+        baseSha: previousWorktree?.baseSha,
+        excludeAdded: previousWorktree?.excludeAdded,
+        worktreeIdentity: previousWorktree?.worktreeIdentity
+      }]
     })
     const prompt = prompts.get(retried?.taskKey ?? '') ?? ''
     assert.match(prompt, /検証のコマンドを直してから進めてください/u)
@@ -714,6 +723,71 @@ test('runner: 止めるように求められると試行を中止せずに 0 で
   }
 })
 
+test('runner: null timeout の保存済み試行は経過時間にかかわらず自動中止しない', async () => {
+  const setup = await setupWithRepository({ env: { ARAYA_DEVELOPMENT_TIMEOUT_MS: '60000' } })
+  const pidFile = path.join(setup.fixture.root, 'bash.pid')
+  setup.models.script((view) => {
+    const results = view.toolResults
+
+    if (results.length === 0) {
+      return toolCall('araya_create_worktree', { repository: 'repo', base: 'HEAD' })
+    }
+
+    if (results.length === 1) {
+      return toolCall('bash', { command: `echo $$ > ${pidFile}; sleep 30` })
+    }
+
+    return answer('完了しました')
+  })
+  const [taskId = 0] = createTasks(setup, 1)
+  const runner = startRunner(setup)
+  const ledger = openLedger(setup)
+
+  try {
+    const bashPid = await readPid(pidFile)
+    const db = new DatabaseSync(path.join(setup.fixture.dataDir, 'tasks.sqlite'))
+
+    try {
+      const row = db.prepare('SELECT settings_json FROM runs WHERE task_id = ? AND attempt = 1').get(taskId)
+      assert.ok(row)
+      const persistedSettings: Record<string, unknown> = JSON.parse(String(row.settings_json))
+      assert.equal(persistedSettings.timeoutMs, 60_000)
+      persistedSettings.timeoutMs = null
+      db.prepare('UPDATE runs SET settings_json = ? WHERE task_id = ? AND attempt = 1').run(
+        JSON.stringify(persistedSettings),
+        taskId,
+      )
+    } finally {
+      db.close()
+    }
+
+    // runner がnullを読み取るloopを通ってから、数値timeoutを大きく超える
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const heartbeatBeforeAdvance = ledger.readRunner('', Date.now()).heartbeatAt
+    setup.clock.advance(70_000)
+    await waitUntil(() => {
+      return ledger.readRunner('', Date.now()).heartbeatAt !== heartbeatBeforeAdvance
+    }, 'heartbeat after the null timeout update')
+
+    assert.equal(ledger.getTask(taskId).status, 'running')
+    assert.equal(isAlive(bashPid), true)
+    assert.equal(
+      readEvents(setup.fixture).some((event) => {
+        return event.taskId === taskId && event.type === 'run.stopping'
+      }),
+      false,
+    )
+
+    assert.equal(ledger.cancelTask(taskId).cancel, 'requested')
+    const stopped = await waitForTaskStatus(setup, taskId, ['completed', 'failed', 'blocked'])
+    assert.equal(stopped.task.status, 'failed')
+    assert.equal(stopped.attempts[0]?.failureReason, 'cancelled')
+  } finally {
+    ledger.close()
+    await finish(setup, runner)
+  }
+})
+
 test('runner: 設定ファイルが不正な間は取り込まずに log に1回だけ書き、直すと次の loop で取り込む', async () => {
   const setup = await setupWithRepository({ env: { ARAYA_TEST_TOKEN: SECRET } })
   const configPath = path.join(setup.fixture.dataDir, 'config.json')
@@ -736,7 +810,9 @@ test('runner: 設定ファイルが不正な間は取り込まずに log に1回
       return ledger.readRunner('', Date.now()).heartbeatAt !== ledger.readRunner('', Date.now()).startedAt
     }, 'heartbeat while the config is invalid')
     assert.equal(ledger.getTask(taskId).status, 'queued')
-    const invalid = parseLogLines(await readRunnerLog(setup.fixture)).filter((entry) => entry.type === 'config_file_invalid')
+    const invalid = parseLogLines(await readRunnerLog(setup.fixture)).filter((entry) => {
+      return entry.type === 'config_file_invalid'
+    })
     assert.equal(invalid.length, 1)
     assert.match(String(invalid[0]?.message), /\[REDACTED\]/u)
     assert.equal((await readRunnerLog(setup.fixture)).includes(SECRET), false)

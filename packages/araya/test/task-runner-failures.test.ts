@@ -298,7 +298,7 @@ test('runner: phase が例外を投げて想定外の outcome で終わった試
     const evidence = attempt?.evidence ?? {}
     assert.equal(evidence.failureReason, 'attempt_error')
     assert.equal(evidence.bodiesStored, false)
-    assert.deepEqual(records(evidence.worktrees).map((worktree) => Object.keys(worktree).sort()), [['branch', 'worktreePath']])
+    assert.deepEqual(records(evidence.worktrees).map((worktree) => Object.keys(worktree).sort()), [['base', 'baseSha', 'branch', 'excludeAdded', 'repository', 'worktreeIdentity', 'worktreePath']])
     assert.deepEqual(eventsOf(setup, taskId, 'run.finished').map((event) => event.data), [{ status: 'failed', failureReason: 'attempt_error' }])
   } finally {
     await teardownRunner(setup, runner)
@@ -916,7 +916,7 @@ test('runner: evidence の phase の始めに試行の scope を止められな�
     assert.equal(shown.task.status, 'failed')
     assert.equal(attempt?.failureReason, 'termination_unconfirmed')
     assert.equal(evidence.bodiesStored, false)
-    assert.deepEqual(records(evidence.worktrees).map((worktree) => Object.keys(worktree).sort()), [['branch', 'worktreePath']])
+    assert.deepEqual(records(evidence.worktrees).map((worktree) => Object.keys(worktree).sort()), [['base', 'baseSha', 'branch', 'excludeAdded', 'repository', 'worktreeIdentity', 'worktreePath']])
     // SHIKI の終わり方は evidence に残る
     assert.ok(isRecord(evidence.agent))
     // 失敗した停止の後に、差分の収集の git も検証のコマンドも起動しない

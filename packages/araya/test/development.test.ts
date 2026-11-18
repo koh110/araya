@@ -1332,7 +1332,7 @@ test('collectDevelopmentResult: decision.json の形式が不正なら task_stat
   }
 })
 
-test('buildWorktreeOnlyEvidence: worktrees.jsonl の path と branch だけを残し、無ければ空、読めなければ空にして理由を返す', async () => {
+test('buildWorktreeOnlyEvidence: worktree identity を残し、無ければ空、読めなければ理由を返す', async () => {
   const fixture = await createFixture()
   const repoA = await createRepository(fixture, 'repo-a')
 
@@ -1340,13 +1340,21 @@ test('buildWorktreeOnlyEvidence: worktrees.jsonl の path と branch だけを�
     const stateDir = await createTaskState(fixture.dataDir, TASK_KEY)
     const missing = await buildWorktreeOnlyEvidence({ taskKey: TASK_KEY, devRoot: fixture.devRoot, stateDir, redact: noRedaction })
     assert.deepEqual(missing, {
-      evidence: { taskKey: TASK_KEY, devRoot: fixture.devRoot, stateDir, worktrees: [], bodiesStored: false },
+      evidence: { taskKey: TASK_KEY, workspaceTaskKey: TASK_KEY, devRoot: fixture.devRoot, stateDir, worktrees: [], bodiesStored: false },
       detail: null
     })
 
-    await serviceFor({ devRoot: fixture.devRoot, stateDir, taskKey: TASK_KEY, env: fixture.env }).createWorktree({ repository: 'repo-a' })
+    const worktree = await serviceFor({ devRoot: fixture.devRoot, stateDir, taskKey: TASK_KEY, env: fixture.env }).createWorktree({ repository: 'repo-a' })
     const recorded = await buildWorktreeOnlyEvidence({ taskKey: TASK_KEY, devRoot: fixture.devRoot, stateDir, redact: noRedaction })
-    assert.deepEqual(recorded.evidence.worktrees, [{ worktreePath: worktreePathOf(repoA), branch: `araya/${TASK_KEY}` }])
+    assert.deepEqual(recorded.evidence.worktrees, [{
+      repository: 'repo-a',
+      worktreePath: worktreePathOf(repoA),
+      branch: `araya/${TASK_KEY}`,
+      base: worktree.base,
+      baseSha: worktree.baseSha,
+      excludeAdded: worktree.excludeAdded,
+      worktreeIdentity: worktree.worktreeIdentity
+    }])
     assert.equal(recorded.detail, null)
 
     await fs.appendFile(path.join(stateDir, 'worktrees.jsonl'), 'not json\n', 'utf8')
@@ -1355,7 +1363,7 @@ test('buildWorktreeOnlyEvidence: worktrees.jsonl の path と branch だけを�
     assert.match(String(broken.detail), /worktrees\.jsonl could not be read/u)
 
     const noState = await buildWorktreeOnlyEvidence({ taskKey: TASK_KEY, devRoot: fixture.devRoot, stateDir: null, redact: noRedaction })
-    assert.deepEqual(noState.evidence, { taskKey: TASK_KEY, devRoot: fixture.devRoot, stateDir: null, worktrees: [], bodiesStored: false })
+    assert.deepEqual(noState.evidence, { taskKey: TASK_KEY, workspaceTaskKey: TASK_KEY, devRoot: fixture.devRoot, stateDir: null, worktrees: [], bodiesStored: false })
   } finally {
     await removeFixture(fixture)
   }
