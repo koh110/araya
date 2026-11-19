@@ -50,17 +50,22 @@ npm uninstall --global --prefix "$PREFIX" --no-audit --no-fund agentctl
 # 同名・同versionの既存symlinkをnpmがup-to-date扱いしないよう強制置換する。
 npm install --global --prefix "$PREFIX" --no-audit --no-fund --force "$1"
 
-# 入れた araya で runner を入れ直し、新しいコードで起動し直す（止めてあった runner も起動する）。
-# runner の unit file には PATH を書くので、npm run が足した entry（checkout の node_modules/.bin など）を外して渡す。
-# araya は、この環境では runner を使えないとき（Linux 以外か、systemd の user manager に接続できない）に終了 code 69 で終わる
-RUNNER_PATH=$(path_without_npm_run_entries)
-printf '%s\n' 'araya runner install を実行します'
-runner_status=0
-PATH=$RUNNER_PATH "$PREFIX/bin/araya" runner install || runner_status=$?
-if [ "$runner_status" -eq 69 ]; then
-  # runner は使えないが、araya のコマンドは使える
-  printf '%s\n' 'この環境では runner を使えないため、runner を入れずに終わります（araya は入れました）' >&2
-elif [ "$runner_status" -ne 0 ]; then
-  printf '%s\n' 'error: araya は入れましたが、runner を入れられませんでした。上の理由を直してから、araya runner install を実行してください' >&2
-  exit 1
+# 入れた araya で Discord bot の unit を入れ直し、新しいコードで起動し直す（止めてあった unit も起動する）。
+# unit file には PATH を書くので、npm run が足した entry（checkout の node_modules/.bin など）を外して渡す。
+# araya は、この環境では Discord bot を使えないとき（Linux 以外か、systemd の user manager に接続できない）に終了 code 69 で終わる
+ARAYA_DATA_DIR_RESOLVED=${ARAYA_DATA_DIR:-$HOME/.araya}
+if [ ! -f "$ARAYA_DATA_DIR_RESOLVED/.env" ]; then
+  printf '%s\n' "Discord の設定（$ARAYA_DATA_DIR_RESOLVED/.env）が無いため、Discord bot の unit は入れませんでした。araya discord init → araya discord install を実行してください" >&2
+else
+  DISCORD_PATH=$(path_without_npm_run_entries)
+  printf '%s\n' 'araya discord install を実行します'
+  discord_status=0
+  PATH=$DISCORD_PATH "$PREFIX/bin/araya" discord install || discord_status=$?
+  if [ "$discord_status" -eq 69 ]; then
+    # systemd の user manager が使えないが、araya のコマンドは使える
+    printf '%s\n' 'この環境では systemd の user manager を使えないため、Discord bot の unit を入れずに終わります（araya は入れました）' >&2
+  elif [ "$discord_status" -ne 0 ]; then
+    printf '%s\n' 'error: araya は入れましたが、Discord bot の unit を入れられませんでした。上の理由を直してから、araya discord install を実行してください' >&2
+    exit 1
+  fi
 fi

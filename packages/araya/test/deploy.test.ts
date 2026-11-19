@@ -54,8 +54,8 @@ const FAKE_ARAYA = `#!/bin/sh
 printf '%s\\t%s\\t%s\\t%s\\n' araya "$*" "$0" "$PATH" >> "$DEPLOY_TEST_LOG"
 result=\${DEPLOY_TEST_ARAYA_RESULT:-ok}
 if [ "$result" = 'ok' ]; then
-  echo '{"unit":"araya-runner-test.service"}'
-  echo 'logout すると runner が止まります（test）' >&2
+  echo '{"unit":"araya-discord-test.service"}'
+  echo 'logout すると Discord bot が止まります（test）' >&2
   exit 0
 fi
 echo "$result: test の失敗" >&2
@@ -77,10 +77,24 @@ async function makeDeployFixture() {
   await fs.mkdir(path.join(root, 'tmp'))
   await fs.writeFile(path.join(binDir, 'npm'), FAKE_NPM, { mode: 0o755 })
   await fs.writeFile(fakeAraya, FAKE_ARAYA, { mode: 0o755 })
+  const dataDir = path.join(root, 'data')
+  await fs.mkdir(dataDir, { mode: 0o700 })
+  await fs.writeFile(
+    path.join(dataDir, '.env'),
+    [
+      'ARAYA_DISCORD_BOT_TOKEN=deploy-test-token',
+      'ARAYA_DISCORD_APPLICATION_ID=12345678901234567',
+      'ARAYA_DISCORD_GUILD_ID=22345678901234567',
+      'ARAYA_DISCORD_CHANNEL_ID=32345678901234567',
+      'ARAYA_DISCORD_ALLOWED_USER_IDS=42345678901234567',
+    ].join('\n'),
+    { mode: 0o600 },
+  )
   const env: NodeJS.ProcessEnv = {
     HOME: path.join(root, 'home'),
     TMPDIR: path.join(root, 'tmp'),
     ARAYA_INSTALL_PREFIX: prefix,
+    ARAYA_DATA_DIR: dataDir,
     DEPLOY_TEST_LOG: logPath,
     DEPLOY_TEST_ARAYA: fakeAraya,
   }
@@ -218,7 +232,7 @@ async function findNpmCli() {
   return null
 }
 
-test('deploy: npm install の後に、入れた araya で runner install を、npm run が足した PATH の entry を外して実行する', async () => {
+test('deploy: npm install の後に、入れた araya で discord install を、npm run が足した PATH の entry を外して実行する', async () => {
   const fixture = await makeDeployFixture()
 
   try {
@@ -233,16 +247,16 @@ test('deploy: npm install の後に、入れた araya で runner install を、n
       'npm pack',
       'npm uninstall',
       'npm install',
-      'araya runner',
+      'araya discord',
     ])
-    const runnerInstall = calls[3]
-    assert.ok(runnerInstall)
-    assert.equal(runnerInstall.args, 'runner install')
-    assert.equal(runnerInstall.self, path.join(fixture.prefix, 'bin', 'araya'))
-    assert.equal(runnerInstall.path, fixture.originalPath)
-    // runner install の stdout と stderr（linger の注意など）は、そのまま利用者に見える
-    assert.match(result.stdout, /araya-runner-test\.service/u)
-    assert.match(result.stderr, /logout すると runner が止まります（test）/u)
+    const discordInstall = calls[3]
+    assert.ok(discordInstall)
+    assert.equal(discordInstall.args, 'discord install')
+    assert.equal(discordInstall.self, path.join(fixture.prefix, 'bin', 'araya'))
+    assert.equal(discordInstall.path, fixture.originalPath)
+    // discord install の stdout と stderr（linger の注意など）は、そのまま利用者に見える
+    assert.match(result.stdout, /araya-discord-test\.service/u)
+    assert.match(result.stderr, /logout すると Discord bot が止まります（test）/u)
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
@@ -259,15 +273,16 @@ test('deploy: npm run を入れ子で実行したときは、重ねて足され�
     )
 
     assert.deepEqual(result.exit, { code: 0, signal: null }, result.stderr)
-    const runnerInstall = (await readCalls(fixture.logPath)).at(-1)
-    assert.equal(runnerInstall?.command, 'araya')
-    assert.equal(runnerInstall?.path, originalPath)
+    const discordInstall = (await readCalls(fixture.logPath)).at(-1)
+    assert.equal(discordInstall?.command, 'araya')
+    assert.equal(discordInstall?.args, 'discord install')
+    assert.equal(discordInstall?.path, originalPath)
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
 })
 
-test('deploy: npm run を通さずに実行したときは、PATH を変えずに runner install を実行する', async () => {
+test('deploy: npm run を通さずに実行したときは、PATH を変えずに discord install を実行する', async () => {
   const fixture = await makeDeployFixture()
 
   try {
@@ -276,15 +291,16 @@ test('deploy: npm run を通さずに実行したときは、PATH を変えず�
     const result = await runDeployScript(fixture, pathValue)
 
     assert.deepEqual(result.exit, { code: 0, signal: null }, result.stderr)
-    const runnerInstall = (await readCalls(fixture.logPath)).at(-1)
-    assert.equal(runnerInstall?.command, 'araya')
-    assert.equal(runnerInstall?.path, pathValue)
+    const discordInstall = (await readCalls(fixture.logPath)).at(-1)
+    assert.equal(discordInstall?.command, 'araya')
+    assert.equal(discordInstall?.args, 'discord install')
+    assert.equal(discordInstall?.path, pathValue)
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
 })
 
-test('deploy: runner install が終了 code 69（この環境では runner を使えない）で終わったときは、注意を出して終了 code 0 で終わる', async () => {
+test('deploy: discord install が終了 code 69（この環境では Discord bot を使えない）で終わったときは、注意を出して終了 code 0 で終わる', async () => {
   for (const code of ['unsupported_platform', 'systemd_unavailable']) {
     const fixture = await makeDeployFixture()
 
@@ -296,15 +312,15 @@ test('deploy: runner install が終了 code 69（この環境では runner を�
 
       assert.deepEqual(result.exit, { code: 0, signal: null }, `${code}: ${result.stderr}`)
       assert.match(result.stderr, new RegExp(`^${code}: test の失敗$`, 'mu'))
-      assert.match(result.stderr, /runner を入れずに終わります/u)
-      assert.doesNotMatch(result.stderr, /runner を入れられませんでした/u)
+      assert.match(result.stderr, /unit を入れずに終わります/u)
+      assert.doesNotMatch(result.stderr, /unit を入れられませんでした/u)
     } finally {
       await fs.rm(fixture.root, { recursive: true, force: true })
     }
   }
 })
 
-test('deploy: runner install がほかの終了 code で終わったときは、stderr の文によらず、araya を入れたまま終了 code 1 で終わる', async () => {
+test('deploy: discord install がほかの終了 code で終わったときは、stderr の文によらず、araya を入れたまま終了 code 1 で終わる', async () => {
   // stderr の行が systemd_unavailable などの形でも、終了 code が 69 でなければ deploy の失敗にする
   const cases = [
     { code: 'systemctl_failed', exit: '1' },
@@ -324,8 +340,8 @@ test('deploy: runner install がほかの終了 code で終わったときは、
 
       assert.deepEqual(result.exit, { code: 1, signal: null }, `${item.code}: ${result.stderr}`)
       assert.match(result.stderr, new RegExp(`^${item.code}: test の失敗$`, 'mu'))
-      assert.match(result.stderr, /runner を入れられませんでした/u)
-      assert.doesNotMatch(result.stderr, /runner を入れずに終わります/u)
+      assert.match(result.stderr, /unit を入れられませんでした/u)
+      assert.doesNotMatch(result.stderr, /unit を入れずに終わります/u)
       await fs.access(path.join(fixture.prefix, 'bin', 'araya'))
     } finally {
       await fs.rm(fixture.root, { recursive: true, force: true })
@@ -333,7 +349,7 @@ test('deploy: runner install がほかの終了 code で終わったときは、
   }
 })
 
-test('deploy: npm install が失敗したときは、runner install を実行しない', async () => {
+test('deploy: npm install が失敗したときは、discord install を実行しない', async () => {
   const fixture = await makeDeployFixture()
 
   try {
@@ -352,7 +368,7 @@ test('deploy: npm install が失敗したときは、runner install を実行し
   }
 })
 
-test('deploy: 本物の npm で npm run deploy を実行しても、npm run が足した PATH の entry を外して runner install を実行する', async (t) => {
+test('deploy: 本物の npm で npm run deploy を実行しても、npm run が足した PATH の entry を外して discord install を実行する', async (t) => {
   const npmCli = await findNpmCli()
 
   if (npmCli === null) {
@@ -398,7 +414,7 @@ test('deploy: 本物の npm で npm run deploy を実行しても、npm run が�
       'npm pack',
       'npm uninstall',
       'npm install',
-      'araya runner',
+      'araya discord',
     ])
     // deploy.sh の中の npm は、npm run が足した entry の付いた PATH で動いた
     const pack = calls[0]
@@ -412,17 +428,26 @@ test('deploy: 本物の npm で npm run deploy を実行しても、npm run が�
 })
 
 // npm が入れる araya の代わりに checkout の araya の CLI を置いて、deploy.sh を実行する。
-// systemctl・systemd-run・loginctl は、呼ばれたら記録して失敗する偽物（systemd の user manager に接続できない環境）。
-// cliPath を指定したときは、CLI の PATH をその値にする
-async function runDeployWithRealAraya(fixture: DeployFixture, cliPath: string | null) {
+// systemctl・loginctl は、呼ばれたら記録する偽物。systemdMode 'offline' は終了 code 1（user manager に接続できない環境）、
+// 'online' は is-system-running だけ running で返し、ほかの command は終了 code 1。validEnv は .env の形を壊す
+async function runDeployWithRealAraya(
+  fixture: DeployFixture,
+  cliPath: string | null,
+  options: { systemdMode?: 'offline' | 'online'; validEnv?: boolean } = {},
+) {
+  const systemdMode = options.systemdMode ?? 'offline'
   const systemdDir = path.join(fixture.root, 'systemd-bin')
   const systemdLog = path.join(fixture.root, 'systemd.log')
-  await fs.mkdir(systemdDir)
+  await fs.mkdir(systemdDir, { recursive: true })
 
-  for (const name of ['systemctl', 'systemd-run', 'loginctl']) {
+  for (const name of ['systemctl', 'loginctl']) {
+    const onlineBranch =
+      systemdMode === 'online'
+        ? `if [ "$2" = 'is-system-running' ]; then printf 'running\\n'; exit 0; fi\n`
+        : ''
     await fs.writeFile(
       path.join(systemdDir, name),
-      `#!/bin/sh\nprintf '%s\\n' "$0 $*" >> ${shellQuote(systemdLog)}\nexit 1\n`,
+      `#!/bin/sh\nprintf '%s\\n' "$0 $*" >> ${shellQuote(systemdLog)}\n${onlineBranch}exit 1\n`,
       { mode: 0o755 },
     )
   }
@@ -434,6 +459,21 @@ async function runDeployWithRealAraya(fixture: DeployFixture, cliPath: string | 
     `#!/bin/sh\n${setPath}exec ${shellQuote(process.execPath)} ${shellQuote(CLI_PATH)} "$@"\n`,
     { mode: 0o755 },
   )
+  const dataDir = path.join(fixture.root, 'data')
+  await fs.mkdir(dataDir, { recursive: true, mode: 0o700 })
+  await fs.writeFile(
+    path.join(dataDir, '.env'),
+    options.validEnv === false
+      ? ['not a key=value line', 'ARAYA_DISCORD_BOT_TOKEN=deploy-test-token'].join('\n')
+      : [
+          'ARAYA_DISCORD_BOT_TOKEN=deploy-test-token',
+          'ARAYA_DISCORD_APPLICATION_ID=12345678901234567',
+          'ARAYA_DISCORD_GUILD_ID=22345678901234567',
+          'ARAYA_DISCORD_CHANNEL_ID=32345678901234567',
+          'ARAYA_DISCORD_ALLOWED_USER_IDS=42345678901234567',
+        ].join('\n'),
+    { mode: 0o600 },
+  )
   const configHome = path.join(fixture.root, 'xdg-config')
   const runtimeDir = path.join(fixture.root, 'xdg-runtime')
   await fs.mkdir(runtimeDir, { mode: 0o700 })
@@ -444,7 +484,7 @@ async function runDeployWithRealAraya(fixture: DeployFixture, cliPath: string | 
       ...fixture.env,
       PATH: [systemdDir, fixture.originalPath].join(':'),
       DEPLOY_TEST_ARAYA: realAraya,
-      ARAYA_DATA_DIR: path.join(fixture.root, 'data'),
+      ARAYA_DATA_DIR: dataDir,
       ARAYA_CODING_AGENT_DIR: path.join(fixture.root, 'pi-agent'),
       XDG_CONFIG_HOME: configHome,
       XDG_RUNTIME_DIR: runtimeDir,
@@ -465,8 +505,11 @@ test('deploy: 本物の araya の CLI が、systemd の user manager に接続�
     )
 
     assert.deepEqual(result.exit, { code: 0, signal: null }, result.stderr)
-    assert.match(result.stderr, /^systemd_unavailable: systemd の user manager に接続できません/mu)
-    assert.match(result.stderr, /runner を入れずに終わります/u)
+    assert.match(
+      result.stderr,
+      /^systemd_unavailable: systemd の user manager に接続できません（応答なし）$/mu,
+    )
+    assert.match(result.stderr, /unit を入れずに終わります/u)
     assert.deepEqual((await fs.readFile(systemdLog, 'utf8')).trim().split('\n'), [
       `${path.join(systemdDir, 'systemctl')} --user is-system-running`,
     ])
@@ -485,11 +528,8 @@ test('deploy: 本物の araya の CLI が、PATH に systemctl が無くて syst
     const { result, systemdLog, configHome } = await runDeployWithRealAraya(fixture, emptyDir)
 
     assert.deepEqual(result.exit, { code: 0, signal: null }, result.stderr)
-    assert.match(
-      result.stderr,
-      /^systemd_unavailable: PATH に systemd-run・systemctl・bash がありません$/mu,
-    )
-    assert.match(result.stderr, /runner を入れずに終わります/u)
+    assert.match(result.stderr, /^systemd_unavailable: PATH に systemctl がありません$/mu)
+    assert.match(result.stderr, /unit を入れずに終わります/u)
     await assert.rejects(fs.access(systemdLog), { code: 'ENOENT' })
     await assert.rejects(fs.access(path.join(configHome, 'systemd')), { code: 'ENOENT' })
   } finally {
@@ -497,27 +537,42 @@ test('deploy: 本物の araya の CLI が、PATH に systemctl が無くて syst
   }
 })
 
-test('deploy: 本物の araya の CLI が設定ファイルの誤りで失敗したときは、誤りのメッセージに systemd_unavailable で始まる行があっても、終了 code 1 で終わる', async () => {
+test('deploy: 本物の araya の CLI が .env の誤りで discord install に失敗したときは、終了 code 1 で終わり、unit file を書かない', async () => {
   const fixture = await makeDeployFixture()
 
   try {
-    // 未知の key は、そのまま誤りのメッセージに入る。key の中の改行で「systemd_unavailable: 」で始まる行ができる
-    const dataDir = path.join(fixture.root, 'data')
-    await fs.mkdir(dataDir)
-    await fs.writeFile(
-      path.join(dataDir, 'config.json'),
-      JSON.stringify({ '\nsystemd_unavailable: test': true }),
-      'utf8',
+    const { result, systemdDir, systemdLog, configHome } = await runDeployWithRealAraya(
+      fixture,
+      null,
+      { systemdMode: 'online', validEnv: false },
     )
-    const { result, systemdLog, configHome } = await runDeployWithRealAraya(fixture, null)
 
     assert.deepEqual(result.exit, { code: 1, signal: null }, result.stderr)
-    assert.match(result.stderr, /invalid Araya config file /u)
-    assert.match(result.stderr, /^systemd_unavailable: test$/mu)
-    assert.match(result.stderr, /runner を入れられませんでした/u)
-    assert.doesNotMatch(result.stderr, /runner を入れずに終わります/u)
-    await assert.rejects(fs.access(systemdLog), { code: 'ENOENT' })
+    assert.match(result.stderr, /^discord_env_file_invalid: /mu)
+    assert.match(result.stderr, /unit を入れられませんでした/u)
+    assert.doesNotMatch(result.stderr, /unit を入れずに終わります/u)
+    assert.deepEqual((await fs.readFile(systemdLog, 'utf8')).trim().split('\n'), [
+      `${path.join(systemdDir, 'systemctl')} --user is-system-running`,
+      `${path.join(systemdDir, 'systemctl')} --user list-unit-files araya-runner-*.service --no-legend --full`,
+    ])
     await assert.rejects(fs.access(path.join(configHome, 'systemd')), { code: 'ENOENT' })
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('deploy: .env が無いときは araya を入れたまま、unit を入れずに init 案内を出して終了 code 0 で終わる', async () => {
+  const fixture = await makeDeployFixture()
+  await fs.rm(path.join(fixture.env.ARAYA_DATA_DIR ?? '', '.env'))
+
+  try {
+    const result = await runDeployScript(fixture, fixture.originalPath)
+
+    assert.deepEqual(result.exit, { code: 0, signal: null }, result.stderr)
+    assert.match(result.stderr, /araya discord init → araya discord install/u)
+    const calls = await readCalls(fixture.logPath)
+    assert.deepEqual(commandsOf(calls), ['npm pack', 'npm uninstall', 'npm install'])
+    await fs.access(path.join(fixture.prefix, 'bin', 'araya'))
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }

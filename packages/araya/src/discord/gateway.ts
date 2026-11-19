@@ -1,21 +1,30 @@
 // discord.js との接続。型Importだけにして discord.js の実行時 import は関内に行う（CLI 起動や test で load しない）
 // gateway interface を関数にすることで bot.ts の loop を fake で test できる
 
-import type { ChatInputCommandInteraction, GuildTextBasedChannel } from 'discord.js'
+import type { ChatInputCommandInteraction, GuildTextBasedChannel, Interaction } from 'discord.js'
 import { type DiscordConfig } from './config.ts'
-import {
-  ARAYA_COMMAND_NAME,
-  discordCommandDefinitionJson,
-  type DiscordCommandRequest,
-} from './interactions.ts'
 import { isDiscordChatMessageAllowed, type DiscordChatMessage } from './chat.ts'
+
+// slash command の interaction を handler に渡すための形（task 機構の撤去後も guild に残った定義への応答に使う）
+export const ARAYA_COMMAND_NAME = 'araya'
+
+export type DiscordCommandRequest = {
+  interactionId: string
+  userId: string
+  guildId: string | null
+  channelId: string | null
+  subcommandGroup: string | null
+  subcommand: string
+  options: Record<string, string | number | boolean | undefined>
+}
 
 export type DiscordCommandReplyFn = (content: string) => Promise<void>
 export type DiscordMessageReplyFn = (content: string, nonce: string) => Promise<void>
 
 export type DiscordGatewayHandlers = {
   onReady(botUserId?: string): Promise<void> | void
-  onInteraction(request: DiscordCommandRequest, reply: DiscordCommandReplyFn): Promise<void> | void
+  // slash command を扱う handler。省略されたら interaction は「撤去済み」の ephemeral reply で返す
+  onInteraction?(request: DiscordCommandRequest, reply: DiscordCommandReplyFn): Promise<void> | void
   onMessage(message: DiscordChatMessage, reply: DiscordMessageReplyFn): Promise<void> | void
   onError(message: string): void
 }
@@ -159,14 +168,86 @@ export function flattenDiscordCommandOptions(entries: readonly InteractionOption
   return options
 }
 
-// slash command 定義を Discord の guild へ登録する（araya discord register）
-export async function registerDiscordCommands(config: DiscordConfig) {
-  const { REST, Routes } = await import('discord.js')
-  await new REST({ version: '10' })
-    .setToken(config.botToken)
-    .put(Routes.applicationGuildCommands(config.applicationId, config.guildId), {
-      body: discordCommandDefinitionJson(),
-    })
+// task 機構の撤去後に返す案内（静的な text）。routeSlashCommandInteraction の実経路で test する
+export const OBSOLETE_COMMAND_REPLY =
+  'araya の slash command は撤去されました。Discord 側の command 定義は guild から削除してください'
+
+// slash command interaction の実処理。createDiscordGateway の client.on('interactionCreate') は
+// この function を呼ぶだけ。handler 不在時は ephemeral の撤去案内を返し、throw しない
+export async function routeSlashCommandInteraction(
+  interaction: Interaction,
+  handlers: DiscordGatewayHandlers,
+) {
+  if (!interaction.isChatInputCommand() || interaction.commandName !== ARAYA_COMMAND_NAME) {
+    return
+  }
+
+  const discord = await import('discord.js')
+  const commandInteraction: ChatInputCommandInteraction = interaction
+
+  let subcommandGroup: string | null
+  let subcommand: string
+
+  try {
+    subcommandGroup = commandInteraction.options.getSubcommandGroup(false)
+    subcommand = commandInteraction.options.getSubcommand()
+  } catch {
+    handlers.onError('slash command の subcommand が読めません')
+
+    return
+  }
+
+  // group と subcommand を再帰的に除き、実際に指定された option だけを渡す
+  let replied = false
+  async function reply(content: string) {
+    if (!replied) {
+      replied = true
+      await commandInteraction.reply({ content, flags: discord.MessageFlags.Ephemeral })
+
+      return
+    }
+
+    await commandInteraction.followUp({ content, flags: discord.MessageFlags.Ephemeral })
+  }
+
+  if (!handlers.onInteraction) {
+    try {
+      await reply(OBSOLETE_COMMAND_REPLY)
+    } catch (error: unknown) {
+      handlers.onError(errorMessage(error))
+    }
+
+    return
+  }
+
+  try {
+    await handlers.onInteraction(
+      {
+        interactionId: commandInteraction.id,
+        userId: commandInteraction.user.id,
+        guildId: commandInteraction.guildId,
+        channelId: commandInteraction.channelId,
+        subcommandGroup,
+        subcommand,
+        options: flattenDiscordCommandOptions(commandInteraction.options.data),
+      },
+      reply,
+    )
+  } catch (error: unknown) {
+    handlers.onError(errorMessage(error))
+  }
+}
+
+// client と routeSlashCommandInteraction の配線。fake client で実配線を test できるように切り出す
+export function wireSlashCommandInteractions(
+  client: {
+    on(event: 'interactionCreate', listener: (interaction: Interaction) => void): unknown
+  },
+  handlers: DiscordGatewayHandlers,
+) {
+  client.on('interactionCreate', (interaction) => {
+    void routeSlashCommandInteraction(interaction, handlers)
+  })
 }
 
 export async function createDiscordGateway(
@@ -207,54 +288,7 @@ export async function createDiscordGateway(
     }
   })
 
-  client.on('interactionCreate', (interaction) => {
-    if (!interaction.isChatInputCommand() || interaction.commandName !== ARAYA_COMMAND_NAME) {
-      return
-    }
-
-    let subcommandGroup: string | null
-    let subcommand: string
-
-    try {
-      subcommandGroup = interaction.options.getSubcommandGroup(false)
-      subcommand = interaction.options.getSubcommand()
-    } catch {
-      handlers.onError('slash command の subcommand が読めません')
-
-      return
-    }
-
-    // group と subcommand を再帰的に除き、実際に指定された option だけを渡す
-    let replied = false
-    const commandInteraction = interaction
-    async function reply(content: string) {
-      if (!replied) {
-        replied = true
-        await commandInteraction.reply({ content, flags: discord.MessageFlags.Ephemeral })
-
-        return
-      }
-
-      await commandInteraction.followUp({ content, flags: discord.MessageFlags.Ephemeral })
-    }
-
-    void Promise.resolve(
-      handlers.onInteraction(
-        {
-          interactionId: interaction.id,
-          userId: interaction.user.id,
-          guildId: interaction.guildId,
-          channelId: interaction.channelId,
-          subcommandGroup,
-          subcommand,
-          options: flattenDiscordCommandOptions(interaction.options.data),
-        },
-        reply,
-      ),
-    ).catch((error: unknown) => {
-      handlers.onError(errorMessage(error))
-    })
-  })
+  wireSlashCommandInteractions(client, handlers)
 
   client.on('messageCreate', (message) => {
     const botUserId = client.user?.id

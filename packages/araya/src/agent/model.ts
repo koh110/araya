@@ -5,7 +5,7 @@ import { clampThinkingLevel, type ThinkingLevel as PiThinkingLevel } from '@eare
 import type { ModelRuntime } from '@earendil-works/pi-coding-agent'
 
 import { loadPiSdk } from '../config/environment.ts'
-import { formatModel, type DevelopmentModel, type ThinkingLevel } from '../config/model.ts'
+import { formatModel, type ConfigModel, type ThinkingLevel } from '../config/model.ts'
 
 // thinking level が設定ファイルにも Pi の設定にも無いときの値。Pi の既定（core/defaults.js の DEFAULT_THINKING_LEVEL）に合わせる
 const DEFAULT_THINKING_LEVEL: ThinkingLevel = 'medium'
@@ -39,7 +39,7 @@ export type AgentModelResolution =
 // 設定ファイルの model、無ければ Pi の既定 model を使う。使えない model から別の model へは切り替えない
 export function resolveAgentModel(
   models: ModelLookup,
-  configured: DevelopmentModel | null,
+  configured: ConfigModel | null,
   piSettings: PiModelSettings,
 ): AgentModelResolution {
   const provider = configured === null ? piSettings.getDefaultProvider() : configured.provider

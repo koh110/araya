@@ -1,54 +1,10 @@
 import os from 'node:os'
 import path from 'node:path'
 
-import type { DevelopmentModel } from './model.ts'
+import type { ConfigModel } from './model.ts'
 
-// 設定ファイルの値は CLI が loadConfigFile で読んで置き換える。読まない経路（test など）では model を指定しない
-const NO_DEVELOPMENT_MODEL: DevelopmentModel | null = null
-
-function numberFromEnv(
-  value: string | undefined,
-  fallback: number,
-  options: { minimum?: number; maximum?: number } = {},
-) {
-  if (value === undefined || value === '') {
-    return fallback
-  }
-
-  const parsed = Number(value)
-
-  if (!Number.isFinite(parsed)) {
-    return fallback
-  }
-
-  const bounded = Math.max(options.minimum ?? 0, Math.floor(parsed))
-
-  return Math.min(options.maximum ?? Number.MAX_SAFE_INTEGER, bounded)
-}
-
-function optionalTimeoutFromEnv(
-  value: string | undefined,
-  fallback: number | null,
-  options: { minimum: number; maximum: number },
-) {
-  if (value === undefined || value === '') {
-    return fallback
-  }
-
-  const parsed = Number(value)
-
-  if (!Number.isFinite(parsed)) {
-    return fallback
-  }
-
-  if (parsed === 0) {
-    return null
-  }
-
-  const bounded = Math.max(options.minimum, Math.floor(parsed))
-
-  return Math.min(options.maximum, bounded)
-}
+// 設定ファイルの値は agent session の開始時に loadConfigFile で読んで置き換える。読まない経路（test など）では model を指定しない
+const NO_AGENT_MODEL: ConfigModel | null = null
 
 // SDK は process.env を実行時と import 時の両方で読む。最初の import 前に Araya 用の環境変数を設定する。
 let piEnvironmentActive = false
@@ -121,16 +77,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     configPath: path.join(dataDir, 'config.json'),
     devRoot: path.resolve(env.ARAYA_DEV_ROOT || path.join(os.homedir(), 'dev')),
     piAgentDir: path.join(dataDir, 'pi'),
-    developmentTimeoutMs: optionalTimeoutFromEnv(env.ARAYA_DEVELOPMENT_TIMEOUT_MS, null, {
-      minimum: 1000,
-      maximum: 60 * 60 * 1000,
-    }),
-    verificationTimeoutMs: numberFromEnv(env.ARAYA_VERIFICATION_TIMEOUT_MS, 5 * 60 * 1000, {
-      minimum: 1000,
-      maximum: 60 * 60 * 1000,
-    }),
-    developmentModel: NO_DEVELOPMENT_MODEL,
-    // araya task・araya runner の command が使う環境変数（unit file に書く変数の選別、秘密の値の置き換え）
+    agentModel: NO_AGENT_MODEL,
+    // Discord bot の unit file に書く環境変数の選別・秘密の値の置き換えが使う
     env: {
       ...env,
       ARAYA_CODING_AGENT_DIR: path.join(dataDir, 'pi'),

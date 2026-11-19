@@ -1,8 +1,6 @@
-import { randomBytes } from 'node:crypto'
 import { constants as fsConstants } from 'node:fs'
 import fs from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
-import path from 'node:path'
 import { TextDecoder } from 'node:util'
 
 import {
@@ -10,12 +8,12 @@ import {
   MODEL_REFERENCE_RULE,
   parseModelReference,
   THINKING_LEVEL_RULE,
-  type DevelopmentModel
+  type ConfigModel
 } from './model.ts'
 
 const MAX_CONFIG_FILE_BYTES = 64 * 1024
-const TOP_LEVEL_KEYS = ['development'] as const
-const DEVELOPMENT_KEYS = ['model', 'thinkingLevel'] as const
+const TOP_LEVEL_KEYS = ['agent'] as const
+const AGENT_KEYS = ['model', 'thinkingLevel'] as const
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -114,7 +112,7 @@ async function readConfigText(configPath: string) {
   }
 }
 
-function parseDevelopmentModel(configPath: string, value: unknown) {
+function parseAgentModel(configPath: string, value: unknown) {
   if (!isRecord(value)) {
     throw invalidConfig(configPath, 'the top level must be a JSON object')
   }
@@ -122,58 +120,62 @@ function parseDevelopmentModel(configPath: string, value: unknown) {
   const unknownTopLevelKeys = findUnknownKeys(value, TOP_LEVEL_KEYS)
 
   if (unknownTopLevelKeys.length > 0) {
-    throw invalidConfig(configPath, `unknown key(s): ${unknownTopLevelKeys.join(', ')}`)
+    const migrationHint = unknownTopLevelKeys.includes('development')
+      ? '（`development` は撤去されました。`development.model` を使っていたときは `model` と `thinkingLevel` を `agent` に移してください。file 内の設定が不要なら file を消すと Pi の default model を使います）'
+      : ''
+
+    throw invalidConfig(configPath, `unknown key(s): ${unknownTopLevelKeys.join(', ')}${migrationHint}`)
   }
 
-  if (!('development' in value)) {
+  if (!('agent' in value)) {
     return null
   }
 
-  const development = value.development
+  const agent = value.agent
 
-  if (!isRecord(development)) {
-    throw invalidConfig(configPath, 'development must be an object')
+  if (!isRecord(agent)) {
+    throw invalidConfig(configPath, 'agent must be an object')
   }
 
-  const unknownDevelopmentKeys = findUnknownKeys(development, DEVELOPMENT_KEYS)
+  const unknownAgentKeys = findUnknownKeys(agent, AGENT_KEYS)
 
-  if (unknownDevelopmentKeys.length > 0) {
-    throw invalidConfig(configPath, `unknown key(s) in development: ${unknownDevelopmentKeys.join(', ')}`)
+  if (unknownAgentKeys.length > 0) {
+    throw invalidConfig(configPath, `unknown key(s) in agent: ${unknownAgentKeys.join(', ')}`)
   }
 
-  if (!('model' in development)) {
-    throw invalidConfig(configPath, 'development.model is required')
+  if (!('model' in agent)) {
+    throw invalidConfig(configPath, 'agent.model is required')
   }
 
-  const reference = parseModelReference(development.model)
+  const reference = parseModelReference(agent.model)
 
   if (reference === undefined) {
-    throw invalidConfig(configPath, `development.model must be ${MODEL_REFERENCE_RULE}`)
+    throw invalidConfig(configPath, `agent.model must be ${MODEL_REFERENCE_RULE}`)
   }
 
-  if (!('thinkingLevel' in development)) {
-    const model: DevelopmentModel = { ...reference, thinkingLevel: null }
+  if (!('thinkingLevel' in agent)) {
+    const model: ConfigModel = { ...reference, thinkingLevel: null }
 
     return model
   }
 
-  const thinkingLevel = development.thinkingLevel
+  const thinkingLevel = agent.thinkingLevel
 
   if (!isThinkingLevel(thinkingLevel)) {
-    throw invalidConfig(configPath, `development.thinkingLevel must be ${THINKING_LEVEL_RULE}`)
+    throw invalidConfig(configPath, `agent.thinkingLevel must be ${THINKING_LEVEL_RULE}`)
   }
 
-  const model: DevelopmentModel = { ...reference, thinkingLevel }
+  const model: ConfigModel = { ...reference, thinkingLevel }
 
   return model
 }
 
-// Araya の設定ファイルを読み、検証する。subcommand の起動時に1回だけ呼ぶ
+// Araya の設定ファイルを読み、検証する。agent session の開始時に呼ぶ
 export async function loadConfigFile(configPath: string) {
   const text = await readConfigText(configPath)
 
   if (text === undefined) {
-    return { developmentModel: null }
+    return { agentModel: null }
   }
 
   let parsed: unknown
@@ -184,167 +186,5 @@ export async function loadConfigFile(configPath: string) {
     throw invalidConfig(configPath, 'the file is not valid JSON')
   }
 
-  return { developmentModel: parseDevelopmentModel(configPath, parsed) }
-}
-
-const MAX_PI_SETTINGS_BYTES = 1024 * 1024
-
-type PiDefaultModel =
-  | { model: string }
-  | { reason: 'pi_settings_missing' | 'pi_settings_unreadable' | 'pi_settings_invalid' | 'pi_default_missing' | 'pi_default_invalid' }
-
-export type DefaultConfigInitialization =
-  | { status: 'created'; configPath: string; model: string }
-  | { status: 'existing'; configPath: string }
-  | { status: 'skipped'; configPath: string; reason: Exclude<PiDefaultModel, { model: string }>['reason'] }
-
-// Pi の defaultProvider/defaultModel だけを読み、秘密情報など他の設定は持ち込まない
-async function readPiDefaultModel(settingsPath: string): Promise<PiDefaultModel> {
-  let linkStat
-
-  try {
-    linkStat = await fs.lstat(settingsPath)
-  } catch (error) {
-    return { reason: isErrno(error, 'ENOENT') ? 'pi_settings_missing' : 'pi_settings_unreadable' }
-  }
-
-  let fileHandle: FileHandle
-
-  try {
-    fileHandle = await fs.open(settingsPath, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK)
-  } catch {
-    return { reason: linkStat.isSymbolicLink() ? 'pi_settings_missing' : 'pi_settings_unreadable' }
-  }
-
-  let settings: unknown
-
-  try {
-    let isRegularFile: boolean
-
-    try {
-      isRegularFile = (await fileHandle.stat()).isFile()
-    } catch {
-      return { reason: 'pi_settings_unreadable' }
-    }
-
-    if (!isRegularFile) {
-      return { reason: 'pi_settings_invalid' }
-    }
-
-    let content: Buffer
-
-    try {
-      content = await readBounded(fileHandle, MAX_PI_SETTINGS_BYTES)
-    } catch {
-      return { reason: 'pi_settings_unreadable' }
-    }
-
-    if (content.byteLength > MAX_PI_SETTINGS_BYTES) {
-      return { reason: 'pi_settings_invalid' }
-    }
-
-    let text: string
-
-    try {
-      text = new TextDecoder('utf-8', { fatal: true }).decode(content)
-    } catch {
-      return { reason: 'pi_settings_invalid' }
-    }
-
-    try {
-      settings = JSON.parse(text)
-    } catch {
-      return { reason: 'pi_settings_invalid' }
-    }
-  } finally {
-    await fileHandle.close()
-  }
-
-  if (!isRecord(settings)) {
-    return { reason: 'pi_settings_invalid' }
-  }
-
-  if (!Object.hasOwn(settings, 'defaultProvider') || !Object.hasOwn(settings, 'defaultModel')) {
-    return { reason: 'pi_default_missing' }
-  }
-
-  if (typeof settings.defaultProvider !== 'string' || typeof settings.defaultModel !== 'string') {
-    return { reason: 'pi_default_invalid' }
-  }
-
-  const model = `${settings.defaultProvider}/${settings.defaultModel}`
-
-  if (parseModelReference(model) === undefined) {
-    return { reason: 'pi_default_invalid' }
-  }
-
-  return { model }
-}
-
-// deploy が runner を install するときに呼ぶ。既存 config は検証したうえで変更しない
-export async function initializeConfigFromPiSettings(configPath: string, settingsPath: string): Promise<DefaultConfigInitialization> {
-  try {
-    await fs.lstat(configPath)
-    await loadConfigFile(configPath)
-
-    return { status: 'existing', configPath }
-  } catch (error) {
-    if (!isErrno(error, 'ENOENT')) {
-      throw error
-    }
-  }
-
-  const piDefault = await readPiDefaultModel(settingsPath)
-
-  if (!('model' in piDefault)) {
-    return { status: 'skipped', configPath, reason: piDefault.reason }
-  }
-
-  await fs.mkdir(path.dirname(configPath), { recursive: true, mode: 0o700 })
-  const temporaryPath = path.join(path.dirname(configPath), `.config.json.${randomBytes(8).toString('hex')}.tmp`)
-  const content = `${JSON.stringify({ development: { model: piDefault.model } }, null, 2)}\n`
-  let temporaryCreated = false
-  let created = false
-  let existing = false
-
-  try {
-    const fileHandle = await fs.open(temporaryPath, 'wx', 0o600)
-    temporaryCreated = true
-
-    try {
-      await fileHandle.writeFile(content, 'utf8')
-      await fileHandle.sync()
-    } finally {
-      await fileHandle.close()
-    }
-
-    try {
-      await fs.link(temporaryPath, configPath)
-      created = true
-    } catch (error) {
-      if (!isErrno(error, 'EEXIST')) {
-        throw error
-      }
-
-      existing = true
-    }
-  } finally {
-    if (temporaryCreated) {
-      await fs.rm(temporaryPath, { force: true })
-    }
-  }
-
-  if (existing) {
-    await loadConfigFile(configPath)
-
-    return { status: 'existing', configPath }
-  }
-
-  if (!created) {
-    throw new Error(`could not initialize Araya config file ${configPath}`)
-  }
-
-  await loadConfigFile(configPath)
-
-  return { status: 'created', configPath, model: piDefault.model }
+  return { agentModel: parseAgentModel(configPath, parsed) }
 }

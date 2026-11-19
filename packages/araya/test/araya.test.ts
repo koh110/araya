@@ -10,6 +10,7 @@ import { loadConfig } from '../src/config/environment.ts'
 import { parseCliArguments } from '../src/cli/arguments.ts'
 import { runCli } from '../src/cli/main.ts'
 import { readAllProcessEnvironment, readProcessEnvironment } from './config.ts'
+import { createFakeSystemd } from './support/fake-systemd.ts'
 
 async function runArayaCliWithoutPiBinary(args: string[]) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-no-pi-cli-test-'))
@@ -71,30 +72,21 @@ test('config: Araya Pi directory ignores the legacy host PI variable', () => {
   assert.equal(config.env.PI_CODING_AGENT_DIR, undefined)
 })
 
-test('config: 開発 timeout は既定と 0 で無効、正数で明示する', () => {
-  assert.equal(loadConfig({}).developmentTimeoutMs, null)
-  assert.equal(loadConfig({ ARAYA_DEVELOPMENT_TIMEOUT_MS: '0' }).developmentTimeoutMs, null)
-  assert.equal(loadConfig({ ARAYA_DEVELOPMENT_TIMEOUT_MS: '5000' }).developmentTimeoutMs, 5000)
-})
-
-test('config: 開発 root と timeout の範囲を設定から読む', () => {
+test('config: 開発 root は canonical path で持ち、不正値は既定に戻す', () => {
   const config = loadConfig({
     ARAYA_DATA_DIR: '/tmp/araya-config-test',
     ARAYA_DEV_ROOT: '/workspace/dev/../dev',
-    ARAYA_DEVELOPMENT_TIMEOUT_MS: '7000000',
-    ARAYA_VERIFICATION_TIMEOUT_MS: '500',
   })
 
   assert.equal(config.devRoot, '/workspace/dev')
-  assert.equal(config.developmentTimeoutMs, 60 * 60 * 1000)
-  assert.equal(config.verificationTimeoutMs, 1000)
+  assert.equal(loadConfig({ ARAYA_DEV_ROOT: '' }).devRoot, path.join(os.homedir(), 'dev'))
 })
 
 test('config: 設定ファイル path と開発 root の既定を解決する', () => {
   const config = loadConfig({ ARAYA_DATA_DIR: '/tmp/araya-config-test' })
 
   assert.equal(config.configPath, '/tmp/araya-config-test/config.json')
-  assert.equal(config.developmentModel, null)
+  assert.equal(config.agentModel, null)
   assert.equal(loadConfig({}).configPath, path.join(os.homedir(), '.araya', 'config.json'))
   assert.equal(loadConfig({}).devRoot, path.join(os.homedir(), 'dev'))
   assert.equal(loadConfig({ ARAYA_DEV_ROOT: '' }).devRoot, path.join(os.homedir(), 'dev'))
@@ -152,40 +144,24 @@ test('CLI: help は現行 command を案内する', async () => {
   })
 
   for (const command of [
-    'araya task create --file <path|->',
-    'araya task list [--status <状態>] [--limit <1〜200>]',
-    'araya task show <taskId> [--events <0〜500>] [--full]',
-    'araya task retry <taskId> [--note <text> | --note-file <path|->] [--confirm-side-effects]',
-    'araya task cancel <taskId>',
-    'araya runner install',
-    'araya runner uninstall',
     'araya discord init',
+    'araya discord install [--auth-mode env-file|1password]',
+    'araya discord uninstall',
+    'araya discord run',
   ]) {
     assert.ok(help.includes(`\n  ${command}\n`), command)
   }
 
   assert.match(help, /^ {2}ARAYA_DEV_ROOT$/mu)
   assert.match(help, /linger は変えない/u)
-  assert.doesNotMatch(help, /blocked の質問への答え/u)
-  assert.match(
-    help,
-    /--note は追加の指示。SHIKI が判断を求めて blocked になった Task では、\s*質問（decisionQuestion）への答えを書く/u,
-  )
-  assert.match(help, /SHIKI（開発の agent）/u)
-  assert.match(
-    help,
-    /runner（台帳の Task を取り込んで SHIKI を動かす常駐の process）を、systemd の user service/u,
-  )
-  assert.match(
-    help,
-    /<dataDir>\/pi\/settings\.json に defaultProvider と defaultModel が両方ある場合だけ model を初期設定する/u,
-  )
   assert.match(help, /<ARAYA_DATA_DIR>\/\.env（既定: ~\/\.araya\/\.env）を mode 0600 で作る/u)
-  assert.match(help, /araya discord install \[--auth-mode env-file\|1password\]/u)
-  assert.match(help, /Service Account launcher を使う場合は --auth-mode 1password を明示/u)
+  assert.match(help, /1Password Service Account launcher を使う場合は --auth-mode 1password を明示/u)
+  assert.match(help, /task ledger・runner・\/araya task slash command は撤去済み/u)
+  assert.match(help, /state.json と agent session の SQLite（<ARAYA_DATA_DIR>\/agent\/）は残す/u)
+  assert.doesNotMatch(help, /araya task create/u)
+  assert.doesNotMatch(help, /araya runner install/u)
   assert.doesNotMatch(help, /Bot token が op:\/\/ 参照の場合/u)
   assert.match(help, /1Password の op:\/\/ 参照は任意/u)
-  assert.match(help, /既存 config は変更せず/u)
 })
 
 test('CLI: unknown command は設定を読まず、dataDir に変更を加えない', async () => {
@@ -236,55 +212,49 @@ test('CLI: 引数なし、pi、help は設定ファイルを読まない', async
     })
 
     assert.deepEqual(started, [[], ['--version']])
-    assert.match(help, /araya task create/u)
-    assert.match(help, /araya runner install/u)
+    assert.match(help, /araya discord install/u)
+    assert.match(help, /araya discord uninstall/u)
   } finally {
     await fs.rm(dataDir, { recursive: true, force: true })
   }
 })
 
-test('CLI: task・runner command は不正な設定 file で何も処理せずに失敗する', async () => {
+test('CLI: discord command は config.json を読まない（config file を読むのは agent session の開始だけ）', async () => {
   const dataDir = await fs.realpath(
     await fs.mkdtemp(path.join(os.tmpdir(), 'araya-cli-config-test-')),
   )
   const configPath = path.join(dataDir, 'config.json')
   await fs.writeFile(
     configPath,
-    JSON.stringify({ development: { model: 'openai/gpt-5.5', fallbackModels: [] } }),
+    JSON.stringify({ agent: { model: 'openai/gpt-5.5', fallbackModels: [] } }),
     'utf8',
   )
   const env = { ARAYA_DATA_DIR: dataDir }
+  const fake = createFakeSystemd({})
+  const lines = await captureConsoleLog(async () => {
+    await runCli(['discord', 'uninstall'], async () => {}, env, {
+      platform: 'linux',
+      createSystemdOps: async () => {
+        return fake.ops
+      },
+    })
+  })
 
-  try {
-    for (const args of [
-      ['task', 'list'],
-      ['runner', 'install'],
-    ]) {
-      await assert.rejects(
-        runCli(args, async () => {}, env, { platform: 'linux' }),
-        (error: unknown) => {
-          assert.ok(error instanceof Error)
-          assert.ok(error.message.startsWith(`invalid Araya config file ${configPath}: `))
-          return true
-        },
-      )
-      assert.deepEqual(await fs.readdir(dataDir), ['config.json'])
-    }
-  } finally {
-    await fs.rm(dataDir, { recursive: true, force: true })
-  }
+  assert.match(lines, /"unit": "araya-discord-/u)
+  assert.deepEqual(await fs.readdir(dataDir), ['config.json'])
+  await fs.rm(dataDir, { recursive: true, force: true })
 })
 
-test('CLI: 不正な設定 file では exit code 1 で終わり、path を含む message を出す', async () => {
+test('CLI: 設定が無い discord run は exit code 1 で discord_not_configured を出す', async () => {
   const dataDir = await fs.realpath(
     await fs.mkdtemp(path.join(os.tmpdir(), 'araya-cli-config-test-')),
   )
   const configPath = path.join(dataDir, 'config.json')
-  await fs.mkdir(configPath)
+  await fs.writeFile(configPath, 'not json', 'utf8')
   const cliPath = fileURLToPath(new URL('../bin/cli.ts', import.meta.url))
 
   try {
-    const child = spawn(process.execPath, [cliPath, 'task', 'list'], {
+    const child = spawn(process.execPath, [cliPath, 'discord', 'run'], {
       env: { PATH: readProcessEnvironment('PATH'), HOME: dataDir, ARAYA_DATA_DIR: dataDir },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
@@ -307,7 +277,7 @@ test('CLI: 不正な設定 file では exit code 1 で終わり、path を含む
 
     assert.deepEqual(exit, { code: 1, signal: null })
     assert.equal(stdout.join(''), '')
-    assert.equal(stderr.join(''), `invalid Araya config file ${configPath}: not a regular file\n`)
+    assert.match(stderr.join(''), /discord_not_configured/u)
     assert.deepEqual(await fs.readdir(dataDir), ['config.json'])
   } finally {
     await fs.rm(dataDir, { recursive: true, force: true })

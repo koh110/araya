@@ -1,10 +1,31 @@
 import assert from 'node:assert/strict'
+import fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 import test from 'node:test'
+
+import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
 
 import { openArayaAgentHost } from '../src/agent/host.ts'
 import { createRedactor } from '../src/infrastructure/redaction.ts'
 import { answer, createFauxModels, toolCall } from './support/faux-shiki.ts'
-import { createRunnerFixture, ctx, removeRunnerFixture } from './support/runner-fixture.ts'
+
+async function makeAgentFixture() {
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'araya-agent-host-test-')))
+  const dataDir = path.join(root, 'data')
+  const devRoot = path.join(root, 'dev')
+  const agentDir = path.join(root, 'pi')
+
+  for (const dir of [dataDir, devRoot, agentDir]) {
+    await fs.mkdir(dir, { recursive: true })
+  }
+
+  return { root, dataDir, devRoot, agentDir }
+}
+
+async function removeAgentFixture(fixture: Awaited<ReturnType<typeof makeAgentFixture>>) {
+  await fs.rm(fixture.root, { recursive: true, force: true })
+}
 
 async function waitUntil(cond: () => boolean, timeoutMs: number) {
   const deadline = Date.now() + timeoutMs
@@ -23,7 +44,7 @@ async function waitUntil(cond: () => boolean, timeoutMs: number) {
 }
 
 test('agent host: task tool の spawn で child が作業し、報告が main 経由で deliverReport に届き、reopen でも name 対応が続く', async () => {
-  const fixture = await createRunnerFixture()
+  const fixture = await makeAgentFixture()
   const models = await createFauxModels(fixture)
   const reports: { name: string; text: string }[] = []
 
@@ -37,7 +58,7 @@ test('agent host: task tool の spawn で child が作業し、報告が main �
       deliverReport: async (name, text) => {
         reports.push({ name, text })
       },
-      context: ctx,
+      context: BACKGROUND_CONTEXT,
     })
   }
 
@@ -110,12 +131,12 @@ test('agent host: task tool の spawn で child が作業し、報告が main �
       await second.close()
     }
   } finally {
-    await removeRunnerFixture(fixture)
+    await removeAgentFixture(fixture)
   }
 })
 
 test('agent host: deliverReport 失敗後は durable state から同じ nonce で再送する', async () => {
-  const fixture = await createRunnerFixture()
+  const fixture = await makeAgentFixture()
   const models = await createFauxModels(fixture)
   const deliveries: { name: string; text: string; nonce: string }[] = []
 
@@ -134,7 +155,7 @@ test('agent host: deliverReport 失敗後は durable state から同じ nonce �
           throw new Error('synthetic delivery failure')
         }
       },
-      context: ctx,
+      context: BACKGROUND_CONTEXT,
     })
   }
 
@@ -168,6 +189,6 @@ test('agent host: deliverReport 失敗後は durable state から同じ nonce �
       await host.close()
     }
   } finally {
-    await removeRunnerFixture(fixture)
+    await removeAgentFixture(fixture)
   }
 })

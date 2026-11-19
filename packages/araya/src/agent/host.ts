@@ -634,7 +634,7 @@ export async function createDefaultArayaAgentSession(input: {
   })
   const resolved = resolveAgentModel(
     runtime,
-    (await loadConfigFile(config.configPath)).developmentModel,
+    (await loadConfigFile(config.configPath)).agentModel,
     await createPiModelSettings({
       agentDir: config.piAgentDir,
       settingsDir: path.join(config.dataDir, 'agent', 'agent-settings'),

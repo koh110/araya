@@ -9,7 +9,7 @@ import {
 } from '@earendil-works/pi-ai'
 import { ModelRuntime } from '@earendil-works/pi-coding-agent'
 
-import type { DevelopmentModel } from '../../src/config/model.ts'
+import type { ConfigModel } from '../../src/config/model.ts'
 
 // faux provider の model と応答。応答は、会話の中の課題の識別子と tool の結果だけで決め、process の memory に状態を持たない
 // （process をまたぐ test でも同じ応答の関数を使えるように）
@@ -65,20 +65,20 @@ export function answer(text: string) {
   return fauxAssistantMessage(text)
 }
 
-// faux の model と、それを登録した ModelRuntime（runner と同じ options。実際の Pi の auth は読まない）。
+// faux の model と、それを登録した ModelRuntime（host と同じ options。実際の Pi の auth は読まない）。
 // reasoning を true にすると、thinking level に対応する model（faux-reasoning-1）にする
 export async function createFauxModels(input: { agentDir: string; dataDir: string }, options: { reasoning?: boolean } = {}) {
   const faux = fauxProvider(options.reasoning === true ? { models: [{ id: 'faux-reasoning-1', reasoning: true }] } : {})
   const runtime = await ModelRuntime.create({
     authPath: path.join(input.agentDir, 'auth.json'),
     modelsPath: path.join(input.agentDir, 'models.json'),
-    modelsStorePath: path.join(input.dataDir, 'runner', 'models-store.json'),
+    modelsStorePath: path.join(input.dataDir, 'agent', 'models-store.json'),
     allowModelNetwork: false,
     refreshOnCreate: false
   })
   runtime.registerNativeProvider(faux.provider)
   await runtime.refresh({ allowNetwork: false })
-  const model: DevelopmentModel = { provider: faux.models[0].provider, id: faux.models[0].id, thinkingLevel: null }
+  const model: ConfigModel = { provider: faux.models[0].provider, id: faux.models[0].id, thinkingLevel: null }
 
   function script(step: FauxStep) {
     faux.setResponses(Array.from({ length: MAX_RESPONSES }, () => {

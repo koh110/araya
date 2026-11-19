@@ -1,4 +1,4 @@
-// 秘密とみなす環境変数の値と URL の userinfo を置き換える。台帳、evidence.json、log、CLI の stderr に書く前に使う
+// 秘密とみなす環境変数の値と URL の userinfo を置き換える。log、CLI の stderr に書く前に使う
 
 export const REDACTED = '[REDACTED]'
 
