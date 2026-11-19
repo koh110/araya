@@ -125,7 +125,7 @@ occurrence ごとの判断結果を `runs` に積む。P0 では dispatch しな
 
 - 即時通知は `notifyDecisions` の allowlist が決める（既定は `request_human` と `invalid`＝安全側）。`noop` / `wait` / `investigate` / `dispatch` は送らず digest で返し、提案は state に残る。
 - 1 occurrence 1 件。nonce は `hoot-<sha256(occurrenceKey) 18 hex>`（再送で同じ nonce）。他の通知は nonce の hash input を `reminder:<key>:<n>`（再提醒）、`digest:<UTC day>`、`review:<goal key>:<reviewAt>`（自動 pause）、`<occurrenceKey>:failure:<回数>`（連続失敗）にして、同じ key が同じ nonce になるようにする。text は 1800 文字で切る。
-- **digest**（`digestHourUtc`、既定 21 UTC、0〜23 / none）: UTC 1 日 1 回、`utcHour(now)` が `digestHourUtc` と一致する tick で送る（`loop.lastDigestAt` が同じ UTC 日なら送らない）。中身はその UTC 日の run 内訳（model 判断 / precheck noop の数と decision 別の件数、最大 6 種 `HOOT_DIGEST_DECISION_LINES`。run が無ければ `判断なし`）、最新の `request_human` の reason、**open proposals（key 付き。最大 3 行 `HOOT_DIGEST_PROPOSAL_LINES`。超過分は「他 N 件は araya hoot proposal list」）**、observation gaps 件数。
+- **digest**（`digestHourUtc`、既定 21 UTC、0〜23 / none）: UTC 1 日 1 回、`utcHour(now)` が `digestHourUtc` と一致する tick で送る（`loop.lastDigestAt` が同じ UTC 日なら送らない）。中身はその UTC 日の run 内訳（model 判断 / precheck noop の数と decision 別の件数、最大 6 種 `HOOT_DIGEST_DECISION_LINES`。run が無ければ `判断なし`）、最新の `request_human` の reason、**open proposals（key 付き。最大 3 行 `HOOT_DIGEST_PROPOSAL_LINES`。超過分は「他 N 件は araya hoot proposal list」）**、observation gaps 件数。 集計対象は保持している `runs`（直近 200 件 `MAX_RUNS_KEPT`）内でその UTC 日のものだけなので、`tickMinutes` を極端に小さくして run が 200 件を超えると内訳は保持分だけになる（digest の数字は「直近 200 run のうちその日」の値）。
 - 再提醒の text は `[decision] key`・REASON・goals・期限を含む（`HOOT 提案の再提醒 <n>/<max>`）。goal の自動 pause は resume / retire の案内を添える。
 - 判断 run が 3 回続けて失敗したときに 1 件だけ失敗通知を送る（同じ streak で繰り返さない）。
 - Discord へ書く text、log へ書く message は model・gh 由来の文字列を含むので、書き込む前に secret を `[REDACTED]` に置き換える。

@@ -426,7 +426,9 @@ export function createHootLoop(deps: HootTickDeps) {
       }
 
       // 変化がない occurrence で model を叩かない（#21「変化がない場合は不要な LLM 呼出しを抑制」）。
-      // 観測が壊れている場合も model 側に倒さない（証拠が無いのに判断させない）。watchdog で必ず 1 度見る
+      // precheck が発動するのは fingerprint 不変・watchdog 前・**gap なし**のときだけ。観測に gap が
+      // 1 件でもある occurrence は precheck しない（証拠が欠けている状態で code 側の noop を確定させず、
+      // model 側に request_human を出す機会を残す。model 呼び出しは maxRunsPerDay で抑止し、件数は digest に出す）
       const prechecked =
         settings.precheckObservation && !fingerprintsChanged && !watchdogDue && gaps.length === 0
 
