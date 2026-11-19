@@ -149,19 +149,19 @@ ARAYA_DISCORD_ALLOWED_USER_IDS=<discord-user-id>
 
 この動作には Discord の `Message Content` privileged intent が必要です。Discord Developer Portal の対象 application の Bot 設定で `Message Content Intent` を有効にしてください。この intent は `ARAYA_DISCORD_CHANNEL_ID` 単位ではなく application に付与されます。bot が見られる範囲を必要最小限にし、Araya は guild/channel/user の allowlist を通過した message 本文だけを会話へ渡します。message 本文はログへ出力しません。
 
-`reset`（または `@Araya reset`）は会話の文脈をリセットしますが、保存済みの SQLite file を消去する操作ではありません。会話は `<ARAYA_DATA_DIR>/discord/chat.sqlite` に永続化され、Bot の再起動後も続きます。既知の secret は保存前に redaction しますが、会話の transcript には Araya の生成 reply も保存されます。credential や他の機密情報を会話に投稿しないでください。
+`reset`（または `@Araya reset`）は会話の文脈をリセットしますが、保存済みの SQLite file を消去する操作ではありません。`stop`（または `@Araya stop`）は会話の実行中 run・queued input・background child task に中止を要求します。会話は `<ARAYA_DATA_DIR>/agent/agent.sqlite` に永続化され、Bot の再起動後も続きます。Discord channel に返す文章は既知の secret を redaction しますが、会話の保存記録（reply・tool 実行ログ）は redaction 対象外です。credential や他の機密情報を会話に投稿しないでください。
 
-実装を依頼するときは、`「この変更を実装してください」` のように明示してください。Araya は会話 agent から repository を直接変更せず、依頼を既存 Task runner に登録して Task ID を返します。実作業・検証・Draft PR は runner が行い、状態は既存の slash command と Task 通知で確認します。質問や設計相談だけでは Task を登録しません。
+実装を依頼するときは、`「この変更を実装してください」` のように明示してください。会話の main agent は development root（既定 `~/dev`）の中で file 編集・shell 実行・file 読取の tool を持ち、依頼を直接扱います。大きな作業は main agent が `task` tool で named child task を起こし、child 会話 が作業して完了報告が main 会話 に戻り、channel に届きます。既存の slash command と Task 通知で runner の開発 Task も従来どおり扱えます（runner は会話とは別の仕組みです）。質問や設計相談だけでは runner の Task を登録しません。
 
 slash command の受付 channel は従来どおり Discord 側の利用許可に従います。実行者は `ARAYA_DISCORD_ALLOWED_USER_IDS` で制限されます。
 
-### GitHub repository の read-only 参照
+### GitHub へのアクセス
 
-会話では `araya_github_repository_list`（directory listing）、`araya_github_repository_search`（code search）、`araya_github_repository_read`（UTF-8 text file read）を使えます。`GH_HOST` が未設定・空・`github.com` の場合、公開 repository の list/read は認証なしの GitHub API を先に使い、認証が必要な場合は Araya bot を動かす OS user の GitHub CLI (`gh`) authorization に fallback します。`GH_HOST` が別 host の場合は `api.github.com` へ接続せず、設定された host を使う `gh api --method GET` だけで読みます。`GH_CONFIG_DIR` と `GH_HOST` は config selector として利用できますが、`GH_TOKEN` / `GITHUB_TOKEN` 等の token 環境変数は bot process と `gh` subprocess に継承しません。常駐 service から使う保存済み `gh` 認証情報は、service と同じ OS user・config path で読み取れる必要があります。対話 shell だけでなく、service の実行 user と設定で `gh auth status` を確認してください。
+会話 agent は GitHub CLI (`gh`) を shell 実行で直接使えます。認証は Araya bot を動かす OS user の `gh` 認証情報です。常駐 service から使う保存済み `gh` 認証情報は、service と同じ OS user・config path で読み取れる必要があります。対話 shell だけでなく、service の実行 user と設定で `gh auth status` を確認してください。tool 実行は bot process の environment を継承します。`GH_TOKEN` / `GITHUB_TOKEN` 等の token を service の environment に置く必要はありません。既存の `gh` 認証（`gh auth login` で保存したもの）で動きます。
 
-ここに新しい per-Discord-user GitHub link や権限モデルはありません。`ARAYA_DISCORD_ALLOWED_USER_IDS` の利用者は bot の OS user が `gh` で読める repository に同じ範囲でアクセスできます。bot の `gh` identity には、その channel の利用者に見せてよい repository だけを許可してください。GitHub tool は GET のみで、repository の変更、shell、git 操作はできません。
+ここに新しい per-Discord-user GitHub link や権限モデルはありません。`ARAYA_DISCORD_ALLOWED_USER_IDS` の利用者は bot の OS user の `gh` identity と shell 権限でアクセスできる範囲を共有します。bot の `gh` identity と bot OS user には、その channel の利用者に見せてよい repository・作業範囲だけを許可してください。
 
-会話 transcript と GitHub / Task lookup tool result は `<ARAYA_DATA_DIR>/discord/chat.sqlite` に保存され、private repository の読み取り内容や Task の結果も残り得ます。Task の session 参照は最大24件・各2,000文字・全体12,000文字までの user / assistant 可視テキスト excerpt に限り、tool の引数・出力は含めません。既知の secrets は上限で切り詰める前に redaction しますが、すべての機密情報を検出できる保証はありません。必要な範囲だけ読み、秘密情報を channel に投稿・引用しないでください。
+会話 transcript と tool 実行記録（shell 出力・file 編集内容を含む）は `<ARAYA_DATA_DIR>/agent/agent.sqlite` に保存され、private repository の読み取り内容や command の結果も残り得ます。channel に返す文章は既知の secrets を redaction しますが、保存記録は redaction 対象外で、すべての機密情報を検出できる保証はありません。`ARAYA_DATA_DIR` と backup のアクセス権を管理し、秘密情報を channel に投稿・引用しないでください。
 
 ```sh
 araya discord register

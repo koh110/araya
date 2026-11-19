@@ -12,10 +12,11 @@ import { openTaskLedger, type TaskLedger } from '../runner/ledger.ts'
 import { loadDiscordConfig, type DiscordConfig } from './config.ts'
 import {
   createDiscordChatHandler,
+  splitDiscordChatReply,
   type DiscordChatHandler,
   type DiscordChatSession,
 } from './chat.ts'
-import { createDefaultDiscordChatSession } from './chat-agent.ts'
+import { createDefaultArayaAgentSession } from '../agent/host.ts'
 import {
   createDiscordGateway,
   type DiscordGateway,
@@ -50,7 +51,7 @@ export type DiscordBotDependencies = {
     config: DiscordConfig,
     handlers: DiscordGatewayHandlers,
   ) => Promise<DiscordGateway>
-  createChatSession?: typeof createDefaultDiscordChatSession
+  createChatSession?: typeof createDefaultArayaAgentSession
   log?: (entry: Record<string, unknown>) => void
 }
 
@@ -252,6 +253,28 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
   }
 
   let chatSession: DiscordChatSession | null = null
+  // report の deliver は gateway 作成後でないと送れないので、late binding で参照する。
+  // 作成失敗時は reject とし、配送待ちの reporter が close を止めない
+  type GatewaySettlement = { ok: true; gateway: DiscordGateway } | { ok: false; error: Error }
+  let settleGatewayReady: (settlement: GatewaySettlement) => void = () => {}
+  const gatewayReady = new Promise<GatewaySettlement>((resolve) => {
+    settleGatewayReady = resolve
+  })
+
+  async function deliverReport(name: string, text: string, nonce: string) {
+    const settlement = await gatewayReady
+
+    if (!settlement.ok) {
+      throw settlement.error
+    }
+
+    const chunks = splitDiscordChatReply(redactor.redact(`task[${name}] の報告:\n${text}`))
+
+    for (const [index, chunk] of chunks.entries()) {
+      // nonce は 25 文字上限。chunk suffix を付けると再送でも同じ nonce になる
+      await settlement.gateway.sendText(chunk, index === 0 ? nonce : `${nonce}-${index.toString(36)}`)
+    }
+  }
 
   async function closeChatSession() {
     try {
@@ -262,11 +285,11 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
   }
 
   try {
-    chatSession = await (deps.createChatSession ?? createDefaultDiscordChatSession)({
+    chatSession = await (deps.createChatSession ?? createDefaultArayaAgentSession)({
       dataDir,
       env: deps.env,
-      ledger,
       redactor,
+      deliverReport,
     })
     logSafe({ type: 'discord_chat_ready' })
   } catch (error) {
@@ -323,11 +346,17 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     gateway = await (deps.createGateway ?? createDiscordGateway)(config, handlers)
   } catch (error) {
     logError('discord_gateway_failed', error)
+    settleGatewayReady({
+      ok: false,
+      error: error instanceof Error ? error : new Error('discord gateway creation failed'),
+    })
     await closeChatSession()
     ledger.close()
 
     return 1
   }
+
+  settleGatewayReady({ ok: true, gateway })
 
   try {
     try {

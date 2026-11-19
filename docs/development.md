@@ -31,6 +31,8 @@ ARAYA_TEST_SYSTEMD=1 node --test packages/araya/test/task-runner-systemd.test.ts
 - `config/`: 環境変数、設定ファイル、model 設定
 - `development/`: SHIKI、worktree、開発結果の収集。`draft-pr/` は Draft PR delivery と snapshot
 - `runner/`: 試行、台帳、runner loop
+- `agent/`: Discord 会話の main agent、model 解決、Pi durable session/task host
+- `discord/`: Discord gateway、会話入口、通知、bot state
 - `infrastructure/`: subprocess、秘密の置換、systemd
 
 import は相対 path と `.ts` 拡張子を使い、必要な module を直接参照します。build 時に `.js` へ変換します。
@@ -99,6 +101,16 @@ runner は、SHIKI を動かすために常駐する Araya の process です。
 - Task の入力・CLI・状態遷移・retry/cancel・evidence の詳しい契約は [Task と SHIKI の実行仕様](spec/task-ledger-and-shiki-runner.md) を参照してください。このガイドでは仕様を重ねて記述しません。
 - Task は `araya task create` から登録します。自律的な課題発見、外部 source の監視、通知連携は未実装です。
 - SHIKI と検証 command は sandbox なしで利用者の権限により動き、開発 root 外の書き込み可能 file や network にアクセスできます。SHIKI への禁止指示は強制境界ではありません。Araya は検証済みの変更について commit・push・Draft PR 作成まで行いますが、merge・deploy・publish はしません（[Draft PR delivery 仕様](spec/draft-pr-delivery.md)）。
+
+## Discord 会話 agent（session-first）
+
+Discord bot process は Pi durable の Harness を持ちます。許可された channel の main conversation が orchestrator で、`openArayaAgentHost()`（`src/agent/host.ts`）が model runtime・tool・child task を接続します。
+
+- main conversation は coding tool（file 読取・編集・shell 実行。cwd は development root）と `task` tool を持ちます。会話と task graph は `<dataDir>/agent/agent.sqlite` に永続化され、再起動時は `harness.resume()` で復元します。
+- `task` tool の action は `spawn`（named child task を作る）、`send`（既存 child に依頼を追加する）、`status`（child task 一覧）、`stop`（child task の中止要求）です。child 会話は main conversation の所有 background task に anchor され、main の run が終わっても動き続けます。reporter task が child へ依頼を届け、回答を待ち、followUp input として main conversation に injection します。main がそれをまとめて channel に送ります。
+- model は `resolveAgentModel()`（`src/agent/model.ts`）が config `developmentModel` → Pi settings（`<dataDir>/agent/agent-settings`）→ Pi の既定の順で解決します。
+- child task は Pi durable の会話そのもので、task 固有のセキュリティ機構（side-effect gate、evidence 照合、worktree 強制）は入れていません。Discord 側の境界は入口 allowlist と、channel に返す text の redaction のみです。
+- `reset` / `stop` は Discord 入口（`src/discord/chat.ts`）で扱います。reset は main conversation を作り直し、stop は main の run・queued input・background child task へ中止を要求します。
 
 ## 設定
 

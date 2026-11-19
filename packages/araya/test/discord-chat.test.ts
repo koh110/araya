@@ -292,3 +292,54 @@ test('discord chat: stopAccepting は受付を止めても進行中のturnをdra
   assert.equal(submitted.length, 1)
   assert.deepEqual(replies, ['first reply'])
 })
+
+test('discord chat: stop は受付済みで未開始のキュー内 message を実行せず破棄する', async () => {
+  const submitted: string[] = []
+  let stopCalls = 0
+  const handler = createDiscordChatHandler({
+    config,
+    botUserId: '12345678901234567',
+    redactor: createRedactor([]),
+    session: {
+      submit: async (content) => {
+        if (content.includes('SLOW')) {
+          await new Promise((resolve) => {
+            setTimeout(resolve, 150)
+          })
+        }
+
+        submitted.push(content)
+
+        return 'ok'
+      },
+      reset: async () => {},
+      stop: async () => {
+        stopCalls += 1
+      },
+    },
+    log: () => {},
+  })
+  const noopReply = async () => {}
+
+  const first = handler.handle(
+    { ...message, messageId: '92345678901234561', content: 'SLOW first' },
+    noopReply,
+  )
+  const queued = handler.handle(
+    { ...message, messageId: '92345678901234562', content: 'QUEUED second' },
+    noopReply,
+  )
+  // queued がまだ開始する前に stop を受け付ける
+  await new Promise((resolve) => {
+    setTimeout(resolve, 30)
+  })
+  const stopAck = handler.handle(
+    { ...message, messageId: '92345678901234563', content: 'stop' },
+    noopReply,
+  )
+
+  await Promise.all([first, queued, stopAck])
+
+  assert.equal(stopCalls, 1)
+  assert.deepEqual(submitted, ['Discord user 42345678901234567 said:\nSLOW first'])
+})

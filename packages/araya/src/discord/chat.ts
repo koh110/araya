@@ -106,6 +106,7 @@ export function isDiscordChatMessageAllowed(
 export type DiscordChatSession = {
   submit(content: string, requestId: string): Promise<string>
   reset(requestId: string): Promise<void>
+  stop?(): Promise<void>
   close?(): Promise<void>
 }
 
@@ -136,6 +137,8 @@ function errorName(error: unknown) {
 export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
   let accepting = true
   let tail = Promise.resolve()
+  // 受付済みで未開始の message。stop で実行中の submit とあわせて無効化する
+  const queued: { message: DiscordChatMessage; reply: DiscordChatReply; cancelled: boolean }[] = []
 
   async function send(message: DiscordChatMessage, reply: DiscordChatReply, content: string) {
     const chunks = splitDiscordChatReply(deps.redactor.redact(content))
@@ -169,6 +172,13 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
     }
 
     try {
+      if (/^stop$/iu.test(content)) {
+        await deps.session.stop?.()
+        await send(message, reply, '実行中・実行待ちの作業があれば中止を要求しました')
+
+        return
+      }
+
       if (/^reset$/iu.test(content)) {
         await deps.session.reset(message.messageId)
         await send(message, reply, 'この channel の会話をリセットしました')
@@ -193,7 +203,36 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
         return Promise.resolve()
       }
 
+      // stop は実行待ちキューの外で処理し、実行中の submit を待たずに abort 要求を届ける
+      if (/^stop$/iu.test(stripDiscordBotMention(message.content, deps.botUserId))) {
+        // 受付済みで未開始の作業も合わせて無効化する
+        for (const item of queued) {
+          item.cancelled = true
+        }
+
+        const operation = process(message, reply)
+        tail = tail.then(async () => {
+          await operation.catch(() => {})
+        })
+
+        return operation
+      }
+
+      const item: (typeof queued)[number] = { message, reply, cancelled: false }
+      queued.push(item)
       const operation = tail.then(async () => {
+        const index = queued.indexOf(item)
+
+        if (index !== -1) {
+          queued.splice(index, 1)
+        }
+
+        if (item.cancelled) {
+          deps.log({ type: 'discord_chat_queued_cancelled', messageId: item.message.messageId })
+
+          return
+        }
+
         await process(message, reply)
       })
       tail = operation.catch(() => {})
