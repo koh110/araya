@@ -16,11 +16,11 @@ model を呼ぶかどうか・人間に何を返すかは、可能な限り **de
 ```
 
 - state の `version` は **2**。version 1 の `state.json` は **読み取り時に v2 へ migration する**（読みのみ。次の `updateHootState` で v2 で保存される）。migration が埋めるもの:
-  - goal の `reviewAt`（migration 時点の now + `settings.goalReviewDays`。古い goal を即 pause しない）
+  - goal の `reviewAt`（基準は **file 内容**・v1 の `loop.lastRunAt` と goal の `updatedAt` の新しい方 + `settings.goalReviewDays`。read のたびに期限が前進しない。最後に走った時刻から `goalReviewDays` をとっくに過ぎている goal は、次の tick で自動 paused になって resume / retire を問う形になる）
   - `loop.lastModelRunAt`（v1 の `lastRunAt` を継ぐ）・`loop.lastDigestAt`・`loop.conversationRuns`（0）・`loop.goalFingerprints`（`{}`）
   - 既存 `runs` の `source: 'model'`
   - `proposals: []`
-  - settings は新しい項目を既定値で埋める。`notifyNoop` は廃止で、`notifyNoop=true` なら `notifyDecisions` に `noop` を 1 本足す
+  - settings は新しい項目を既定値で埋める。`notifyNoop` は廃止で、`notifyNoop=true` なら `notifyDecisions` に `noop` を 1 本足す（`false`・**key 欠落**は既定の allowlist。型が違う値は v1 の形として受け付けない）
 - state は JSON 1 件。壊れた file は **復旧せず** `hoot_state_invalid` の誤りとして表面化する（黙って初期化しない）。restore は unit stop → file 差し替え → unit start。
 - 判断 run の記録（`runs`）は直近 200 件だけ保つ（`MAX_RUNS_KEPT`）。proposals は直近 50 件（`MAX_PROPOSALS_KEPT`。closed を古い順に落として open を残す）。open な proposal は最大 10 件（`MAX_OPEN_PROPOSALS`）。
 - 書き込みは `state.json.<rand>.tmp` → rename（atomic）。directory は `0700`、file は `0600`。
@@ -58,6 +58,7 @@ araya hoot goal add --key araya-quality \
 - status は `active` / `paused` / `retired`。active が 1 つ以上あるときだけ tick が進む。goal は最大 20 件。
 - `reviewAt` は goal の review 期限（ISO UTC。`YYYY-MM-DD` は 00:00 UTC）。未指定時の解決規則（`parseReviewAt`）: **new は `settings.goalReviewDays`（`0` なら `null` で無期限）／update は `--review-at` を渡さない限り現在の値を保持（goal 編集で review を伸ばさない）／`none`・`null`・空 text は無期限（既定日数を足し直さない）**。CLI は `--review-at <YYYY-MM-DD | ISO datetime | none>`。
 - `reviewAt` を過ぎた active goal は tick 冒頭で **model を呼ばず自動 `paused`** になり、goal ごとに 1 件案内を送る。人間の応答は `goal resume`（続ける）か `goal retire`（終わらせる）。HOOT が同じ空腹を繰り返さないための期限付きの歯止め。
+- `goal resume`（`setGoalStatus active`）は review 期限も扱う: **過ぎた期限は `settings.goalReviewDays` 分伸ばす**（過ぎていない期限は動かさない／無期限の goal は `null` のまま／`goalReviewDays=0` なら無期限に戻す）。`goal pause` は期限を変えない。resume が期限を伸ばさないと、次の tick で即再 pause になる（test で固定）。
 
 ## schedule（occurrence）
 
@@ -107,6 +108,7 @@ occurrence ごとの判断結果を `runs` に積む。P0 では dispatch しな
 `occurrenceKey` / `source`（`model` / `precheck`） / `plannedAt` / `decidedAt` / `decision` / `reason` / `summary` / `goalKeys` / `missedOccurrences` / `dispatched` / `observedRepos` / `observationGaps`
 
 - `source: 'model'` は判断 run を走らせた記録。`source: 'precheck'` は code 側 noop（`decision: 'noop'`、`summary` は空、`observationGaps` は空）で model を呼んでいない。
+- `recordHootRun` は `source: 'model'` の run を書いたときに `loop.lastModelRunAt`（watchdog の基準）も進める。基準の書き手は store 1 箇所で、tick は別の update をしない。precheck noop と、同じ `occurrenceKey` の replay は進めない。
 - `observationGaps` は 1 run につき 12 件まで保存する（log も 12 件）。
 
 ## proposals（人間が応答すべき pending）

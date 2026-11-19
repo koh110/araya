@@ -534,7 +534,7 @@ export function createHootLoop(deps: HootTickDeps) {
 
       await updateHootState(deps.dataDir, (next) => {
         next.loop.goalFingerprints = fingerprints
-        next.loop.lastModelRunAt = run.decidedAt
+        // lastModelRunAt は recordHootRun が source: 'model' で更新済み
         next.loop.conversationRuns = reuseConversation ? next.loop.conversationRuns + 1 : 1
         // 判断 text が書けたので連続失敗は戻す（invalid も run として記録したので 0 にする）
         next.loop.consecutiveFailures = 0

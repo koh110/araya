@@ -5,7 +5,7 @@ import path from 'node:path'
 import test from 'node:test'
 
 import { createHootLoop, type HootTickOutcome } from '../src/hoot/tick.ts'
-import { readHootState, writeHootState } from '../src/hoot/store.ts'
+import { readHootState, setGoalStatus, writeHootState } from '../src/hoot/store.ts'
 import { defaultState, proposalKeyOf, type HootGoal, type HootProposal, type HootSettings, type HootState } from '../src/hoot/model.ts'
 import { collectSecretValues, createRedactor } from '../src/infrastructure/redaction.ts'
 import type { BoundedProcessResult } from '../src/infrastructure/process.ts'
@@ -687,6 +687,38 @@ test('hoot tick: review 期限を過ぎた active goal を model を呼ばず自
     // paused になったので次の tick は active goal 無しで止まる（空腹を繰り返さない）
     const next = await fixture.loop.tickOnce()
     assert.equal(next.kind, 'no_active_goal')
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot tick: 自動 paused になった goal は resume 後の occurrence で再 pause しない（resume が review 期限を伸ばす）', async () => {
+  const fixture = await makeHootLoopFixture({
+    settings: { enabled: true, tickMinutes: 5 },
+    goals: [goalFixture('araya-quality', { reviewAt: '2026-11-19T08:00:00.000Z' })],
+  })
+
+  try {
+    const paused = await fixture.loop.tickOnce()
+    assert.equal(paused.kind, 'goals_review_paused')
+    assert.equal(fixture.notices.length, 1)
+
+    // 人間の応答（CLI と同じ store 経路）。active に戻すときに過ぎた期限を goalReviewDays 分伸ばす
+    await setGoalStatus(fixture.dataDir, 'araya-quality', 'active')
+    const afterResume = await fixture.readState()
+    assert.equal(afterResume.goals[0]?.status, 'active')
+    assert.ok(Date.parse(afterResume.goals[0]?.reviewAt ?? '') > Date.parse('2026-11-19T09:00:00.000Z'))
+
+    fixture.setNow('2026-11-19T09:05:00.000Z')
+    const next = await fixture.loop.tickOnce()
+    // すぐ再 pause ではなく判断 run が走る（resume が歯止めを無効化しない）
+    assert.equal(next.kind, 'ran')
+
+    const state = await fixture.readState()
+    assert.equal(state.goals[0]?.status, 'active')
+    assert.equal(fixture.notices.filter((notice) => {
+      return /自動 paused/u.test(notice.text)
+    }).length, 1)
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }

@@ -35,6 +35,7 @@ import {
   defaultState,
   isoUtc,
   proposalKeyOf,
+  reviewPassed,
   utcDayKey,
   type HootGoal,
   type HootGoalInput,
@@ -406,8 +407,9 @@ test('hoot store: 同じ occurrenceKey の run は書き込まず、記録は直
     let state = await readHootState(fixture.dataDir)
     assert.equal(state.loop.lastOccurrenceAt, '2026-11-19T01:00:00.000Z')
     assert.equal(state.loop.lastRunAt, '2026-11-19T01:00:01.000Z')
-    // recordHootRun 自身は lastModelRunAt を進めない（model を呼んだ時刻は tick が別 update で書く）
-    assert.equal(state.loop.lastModelRunAt, null)
+    // recordHootRun が watchdog の基準も進める（source: 'model' の run だけ。precheck noop と
+    // 同じ occurrenceKey の replay は進めない）。tick は別途 lastModelRunAt を書き直さない
+    assert.equal(state.loop.lastModelRunAt, '2026-11-19T00:00:01.000Z')
     assert.equal(state.runs[1]?.source, 'precheck')
 
     const padded = (value: number) => {
@@ -564,11 +566,11 @@ test('hoot store: version 1 の state.json は読み取り時に v2 へ migratio
     assert.equal(migrated.settings.proposalTtlHours, defaultSettings().proposalTtlHours)
     assert.equal(migrated.settings.maxProposalReminders, defaultSettings().maxProposalReminders)
 
-    // goal は review 期限が無いままだった分を now + goalReviewDays で埋める（古い goal を即 pause しない）
-    const reviewAtMs = Date.parse(migrated.goals[0]?.reviewAt ?? '')
-    assert.ok(Number.isFinite(reviewAtMs))
-    assert.ok(reviewAtMs >= beforeMs + DEFAULT_GOAL_REVIEW_DAYS * DAY_MS)
-    assert.ok(reviewAtMs <= afterMs + DEFAULT_GOAL_REVIEW_DAYS * DAY_MS)
+    // goal の review 期限は file 内容から決める（v1 の loop.lastRunAt と goal.updatedAt の新しい方 + goalReviewDays）。
+    // read のたびに期限が前進しない。最後に走ったのが 2026-01-03 なので期限は 2026-02-02 で、read 時点では過ぎている
+    // （tick が自動 paused にして人間に resume / retire を問う形になる）
+    assert.equal(migrated.goals[0]?.reviewAt, '2026-02-02T00:00:05.000Z')
+    assert.ok(reviewPassed(migrated.goals[0] ?? { reviewAt: null }, beforeMs))
     assert.equal(migrated.goals[0]?.objective, 'legacy objective')
     assert.deepEqual(migrated.goals[0]?.scope, ['github:koh110/araya'])
     assert.equal(migrated.goals[0]?.createdAt, '2026-01-01T00:00:00.000Z')
@@ -608,16 +610,13 @@ test('hoot store: version 1 の state.json は読み取り時に v2 へ migratio
     assert.deepEqual(persisted.notifyDecisions, [...DEFAULT_NOTIFY_DECISIONS, 'noop'])
     assert.equal('notifyNoop' in persisted, false)
     const persistedGoal = (fileAfterWrite.goals as Record<string, unknown>[])[0] ?? {}
-    // migration は read ごとに now 起点で reviewAt を作り直す（file が v2 になるまでは時刻が動く）
-    const migratedReviewAtMs = Date.parse(migrated.goals[0]?.reviewAt ?? '')
-    const persistedReviewAtMs = Date.parse(String(persistedGoal.reviewAt))
-    assert.ok(persistedReviewAtMs >= migratedReviewAtMs)
-    assert.ok(persistedReviewAtMs - migratedReviewAtMs < 60_000)
-    assert.ok(persistedReviewAtMs >= beforeMs + DEFAULT_GOAL_REVIEW_DAYS * DAY_MS)
+    // migration は file 内容基準（read ごとに期限が動かない）。v2 に保存した値とも一致する
+    assert.equal(String(persistedGoal.reviewAt), migrated.goals[0]?.reviewAt)
     assert.equal((fileAfterWrite.runs as Record<string, unknown>[])[0]?.source, 'model')
 
     const state = await readHootState(fixture.dataDir)
     assert.equal(state.settings.tickMinutes, 45)
+    assert.equal(state.goals[0]?.reviewAt, migrated.goals[0]?.reviewAt)
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
@@ -631,11 +630,17 @@ test('hoot store: version 1 migration の notifyNoop=false / 壊れた version 1
     const migrated = await readHootState(fixture.dataDir)
     assert.deepEqual(migrated.settings.notifyDecisions, [...DEFAULT_NOTIFY_DECISIONS])
 
-    // v1 settings の検査は notifyNoop を要求する（v1 の実 file では常にあった）。無い version 1 は復旧せず誤り
+    // v1 settings に notifyNoop が無い file（手で直した / 古い v1）も読める。notifyDecisions は既定
     await writeV1File(fixture.dataDir, {
       ...v1StateFixture(),
       settings: { enabled: false, mode: 'dry_run', tickMinutes: 60, maxRunsPerDay: 8 },
     })
+    const withoutFlag = await readHootState(fixture.dataDir)
+    assert.equal(withoutFlag.settings.enabled, false)
+    assert.deepEqual(withoutFlag.settings.notifyDecisions, [...DEFAULT_NOTIFY_DECISIONS])
+
+    // 型が違う notifyNoop は v1 の形として受け付けない
+    await writeV1File(fixture.dataDir, v1StateFixture({ settings: { notifyNoop: 'yes' } }))
     await assert.rejects(
       () => {
         return readHootState(fixture.dataDir)
@@ -663,6 +668,103 @@ test('hoot store: version 1 migration の notifyNoop=false / 壊れた version 1
       },
       /hoot_state_invalid/
     )
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot store: setGoalStatus active は review 期限を過ぎた goal の期限を goalReviewDays だけ伸ばす（次の tick で再 pause しない）', async () => {
+  const fixture = await makeHootFixture()
+
+  try {
+    await writeHootState(fixture.dataDir, {
+      ...defaultState(),
+      goals: [
+        goalFixture('expired-goal', { reviewAt: '2026-11-19T08:00:00.000Z' }),
+        goalFixture('future-goal', { reviewAt: '2026-12-19T00:00:00.000Z' }),
+        goalFixture('none-goal', { reviewAt: null }),
+        goalFixture('paused-past-goal', { status: 'paused', reviewAt: '2026-01-01T00:00:00.000Z' }),
+      ],
+    })
+
+    const nowMs = Date.now()
+    const paused = await pauseExpiredGoals(fixture.dataDir, nowMs)
+    assert.deepEqual(
+      paused.map((goal) => {
+        return goal.key
+      }),
+      ['expired-goal']
+    )
+
+    const resumed = await setGoalStatus(fixture.dataDir, 'expired-goal', 'active')
+    const resumedUpdatedAtMs = Date.parse(resumed.updatedAt)
+    const resumedReviewAtMs = Date.parse(resumed.reviewAt ?? '')
+    // resume は過ぎた期限を settings.goalReviewDays 分だけ伸ばす（これをしないと次の tick で即再 pause になる）
+    assert.ok(resumedUpdatedAtMs >= nowMs)
+    assert.equal(resumedReviewAtMs, resumedUpdatedAtMs + DEFAULT_GOAL_REVIEW_DAYS * DAY_MS)
+    // resume 後は同じ goal を繰り返さない
+    const second = await pauseExpiredGoals(fixture.dataDir, Date.now())
+    assert.equal(second.length, 0)
+
+    // まだ過ぎていない期限は動かさない
+    const future = await setGoalStatus(fixture.dataDir, 'future-goal', 'active')
+    assert.equal(future.reviewAt, '2026-12-19T00:00:00.000Z')
+
+    // 無期限の goal は resume でも null のまま（期限を作らない）
+    const none = await setGoalStatus(fixture.dataDir, 'none-goal', 'active')
+    assert.equal(none.reviewAt, null)
+
+    // pause は review 期限を変えない（resume で決める）
+    const pausedAgain = await setGoalStatus(fixture.dataDir, 'expired-goal', 'paused')
+    assert.equal(pausedAgain.reviewAt, resumed.reviewAt)
+
+    // goalReviewDays=0 の設定で過ぎた期限を resume するなら無期限に戻す
+    await updateSettings(fixture.dataDir, { goalReviewDays: 0 })
+    const indefinite = await setGoalStatus(fixture.dataDir, 'paused-past-goal', 'active')
+    assert.equal(indefinite.reviewAt, null)
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot store: 最近使った version 1 の migration は goal を即 pause しない期限で v2 化する（read ごとに動かない）', async () => {
+  const fixture = await makeHootFixture()
+
+  try {
+    const recentRunAt = isoUtc(Date.now() - 60_000)
+
+    await writeV1File(fixture.dataDir, v1StateFixture({
+      loop: {
+        lastOccurrenceAt: recentRunAt,
+        lastRunAt: recentRunAt,
+        conversationId: null,
+        consecutiveFailures: 0,
+        failureCooldownUntil: null,
+      },
+      goals: [
+        {
+          key: 'legacy-goal',
+          objective: 'legacy objective',
+          scope: [],
+          constraints: [],
+          status: 'active',
+          createdAt: recentRunAt,
+          updatedAt: recentRunAt,
+        },
+      ],
+    }))
+
+    const migrated = await readHootState(fixture.dataDir)
+    const reviewAtMs = Date.parse(migrated.goals[0]?.reviewAt ?? '')
+    // 基準は file 内の lastRunAt / goal.updatedAt。最近使った file なら期限は過ぎていない
+    assert.equal(reviewAtMs, Date.parse(recentRunAt) + DEFAULT_GOAL_REVIEW_DAYS * DAY_MS)
+    assert.ok(reviewAtMs > Date.now())
+
+    const paused = await pauseExpiredGoals(fixture.dataDir, Date.now())
+    assert.equal(paused.length, 0)
+
+    const again = await readHootState(fixture.dataDir)
+    assert.equal(again.goals[0]?.reviewAt, migrated.goals[0]?.reviewAt)
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }

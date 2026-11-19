@@ -589,7 +589,8 @@ export type HootSettingsV1 = {
   mode: HootMode
   tickMinutes: number
   maxRunsPerDay: number
-  notifyNoop: boolean
+  // version 1 の flag。手で直した file などでは無いこともあり、無い場合は notifyDecisions の既定を使う
+  notifyNoop?: boolean
 }
 
 export type HootStateV1 = {
@@ -666,7 +667,7 @@ export function isSettingsShapeV1(value: unknown): value is HootSettingsV1 {
     (value.mode === 'dry_run' || value.mode === 'active') &&
     isBoundedInt(value.tickMinutes, TICK_MINUTES_MIN, TICK_MINUTES_MAX) &&
     isBoundedInt(value.maxRunsPerDay, MAX_RUNS_PER_DAY_MIN, MAX_RUNS_PER_DAY_MAX) &&
-    typeof value.notifyNoop === 'boolean'
+    (value.notifyNoop === undefined || typeof value.notifyNoop === 'boolean')
   )
 }
 

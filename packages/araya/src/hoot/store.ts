@@ -111,8 +111,8 @@ function migrateStateV1(state: HootStateV1, nowMs: number): HootState {
   settings.tickMinutes = state.settings.tickMinutes
   settings.maxRunsPerDay = state.settings.maxRunsPerDay
 
-  // v1 の notifyNoop は notifyDecisions の noop 1 本として引き継ぐ
-  settings.notifyDecisions = state.settings.notifyNoop
+  // v1 の notifyNoop は notifyDecisions の noop 1 本として引き継ぐ（無い場合は既定のまま）
+  settings.notifyDecisions = state.settings.notifyNoop === true
     ? [...DEFAULT_NOTIFY_DECISIONS, 'noop' as HootDecision]
     : [...DEFAULT_NOTIFY_DECISIONS]
 
@@ -120,8 +120,7 @@ function migrateStateV1(state: HootStateV1, nowMs: number): HootState {
     version: HOOT_STATE_VERSION,
     settings,
     goals: state.goals.map((goal) => {
-      // review 期限の無い version からの migration。既定日数を now 起点で与える（古い goal を即 pause しない）
-      return { ...goal, reviewAt: isoUtc(nowMs + settings.goalReviewDays * 86_400_000) }
+      return { ...goal, reviewAt: migratedReviewAt(state, goal, settings.goalReviewDays, nowMs) }
     }),
     loop: {
       ...state.loop,
@@ -135,6 +134,26 @@ function migrateStateV1(state: HootStateV1, nowMs: number): HootState {
     }),
     proposals: [],
   }
+}
+
+// review 期限の無い version からの migration。基準は file 内容から決める（read のたびに期限が前進しないため）
+// v1 の loop.lastRunAt と goal.updatedAt の新しい方 + goalReviewDays。どちらも読めなければ read 時点の now
+function migratedReviewAt(
+  state: HootStateV1,
+  goal: Omit<HootGoal, 'reviewAt'>,
+  defaultDays: number,
+  nowMs: number
+) {
+  if (defaultDays === 0) {
+    return null
+  }
+
+  const anchors = [parseIso(state.loop.lastRunAt), parseIso(goal.updatedAt)].filter((entry) => {
+    return entry !== null
+  })
+  const anchorMs = anchors.length === 0 ? nowMs : Math.max(...anchors)
+
+  return isoUtc(anchorMs + defaultDays * 86_400_000)
 }
 
 // 同じ directory の一時 file（mode 0600）に書いてから rename する
@@ -359,8 +378,16 @@ export async function setGoalStatus(dataDir: string, key: string, status: HootGo
       throw hootError('hoot_goal_not_found', `goal key ${key} がありません`)
     }
 
+    const nowMs = Date.now()
     goal.status = status
-    goal.updatedAt = new Date().toISOString()
+    goal.updatedAt = isoUtc(nowMs)
+
+    // review 期限を過ぎた goal を active に戻すとき、期限を伸ばさないと次の tick で即再 pause になる
+    // （無期限の goal は null のまま。まだ過ぎていない期限は動かさない）
+    if (status === 'active' && goal.reviewAt !== null && reviewPassed(goal, nowMs)) {
+      const days = state.settings.goalReviewDays
+      goal.reviewAt = days === 0 ? null : isoUtc(nowMs + days * 86_400_000)
+    }
 
     return goal
   })
@@ -401,6 +428,11 @@ export async function recordHootRun(dataDir: string, run: HootRun) {
 
     state.loop.lastOccurrenceAt = run.plannedAt
     state.loop.lastRunAt = run.decidedAt
+
+    // model を呼んだ run は watchdog の基準も同時に進める（precheck noop は lastModelRunAt を進めない）
+    if (run.source === 'model') {
+      state.loop.lastModelRunAt = run.decidedAt
+    }
 
     return { run, recorded: true }
   })
