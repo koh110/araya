@@ -862,6 +862,48 @@ test('hoot tick: digest は open proposal を key 付きで返し、人間が応
   }
 })
 
+test('hoot tick: digest の open proposal 行は上限 3 件で、超過分は araya hoot proposal list 案内に寄せる', async () => {
+  const proposals = ['goal-1', 'goal-2', 'goal-3', 'goal-4'].map((key) => {
+    return proposalFixture({
+      key: proposalKeyOf({ goalKeys: [key], decision: 'request_human' }),
+      goalKeys: [key],
+      reason: `${key} の優先順位を決めてください`,
+      // 提醒は上限まで送済み。digest 以外に notice を増やさない
+      reminders: 1,
+      lastReminderAt: '2026-11-19T08:50:00.000Z',
+      expiresAt: '2026-11-19T12:00:00.000Z',
+    })
+  })
+  const fixture = await makeHootLoopFixture({
+    settings: { enabled: true, tickMinutes: 5, digestHourUtc: 9, maxProposalReminders: 1 },
+    goals: [goalFixture()],
+    proposals,
+    decide: async () => {
+      return { text: 'DECISION: noop\nREASON: 変化なし', conversationId: 20 }
+    },
+  })
+
+  try {
+    const outcome = await fixture.loop.tickOnce()
+    assert.equal(outcome.kind, 'ran')
+    assert.equal(outcome.remindersSent, 0)
+    assert.equal(outcome.digestSent, true)
+    assert.equal(fixture.notices.length, 1)
+
+    const text = fixture.notices[0]?.text ?? ''
+    assert.match(text, /open proposals: 4/u)
+
+    const keyLines = text.split('\n').filter((line) => {
+      return line.startsWith('  - [request_human] ')
+    })
+    // key を出せるのは 3 件まで（人間が proposal resolve --key で応答できる行）
+    assert.equal(keyLines.length, 3)
+    assert.match(text, /（他 1 件は araya hoot proposal list）/u)
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
 test('hoot tick: resetConversationAfterRuns で HOOT 判断会話を新しくする', async () => {
   const fixture = await makeHootLoopFixture({
     settings: { enabled: true, tickMinutes: 5, precheckObservation: false, resetConversationAfterRuns: 2 },
