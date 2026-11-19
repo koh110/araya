@@ -54,13 +54,13 @@ npm run araya -- discord run
 root で `npm run deploy`（`scripts/deploy.sh`）を実行すると、次のことが起きます。
 
 1. root package（version `0.0.1`）に `npm pack` を実行し、一時 tarball からユーザーの global prefix（既定 `$HOME/.local`、`ARAYA_INSTALL_PREFIX` で変更可）へ araya を install します。checkout への symlink ではないため、以後のソース変更は再 deploy まで反映されず、araya の checkout を移動・削除しても、install 済みコマンドは影響を受けません。npm registry への publish は行いません。指定 prefix 内に旧 `agentctl` package があれば先に `npm uninstall --global` を実行し、`araya` の bin 競合を解消してから置き換えます。
-2. data directory（deploy の環境の `ARAYA_DATA_DIR`、無ければ `~/.araya`）に `.env` がある場合だけ、入れた araya（`<prefix>/bin/araya`）で `araya discord install` を実行し、その data directory の Discord bot unit を新しいコードで入れ直して起動します（「Discord bot unit の仕組み」）。`.env` が無い場合は unit を入れず、`araya discord init` への案内を出して成功で終わります。
+2. data directory（deploy の環境の `ARAYA_DATA_DIR`、無ければ `~/.araya`）に `.env` がある場合だけ、入れた araya（`<prefix>/bin/araya`）で `araya discord install` を実行し、その data directory の Discord bot unit を新しいコードで入れ直して起動します（「Discord bot unit の仕組み」）。`.env` が無い場合は unit を入れず、`araya discord init` への案内を出して成功で終わります。`.env` に 1Password の参照（値が `op://` で始まる行。コメント行は除く）がある場合は、`op run --env-file=<dataDir>/.env -- <prefix>/bin/araya discord install --auth-mode 1password` で実行し、参照を解決した値で検証してから unit を入れ直します。この場合、`npm pack` より前に PATH の `op` と `OP_SERVICE_ACCOUNT_TOKEN` を確かめ、どちらかが無ければ araya を入れ替えずに終了 code 1 で終わります。
 3. unit file に書く `PATH` は、`npm run` が先頭に足した entry（checkout などの `node_modules/.bin` と、npm の `node-gyp-bin`）を除いた値になります。
 
 - 対象の bot は、deploy を実行した環境の `ARAYA_DATA_DIR` のものです。unit file の `Environment=` も、その環境の値で書き直します。`~/.araya` 以外の `ARAYA_DATA_DIR` の bot を使っているときは、deploy を実行する環境の `ARAYA_DATA_DIR` にその値を設定してください。設定しないと、`~/.araya` の bot を入れます（使っている bot は、次に起動するまで前のコードのまま動き続けます）。
 - `ARAYA_INSTALL_PREFIX` で別の prefix に入れたときも、bot はその prefix に入れた araya で動きます。
 - Linux 以外の環境と、systemd の user manager に接続できない環境（`systemctl` が無い環境を含む）では、`araya discord install` は終了 code 69 で終わります。このとき deploy は、unit を入れずに注意を出し、成功で終わります。user manager に接続できない session（`su` で切り替えた session など）から deploy すると、動いている bot は、次に起動するまで前のコードのまま動き続けます。
-- それ以外の理由で `araya discord install` が失敗したときは（`PATH` に unit file に書けない文字がある、unit の restart が失敗した、など）、deploy は araya を入れたまま、終了 code 1 で終わります。理由を直してから `araya discord install` を実行してください。
+- それ以外の理由で `araya discord install` が失敗したときは（`PATH` に unit file に書けない文字がある、unit の restart が失敗した、など）、deploy は araya を入れたまま、終了 code 1 で終わります。理由を直してから、表示された command（`araya discord install`、1Password の参照がある `.env` では `op run --env-file=... -- araya discord install --auth-mode 1password`）を実行してください。
 
 別の prefix に入れる例:
 

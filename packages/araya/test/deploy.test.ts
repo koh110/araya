@@ -62,6 +62,19 @@ echo "$result: test の失敗" >&2
 exit \${DEPLOY_TEST_ARAYA_EXIT:-1}
 `
 
+// 偽物の op。呼ばれ方を記録し、-- の後ろの command をそのまま実行する（op run の代わり。参照は解決しない）
+const FAKE_OP = `#!/bin/sh
+printf '%s\\t%s\\t%s\\t%s\\n' op "$*" "$0" "$PATH" >> "$DEPLOY_TEST_LOG"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '--' ]; then
+    shift
+    break
+  fi
+  shift
+done
+exec "$@"
+`
+
 type Call = { command: string; args: string; self: string; path: string }
 
 type DeployFixture = Awaited<ReturnType<typeof makeDeployFixture>>
@@ -104,6 +117,7 @@ async function makeDeployFixture() {
     root,
     binDir,
     prefix,
+    dataDir,
     logPath,
     env,
     originalPath: [binDir, '/usr/bin', '/bin'].join(':'),
@@ -189,6 +203,38 @@ function commandsOf(calls: Call[]) {
   return calls.map((call) => {
     return `${call.command} ${call.args.split(' ')[0] ?? ''}`
   })
+}
+
+// 全項目を 1Password の参照（op://）で書いた .env にする
+async function writeOpReferenceEnvFile(fixture: DeployFixture) {
+  await fs.writeFile(
+    path.join(fixture.dataDir, '.env'),
+    [
+      'ARAYA_DISCORD_BOT_TOKEN=op://deploy-test/discord/token',
+      'ARAYA_DISCORD_APPLICATION_ID=op://deploy-test/discord/application_id',
+      'ARAYA_DISCORD_GUILD_ID=op://deploy-test/discord/guild_id',
+      'ARAYA_DISCORD_CHANNEL_ID=op://deploy-test/discord/channel_id',
+      'ARAYA_DISCORD_ALLOWED_USER_IDS=op://deploy-test/discord/allowed_user_ids',
+    ].join('\n'),
+    { mode: 0o600 },
+  )
+}
+
+// /usr/bin か /bin にある command の path。host の op が見えない PATH を作るときに使う
+async function findSystemCommand(name: string) {
+  for (const directory of ['/usr/bin', '/bin']) {
+    const candidate = path.join(directory, name)
+
+    try {
+      await fs.access(candidate, fs.constants.X_OK)
+
+      return candidate
+    } catch {
+      continue
+    }
+  }
+
+  throw new Error(`${name} が見つかりません`)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -573,6 +619,134 @@ test('deploy: .env が無いときは araya を入れたまま、unit を入れ�
     const calls = await readCalls(fixture.logPath)
     assert.deepEqual(commandsOf(calls), ['npm pack', 'npm uninstall', 'npm install'])
     await fs.access(path.join(fixture.prefix, 'bin', 'araya'))
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('deploy: .env に 1Password の参照（op://）があるときは、npm install の後に、op run 経由で discord install --auth-mode 1password を、npm run が足した PATH の entry を外して実行する', async () => {
+  const fixture = await makeDeployFixture()
+
+  try {
+    await writeOpReferenceEnvFile(fixture)
+    await fs.writeFile(path.join(fixture.binDir, 'op'), FAKE_OP, { mode: 0o755 })
+    const result = await runDeployScript(
+      fixture,
+      [...npmRunEntries(REPO_ROOT), fixture.originalPath].join(':'),
+      { OP_SERVICE_ACCOUNT_TOKEN: 'ops_deploy_test' },
+    )
+
+    assert.deepEqual(result.exit, { code: 0, signal: null }, result.stderr)
+    const calls = await readCalls(fixture.logPath)
+    assert.deepEqual(commandsOf(calls), [
+      'npm pack',
+      'npm uninstall',
+      'npm install',
+      'op run',
+      'araya discord',
+    ])
+    const araya = path.join(fixture.prefix, 'bin', 'araya')
+    const opRun = calls[3]
+    assert.ok(opRun)
+    assert.equal(
+      opRun.args,
+      `run --env-file=${path.join(fixture.dataDir, '.env')} -- ${araya} discord install --auth-mode 1password`,
+    )
+    assert.equal(opRun.self, path.join(fixture.binDir, 'op'))
+    assert.equal(opRun.path, fixture.originalPath)
+    const discordInstall = calls[4]
+    assert.ok(discordInstall)
+    assert.equal(discordInstall.args, 'discord install --auth-mode 1password')
+    assert.equal(discordInstall.self, araya)
+    assert.equal(discordInstall.path, fixture.originalPath)
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('deploy: op run 経由の discord install が 69 以外で失敗したときは、op run の形で実行し直す案内を出して終了 code 1 で終わる', async () => {
+  const fixture = await makeDeployFixture()
+
+  try {
+    await writeOpReferenceEnvFile(fixture)
+    await fs.writeFile(path.join(fixture.binDir, 'op'), FAKE_OP, { mode: 0o755 })
+    const result = await runDeployScript(fixture, fixture.originalPath, {
+      OP_SERVICE_ACCOUNT_TOKEN: 'ops_deploy_test',
+      DEPLOY_TEST_ARAYA_RESULT: 'systemctl_failed',
+      DEPLOY_TEST_ARAYA_EXIT: '1',
+    })
+
+    assert.deepEqual(result.exit, { code: 1, signal: null }, result.stderr)
+    assert.match(result.stderr, /^systemctl_failed: test の失敗$/mu)
+    assert.ok(
+      result.stderr.includes(
+        `op run --env-file=${path.join(fixture.dataDir, '.env')} -- araya discord install --auth-mode 1password を実行してください`,
+      ),
+      result.stderr,
+    )
+    await fs.access(path.join(fixture.prefix, 'bin', 'araya'))
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('deploy: .env に 1Password の参照（op://）があり、OP_SERVICE_ACCOUNT_TOKEN が無いときは、npm も op も実行せずに終了 code 1 で終わる', async () => {
+  const fixture = await makeDeployFixture()
+
+  try {
+    await writeOpReferenceEnvFile(fixture)
+    await fs.writeFile(path.join(fixture.binDir, 'op'), FAKE_OP, { mode: 0o755 })
+    const result = await runDeployScript(fixture, fixture.originalPath)
+
+    assert.deepEqual(result.exit, { code: 1, signal: null }, result.stderr)
+    assert.match(result.stderr, /OP_SERVICE_ACCOUNT_TOKEN を設定してから実行してください/u)
+    assert.match(result.stderr, /araya は入れ替えていません/u)
+    assert.deepEqual(await readCalls(fixture.logPath), [])
+    await assert.rejects(fs.access(path.join(fixture.prefix, 'bin', 'araya')))
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('deploy: .env に 1Password の参照（op://）があり、PATH に op が無いときは、npm を実行せずに終了 code 1 で終わる', async () => {
+  const fixture = await makeDeployFixture()
+
+  try {
+    await writeOpReferenceEnvFile(fixture)
+    // host の /usr/bin などに op があっても見えないよう、deploy.sh が npm pack より前に使う command だけを置いた PATH にする
+    const toolsDir = path.join(fixture.root, 'tools')
+    await fs.mkdir(toolsDir)
+
+    for (const name of ['dirname', 'mktemp', 'grep', 'rm']) {
+      await fs.symlink(await findSystemCommand(name), path.join(toolsDir, name))
+    }
+
+    const result = await runDeployScript(fixture, [fixture.binDir, toolsDir].join(':'), {
+      OP_SERVICE_ACCOUNT_TOKEN: 'ops_deploy_test',
+    })
+
+    assert.deepEqual(result.exit, { code: 1, signal: null }, result.stderr)
+    assert.match(result.stderr, /PATH に 1Password CLI（op）がありません/u)
+    assert.deepEqual(await readCalls(fixture.logPath), [])
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('deploy: .env の op:// がコメント行にしか無いときは、op を使わずに discord install を実行する', async () => {
+  const fixture = await makeDeployFixture()
+
+  try {
+    const envPath = path.join(fixture.dataDir, '.env')
+    const plain = await fs.readFile(envPath, 'utf8')
+    await fs.writeFile(envPath, ['# ARAYA_DISCORD_BOT_TOKEN=op://deploy-test/discord/token', plain].join('\n'))
+    await fs.writeFile(path.join(fixture.binDir, 'op'), FAKE_OP, { mode: 0o755 })
+    const result = await runDeployScript(fixture, fixture.originalPath)
+
+    assert.deepEqual(result.exit, { code: 0, signal: null }, result.stderr)
+    const calls = await readCalls(fixture.logPath)
+    assert.deepEqual(commandsOf(calls), ['npm pack', 'npm uninstall', 'npm install', 'araya discord'])
+    assert.equal(calls[3]?.args, 'discord install')
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }

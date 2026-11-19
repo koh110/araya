@@ -20,7 +20,7 @@ npm ci
 npm run deploy
 ```
 
-`npm run deploy` は、`araya` コマンドをユーザーの global prefix（既定 `~/.local`）に入れ、`~/.local/bin` を PATH に足してください。data directory（既定 `~/.araya`）に `.env` がある場合は、そのまま Discord bot を systemd の user service として入れます。`.env` が無い場合は unit を入れず、次の init を案内して成功で終わります。
+`npm run deploy` は、`araya` コマンドをユーザーの global prefix（既定 `~/.local`）に入れ、`~/.local/bin` を PATH に足してください。data directory（既定 `~/.araya`）に `.env` がある場合は、そのまま Discord bot を systemd の user service として入れます。`.env` が無い場合は unit を入れず、次の init を案内して成功で終わります。`.env` に 1Password の参照（値が `op://` で始まる行）がある場合は、`op run --env-file` で参照を解決してから `araya discord install --auth-mode 1password` を実行します（「1Password に保存した settings を使う」）。このとき PATH に 1Password CLI（`op`）が無いか `OP_SERVICE_ACCOUNT_TOKEN` が未設定なら、araya を入れ替える前に終了 code 1 で止まります。
 
 ```sh
 araya discord init
@@ -42,7 +42,7 @@ araya discord install
 
 Discord の settings は平文の `.env` file に保存します。1Password の Desktop アプリに保存した値（`op://` の vault/item/field の参照）を使いたい場合は、unit file に入れた service が起動するたびに 1Password CLI が `.env` の `op://` 参照を解決し、値は unit file、systemd の control command、起動する process の command line に現れません。1Password を使わない利用者が install で迷わないよう、この mode は `--auth-mode 1password` を明示したときだけ使えます。unit file には `araya discord install` を実行した環境の `OP_SERVICE_ACCOUNT_TOKEN` の値は書きません。Service Account token 自体は、systemd が管理する暗号化 credential file として保存します（「1Password Service Account を systemd credential に保存する」）。
 
-`.env` に平文の値と `op://` 参照を混ぜることもできます。1Password mode で `.env` file 内の全項目が `op://` 参照の file を作ってもよいですが、`op run` は file に平文の項目が 1 つでもあることを要求するので、すべてを `op://` 参照にすることはできません。Service Account の token が読める vault に Discord settings を集約してください。
+`.env` には平文の値と `op://` 参照を混ぜても、すべての項目を `op://` 参照にしても構いません（全項目が参照の `.env` を 1Password CLI 2.42.0-beta.01 の `op run --env-file` で解決できることを確認しています）。Service Account の token が読める vault に Discord settings を集約してください。
 
 ## model を選ぶ
 
@@ -90,7 +90,7 @@ Discord developer portal で application を作成し、`araya discord init` の
 
 - 設定 channel に発言すると、channel ごとの 1 つの Pi durable conversation（main agent session）が応答します。bot を再起動しても同じ文脈から続けます
 - main agent session には file tool（read・edit・write）と bash が付いています。development root の repository を編集し、`git`・`gh` を使って commit・push・draft PR 作成まで行えます。large な作業は Pi durable の named child session（子 session）へ依頼でき、子 session は main session と同じ file tool・bash を持ちます。araya 側の task 台帳・runner・`/araya task` slash command は撤去済みで、task の作成・進捗・実行管理は Pi durable の session に任せます
-- 古い slash command 定義が残っている guild では、実行すると「撤去されました」の応答だけ返ります。Discord 側（guild の Integrations）で `/araya task` などの command 定義を削除してください
+- 古い slash command 定義が残っている guild では、実行すると「撤去されました」の応答だけ返ります。定義の消し方は「araya を更新する」にあります
 - main agent が report delivery（channel への送信依頼）を宣言した送信は、設定 channel へ届くまで再送されます
 - 送信は 1 件の message を 2000 文字ごとに分割して届けます。Discord へ出る文字列と log には既知の secret 相当の文字列を伏字（`[REDACTED]`）して書きます。channel への入力（user message・reply 待ち）も伏字します
 - 「session reset」と書いた message で channel の会話 session を作り直せます。「stop」でその channel で進行中の処理を止めることができます（queue に並んだ依頼も取り消します）
@@ -123,7 +123,7 @@ Discord bot の起動を確かめたことは、`<dataDir>/discord/state.json` �
 - 止める: `systemctl --user stop araya-discord-<hash>.service`
 - 起動・再開: `systemctl --user start araya-discord-<hash>.service`
 - log を見る: `<dataDir>/logs/discord.log`（1 行 1 件の JSON、秘密を置き換えたもの）。bot の stdout と stderr は捨てます。env-file launcher を使った unit では、Discord 設定の解決に失敗したときの note が `<dataDir>/logs/discord-launcher.log` に出ます
-- 削除する: `araya discord uninstall`。unit を止めて無効にし、unit file を消します。state.json と agent session の SQLite（`<dataDir>/agent/`）は残ります。Discord 側の slash command 定義は残るので、guild 側で削除してください
+- 削除する: `araya discord uninstall`。unit を止めて無効にし、unit file を消します。state.json と agent session の SQLite（`<dataDir>/agent/`）は残ります。現行の araya は slash command を登録しません。古い version が登録した定義が guild に残っている場合は、「araya を更新する」の手順で消してください
 
 `araya discord install` は linger を変えません。有効な host では logout 後も bot が動き続け、linger が無効な host では logout で bot が止まります。install は、linger が無効で、その host での logout が bot を止めることを `araya discord install` の warning として出します。linger を有効にするコマンド（`loginctl enable-linger`）の自動実行はしません。実行しないまま logout すると、次に login するまで bot は止まります。`araya discord install` は systemd の user manager に接続できる環境で実行してください（`su` で切り替えた session など、user manager に接続できない session からは実行できません）。
 
@@ -145,6 +145,24 @@ npm run deploy
 
 task 機構があった古い version からの更新: `araya discord install` が残った runner unit（`araya-runner-<hash>.service`）を止めて削除し、結果に `removedLegacyRunnerUnits` を表示します。`--auth-mode` を省略すると既存 unit の mode を保ちます。設定 file の `development` key も撤去済みで、`development.model` を使っていたときは `model` と `thinkingLevel` を `agent` へ移してください（移行しないと config 不正になり、error に案内が出ます）。
 
+古い version が guild に登録した slash command（`/araya task` など）の定義は、更新しても Discord 側に残ります。現行の araya は slash command を使わないので、Discord API の bulk overwrite に空の一覧を送り、この application が guild に登録した command をすべて消します（成功すると `200 []` が出ます）。token は環境変数から読み、command line には出しません。`.env` に 1Password の参照がある場合は、先頭に `op run --env-file="$data_dir/.env" --` を付けて実行してください。
+
+```sh
+data_dir="${ARAYA_DATA_DIR:-$HOME/.araya}"
+node --env-file="$data_dir/.env" --input-type=module -e '
+const env = process.env
+const url = `https://discord.com/api/v10/applications/${env.ARAYA_DISCORD_APPLICATION_ID}/guilds/${env.ARAYA_DISCORD_GUILD_ID}/commands`
+const response = await fetch(url, {
+  method: "PUT",
+  headers: { Authorization: `Bot ${env.ARAYA_DISCORD_BOT_TOKEN}`, "Content-Type": "application/json" },
+  body: "[]",
+})
+console.log(response.status, await response.text())
+'
+```
+
+data directory に残った古い version の file（`tasks.sqlite*`、`runner/`、`runtime/`、`development/`、`discord/chat.sqlite*`、`discord/chat-settings/`、`discord/runner/`、`logs/runner.log` など）は現行の araya が読まないので、使っている process が無いことを確かめてから削除できます。`discord/state.json`、`agent/`、`pi/`、`.discord-bot.lock` は現行の araya が使うので残してください。
+
 ## 注意
 
 - agent（main session も child session も）は sandbox 無しで、bot を動かしている OS user の権限で動きます。会話で指定した repository だけでなく、利用者が書き込める file を変更でき、`git`・`gh` で remote を直接変更することもできます。commit・push・PR 作成を agent に依頼するか、人の確認を挟むかは会話の中で決めてください
@@ -165,7 +183,7 @@ task 機構があった古い version からの更新: `araya discord install` �
 install を実行する環境に Service Account token を用意します。
 
 ```sh
-export OP_SERVICE_ACCOUNT_TOKEN="$(op credential item get <vault>/<item> --field=token)"
+export OP_SERVICE_ACCOUNT_TOKEN="$(op read 'op://<vault>/<item>/<field>')"
 data_dir="${ARAYA_DATA_DIR:-$HOME/.araya}"
 op run --env-file="$data_dir/.env" -- araya discord install --auth-mode 1password
 ```
