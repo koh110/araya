@@ -5,6 +5,7 @@
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import { createRequire } from 'node:module'
+import os from 'node:os'
 import path from 'node:path'
 import { collectSecretValues, createRedactor } from '../infrastructure/redaction.ts'
 import { dataDirHash, discordUnitName } from '../infrastructure/systemd.ts'
@@ -13,9 +14,11 @@ import {
   createDiscordChatHandler,
   splitDiscordChatReply,
   type DiscordChatHandler,
-  type DiscordChatSession,
 } from './chat.ts'
-import { createDefaultArayaAgentSession } from '../agent/host.ts'
+import { createDefaultArayaAgentSession, type ArayaAgentSession } from '../agent/host.ts'
+import { createHootLoop } from '../hoot/tick.ts'
+import type { ObservationDependencies } from '../hoot/observe.ts'
+import { readHootState } from '../hoot/store.ts'
 import {
   createDiscordGateway,
   type DiscordGateway,
@@ -34,6 +37,8 @@ const properLockfile: ProperLockfile = createRequire(import.meta.url)('proper-lo
 const DISCORD_PROCESS_LOCK_STALE_MS = 30_000
 const DISCORD_PROCESS_LOCK_UPDATE_MS = 10_000
 const DEFAULT_POLL_MS = 5_000
+// 終了時に HOOT 判断 run の完了を待つ上限。越えたら close を進め、durable state 側で resume する
+const HOOT_STOP_WAIT_MS = 20_000
 
 export type DiscordBotDependencies = {
   dataDir: string
@@ -51,6 +56,11 @@ export type DiscordBotDependencies = {
   ) => Promise<DiscordGateway>
   createChatSession?: typeof createDefaultArayaAgentSession
   log?: (entry: Record<string, unknown>) => void
+  // HOOT loop の poll 間隔（test で短くする）。既定 60000
+  hootPollMs?: number
+  // HOOT 観測の command 実行（test で fake を入れる）。既定は runBoundedCommand での gh 実行
+  hootRunCommand?: ObservationDependencies['runCommand']
+  hootObservationTimeoutMs?: number
 }
 
 function errorMessage(error: unknown) {
@@ -238,7 +248,7 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     return 1
   }
 
-  let chatSession: DiscordChatSession | null = null
+  let chatSession: ArayaAgentSession | null = null
   // report の deliver は gateway 作成後でないと送れないので、late binding で参照する。
   // 作成失敗時は reject とし、配送待ちの reporter が close を止めない
   type GatewaySettlement = { ok: true; gateway: DiscordGateway } | { ok: false; error: Error }
@@ -325,6 +335,71 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
 
   settleGatewayReady({ ok: true, gateway })
 
+  // HOOT（Human Out of the Loop）の wakeup loop。state が無効なら model も gh も呼ばない。
+  // 判断 run は tool を持たない専用 conversation なので、ここで file も child も変わらない
+  let hoot: ReturnType<typeof createHootLoop> | undefined
+  let hootTask: Promise<void> | undefined
+
+  try {
+    const hootState = await readHootState(dataDir)
+    logSafe({
+      type: 'hoot_state',
+      enabled: hootState.settings.enabled,
+      mode: hootState.settings.mode,
+      activeGoals: hootState.goals.filter((goal) => {
+        return goal.status === 'active'
+      }).length,
+      lastRunAt: hootState.loop.lastRunAt,
+    })
+
+    if (chatSession === null) {
+      logSafe({ type: 'hoot_disabled', reason: 'no_agent_session' })
+    } else {
+      const session = chatSession
+      hoot = createHootLoop({
+        dataDir,
+        devRoot: path.resolve(deps.env.ARAYA_DEV_ROOT || path.join(deps.env.HOME || os.homedir(), 'dev')),
+        decide: async (input) => {
+          if (session.hootDecide === undefined) {
+            throw new Error('hoot_decide_unavailable: agent session に hootDecide がありません')
+          }
+
+          return await session.hootDecide(input)
+        },
+        deliver: async (text, nonce) => {
+          const settlement = await gatewayReady
+
+          if (!settlement.ok) {
+            throw settlement.error
+          }
+
+          await settlement.gateway.sendText(text, nonce)
+        },
+        redactor,
+        // HOOT の log entry は gh・model 由来の text を含む。書く前に秘密を置き換える
+        log: (entry) => {
+          const redacted = redactor.redactDeep(entry)
+
+          logSafe(
+            typeof redacted === 'object' && redacted !== null
+              ? (redacted as Record<string, unknown>)
+              : { message: String(redacted) }
+          )
+        },
+        nowMs,
+        env: deps.env,
+        pollMs: deps.hootPollMs,
+        runCommand: deps.hootRunCommand,
+        observationTimeoutMs: deps.hootObservationTimeoutMs,
+      })
+      hootTask = hoot.run().catch((error: unknown) => {
+        logError('hoot_loop_failed', error)
+      })
+    }
+  } catch (error) {
+    logError('hoot_state_failed', error)
+  }
+
   try {
     try {
       await gateway.connect()
@@ -341,6 +416,22 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
       await sleep(pollMs, deps.stopSignal)
     }
   } finally {
+    // gateway を閉じる前に HOOT loop を止める（送信先の gateway が無くなった後の deliver を避ける）
+    hoot?.stop()
+
+    if (hootTask !== undefined) {
+      await Promise.race([
+        hootTask,
+        new Promise<void>((resolve) => {
+          const timer = setTimeout(() => {
+            clearTimeout(timer)
+            resolve()
+          }, HOOT_STOP_WAIT_MS)
+          timer.unref?.()
+        }),
+      ])
+    }
+
     chatHandlerRef.current?.stopAccepting()
     await chatHandlerRef.current?.drain()
 

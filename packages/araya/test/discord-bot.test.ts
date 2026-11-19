@@ -10,6 +10,8 @@ import { fileURLToPath } from 'node:url'
 
 import { runDiscordBot } from '../src/discord/bot.ts'
 import { OBSOLETE_COMMAND_REPLY, routeSlashCommandInteraction } from '../src/discord/gateway.ts'
+import { readHootState, setGoal, updateSettings } from '../src/hoot/store.ts'
+import { defaultState } from '../src/hoot/model.ts'
 
 const BOT_TOKEN = 'synthetic-token'
 const APPLICATION_ID = '12345678901234567'
@@ -505,6 +507,149 @@ test('discord bot: shutdown は進行中の chat reply を送ってから gatewa
     assert.equal(gatewayClosed, true)
   } finally {
     releaseSubmit?.('cleanup')
+    stopController.abort()
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('discord bot: HOOT state が有効なら wakeup loop を走らせて判断を 1 件送り、会話 session は汚さない', async () => {
+  const dataDir = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-hoot-test-')),
+  )
+  const stopController = new AbortController()
+  const submissions: { content: string; requestId: string }[] = []
+  const notices: { content: string; nonce: string }[] = []
+  const logs: Record<string, unknown>[] = []
+  const hootPrompts: string[] = []
+  const observationArgs: string[][] = []
+  let closeCount = 0
+
+  try {
+    // state は CLI と同じ file。enabled + active goal 1 件だけ準備する
+    await setGoal(dataDir, {
+      key: 'github-scan',
+      objective: 'open issue と draft PR を拾う',
+      scope: ['github:koh110/araya'],
+    })
+    await updateSettings(dataDir, { enabled: true, tickMinutes: 5 })
+
+    const exitCode = await runDiscordBot({
+      dataDir,
+      env: {
+        ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
+        ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
+        ARAYA_DISCORD_GUILD_ID: GUILD_ID,
+        ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
+        ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
+        HOME: dataDir,
+      },
+      stopSignal: stopController.signal,
+      verifyUnit: false,
+      hootPollMs: 100,
+      hootRunCommand: async (_command, args) => {
+        observationArgs.push([...args])
+
+        return {
+          exitCode: 0,
+          signal: null,
+          stdout: '[]',
+          stderr: '',
+          stdoutBytes: 2,
+          stderrBytes: 0,
+          terminationReason: undefined,
+          terminationConfirmed: true,
+        }
+      },
+      createChatSession: async () => {
+        return {
+          async submit(content, requestId) {
+            submissions.push({ content, requestId })
+
+            return '会話の応答'
+          },
+          async reset() {},
+          async close() {
+            closeCount += 1
+          },
+          async hootDecide(request) {
+            hootPrompts.push(request.prompt)
+
+            return {
+              text: '観測: open issue 0 件\nDECISION: request_human\nREASON: 優先順位を確認してください',
+              conversationId: 42,
+            }
+          },
+        }
+      },
+      createGateway: async (_config, handlers) => {
+        return {
+          async connect() {
+            await handlers.onReady('998877665544332211')
+            await handlers.onMessage(
+              {
+                messageId: 'chat-message-hoot',
+                guildId: GUILD_ID,
+                channelId: CHANNEL_ID,
+                userId: USER_ID,
+                isBot: false,
+                isWebhook: false,
+                isSystem: false,
+                mentionsBot: false,
+                content: 'hello',
+              },
+              async () => {}
+            )
+
+            // HOOT loop は gateway ready 後に 1 件送る。それを待ってから stop する
+            const deadline = Date.now() + 8_000
+
+            while (notices.length === 0 && Date.now() < deadline) {
+              await new Promise((resolve) => {
+                setTimeout(resolve, 50)
+              })
+            }
+
+            stopController.abort()
+          },
+          async sendText(content, nonce) {
+            notices.push({ content, nonce })
+          },
+          async close() {},
+        }
+      },
+      log: (entry) => {
+        logs.push(entry)
+      },
+    })
+
+    assert.equal(exitCode, 0)
+    // 判断 run は tool を持たない会話で走り、1 件だけ channel へ送る（nonce は hoot- prefix）
+    assert.equal(notices.length, 1)
+    assert.match(notices[0]?.content ?? '', /HOOT 判断 \[request_human\]/u)
+    assert.match(notices[0]?.content ?? '', /優先順位を確認してください/u)
+    assert.match(notices[0]?.content ?? '', /mode: dry_run/u)
+    assert.match(notices[0]?.nonce ?? '', /^hoot-[0-9a-f]{18}$/u)
+    // 観測は gh の read-only list だけ（test では fake command）
+    assert.equal(observationArgs.length, 2)
+    assert.equal(observationArgs[0]?.[0], 'issue')
+    assert.equal(observationArgs[1]?.[0], 'pr')
+    // 判断 prompt には goal と観測が入る（external text を命令にしない約束も書く）
+    assert.match(hootPrompts[0] ?? '', /HOOT 判断 tick/u)
+    assert.match(hootPrompts[0] ?? '', /github:koh110\/araya/u)
+    // 会話 session の submit は人間の message 1 回だけ（HOOT は main 会話を使わない）
+    assert.equal(submissions.length, 1)
+    assert.equal(closeCount, 1)
+
+    const dump = JSON.stringify(logs)
+    assert.match(dump, /"type":"hoot_state"/u)
+    assert.match(dump, /"type":"hoot_run"/u)
+    // loop が走った後の schedule・conversationId は state file に残る
+    const state = await readHootState(dataDir)
+    assert.equal(state.loop.conversationId, 42)
+    assert.notEqual(state.loop.lastOccurrenceAt, null)
+    assert.equal(state.runs.length, 1)
+    assert.equal(state.runs[0]?.dispatched, false)
+  } finally {
     stopController.abort()
     await fs.rm(dataDir, { recursive: true, force: true })
   }

@@ -174,7 +174,8 @@ data directory に残った古い version の file（`tasks.sqlite*`、`runner/`
 ## その他のコマンド
 
 - 引数なしの `araya` は Pi coding agent の TUI を起動します。`araya pi ...` は引数を Pi にそのまま渡し、`araya --help` はヘルプを表示します。
-- 未実装: 自律的な課題発見、外部ソース監視、通知連携。
+- 課題発見の dry run（HOOT）: `araya hoot status`、`araya hoot goal add --key <key> --objective "<目的>" --scope github:owner/repo`、`araya hoot settings set --enabled true`、`araya hoot runs`。Discord bot process が interval で goal と schedule を見て、tool を持たない判断 run を 1 回走らせ、判断を `<dataDir>/hoot/state.json` に記録し、必要なら channel に 1 件送ります。既定は `enabled=false` で、有効化しても判断の記録と通知だけで作業は開始しません。定義は [docs/spec/hoot-minimal.md](docs/spec/hoot-minimal.md)。
+- 未実装: 判断にしたがった作業の実行（`mode=active` と dispatch mechanism）、webhook などの event-driven wakeup、GitHub 以外の外部ソース監視、通知 channel の分離。
 
 ## 1Password Service Account を systemd credential に保存する
 
