@@ -325,14 +325,14 @@ test('runner process: bash の実行中の SIGTERM は試行を中止せずに 0
     assert.equal(tasks.filter((item) => item.record.kind === ATTEMPT_TASK_NAME).length, 1)
     assert.deepEqual(tasks.map((item) => item.record.restarts ?? 0).filter((restarts) => restarts !== 0), [])
 
-    // 旧 version の保存済み settings に、正の active_ms と timeoutMs:null がある状態で再開する
+    // 保存済み settings の timeoutMs は既定で null（main の既定無効化）。正の active_ms と timeoutMs:null がある状態で再開する
     const db = new DatabaseSync(path.join(setup.fixture.dataDir, 'tasks.sqlite'))
 
     try {
       const row = db.prepare('SELECT settings_json FROM runs WHERE task_id = ? AND attempt = 1').get(taskId)
       assert.ok(row)
       const persistedSettings: Record<string, unknown> = JSON.parse(String(row.settings_json))
-      assert.equal(typeof persistedSettings.timeoutMs, 'number')
+      assert.equal(persistedSettings.timeoutMs, null)
       persistedSettings.timeoutMs = null
       db.prepare('UPDATE runs SET settings_json = ?, active_ms = 1 WHERE task_id = ? AND attempt = 1').run(
         JSON.stringify(persistedSettings),

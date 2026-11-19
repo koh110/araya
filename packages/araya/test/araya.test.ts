@@ -71,6 +71,12 @@ test('config: Araya Pi directory ignores the legacy host PI variable', () => {
   assert.equal(config.env.PI_CODING_AGENT_DIR, undefined)
 })
 
+test('config: 開発 timeout は既定と 0 で無効、正数で明示する', () => {
+  assert.equal(loadConfig({}).developmentTimeoutMs, null)
+  assert.equal(loadConfig({ ARAYA_DEVELOPMENT_TIMEOUT_MS: '0' }).developmentTimeoutMs, null)
+  assert.equal(loadConfig({ ARAYA_DEVELOPMENT_TIMEOUT_MS: '5000' }).developmentTimeoutMs, 5000)
+})
+
 test('config: 開発 root と timeout の範囲を設定から読む', () => {
   const config = loadConfig({
     ARAYA_DATA_DIR: '/tmp/araya-config-test',

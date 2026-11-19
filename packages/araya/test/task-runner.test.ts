@@ -130,7 +130,7 @@ test('runner: completed の試行の summary・model・evidence（resumes 0, act
     const evidence = attempt?.evidence ?? {}
     assert.equal(evidence.outcome, 'completed')
     assert.deepEqual(evidence.agent, { model: expectedModel })
-    assert.equal(evidence.timeoutMs, 20 * 60 * 1000)
+    assert.equal(evidence.timeoutMs, null)
     assert.deepEqual(evidence.tools, [...SHIKI_TOOL_NAMES])
     assert.equal(SHIKI_TOOL_NAMES.length, 7)
     assert.equal(evidence.resumes, 0)
