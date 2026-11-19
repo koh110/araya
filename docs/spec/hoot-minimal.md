@@ -159,6 +159,7 @@ araya hoot <command> ... [--data-dir <path>]
 - `goal add` / `goal update` は `--key <key> --objective "<目的>" [--scope github:owner/repo,...] [--constraint "<制約>",...] [--review-at <YYYY-MM-DD|ISO datetime|none>]`。
 - `settings set` は `[--enabled true|false] [--mode dry_run|active] [--tick-minutes N] [--max-runs-per-day N] [--notify-decisions a,b,c] [--precheck true|false] [--watchdog-hours N] [--digest-hour-utc N|none] [--reset-conversation-after-runs N] [--goal-review-days N] [--proposal-ttl-hours N] [--max-proposal-reminders N]`（`--notify-noop` は撤去）。
 - `status` は open proposals・`conversationRuns`・`lastModelRunAt`・`lastDigestAt`・goal の `reviewAt` を表示する。
+- `proposal list` は open を全件、closed を直近 5 件表示して総数は `open N / closed M` に出す。1 件は key・status・decision・goals・reason・`created / confirmed / expires / reminders` の 3 行。`proposal resolve --key <key>` は open だけ（resolved / expired 済みの key も `hoot_proposal_not_found`）。closed を動かす導線は用意しない（proposal の life cycle は open -> resolved / expired の 1 往復だけ）
 
 `dataDir` は `araya` と同じ設定源（`ARAYA_DATA_DIR` / config file）を使う。全ての `araya hoot` subcommand は任意で `--data-dir <path>` を取れる（`options['data-dir'] ?? deps.dataDir`）: **未指定なら bot process と同じ resolution なので、`araya hoot status` は既定で稼働中 bot の `<dataDir>/hoot/state.json` を見る**。明示指定したときだけ別の file を指す（state 復旧作業で unit を stop した file を確かめる用途など）。bot process の起動・停止はしない。bot は次の tick（既定 60 秒以内）から新しい settings を読む。
 
