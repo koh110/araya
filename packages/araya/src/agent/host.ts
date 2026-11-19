@@ -594,25 +594,40 @@ export async function openArayaAgentHost(
     // child も変更できない。id を覚えておき、再起動後は同じ transcript を続ける
     let hootConversation: Conversation | undefined
 
+    const startHootConversation = async () => {
+      return await activeHarness.createConversation(
+        {
+          ownership: { kind: 'ownerless' },
+        },
+        input.context,
+      )
+    }
+
     const ensureHootConversation = async (request: HootDecideRequest) => {
-      if (hootConversation === undefined && request.conversationId !== null) {
-        // hoot state に number で保存した id。pi-durable の ConversationId は branded number
-        hootConversation = await activeHarness.conversation(
-          request.conversationId as ConversationId,
-          input.context,
-        )
+      let conversation: Conversation
+
+      if (request.conversationId === null) {
+        // 会話 reset の依頼。前の判断の続きにすると noop が自己強化するので、新しい会話から始める
+        conversation = await startHootConversation()
+      } else {
+        const cached = hootConversation
+
+        if (cached !== undefined && cached.id === request.conversationId) {
+          conversation = cached
+        } else {
+          try {
+            // hoot state に number で保存した id。pi-durable の ConversationId は branded number
+            const resumed = await activeHarness.conversation(request.conversationId as ConversationId, input.context)
+            // state の conversationId がこの storage に無い（dataDir を書き換えた等）ときは新しい会話で続ける。
+            // 失敗を繰り返させない。id の変化は tick 側が state に書き直す
+            conversation = resumed ?? (await startHootConversation())
+          } catch {
+            conversation = await startHootConversation()
+          }
+        }
       }
 
-      if (hootConversation === undefined) {
-        hootConversation = await activeHarness.createConversation(
-          {
-            ownership: { kind: 'ownerless' },
-          },
-          input.context,
-        )
-      }
-
-      const conversation = hootConversation
+      hootConversation = conversation
       // policy は毎回書き直す。古い conversation に tool が残っていても判断 run には渡さない
       await conversation.configure(
         {

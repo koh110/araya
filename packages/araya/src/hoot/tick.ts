@@ -1,6 +1,7 @@
 // HOOT の Wakeup loop（Issue #21）の最小形。interval だけの schedule occurrence を deterministic に決め、
 // 判断 run を 1 回走らせて record し、必要なら Discord へ 1 件送る。
-// 実行前の gate（enabled・active goal の有無・daily limit・ occurrence の重複）を model を呼ばずに通過させる。
+// 実行前の gate（enabled・active goal の有無・daily limit・occurrence の重複）と、観測 fingerprint の
+// precheck（変化がなければ model を呼ばない）を deterministic な code だけで通す。
 
 import { createHash } from 'node:crypto'
 
@@ -8,25 +9,46 @@ import type { Redactor } from '../infrastructure/redaction.ts'
 import { collectGitHubObservations, type HootObservation, type ObservationDependencies } from './observe.ts'
 import { HOOT_CONVERSATION_INSTRUCTIONS, PROMPT_RECENT_RUNS, buildDecisionPrompt } from './prompt.ts'
 import {
-  AUTO_DISPATCH_DECISIONS,
+  HOOT_DECISIONS,
   MAX_REASON_CHARS,
   MAX_SUMMARY_CHARS,
+  PROPOSAL_DECISIONS,
   activeGoalsOf,
+  anyGoalChanged,
   githubReposOf,
+  goalFingerprintsOf,
   isoUtc,
   parseDecision,
   parseIso,
+  proposalKeyOf,
+  reviewPassed,
   tickMinutesOf,
   utcDayKey,
+  utcHour,
   type HootDecision,
+  type HootGoal,
+  type HootProposal,
   type HootRun,
+  type HootSettings,
   type HootState,
 } from './model.ts'
-import { readHootState, recordHootRun, setHootConversationId, updateHootState } from './store.ts'
+import {
+  pauseExpiredGoals,
+  readHootState,
+  recordHootDigest,
+  recordHootRun,
+  setHootConversationId,
+  takeProposalReminder,
+  updateHootState,
+  upsertProposal,
+} from './store.ts'
 
 export const HOOT_TICK_POLL_MS = 60_000
 export const HOOT_NOTICE_MAX_CHARS = 1800
 export const HOOT_FAILURE_NOTICE_AFTER = 3
+export const HOOT_DIGEST_DECISION_LINES = 6
+// digest に並べる open proposal の行数（全部は Discord に流さない。full list は CLI）
+export const HOOT_DIGEST_PROPOSAL_LINES = 3
 
 export type HootDecideInput = {
   prompt: string
@@ -58,11 +80,27 @@ export type HootTickOutcome =
   | { kind: 'disabled' }
   | { kind: 'no_active_goal' }
   | { kind: 'failure_cooldown'; cooldownUntil: string }
+  | { kind: 'goals_review_paused'; goals: string[] }
   | { kind: 'not_due'; occurrenceKey: string; dueAt: string }
   | { kind: 'occurrence_recorded'; occurrenceKey: string }
   | { kind: 'daily_limit'; runsToday: number; maxRunsPerDay: number }
   | { kind: 'already_running' }
-  | { kind: 'ran'; occurrenceKey: string; decision: HootDecision; notified: boolean }
+  | {
+      kind: 'prechecked_noop'
+      occurrenceKey: string
+      reason: string
+      remindersSent: number
+      digestSent: boolean
+    }
+  | {
+      kind: 'ran'
+      occurrenceKey: string
+      decision: HootDecision
+      notified: boolean
+      proposalKey: string | null
+      remindersSent: number
+      digestSent: boolean
+    }
   | { kind: 'failed'; occurrenceKey: string; consecutiveFailures: number; message: string }
 
 function occurrenceKeyOf(plannedAtMs: number) {
@@ -73,11 +111,11 @@ function noticeNonce(occurrenceKey: string) {
   return `hoot-${createHash('sha256').update(occurrenceKey).digest('hex').slice(0, 18)}`
 }
 
-export function buildHootNotice(run: HootRun, mode: string) {
+export function buildHootNotice(run: HootRun, settings: HootSettings) {
   const dispatchedNote =
-    AUTO_DISPATCH_DECISIONS.includes(run.decision) && !run.dispatched
-      ? `mode: ${mode}（提案の記録だけ。作業は実行していません）`
-      : `mode: ${mode}`
+    run.decision === 'investigate' || run.decision === 'dispatch'
+      ? `mode: ${settings.mode}（提案の記録だけ。作業は実行していません）`
+      : `mode: ${settings.mode}`
   const lines = [
     `HOOT 判断 [${run.decision}] ${run.plannedAt}`,
     `REASON: ${run.reason}`,
@@ -96,20 +134,87 @@ export function buildHootNotice(run: HootRun, mode: string) {
   return lines.join('\n').slice(0, HOOT_NOTICE_MAX_CHARS)
 }
 
-function runsOfToday(state: HootState, nowMs: number) {
+function buildReviewPauseNotice(goal: HootGoal) {
+  return [
+    `HOOT goal review: ${goal.key} を自動 paused にしました（reviewAt ${goal.reviewAt}）`,
+    '続けるには `araya hoot goal resume --key ' + goal.key + '`、終わらせるなら `araya hoot goal retire --key ' + goal.key + '`',
+  ].join('\n').slice(0, HOOT_NOTICE_MAX_CHARS)
+}
+
+function buildReminderNotice(proposal: HootProposal, reminderIndex: number, maxReminders: number) {
+  return [
+    `HOOT 提案の再提醒 ${reminderIndex}/${maxReminders} [${proposal.decision}] ${proposal.key}`,
+    `REASON: ${proposal.reason}`,
+    `goals: ${proposal.goalKeys.join(', ') || '（なし）'}`,
+    `期限: ${proposal.expiresAt}（応答がなければ期限切れになります）`,
+  ].join('\n').slice(0, HOOT_NOTICE_MAX_CHARS)
+}
+
+function buildDigestNotice(runs: readonly HootRun[], openProposals: readonly HootProposal[], gaps: number, nowMs: number) {
+  const counts = new Map<string, number>()
+
+  for (const run of runs) {
+    counts.set(run.decision, (counts.get(run.decision) ?? 0) + 1)
+  }
+
+  const decisionLines = [...counts.entries()]
+    .sort((left, right) => {
+      return right[1] - left[1]
+    })
+    .slice(0, HOOT_DIGEST_DECISION_LINES)
+    .map(([decision, count]) => {
+      return `${decision}: ${count}`
+    })
+  const latestRequest = runs.findLast((run) => {
+    return run.decision === 'request_human'
+  })
+  const lines = [
+    `HOOT digest ${utcDayKey(nowMs)}`,
+    `runs: ${runs.length}（model 判断 ${runs.filter((run) => {
+      return run.source === 'model'
+    }).length} / precheck noop ${runs.length - runs.filter((run) => {
+      return run.source === 'model'
+    }).length}）`,
+    decisionLines.length > 0 ? decisionLines.join(' / ') : '判断なし',
+  ]
+
+  if (latestRequest !== undefined) {
+    lines.push(`最新の request_human: ${latestRequest.reason}`)
+  }
+
+  lines.push(`open proposals: ${openProposals.length}`)
+
+  for (const proposal of openProposals.slice(0, HOOT_DIGEST_PROPOSAL_LINES)) {
+    // 人間が `araya hoot proposal resolve --key <key>` で応答できるよう key をそのまま出す
+    lines.push(`  - [${proposal.decision}] ${proposal.key} ${proposal.reason.slice(0, 120)}`)
+  }
+
+  if (openProposals.length > HOOT_DIGEST_PROPOSAL_LINES) {
+    lines.push(`  （他 ${openProposals.length - HOOT_DIGEST_PROPOSAL_LINES} 件は araya hoot proposal list）`)
+  }
+
+  if (gaps > 0) {
+    lines.push(`observation gaps: ${gaps} 件`)
+  }
+
+  return lines.join('\n').slice(0, HOOT_NOTICE_MAX_CHARS)
+}
+
+// model を呼ばずに 1 日の run を数える。precheck noop は model budget を使わない
+function modelRunsOfToday(state: HootState, nowMs: number) {
   const day = utcDayKey(nowMs)
 
   return state.runs.filter((run) => {
     const decidedAt = parseIso(run.decidedAt)
 
-    return decidedAt !== null && utcDayKey(decidedAt) === day
+    return run.source === 'model' && decidedAt !== null && utcDayKey(decidedAt) === day
   }).length
 }
 
 export function createHootLoop(deps: HootTickDeps) {
   const pollMs = deps.pollMs ?? HOOT_TICK_POLL_MS
   const controller = new AbortController()
-  // 実行中 flag だけ memory。連続失敗と cooldown は state file（durable）を追う
+  // 実行中 flag だけ memory。連続失敗・cooldown・fingerprint・proposal は state file（durable）
   let running = false
 
   async function safeObserve(goals: HootState['goals']) {
@@ -132,14 +237,91 @@ export function createHootLoop(deps: HootTickDeps) {
 
   async function notify(text: string, nonce: string) {
     if (deps.deliver === undefined) {
-      return
+      return false
     }
 
     try {
       await deps.deliver(text, nonce)
+
+      return true
     } catch (error) {
-      deps.log({ type: 'hoot_notice_failed', nonce, message: errorMessage(error) })
+      deps.log({ type: 'hoot_notice_failed', nonce, message: deps.redactor.redact(errorMessage(error)) })
+
+      return false
     }
+  }
+
+  // review 期限を過ぎた goal を自動 paused にし、goal ごとに 1 件だけ案内する
+  async function pauseExpiredGoalsAndNotify(now: number) {
+    const paused = await pauseExpiredGoals(deps.dataDir, now)
+
+    for (const goal of paused) {
+      deps.log({ type: 'hoot_goal_review_paused', key: goal.key, reviewAt: goal.reviewAt ?? '' })
+      await notify(buildReviewPauseNotice(goal), noticeNonce(`review:${goal.key}:${goal.reviewAt ?? ''}`))
+    }
+
+    return paused
+  }
+
+  // 未解決 proposal の再提醒を 1 件だけ送る（backoff: tickMinutes * 2^n、上限 maxProposalReminders）
+  async function sendOneReminder(now: number, everyMs: number) {
+    const taken = await takeProposalReminder(deps.dataDir, { nowMs: now, everyMs })
+
+    if (taken === null) {
+      return 0
+    }
+
+    const state = await readHootState(deps.dataDir)
+    const sent = await notify(
+      buildReminderNotice(taken.proposal, taken.reminderIndex, state.settings.maxProposalReminders),
+      noticeNonce(`reminder:${taken.proposal.key}:${taken.reminderIndex}`)
+    )
+    deps.log({
+      type: 'hoot_proposal_reminder',
+      key: taken.proposal.key,
+      decision: taken.proposal.decision,
+      reminderIndex: taken.reminderIndex,
+      sent,
+    })
+
+    return 1
+  }
+
+  async function sendDigestIfNeeded(now: number) {
+    const state = await readHootState(deps.dataDir)
+    const settings = state.settings
+
+    if (settings.digestHourUtc === null || utcHour(now) !== settings.digestHourUtc) {
+      return false
+    }
+
+    const last = parseIso(state.loop.lastDigestAt)
+
+    if (last !== null && utcDayKey(last) === utcDayKey(now)) {
+      return false
+    }
+
+    const day = utcDayKey(now)
+    const runs = state.runs.filter((run) => {
+      const decidedAt = parseIso(run.decidedAt)
+
+      return decidedAt !== null && utcDayKey(decidedAt) === day
+    })
+    const openProposals = state.proposals.filter((proposal) => {
+      return proposal.status === 'open'
+    })
+    const gaps = runs.reduce((total, run) => {
+      return total + run.observationGaps.length
+    }, 0)
+    const sent = await notify(buildDigestNotice(runs, openProposals, gaps, now), noticeNonce(`digest:${day}`))
+
+    if (sent) {
+      await recordHootDigest(deps.dataDir, now)
+    }
+
+    deps.log({ type: 'hoot_digest', day, runs: runs.length, openProposals: openProposals.length, sent })
+
+    return sent
   }
 
   async function tickOnce(): Promise<HootTickOutcome> {
@@ -160,16 +342,31 @@ export function createHootLoop(deps: HootTickDeps) {
       return { kind: 'failure_cooldown', cooldownUntil: state.loop.failureCooldownUntil ?? '' }
     }
 
+    const settings = state.settings
+    const everyMs = tickMinutesOf(settings)
+    // state file への write は本当に期限切れの goal があるときだけ（60 秒 poll で毎回書き換えない）
+    const expiredGoal = state.goals.find((goal) => {
+      return goal.status === 'active' && reviewPassed(goal, now)
+    })
+    const reviewPaused = expiredGoal === undefined ? [] : await pauseExpiredGoalsAndNotify(now)
+
+    if (reviewPaused.length > 0) {
+      return {
+        kind: 'goals_review_paused',
+        goals: reviewPaused.map((goal) => {
+          return goal.key
+        }),
+      }
+    }
+
     const goals = activeGoalsOf(state)
 
     if (goals.length === 0) {
       return { kind: 'no_active_goal' }
     }
 
-    const everyMs = tickMinutesOf(state.settings)
-    const lastOccurrenceAt = parseIso(state.loop.lastOccurrenceAt)
     // 停止中に過ぎた occurrence は catch-up せず、now 以下の最新の occurrence 1 件で判断する
-    //（restart のたびに古い予定を順に走らせて model を叩かない）
+    const lastOccurrenceAt = parseIso(state.loop.lastOccurrenceAt)
     const elapsed = lastOccurrenceAt === null ? 0 : Math.floor((now - lastOccurrenceAt) / everyMs)
     let plannedAt: number
     let missedOccurrences = 0
@@ -200,10 +397,10 @@ export function createHootLoop(deps: HootTickDeps) {
       return { kind: 'occurrence_recorded', occurrenceKey }
     }
 
-    const runsToday = runsOfToday(state, now)
+    const runsToday = modelRunsOfToday(state, now)
 
-    if (runsToday >= state.settings.maxRunsPerDay) {
-      return { kind: 'daily_limit', runsToday, maxRunsPerDay: state.settings.maxRunsPerDay }
+    if (runsToday >= settings.maxRunsPerDay) {
+      return { kind: 'daily_limit', runsToday, maxRunsPerDay: settings.maxRunsPerDay }
     }
 
     running = true
@@ -211,31 +408,106 @@ export function createHootLoop(deps: HootTickDeps) {
 
     try {
       const observation = await safeObserve(goals)
-      const prompt = buildDecisionPrompt({
-        goals,
-        settings: state.settings,
-        observation,
-        recentRuns: state.runs.slice(-PROMPT_RECENT_RUNS),
-        nowMs: plannedAt,
-      })
-      const decided = await deps.decide({
-        prompt,
-        requestId: occurrenceKey,
-        conversationId: state.loop.conversationId,
-        instructions: HOOT_CONVERSATION_INSTRUCTIONS,
-      })
-      const parsed = parseDecision(decided.text)
-      const decidedAtMs = deps.nowMs()
       const gaps = observation.repos.flatMap((repo) => {
         // gh の label に repo を含む gap text はそのまま使う（prefix の重複を避ける）
         return repo.gaps.map((gap) => {
           return gap.includes(repo.repo) ? gap : `${repo.repo}: ${gap}`
         })
       })
+      const fingerprints = goalFingerprintsOf(goals, observation.repos)
+      const fingerprintsChanged = anyGoalChanged(state.loop.goalFingerprints, fingerprints)
+      const lastModelRunAt = parseIso(state.loop.lastModelRunAt)
+      const watchdogDue =
+        settings.watchdogHours > 0 &&
+        (lastModelRunAt === null || lastModelRunAt + settings.watchdogHours * 3_600_000 <= now)
+
+      if (gaps.length > 0) {
+        deps.log({ type: 'hoot_observation_gaps', occurrenceKey, gaps: gaps.slice(0, 12) })
+      }
+
+      // 変化がない occurrence で model を叩かない（#21「変化がない場合は不要な LLM 呼出しを抑制」）。
+      // 観測が壊れている場合も model 側に倒さない（証拠が無いのに判断させない）。watchdog で必ず 1 度見る
+      const prechecked =
+        settings.precheckObservation && !fingerprintsChanged && !watchdogDue && gaps.length === 0
+
+      if (prechecked) {
+        const run: HootRun = {
+          occurrenceKey,
+          plannedAt: isoUtc(plannedAt),
+          decidedAt: isoUtc(deps.nowMs()),
+          source: 'precheck',
+          decision: 'noop',
+          reason: '観測 fingerprint が前回と同じため model を呼ばない',
+          summary: '',
+          goalKeys: goals.map((goal) => {
+            return goal.key
+          }),
+          missedOccurrences: Math.min(1000, missedOccurrences),
+          dispatched: false,
+          observedRepos: observation.repos.map((repo) => {
+            return repo.repo
+          }),
+          observationGaps: [],
+        }
+        const recorded = await recordHootRun(deps.dataDir, run)
+
+        if (recorded.run.occurrenceKey !== occurrenceKey) {
+          deps.log({ type: 'hoot_run_conflict', occurrenceKey })
+
+          return { kind: 'occurrence_recorded', occurrenceKey }
+        }
+
+        await updateHootState(deps.dataDir, (next) => {
+          next.loop.goalFingerprints = fingerprints
+          next.loop.consecutiveFailures = 0
+          next.loop.failureCooldownUntil = null
+        })
+
+        deps.log({ type: 'hoot_precheck_noop', occurrenceKey, goals: run.goalKeys })
+
+        const remindersSent = await sendOneReminder(deps.nowMs(), everyMs)
+        const digestSent = await sendDigestIfNeeded(deps.nowMs())
+
+        return {
+          kind: 'prechecked_noop',
+          occurrenceKey,
+          reason: 'observation_unchanged',
+          remindersSent,
+          digestSent,
+        }
+      }
+
+      const reuseConversation =
+        settings.resetConversationAfterRuns === 0 || state.loop.conversationRuns < settings.resetConversationAfterRuns
+
+      if (!reuseConversation) {
+        deps.log({ type: 'hoot_conversation_reset', conversationRuns: state.loop.conversationRuns })
+      }
+
+      const openProposals = state.proposals.filter((proposal) => {
+        return proposal.status === 'open'
+      })
+      const prompt = buildDecisionPrompt({
+        goals,
+        settings,
+        observation,
+        recentRuns: state.runs.slice(-PROMPT_RECENT_RUNS),
+        openProposals,
+        nowMs: plannedAt,
+      })
+      const decided = await deps.decide({
+        prompt,
+        requestId: occurrenceKey,
+        conversationId: reuseConversation ? state.loop.conversationId : null,
+        instructions: HOOT_CONVERSATION_INSTRUCTIONS,
+      })
+      const parsed = parseDecision(decided.text)
+      const decidedAtMs = deps.nowMs()
       const run: HootRun = {
         occurrenceKey,
         plannedAt: isoUtc(plannedAt),
         decidedAt: isoUtc(decidedAtMs),
+        source: 'model',
         decision: parsed.decision,
         reason: deps.redactor.redact(parsed.reason).slice(0, MAX_REASON_CHARS),
         summary: deps.redactor.redact(parsed.summary).slice(0, MAX_SUMMARY_CHARS),
@@ -250,14 +522,6 @@ export function createHootLoop(deps: HootTickDeps) {
         }),
         observationGaps: gaps.slice(0, 12),
       }
-      if (run.observationGaps.length > 0) {
-        deps.log({
-          type: 'hoot_observation_gaps',
-          occurrenceKey,
-          gaps: run.observationGaps,
-        })
-      }
-
       const recorded = await recordHootRun(deps.dataDir, run)
 
       if (recorded.run.occurrenceKey !== occurrenceKey) {
@@ -266,20 +530,65 @@ export function createHootLoop(deps: HootTickDeps) {
         return { kind: 'occurrence_recorded', occurrenceKey }
       }
 
-      const shouldNotify = parsed.parsed ? parsed.decision !== 'noop' || state.settings.notifyNoop : true
-
-      if (decided.conversationId !== state.loop.conversationId) {
-        await setHootConversationId(deps.dataDir, decided.conversationId)
-      }
-
-      // 判断が書けたので連続失敗は戻す（invalid も run として記録したので 0 にする）
       await updateHootState(deps.dataDir, (next) => {
+        next.loop.goalFingerprints = fingerprints
+        next.loop.lastModelRunAt = run.decidedAt
+        next.loop.conversationRuns = reuseConversation ? next.loop.conversationRuns + 1 : 1
+        // 判断 text が書けたので連続失敗は戻す（invalid も run として記録したので 0 にする）
         next.loop.consecutiveFailures = 0
         next.loop.failureCooldownUntil = null
       })
 
+      if (decided.conversationId !== state.loop.conversationId) {
+        // 会話を新しくしたのは tick 側か host 側か。host 側（resume 失敗）も state に新しい id を覚えさせる
+        const reason = reuseConversation ? 'host_recreated' : 'threshold'
+
+        if (reuseConversation) {
+          deps.log({
+            type: 'hoot_conversation_recreated',
+            previousConversationId: state.loop.conversationId,
+            conversationId: decided.conversationId,
+          })
+        }
+
+        await setHootConversationId(deps.dataDir, decided.conversationId)
+        deps.log({ type: 'hoot_conversation_id_saved', reason, conversationId: decided.conversationId })
+      }
+
+      let proposalKey: string | null = null
+
+      if (PROPOSAL_DECISIONS.includes(parsed.decision)) {
+        proposalKey = proposalKeyOf({
+          goalKeys: run.goalKeys,
+          decision: parsed.decision,
+        })
+        const upserted = await upsertProposal(deps.dataDir, {
+          key: proposalKey,
+          decision: parsed.decision,
+          goalKeys: run.goalKeys,
+          reason: run.reason,
+          occurrenceKey,
+          nowMs: decidedAtMs,
+        })
+
+        if (upserted.proposal === null) {
+          deps.log({ type: 'hoot_proposal_limit', occurrenceKey, key: proposalKey })
+          proposalKey = null
+        } else {
+          deps.log({
+            type: 'hoot_proposal',
+            occurrenceKey,
+            key: upserted.proposal.key,
+            decision: upserted.proposal.decision,
+            created: upserted.created,
+          })
+        }
+      }
+
+      const shouldNotify = settings.notifyDecisions.includes(parsed.decision)
+
       if (shouldNotify) {
-        await notify(buildHootNotice(recorded.run, state.settings.mode), noticeNonce(occurrenceKey))
+        await notify(buildHootNotice(recorded.run, settings), noticeNonce(occurrenceKey))
       }
 
       deps.log({
@@ -290,12 +599,24 @@ export function createHootLoop(deps: HootTickDeps) {
         durationMs: decidedAtMs - startedAt,
         missedOccurrences: run.missedOccurrences,
         notify: shouldNotify,
+        watchdog: watchdogDue,
       })
 
-      return { kind: 'ran', occurrenceKey, decision: run.decision, notified: shouldNotify }
+      const remindersSent = hasOpenProposals(state) ? await sendOneReminder(deps.nowMs(), everyMs) : 0
+      const digestSent = await sendDigestIfNeeded(deps.nowMs())
+
+      return {
+        kind: 'ran',
+        occurrenceKey,
+        decision: run.decision,
+        notified: shouldNotify,
+        proposalKey,
+        remindersSent,
+        digestSent,
+      }
     } catch (error) {
       const consecutiveFailures = state.loop.consecutiveFailures + 1
-      const cooldownAt = deps.nowMs() + tickMinutesOf(state.settings)
+      const cooldownAt = deps.nowMs() + everyMs
 
       try {
         await updateHootState(deps.dataDir, (next) => {
@@ -353,6 +674,12 @@ export function createHootLoop(deps: HootTickDeps) {
   }
 
   return { tickOnce, run, stop }
+}
+
+function hasOpenProposals(state: HootState) {
+  return state.proposals.some((proposal) => {
+    return proposal.status === 'open'
+  })
 }
 
 function errorMessage(error: unknown) {

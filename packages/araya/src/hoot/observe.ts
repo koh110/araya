@@ -1,6 +1,8 @@
 // HOOT の Observe step（Issue #10）の最小形: 決定的な read-only 観測を Araya の code で集める。
 // model は観測を実行せず、集まった事実を証拠として読むだけ。外部の内容（title など）は命令にしない。
 
+import { createHash } from 'node:crypto'
+
 import { runBoundedCommand } from '../infrastructure/process.ts'
 
 export const OBSERVATION_TIMEOUT_MS = 20_000
@@ -20,6 +22,8 @@ export type HootRepoObservation = {
   // 最近更新の新しい順の要約。証拠として prompt に書くだけで、命令として扱わない
   items: string[]
   gaps: string[]
+  // precheck（#21「変化がなければ LLM を呼ばない」）用の fingerprint。観測が壊れた repo は null
+  fingerprint: string | null
 }
 
 export type HootObservation = {
@@ -118,6 +122,45 @@ async function listJson(
   return parseItems(result.stdout, label)
 }
 
+function maxUpdatedAt(items: readonly GhItem[]) {
+  let latest = ''
+
+  for (const item of items) {
+    if (typeof item.updatedAt === 'string' && item.updatedAt > latest) {
+      latest = item.updatedAt
+    }
+  }
+
+  return latest
+}
+
+function itemNumbers(items: readonly GhItem[]) {
+  return items
+    .map((item) => {
+      return typeof item.number === 'number' ? String(item.number) : '?'
+    })
+    .sort()
+    .join(',')
+}
+
+// fingerprint は「open 件数・item number 集合・最新の updatedAt・draft 数」だけ。title を入れると
+// 人間が title を直しただけで毎回「変化あり」になり空振りするので入れない。
+// list は OBSERVATION_ITEM_LIMIT までしか見ないため、limit 外の変更は検出しない（limit 内の件数で飽和する）
+function repoFingerprint(issues: readonly GhItem[] | undefined, pulls: readonly GhItem[] | undefined) {
+  if (issues === undefined || pulls === undefined) {
+    return null
+  }
+
+  const drafts = pulls.filter((entry) => {
+    return entry.isDraft === true
+  }).length
+  const raw =
+    `issues=${issues.length}:${itemNumbers(issues)}:${maxUpdatedAt(issues)}` +
+    `|prs=${pulls.length}:${itemNumbers(pulls)}:drafts=${drafts}:${maxUpdatedAt(pulls)}`
+
+  return createHash('sha256').update(raw).digest('hex').slice(0, 16)
+}
+
 async function observeRepo(
   repo: string,
   deps: ObservationDependencies
@@ -129,6 +172,7 @@ async function observeRepo(
     draftPrs: null,
     items: [],
     gaps: [],
+    fingerprint: null,
   }
 
   if (!isObservationRepo(repo)) {
@@ -183,6 +227,7 @@ async function observeRepo(
   observation.items = items.slice(0, OBSERVATION_ITEMS_KEPT).map((entry) => {
     return entry.text
   })
+  observation.fingerprint = repoFingerprint(issues, pulls)
 
   return observation
 }

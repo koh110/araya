@@ -227,3 +227,66 @@ test('hoot agent host: reopen 後も hootDecide は state に覚えた conversat
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
 })
+
+test('hoot agent host: conversationId null で依頼すると新しい会話になり、前の判断 text を継がない（conversation reset）', async () => {
+  const fixture = await makeHootAgentFixture()
+  const models = await createFauxModels(fixture)
+  const prompts: string[] = []
+
+  try {
+    models.script((view) => {
+      if (view.prompt.includes('HOOT 判断 tick')) {
+        prompts.push(view.prompt)
+
+        return answer('DECISION: noop\nREASON: 変化なし')
+      }
+
+      return answer('main の answer')
+    })
+
+    const session = await openArayaAgentHost({
+      dataDir: fixture.dataDir,
+      devRoot: fixture.devRoot,
+      models: models.runtime,
+      model: { provider: models.model.provider, modelId: models.model.id, thinkingLevel: 'medium' },
+      redactor: createRedactor([]),
+      deliverReport: async () => {},
+      context: BACKGROUND_CONTEXT,
+    })
+
+    try {
+      const first = await decideOf(session)({
+        prompt: hootPrompt('hoot-reset-A'),
+        requestId: 'hoot:2026-11-19T14:00:00.000Z',
+        conversationId: null,
+        instructions: HOOT_CONVERSATION_INSTRUCTIONS,
+      })
+      // 同じ id を渡す continuation は前の観測 marker を継ぐ（自己強化する会話の形）
+      const continued = await decideOf(session)({
+        prompt: hootPrompt('hoot-reset-B'),
+        requestId: 'hoot:2026-11-19T15:00:00.000Z',
+        conversationId: first.conversationId,
+        instructions: HOOT_CONVERSATION_INSTRUCTIONS,
+      })
+      assert.equal(continued.conversationId, first.conversationId)
+      // 同じ会話の continuation: model が見せる context は前の turn を含む会話が続き（faux の view は会話の最初の user message を返す）
+      assert.match(prompts.at(1) ?? '', /hoot-reset-A/u)
+
+      // resetConversationAfterRuns のつもりで conversationId null で依頼する
+      const reset = await decideOf(session)({
+        prompt: hootPrompt('hoot-reset-C'),
+        requestId: 'hoot:2026-11-19T16:00:00.000Z',
+        conversationId: null,
+        instructions: HOOT_CONVERSATION_INSTRUCTIONS,
+      })
+      assert.notEqual(reset.conversationId, first.conversationId)
+      // 新しい会話は新しい user message から始まる。前の判断（A）と同じ会話の続きにしない = noop の連鎖を model に見せない
+      assert.match(prompts.at(2) ?? '', /hoot-reset-C/u)
+      assert.doesNotMatch(prompts.at(2) ?? '', /hoot-reset-A/u)
+    } finally {
+      await session.close()
+    }
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})

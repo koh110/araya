@@ -6,6 +6,7 @@ import {
   MAX_GOALS,
   MAX_REASON_CHARS,
   type HootGoal,
+  type HootProposal,
   type HootRun,
   type HootSettings,
   isoUtc,
@@ -26,6 +27,8 @@ export type DecisionPromptInput = {
   settings: HootSettings
   observation: HootObservation
   recentRuns: readonly HootRun[]
+  // 既に人間に渡していて未応答の提案。同じ状況を重ねて提案しないための material
+  openProposals?: readonly HootProposal[]
   nowMs: number
 }
 
@@ -73,7 +76,30 @@ function recentRunBlock(run: HootRun) {
   return `- ${run.decidedAt} ${run.decision}: ${run.reason.slice(0, RECENT_RUN_REASON_CHARS)}`
 }
 
+function formatProposal(proposal: HootProposal) {
+  return [
+    `[${proposal.decision}] key=${proposal.key} goals=${proposal.goalKeys.join(', ') || '（なし）'}`,
+    `created=${proposal.createdAt} 期限=${proposal.expiresAt} 提醒 ${proposal.reminders}`,
+    `REASON: ${proposal.reason}`,
+  ].join(' / ')
+}
+
+// 人間が応答していない pending を model に見せて、同じ提案の再生産（noop の自己強化）を止める
+function proposalsBlock(proposals: readonly HootProposal[]) {
+  if (proposals.length === 0) {
+    return ''
+  }
+
+  return [
+    '# 未解決の提案（人間への pending。Araya は実行していません）',
+    ...proposals.slice(0, 8).map(formatProposal),
+    'これらと同じ状況なら INVESTIGATE / DISPATCH / REQUEST_HUMAN を重ねずに WAIT か NOOP にしてください。',
+    '',
+  ].join('\n')
+}
+
 export function buildDecisionPrompt(input: DecisionPromptInput) {
+  const openProposals = input.openProposals ?? []
   const modeNote =
     input.settings.mode === 'dry_run'
       ? 'mode: dry_run。dispatch・investigate は提案として記録するだけで、実行しません。次の mode 変更まで Araya は何も始めません。'
@@ -94,11 +120,11 @@ ${
     : input.recentRuns.map(recentRunBlock).join('\n')
 }
 
-# 判断
+${proposalsBlock(openProposals)}# 判断
 1. goal に対して、新しく着手すべき課題がありますか
 2. 既に走っている work の完了待ち・情報不足がありますか
 3. 人間に依頼・確認が必要ですか
-4. どれもなければ noop
+4. どれもなければ noop（同じ理由の noop を繰り返さない）
 
 ${modeNote}
 実行しない判断（investigate・dispatch）を提案として出すことはできます（${AUTO_DISPATCH_DECISIONS.join(' / ')}）。
