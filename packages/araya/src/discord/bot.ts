@@ -1,4 +1,4 @@
-// Discord bot の常駐 loop。unit 稼働の確かめ、台帳の open、gateway 接続、通知 tick を組み立てる。
+// Discord bot の常駐 loop。unit 稼働の確かめ、agent session の open、gateway 接続を組み立てる。
 // 設定が無ければ有効化されない（discord_disabled を log して終了 code 1。unit file を入れるのは人間）
 // log は <dataDir>/logs/discord.log（JSON lines）。external 由来の文字列は秘密を置き換えてから書く
 
@@ -7,22 +7,20 @@ import fs from 'node:fs'
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import { collectSecretValues, createRedactor } from '../infrastructure/redaction.ts'
-import { dataDirHash, discordUnitName, runnerUnitName } from '../infrastructure/systemd.ts'
-import { openTaskLedger, type TaskLedger } from '../runner/ledger.ts'
+import { dataDirHash, discordUnitName } from '../infrastructure/systemd.ts'
 import { loadDiscordConfig, type DiscordConfig } from './config.ts'
 import {
   createDiscordChatHandler,
+  splitDiscordChatReply,
   type DiscordChatHandler,
   type DiscordChatSession,
 } from './chat.ts'
-import { createDefaultDiscordChatSession } from './chat-agent.ts'
+import { createDefaultArayaAgentSession } from '../agent/host.ts'
 import {
   createDiscordGateway,
   type DiscordGateway,
   type DiscordGatewayHandlers,
 } from './gateway.ts'
-import { handleDiscordCommand } from './interactions.ts'
-import { NOTIFICATION_POLL_MS, notificationTick } from './notifier.ts'
 import { newState, readDiscordBotState, writeDiscordBotState } from './state.ts'
 
 type ProperLockfile = {
@@ -35,6 +33,7 @@ type ProperLockfile = {
 const properLockfile: ProperLockfile = createRequire(import.meta.url)('proper-lockfile')
 const DISCORD_PROCESS_LOCK_STALE_MS = 30_000
 const DISCORD_PROCESS_LOCK_UPDATE_MS = 10_000
+const DEFAULT_POLL_MS = 5_000
 
 export type DiscordBotDependencies = {
   dataDir: string
@@ -50,7 +49,7 @@ export type DiscordBotDependencies = {
     config: DiscordConfig,
     handlers: DiscordGatewayHandlers,
   ) => Promise<DiscordGateway>
-  createChatSession?: typeof createDefaultDiscordChatSession
+  createChatSession?: typeof createDefaultArayaAgentSession
   log?: (entry: Record<string, unknown>) => void
 }
 
@@ -91,7 +90,7 @@ function fileLogger(filePath: string) {
   }
 }
 
-// unit process であることを確かめる（runner と同じ INVOCATION_ID・cgroup の使い方）
+// systemd unit process であることを INVOCATION_ID と cgroup で確かめる
 async function verifyDiscordUnit(
   expectedUnit: string,
   env: Readonly<Record<string, string | undefined>>,
@@ -144,7 +143,7 @@ export async function runDiscordBot(deps: DiscordBotDependencies) {
   try {
     await fs.promises.mkdir(path.join(deps.dataDir, 'logs'), { recursive: true, mode: 0o700 })
   } catch {
-    // runDiscordBotUnlocked が設定・台帳の誤りを処理し、必要なら失敗を記録する
+    // runDiscordBotUnlocked が設定の誤りを処理し、必要なら失敗を記録する
   }
 
   const log = deps.log ?? fileLogger(path.join(deps.dataDir, 'logs', 'discord.log'))
@@ -183,7 +182,7 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
       return Date.now()
     })
   const sleep = deps.sleep ?? defaultSleep
-  const pollMs = deps.pollMs ?? NOTIFICATION_POLL_MS
+  const pollMs = deps.pollMs ?? DEFAULT_POLL_MS
 
   const log = deps.log ?? fileLogger(path.join(dataDir, 'logs', 'discord.log'))
   const environmentSecretValues = collectSecretValues(deps.env)
@@ -217,7 +216,6 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
   redactor = createRedactor(secretValues)
   const dataHash = dataDirHash(await fs.promises.realpath(dataDir))
   const unit = discordUnitName(dataHash)
-  const runnerUnit = runnerUnitName(dataHash)
   const readyId = randomUUID()
 
   if (deps.verifyUnit !== false) {
@@ -230,28 +228,39 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     }
   }
 
-  let ledger: TaskLedger
-
-  try {
-    ledger = openTaskLedger(dataDir, { secretValues })
-  } catch (error) {
-    logError('discord_ledger_failed', error)
-
-    return 1
-  }
-
   let state
 
   try {
-    state = readDiscordBotState(dataDir) ?? newState(null)
+    state = readDiscordBotState(dataDir) ?? newState()
   } catch (error) {
     logError('discord_state_failed', error)
-    ledger.close()
 
     return 1
   }
 
   let chatSession: DiscordChatSession | null = null
+  // report の deliver は gateway 作成後でないと送れないので、late binding で参照する。
+  // 作成失敗時は reject とし、配送待ちの reporter が close を止めない
+  type GatewaySettlement = { ok: true; gateway: DiscordGateway } | { ok: false; error: Error }
+  let settleGatewayReady: (settlement: GatewaySettlement) => void = () => {}
+  const gatewayReady = new Promise<GatewaySettlement>((resolve) => {
+    settleGatewayReady = resolve
+  })
+
+  async function deliverReport(name: string, text: string, nonce: string) {
+    const settlement = await gatewayReady
+
+    if (!settlement.ok) {
+      throw settlement.error
+    }
+
+    const chunks = splitDiscordChatReply(redactor.redact(`task[${name}] の報告:\n${text}`))
+
+    for (const [index, chunk] of chunks.entries()) {
+      // nonce は 25 文字上限。chunk suffix を付けると再送でも同じ nonce になる
+      await settlement.gateway.sendText(chunk, index === 0 ? nonce : `${nonce}-${index.toString(36)}`)
+    }
+  }
 
   async function closeChatSession() {
     try {
@@ -262,11 +271,11 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
   }
 
   try {
-    chatSession = await (deps.createChatSession ?? createDefaultDiscordChatSession)({
+    chatSession = await (deps.createChatSession ?? createDefaultArayaAgentSession)({
       dataDir,
       env: deps.env,
-      ledger,
       redactor,
+      deliverReport,
     })
     logSafe({ type: 'discord_chat_ready' })
   } catch (error) {
@@ -287,27 +296,9 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
       state.readyId = readyId
       state.lastReadyAt = new Date(nowMs()).toISOString()
 
-      // 初回は、この起動より前の event をさかのぼって送らない
-      if (state.cursor === null) {
-        state.cursor = ledger.lastEventSeq()
-      }
-
-      // install の ready 判定と、再開時の cursor 継続は state file を読む
+      // install の ready 判定は state file を読む
       writeDiscordBotState(dataDir, state)
-      logSafe({ type: 'discord_ready', unit, cursor: state.cursor })
-    },
-    onInteraction: async (request, reply) => {
-      const replies = handleDiscordCommand(request, {
-        config,
-        unit: runnerUnit,
-        ledger,
-        nowMs,
-        redactor,
-      })
-
-      for (const item of replies) {
-        await reply(item.content)
-      }
+      logSafe({ type: 'discord_ready', unit })
     },
     onMessage: async (message, reply) => {
       await chatHandlerRef.current?.handle(message, reply)
@@ -323,11 +314,16 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     gateway = await (deps.createGateway ?? createDiscordGateway)(config, handlers)
   } catch (error) {
     logError('discord_gateway_failed', error)
+    settleGatewayReady({
+      ok: false,
+      error: error instanceof Error ? error : new Error('discord gateway creation failed'),
+    })
     await closeChatSession()
-    ledger.close()
 
     return 1
   }
+
+  settleGatewayReady({ ok: true, gateway })
 
   try {
     try {
@@ -340,35 +336,9 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
 
     logSafe({ type: 'discord_started', unit, pollMs })
 
+    // report 配送は agent host の durable task 側で進む。bot loop は stop まで待つ
     while (!deps.stopSignal.aborted) {
       await sleep(pollMs, deps.stopSignal)
-
-      if (deps.stopSignal.aborted) {
-        break
-      }
-
-      try {
-        const result = await notificationTick({
-          dataDir,
-          ledger,
-          state,
-          send: gateway.sendText,
-          nowMs,
-          log: logSafe,
-          redactor,
-        })
-
-        if (result.sent > 0 || result.skipped > 0) {
-          logSafe({
-            type: 'discord_notifications',
-            sent: result.sent,
-            skipped: result.skipped,
-            cursor: state.cursor,
-          })
-        }
-      } catch (error) {
-        logError('discord_tick_failed', error)
-      }
     }
   } finally {
     chatHandlerRef.current?.stopAccepting()
@@ -381,7 +351,6 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     }
 
     await closeChatSession()
-    ledger.close()
     logSafe({ type: 'discord_stopped' })
   }
 

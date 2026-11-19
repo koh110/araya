@@ -7,8 +7,6 @@ const MAX_STDERR_BYTES = 64 * 1024
 const MAX_TERMINATION_GRACE_MS = 60 * 1000
 const DEFAULT_TERMINATION_GRACE_MS = 250
 const ABANDONMENT_AFTER_KILL_MS = 3000
-export const VERIFICATION_OUTPUT_BYTES = 8 * 1024
-const VERIFICATION_TERMINATION_GRACE_MS = 2000
 
 export type OutputOptions = {
   // strict: 上限超過または不正な UTF-8 で process を止める。tail: 止めずに末尾だけ残す
@@ -38,35 +36,6 @@ export type BoundedCommandOptions = {
   stderr?: OutputOptions
   // 中止されたら timeout と同じ手順（SIGTERM → 猶予 → SIGKILL）で止める。起動前に中止されていれば起動しない
   signal?: AbortSignal
-}
-
-// command を起動する関数。runBoundedCommand と同じ形。runner は試行の scope の中で起動する関数を渡す
-export type GitCommandRunner = (
-  command: string,
-  args: readonly string[],
-  options: BoundedCommandOptions
-) => Promise<BoundedProcessResult>
-
-export type VerificationCommandInput = {
-  command: readonly string[]
-  cwd: string
-  env: Readonly<Record<string, string | undefined>>
-  timeoutMs: number
-  signal?: AbortSignal
-  // 検証のコマンドを起動する関数。省略時は runBoundedCommand
-  launch?: GitCommandRunner
-}
-
-export type VerificationCommandResult = {
-  status: 'passed' | 'failed' | 'timeout'
-  exitCode: number | null
-  signal: NodeJS.Signals | null
-  stdout: string
-  stderr: string
-  stdoutBytes: number
-  stderrBytes: number
-  terminationConfirmed: boolean
-  reason?: string
 }
 
 function isErrno(error: unknown, code: string) {
@@ -344,90 +313,4 @@ export async function runBoundedCommand(
   }
 
   return result
-}
-
-async function isDirectory(target: string) {
-  try {
-    return (await fs.stat(target)).isDirectory()
-  } catch (error) {
-    if (isErrno(error, 'ENOENT') || isErrno(error, 'ENOTDIR')) {
-      return false
-    }
-
-    throw error
-  }
-}
-
-function notStarted(reason: string) {
-  const result: VerificationCommandResult = {
-    status: 'failed',
-    exitCode: null,
-    signal: null,
-    stdout: '',
-    stderr: '',
-    stdoutBytes: 0,
-    stderrBytes: 0,
-    terminationConfirmed: true,
-    reason
-  }
-
-  return result
-}
-
-export async function runVerificationCommand(input: VerificationCommandInput) {
-  const executable = input.command[0]
-
-  if (executable === undefined || executable === '') {
-    return notStarted('launch_failed')
-  }
-
-  if (!await isDirectory(input.cwd)) {
-    return notStarted('cwd_missing')
-  }
-
-  let result: BoundedProcessResult
-
-  const launch = input.launch ?? runBoundedCommand
-
-  try {
-    result = await launch(executable, input.command.slice(1), {
-      cwd: input.cwd,
-      env: input.env,
-      timeoutMs: input.timeoutMs,
-      terminationGraceMs: VERIFICATION_TERMINATION_GRACE_MS,
-      stdout: { mode: 'tail', limitBytes: VERIFICATION_OUTPUT_BYTES },
-      stderr: { mode: 'tail', limitBytes: VERIFICATION_OUTPUT_BYTES },
-      ...(input.signal === undefined ? {} : { signal: input.signal })
-    })
-  } catch (error) {
-    if (isErrno(error, 'subprocess_launch_failed')) {
-      return notStarted('launch_failed')
-    }
-
-    throw error
-  }
-
-  const status = result.terminationReason === 'timeout'
-    ? 'timeout'
-    : result.exitCode === 0 && result.signal === null && result.terminationConfirmed
-      ? 'passed'
-      : 'failed'
-
-  const verification: VerificationCommandResult = {
-    status,
-    exitCode: result.exitCode,
-    signal: result.signal,
-    stdout: result.stdout,
-    stderr: result.stderr,
-    stdoutBytes: result.stdoutBytes,
-    stderrBytes: result.stderrBytes,
-    terminationConfirmed: result.terminationConfirmed,
-    ...(!result.terminationConfirmed
-      ? { reason: 'termination_unconfirmed' }
-      : result.terminationReason === 'aborted'
-        ? { reason: 'aborted' }
-        : {})
-  }
-
-  return verification
 }

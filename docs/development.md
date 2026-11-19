@@ -1,10 +1,10 @@
 # araya development
 
-内蔵 Pi の設定・認証・session は `<dataDir>/pi`（既定 `~/.araya/pi`）に置きます。`settings.json`・`auth.json`・`models.json`・`models-store.json`・`sessions/`・Pi SDK が管理する `bin/` はここに置き、runner の model cache は `<dataDir>/runner/models-store.json` に置きます。Araya 側の TUI（`araya` または `araya pi`）で `/login` と `/model` を設定します。
+内蔵 Pi の設定・認証・session は `<dataDir>/pi`（既定 `~/.araya/pi`）に置きます。`settings.json`・`auth.json`・`models.json`・`models-store.json`・`sessions/`・Pi SDK が管理する `bin/` はここに置きます。Araya 側の TUI（`araya` または `araya pi`）で `/login` と `/model` を設定します。
 
-Pi SDK は import 時に環境変数から agent directory を読み、`bin/` の場所を module cache に固定します。実行時 import は `loadPiSdk(agentDir)` に集約し、最初の import より前に Araya の環境を束縛してください。runner・attempt へ Pi SDK の runtime static import を追加しないでください。回帰テストは新規 child process で、SDK が解決する `bin/` の path を検証します。親 test process が SDK を先に import すると、その module cache の binding は後から修正できません。
+Pi SDK は import 時に環境変数から agent directory を読み、`bin/` の場所を module cache に固定します。実行時 import は `loadPiSdk(agentDir)` に集約し、最初の import より前に Araya の環境を束縛してください。Pi SDK の runtime static import を他の module に追加しないでください。回帰テストは新規 child process で、SDK が解決する `bin/` の path を検証します。親 test process が SDK を先に import すると、その module cache の binding は後から修正できません。
 
-repository の中で araya をビルド・テスト・変更する人向けの文書です。`araya` の使い方は [README.md](../README.md)、動作の詳しい定義は [docs/spec/](spec/) にあります。
+repository の中で araya をビルド・テスト・変更する人向けの文書です。`araya` の使い方は [README.md](../README.md)、model 設定の定義は [docs/spec/agent-model-config.md](spec/agent-model-config.md)、Discord 会話の定義は [docs/spec/discord-persistent-chat.md](spec/discord-persistent-chat.md) にあります。
 
 ## checkout とテスト
 
@@ -17,27 +17,25 @@ npm test
 npm run typecheck
 ```
 
-テストは一時 directory を使い、実際の SQLite と Pi Durable storage を通して状態遷移を検証します。model は pi-ai の faux provider を使い、Pi の認証情報と model の API は使いません。systemd の操作は、通常は test 用の差し替えを使います。本物の systemd の user manager を使う runner の test は、`ARAYA_TEST_SYSTEMD=1` を指定したときだけ実行します（unit file は書かずに、一時的な unit を作って消します）。
-
-```sh
-ARAYA_TEST_SYSTEMD=1 node --test packages/araya/test/task-runner-systemd.test.ts
-```
+テストは一時 directory を使い、実際の SQLite と Pi Durable storage を通して状態遷移を検証します。model は pi-ai の faux provider を使い、Pi の認証情報と model の API は使いません。systemd の操作（`systemctl`・`loginctl`）は test 用の差し替え（`test/support/fake-systemd.ts`）を使い、本物の systemd user manager を要求する test はありません。Discord gateway も fake で差し替えます（`test/support/discord-bot-process.mjs` は bot process を実際に起動する test に使います）。
 
 ## source の配置と import
 
 `packages/araya/src/` は機能ごとに分けています。
 
-- `cli/`: 引数解析と CLI command の実行
+- `cli/`: 引数解析と CLI command（`araya discord init`・`install`・`uninstall`・`run`）の実行
 - `config/`: 環境変数、設定ファイル、model 設定
-- `development/`: SHIKI、worktree、開発結果の収集。`draft-pr/` は Draft PR delivery と snapshot
-- `runner/`: 試行、台帳、runner loop
-- `infrastructure/`: subprocess、秘密の置換、systemd
+- `agent/`: Discord 会話の main agent、model 解決、Pi durable session host（`openArayaAgentHost()`）
+- `discord/`: Discord gateway、会話入口、bot state、env/op launcher
+- `infrastructure/`: subprocess 実行、秘密の置換、systemd unit
+
+`packages/araya/bin/` は起動 entrypoint（`cli.ts`、`discord-bot.ts`、`discord-env-runner.ts`、`discord-op-runner.ts`）です。unit file の `ExecStart` は Node.js で dist の absolute path を実行します。
 
 import は相対 path と `.ts` 拡張子を使い、必要な module を直接参照します。build 時に `.js` へ変換します。
 
 ## CI
 
-`.github/workflows/ci.yml` は pull_request と main への push で動きます。ubuntu-26.04（Node 26）の job が2つで、`test`（typecheck と `npm test`）と `systemd`（`ARAYA_TEST_SYSTEMD=1` で task-runner-systemd.test.ts を実行。linger を有効にして user manager を起動）です。
+`.github/workflows/ci.yml` は pull_request と main への push で動きます。ubuntu-26.04（Node 26）の job は `test`（typecheck と `npm test`）1 つです。unit file を実際に書く操作は fake systemd への差し替えで検証し、CI の中で本物の systemd user manager は使いません。
 
 ## checkout から動かす
 
@@ -45,26 +43,24 @@ global install をせずに、checkout からコマンドを試すことがで�
 
 ```sh
 npm run araya -- --help
-npm run araya -- task create --file task.json
-npm run araya -- runner install
+npm run araya -- discord init
+npm run araya -- discord run
 ```
 
-`araya runner install` を実行した araya のコードで runner が動きます（unit file の `ExecStart` は Node.js を起動し、runner の entrypoint の絶対 path を引数に渡します。`npm run deploy` で入れた araya なら、entrypoint は install 先の `packages/araya/dist/bin/task-runner.js` です）。checkout で `npm run araya -- runner install` を実行すると、runner はその checkout の `packages/araya/bin/task-runner.ts` で動きます。その checkout の file を変えると runner の動作が変わり、checkout を移動・削除すると runner は起動できなくなります。
+`araya discord run` は foreground で 1 度だけ bot を動かす試験起動です。`araya discord install` を checkout から実行すると、unit file の `ExecStart` はその checkout の `packages/araya/dist/`（build 済み code）を指します。checkout を移動・削除すると unit は起動できなくなります。
 
 ## deploy の仕組み
 
 root で `npm run deploy`（`scripts/deploy.sh`）を実行すると、次のことが起きます。
 
 1. root package（version `0.0.1`）に `npm pack` を実行し、一時 tarball からユーザーの global prefix（既定 `$HOME/.local`、`ARAYA_INSTALL_PREFIX` で変更可）へ araya を install します。checkout への symlink ではないため、以後のソース変更は再 deploy まで反映されず、araya の checkout を移動・削除しても、install 済みコマンドは影響を受けません。npm registry への publish は行いません。指定 prefix 内に旧 `agentctl` package があれば先に `npm uninstall --global` を実行し、`araya` の bin 競合を解消してから置き換えます。
-2. 入れた araya（`<prefix>/bin/araya`）で `araya runner install` を実行し、deploy の環境の `ARAYA_DATA_DIR`（無ければ `~/.araya`）の data directory の runner を新しいコードで入れ直して起動します（「runner の仕組み」）。初めての deploy では runner を入れ、止めてあった runner も起動します。動いていた試行は一時停止の扱いで続きから進みます（新しいコードで試行の進め方が変わったときは、`attempt_error` で失敗することがあります）。
+2. data directory（deploy の環境の `ARAYA_DATA_DIR`、無ければ `~/.araya`）に `.env` がある場合だけ、入れた araya（`<prefix>/bin/araya`）で `araya discord install` を実行し、その data directory の Discord bot unit を新しいコードで入れ直して起動します（「Discord bot unit の仕組み」）。`.env` が無い場合は unit を入れず、`araya discord init` への案内を出して成功で終わります。`.env` に 1Password の参照（値が `op://` で始まる行。コメント行は除く）がある場合は、`op run --env-file=<dataDir>/.env -- <prefix>/bin/araya discord install --auth-mode 1password` で実行し、参照を解決した値で検証してから unit を入れ直します。この場合、`npm pack` より前に PATH の `op` と `OP_SERVICE_ACCOUNT_TOKEN` を確かめ、どちらかが無ければ araya を入れ替えずに終了 code 1 で終わります。
 3. unit file に書く `PATH` は、`npm run` が先頭に足した entry（checkout などの `node_modules/.bin` と、npm の `node-gyp-bin`）を除いた値になります。
 
-- 対象の runner は、deploy を実行した環境の `ARAYA_DATA_DIR` のものです。unit file の `Environment=` も、その環境の値で書き直します。`~/.araya` 以外の `ARAYA_DATA_DIR` の runner を使っているときは、deploy を実行する環境の `ARAYA_DATA_DIR` にその値を設定してください。設定しないと、`~/.araya` の runner を入れます（使っている runner は、次に起動するまで前のコードのまま動き続けます）。
-- `ARAYA_INSTALL_PREFIX` で別の prefix に入れたときも、runner はその prefix に入れた araya で動きます。
-- runner を止めたままにするときは、deploy の後に `systemctl --user stop araya-runner-<hash>.service` を実行してください。
-- deploy は、runner が起動したことまでは確かめません。出力の `runner.state` が `running` でなければ、`<dataDir>/logs/runner.log` を確認してください。
-- Linux 以外の環境と、systemd の user manager に接続できない環境（`systemctl` が無い環境を含む）では、`araya runner install` が終了 code 69 で終わります。このとき deploy は、runner を入れずに注意を出し、成功で終わります。user manager に接続できない session（`su` で切り替えた session など）から deploy すると、動いている runner は、次に起動するまで前のコードのまま動き続けます。
-- それ以外の理由で `araya runner install` が失敗したときは（`PATH` に unit file に書けない文字がある、など）、deploy は araya を入れたまま、終了 code 1 で終わります。理由を直してから `araya runner install` を実行してください。
+- 対象の bot は、deploy を実行した環境の `ARAYA_DATA_DIR` のものです。unit file の `Environment=` も、その環境の値で書き直します。`~/.araya` 以外の `ARAYA_DATA_DIR` の bot を使っているときは、deploy を実行する環境の `ARAYA_DATA_DIR` にその値を設定してください。設定しないと、`~/.araya` の bot を入れます（使っている bot は、次に起動するまで前のコードのまま動き続けます）。
+- `ARAYA_INSTALL_PREFIX` で別の prefix に入れたときも、bot はその prefix に入れた araya で動きます。
+- Linux 以外の環境と、systemd の user manager に接続できない環境（`systemctl` が無い環境を含む）では、`araya discord install` は終了 code 69 で終わります。このとき deploy は、unit を入れずに注意を出し、成功で終わります。user manager に接続できない session（`su` で切り替えた session など）から deploy すると、動いている bot は、次に起動するまで前のコードのまま動き続けます。
+- それ以外の理由で `araya discord install` が失敗したときは（`PATH` に unit file に書けない文字がある、unit の restart が失敗した、など）、deploy は araya を入れたまま、終了 code 1 で終わります。理由を直してから、表示された command（`araya discord install`、1Password の参照がある `.env` では `op run --env-file=... -- araya discord install --auth-mode 1password`）を実行してください。
 
 別の prefix に入れる例:
 
@@ -74,51 +70,47 @@ ARAYA_INSTALL_PREFIX="$HOME/.npm-global" npm run deploy
 
 prefix の `bin` directory が `PATH` に含まれていることを確認してください。
 
-## runner の仕組み
+## Discord bot unit の仕組み
 
-runner は、SHIKI を動かすために常駐する Araya の process です。SHIKI は、試行ごとに runner の中で新しく作られる会話です（試行は Task を1回実行することで、再実行のたびに新しい試行になります）。Task が無い間も runner は動き続けますが、SHIKI は動かず、runner も model を呼びません。差分の収集、検証の実行、結果の判定と記録は、SHIKI ではなく runner が行います。runner は2秒ごとに台帳を見て、待ちの Task を古い順に取り込みます。
-
-- unit file は `~/.config/systemd/user/araya-runner-<hash>.service`（`XDG_CONFIG_HOME` が絶対 path ならその下）に書き、`systemctl --user daemon-reload`・`enable`・`restart` を実行します。`<hash>` は `<dataDir>` の実 path の SHA-256 の先頭12文字で、`<dataDir>` ごとに runner は1つです。
-- `<dataDir>/config.json` が無い場合、Pi の `settings.json` に有効な `defaultProvider` と `defaultModel` が両方あれば、`development.model` だけを mode 0600 で初期設定します。`thinkingLevel`・認証情報は写さず、API も呼びません。設定が無い・読めない・不正なら config を作らず warning を出して runner install は続けます。既存 config（`{}` を含む）は変更しません。出力の `config.status` は `created`・`existing`・`skipped` のいずれかです。
-- unit file の `Environment=` には、`araya runner install` を実行した環境の `PATH`・`LANG`・`LANGUAGE`・`TZ`・`LC_*`・`ARAYA_*`（`TOKEN`・`SECRET`・`PASSWORD`・`API_KEY`・`AUTH` などを名前に含む、秘密とみなす変数を除く）だけを書きます。`ARAYA_DATA_DIR` と `ARAYA_DEV_ROOT` は絶対 path にして書きます。内蔵 Pi の保存先変数 `ARAYA_CODING_AGENT_DIR` は `<ARAYA_DATA_DIR>/pi` の絶対 path に正規化します。ほかの変数（model の API key、proxy の設定など）は runner にも SHIKI にも渡りません。model の認証は Pi の `auth.json` から読みます。
+- unit file は `~/.config/systemd/user/araya-discord-<hash>.service`（`XDG_CONFIG_HOME` が絶対 path ならその下）に書き、`systemctl --user daemon-reload`・`enable`・`restart` を実行します。`<hash>` は `<dataDir>` の実 path の SHA-256 の先頭12文字で、`<dataDir>` ごとに bot は1つです。
+- env-file mode の `ExecStart` は `/usr/bin/env <launcher>` で、launcher が `.env`（`EnvironmentFiles=-` の optional 指定も可）を解決して bot process を起動します。1Password mode は `OP_SERVICE_ACCOUNT_TOKEN` の値を unit file に書かず、`LoadCredentialEncrypted=` で復号した credential から 1Password CLI launcher を起動します。
+- unit file の `Environment=` には、`araya discord install` を実行した環境の `PATH`・`LANG`・`LANGUAGE`・`TZ`・`LC_*`・`ARAYA_*`（`TOKEN`・`SECRET`・`PASSWORD`・`API_KEY`・`AUTH` などを名前に含む、秘密とみなす変数を除く）だけを書きます。`ARAYA_DATA_DIR` と `ARAYA_DEV_ROOT` は絶対 path にして書きます。内蔵 Pi の保存先変数 `ARAYA_CODING_AGENT_DIR` は `<ARAYA_DATA_DIR>/pi` の絶対 path に正規化します。ほかの変数（model の API key、proxy の設定など）は bot に渡りません。model の認証は Pi の `auth.json` から読みます。
+- bot process の実行時環境から GitHub token 変数（`GH_TOKEN`・`GITHUB_TOKEN` 等）を除き、`GH_CONFIG_DIR`・`GH_HOST` selector だけを引き継ぎます（README「GitHub の repository へアクセスさせる」）。
 - `<dataDir>` などの path と環境変数の値に、空白・引用符・`\`・`$`・`%`・`;`・制御文字があると、unit file を書かずに `unsupported_path` で失敗します。
-- 環境変数を変えたとき、`araya runner install` をやり直すまで、unit file の `Environment=` は前の値のままで、runner は前の環境で動きます。動いている runner は、起動したときに読み込んだコードで動き続けます。
-- `ARAYA_DATA_DIR` を変えて `araya runner install` を実行すると、`<hash>` が変わるので別の unit（別の runner）ができ、前の runner は動き続けます。前の runner を残さないときは、先に前の `ARAYA_DATA_DIR` で `araya runner uninstall` を実行してください。
-- `systemctl --user stop` は一時停止です。動いていた試行は中止されず、次に起動したときに続きから進みます。runner が落ちたときは、systemd が間隔を空けて起動し直します。
-- `araya runner uninstall` は unit を止めて無効にし、unit file を消します。台帳は変えないので、動いていた試行は `running` のまま残り、入れ直すと続きから進みます。
-- runner の log は `<dataDir>/logs/runner.log`（1行1件の JSON、秘密を置き換えたもの）です。runner の stdout と stderr は捨てます。
-- GitHub.com の Draft PR delivery は、runner が利用する `gh` CLI と、その OS user の保存済み `gh auth` 状態を使います。GitHub token を agent・evidence・log・command arguments に渡したり記録したりしません。`gh` が無い・認証できない場合や GitHub Enterprise / 他 host の remote は、success にせず `blocked` にします。
-- SHIKI の bash は command ごとに、検証 command は1件ごとに、worktree 作成と差分収集の git も実行ごとに、さらに delivery の commit/push と GitHub CLI も各 command ごとに、それぞれ別の transient な systemd scope（名前は `araya-<hash>-<taskKey>-…`）の中で動きます。runner は、差分を集める前と結果を記録する前に、その試行の名前の scope をすべて止めるので、`setsid` などで切り離した process も残りません。
-- `araya task` と `araya runner` は Linux と systemd（254 以降）の user manager が必要です。Linux 以外では何もせずに `unsupported_platform` で終わります。各コマンドは JSON 1件を stdout に出します。失敗したときは理由を stderr に出し、終了 code 1 で終わります。ただし、Linux 以外（`unsupported_platform`）と、systemd の user manager に接続できないとき（`systemd_unavailable`）は、終了 code 69 で終わります。
-- `araya task` の各コマンドは、結果といっしょに台帳の `runner` と `queue` を出力に含めます。`runner.state` が `running` でないときは、出力とは別に stderr へ注意を出します（登録などの処理自体は成功します）。
-- `araya runner install` は linger を変えずに読むだけで、出力に `linger` を含めます。`linger` が `false` のときは stderr に注意を出します。
+- 環境変数を変えたとき、`araya discord install` を実行し直すまで、unit file の `Environment=` は前の値のままで、bot は前の環境で動きます。
+- `ARAYA_DATA_DIR` を変えて `araya discord install` を実行すると、`<hash>` が変わるので別の unit（別の bot）ができ、前の bot は動き続けます。前の bot を残さないときは、先に前の `ARAYA_DATA_DIR` で `araya discord uninstall` を実行してください。
+- install は restart 後に `<dataDir>/discord/state.json` の ready state（readyId・lastReadyAt・readyGeneration）で起動を確かめます。state に credential の値は書きません。確かめられない場合は install が失敗で終わり、service は起動したまま残ることがあります。
+- bot の log は `<dataDir>/logs/discord.log`（1行1件の JSON、秘密を置き換えたもの）です。bot の stdout と stderr は捨てます。env-file launcher の失敗 note は `<dataDir>/logs/discord-launcher.log` に出ます。
+- `araya discord` は Linux と systemd（254 以降）の user manager が必要です。Linux 以外では何もせずに `unsupported_platform` で終わります。失敗したときは理由を stderr に出し、終了 code 1 で終わります。Linux 以外（`unsupported_platform`）と、systemd の user manager に接続できないとき（`systemd_unavailable`）は、終了 code 69 で終わります。各 command は JSON 1件を stdout に出します。
+- `araya discord install` は linger を変えずに読むだけで、出力に `linger` を含めます。`linger` が `false` のときは stderr に注意を出します。
+- 古い slash command（`/araya task` 等）への interaction には、静的な「撤去されました」の ephemeral 応答を返すだけで、option の値はどこにも書きません。Discord 側の command 定義は araya からは削除しません（guild 側で削除する）。
 
-## Task の内部
+## Discord 会話 agent（session-first）
 
-- `<dataDir>/tasks.sqlite` は Task・試行・途中経過・runner 状態を、`<dataDir>/runner/durable.sqlite` は Pi Durable の task graph・checkpoint・SHIKI の会話と tool 記録を保持します。別々の SQLite DB で、双方をまたぐ transaction はありません。会話・台帳・状態 directory・log・worktree は自動削除しません。会話には秘密が含まれることがあり、evidence/log の redaction 対象外なので、`ARAYA_DATA_DIR` と backup のアクセス権を管理してください。
-- Task の入力・CLI・状態遷移・retry/cancel・evidence の詳しい契約は [Task と SHIKI の実行仕様](spec/task-ledger-and-shiki-runner.md) を参照してください。このガイドでは仕様を重ねて記述しません。
-- Task は `araya task create` から登録します。自律的な課題発見、外部 source の監視、通知連携は未実装です。
-- SHIKI と検証 command は sandbox なしで利用者の権限により動き、開発 root 外の書き込み可能 file や network にアクセスできます。SHIKI への禁止指示は強制境界ではありません。Araya は検証済みの変更について commit・push・Draft PR 作成まで行いますが、merge・deploy・publish はしません（[Draft PR delivery 仕様](spec/draft-pr-delivery.md)）。
+Discord bot process は Pi durable の Harness を持ちます。許可された channel の main conversation が orchestrator で、`openArayaAgentHost()`（`src/agent/host.ts`）が model runtime・tool・child session を接続します。
+
+- main conversation は coding tool（file 読取・編集・shell 実行。cwd は development root）を持ちます。会話と child session の graph は `<dataDir>/agent/agent.sqlite` に永続化され、再起動時は `harness.resume()` で復元します。
+- main agent は Pi durable の child conversation を作成・送信・status 確認・中止でき、child 会話は main conversation の所有 background task に anchor され、main の run が終わっても動き続けます。reporter task が child へ依頼を届け、回答を待ち、followUp input として main conversation に injection します。main がそれをまとめて channel に送ります。report delivery は届くまで再送されます。
+- task の作成・進捗・実行管理は Pi durable の session に任せます。araya 側の task 台帳・runner・side-effect gate・evidence 照合・worktree 強制・`/araya task` slash command は撤去済みです。Discord 側の境界は入口 allowlist と、channel に返す text の redaction のみです。
+- model は `resolveAgentModel()`（`src/agent/model.ts`）が config `agent.model` → Pi settings（`<dataDir>/agent/agent-settings`）→ Pi の既定の順で解決します。
+- `reset` / `stop` は Discord 入口（`src/discord/chat.ts`）で扱います。reset は main conversation を作り直し、stop は main の run・queued input・background child session へ中止を要求します。
 
 ## 設定
 
 - `ARAYA_DATA_DIR` — データの directory（既定: `~/.araya`）。この文書では `<dataDir>` と書きます。
-- `ARAYA_DEV_ROOT` — 開発 root（既定: `~/dev`）。runner の SHIKI がここで repository を探し、worktree を作ります。
-- `ARAYA_DEVELOPMENT_TIMEOUT_MS` / `ARAYA_VERIFICATION_TIMEOUT_MS` — [期限と数値の扱い](spec/task-ledger-and-shiki-runner.md#期限)
-- 内蔵 Pi の agent directory は `<ARAYA_DATA_DIR>/pi`（既定 `~/.araya/pi`）です。TUI・runner・SHIKI・runner install は `ARAYA_CODING_AGENT_DIR` でこの directory を使います。
+- `ARAYA_DEV_ROOT` — 開発 root（既定: `~/dev`）。agent の file tool・bash がここで repository を編集します。
+- 内蔵 Pi の agent directory は `<ARAYA_DATA_DIR>/pi`（既定 `~/.araya/pi`）です。TUI・bot は `ARAYA_CODING_AGENT_DIR` でこの directory を使います。`ARAYA_CODING_AGENT_SESSION_DIR` は使いません（session の保存は `<dataDir>/agent/agent.sqlite`）。
 - `ARAYA_INSTALL_PREFIX` — deploy の install prefix（「deploy の仕組み」）
-- `ARAYA_TEST_SYSTEMD` — 本物の systemd user manager を使う test を実行するかどうか（「checkout とテスト」）
 
 ### 設定ファイル
 
-設定ファイル `<dataDir>/config.json`（既定: `~/.araya/config.json`）は、runner の SHIKI が使う model と thinking level を選びます。保存場所は `ARAYA_DATA_DIR` に従い、専用の path 環境変数はありません。`task`・`runner` command の開始時と、runner が試行を取り込むときに読み込みます。
+設定ファイル `<dataDir>/config.json`（既定: `~/.araya/config.json`）は、agent session が使う model と thinking level を選びます。保存場所は `ARAYA_DATA_DIR` に従い、専用の path 環境変数はありません。bot は起動時に 1 回読みます。
 
-schema、初期設定、model の選び方、エラー時の挙動は [開発 model の設定](spec/development-model-config.md) にまとめています。この文書では設定値の詳細を重ねて記述しません。
+schema、model の選び方、エラー時の挙動は [agent model の設定](spec/agent-model-config.md) にまとめています。この文書では設定値の詳細を重ねて記述しません。
 
 ## 状態と安全境界
 
-- `<dataDir>/tasks.sqlite` は開発 Task・試行・途中経過・runner 状態を保持し、`<dataDir>/runner/durable.sqlite` は Pi Durable の task graph、checkpoint、SHIKI の会話と tool 記録を保持します。`araya task show --full` が表示するのは evidence で、会話全文を閲覧・export する CLI はありません。
-- 会話と task ledger は別の SQLite DB で、両方をまたぐ単一 transaction はありません。DB、試行の状態 directory、log、worktree と branch は自動削除しません。
-- 会話には課題本文、model の応答、tool の引数と出力が含まれ得ます。会話 DB はevidence/logの redaction 対象ではないため、`ARAYA_DATA_DIR` と backup のアクセス権を管理してください。
-- 自律的な課題発見、外部ソース監視、通知連携は未実装です。Task は `araya task create` から登録します。
-- runner の SHIKI と検証コマンドは利用者の権限で sandbox なしに動き、開発 root 以外の書き込み可能 file にも触れます。SHIKI には自分で commit・push・PR 作成・merge・deploy・publish をしないよう指示しますが、network 制限や sandbox はなく、直接 remote を変更する可能性があります。Araya の built-in delivery は全検証成功後に commit・push・GitHub.com Draft PR 作成を行い、merge・deploy・publish はしません。詳しくは [Draft PR delivery 仕様](spec/draft-pr-delivery.md) を見てください。
+- `<dataDir>/agent/agent.sqlite` は main conversation、child session、task graph、checkpoint、tool 記録を保持します。DB・session の状態 directory・log は自動削除しません。
+- 会話には課題本文、model の応答、tool の引数と出力が含まれ得ます。transcript は log の redaction 対象ではないため、`ARAYA_DATA_DIR` と backup のアクセス権を管理してください。credential を会話に投稿しないことが唯一の防御策です。
+- agent（main も child も）は利用者の権限で sandbox なしに動き、開発 root 以外の書き込み可能 file にも触れ、`git`・`gh` で remote を直接変更できます。commit・push・PR 作成・merge かどうかは会話の中の依頼で決めます。araya 自体は merge・deploy・publish をしません。
+- 自律的な課題発見、外部ソース監視、通知連携は未実装です。

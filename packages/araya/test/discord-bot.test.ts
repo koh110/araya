@@ -8,9 +8,8 @@ import test from 'node:test'
 import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
 
-import { openTaskLedger } from '../src/runner/ledger.ts'
 import { runDiscordBot } from '../src/discord/bot.ts'
-import { dataDirHash, discordUnitName, runnerUnitName } from '../src/infrastructure/systemd.ts'
+import { OBSOLETE_COMMAND_REPLY, routeSlashCommandInteraction } from '../src/discord/gateway.ts'
 
 const BOT_TOKEN = 'synthetic-token'
 const APPLICATION_ID = '12345678901234567'
@@ -25,6 +24,38 @@ async function createInertChatSession() {
     },
     async reset() {},
     async close() {},
+  }
+}
+
+// 撤去済み slash command の fake interaction。reply / followUp を record に写す
+function makeRemovedCommandInteraction(
+  subcommand: string,
+  record: (content: string, ephemeral: boolean) => void,
+) {
+  return {
+    isChatInputCommand: () => {
+      return true
+    },
+    commandName: 'araya',
+    id: `removed-command-${subcommand}`,
+    user: { id: '42345678901234567' },
+    guildId: '22345678901234567',
+    channelId: '32345678901234567',
+    options: {
+      data: [{ name: 'task', type: 1 }],
+      getSubcommandGroup: () => {
+        return null
+      },
+      getSubcommand: () => {
+        return subcommand
+      },
+    },
+    reply: async (payload: { content: string; flags: number }) => {
+      record(payload.content, (payload.flags & 64) === 64)
+    },
+    followUp: async (payload: { content: string }) => {
+      record(payload.content, false)
+    },
   }
 }
 
@@ -234,14 +265,14 @@ test('discord bot: 指定 channel の mention なし投稿を会話 session に�
   }
 })
 
-test('discord bot: 会話 session 初期化に失敗しても既存 slash command は利用できる', async () => {
+test('discord bot: 会話 session 初期化に失敗すると会話利用不可を返し、task handler は gateway に渡さない', async () => {
   const dataDir = await fs.realpath(
     await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-chat-unavailable-test-')),
   )
   const stopController = new AbortController()
   const chatReplies: string[] = []
-  const commandReplies: string[] = []
   const logs: Record<string, unknown>[] = []
+  let interactionHandlerSeen: unknown = 'unset'
 
   try {
     const exitCode = await runDiscordBot({
@@ -265,10 +296,6 @@ test('discord bot: 会話 session 初期化に失敗しても既存 slash comman
               chatReplies.push(content)
             }
 
-            async function captureCommandReply(content: string) {
-              commandReplies.push(content)
-            }
-
             await handlers.onReady('998877665544332211')
             await handlers.onMessage(
               {
@@ -284,18 +311,7 @@ test('discord bot: 会話 session 初期化に失敗しても既存 slash comman
               },
               captureChatReply,
             )
-            await handlers.onInteraction(
-              {
-                interactionId: 'chat-unavailable-list',
-                userId: USER_ID,
-                guildId: GUILD_ID,
-                channelId: CHANNEL_ID,
-                subcommandGroup: 'task',
-                subcommand: 'list',
-                options: {},
-              },
-              captureCommandReply,
-            )
+            interactionHandlerSeen = handlers.onInteraction
             stopController.abort()
           },
           async sendText() {},
@@ -314,7 +330,7 @@ test('discord bot: 会話 session 初期化に失敗しても既存 slash comman
       }),
       '会話機能の利用不可を返信する',
     )
-    assert.ok(commandReplies.length > 0, '既存 command に返信する')
+    assert.equal(interactionHandlerSeen, undefined, 'bot は task の interaction handler を gateway に渡さない')
     assert.ok(
       logs.some((entry) => {
         return entry.type === 'discord_chat_unavailable'
@@ -327,81 +343,13 @@ test('discord bot: 会話 session 初期化に失敗しても既存 slash comman
   }
 })
 
-test('discord bot: Task 操作の返信では Discord unit でなく runner unit を示す', async () => {
-  const dataDir = await fs.realpath(
-    await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-test-')),
-  )
-  const stopController = new AbortController()
-  const replies: string[] = []
-
-  try {
-    const exitCode = await runDiscordBot({
-      dataDir,
-      env: {
-        ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
-        ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
-        ARAYA_DISCORD_GUILD_ID: GUILD_ID,
-        ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
-        ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
-      },
-      stopSignal: stopController.signal,
-      verifyUnit: false,
-      createChatSession: createInertChatSession,
-      createGateway: async (_config, handlers) => {
-        return {
-          connect: async () => {
-            await handlers.onInteraction(
-              {
-                interactionId: 'interaction-unit-name',
-                userId: USER_ID,
-                guildId: GUILD_ID,
-                channelId: CHANNEL_ID,
-                subcommandGroup: 'task',
-                subcommand: 'submit',
-                options: { title: 'unit name', goal: 'check displayed service' },
-              },
-              async (content) => {
-                replies.push(content)
-              },
-            )
-            stopController.abort()
-          },
-          sendText: async () => {},
-          close: async () => {},
-        }
-      },
-      log: () => {},
-    })
-
-    const hash = dataDirHash(dataDir)
-    const runnerUnit = runnerUnitName(hash)
-    const discordUnit = discordUnitName(hash)
-
-    assert.equal(exitCode, 0)
-    assert.ok(
-      replies.some((content) => {
-        return content.includes(`warning: ${runnerUnit} の unit`)
-      }),
-      replies.join('\n'),
-    )
-    assert.ok(
-      !replies.some((content) => {
-        return content.includes(discordUnit)
-      }),
-      replies.join('\n'),
-    )
-  } finally {
-    await fs.rm(dataDir, { recursive: true, force: true })
-  }
-})
-
-test('discord bot: 1Passwordで解決したbot tokenを task・retry note・reply・notification に残さない', async () => {
+test('discord bot: 撤去済み slash command の返信と log に bot token を残さない', async () => {
   const dataDir = await fs.realpath(
     await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-secret-test-')),
   )
   const stopController = new AbortController()
   const replies: string[] = []
-  const notifications: string[] = []
+  const logs: Record<string, unknown>[] = []
   const envFile = path.join(dataDir, '.env')
 
   await fs.writeFile(
@@ -428,105 +376,47 @@ test('discord bot: 1Passwordで解決したbot tokenを task・retry note・repl
         return {
           connect: async () => {
             handlers.onReady()
-            const request = {
-              interactionId: 'secret-task',
-              userId: USER_ID,
-              guildId: GUILD_ID,
-              channelId: CHANNEL_ID,
-              subcommandGroup: 'task',
-            }
 
-            await handlers.onInteraction(
-              {
-                ...request,
-                subcommand: 'submit',
-                options: { title: `Task ${BOT_TOKEN}`, goal: `Goal ${BOT_TOKEN}` },
-              },
-              async (content) => {
-                replies.push(content)
-              },
-            )
-            await handlers.onInteraction(
-              {
-                ...request,
-                interactionId: 'secret-cancel',
-                subcommand: 'cancel',
-                options: { task: 1 },
-              },
-              async (content) => {
-                replies.push(content)
-              },
-            )
-            await handlers.onInteraction(
-              {
-                ...request,
-                interactionId: 'secret-retry',
-                subcommand: 'retry',
-                options: { task: 1, note: `retry ${BOT_TOKEN}` },
-              },
-              async (content) => {
-                replies.push(content)
-              },
-            )
-            await handlers.onInteraction(
-              { ...request, interactionId: 'secret-list', subcommand: 'list', options: {} },
-              async (content) => {
-                replies.push(content)
-              },
-            )
-            await handlers.onInteraction(
-              {
-                ...request,
-                interactionId: 'secret-show',
-                subcommand: 'show',
-                options: { task: 1 },
-              },
-              async (content) => {
-                replies.push(content)
-              },
-            )
-          },
-          sendText: async (content) => {
-            notifications.push(content)
+            // 撤去応答は production の routeSlashCommandInteraction をそのまま通す。
+            // bot が interaction handler を渡さないことが撤去 reply の条件
+            assert.equal(handlers.onInteraction, undefined, 'bot は task handler を gateway に渡さない')
+
+            for (const subcommand of ['submit', 'cancel', 'retry', 'list', 'show']) {
+              await routeSlashCommandInteraction(
+                makeRemovedCommandInteraction(subcommand, (content, ephemeral) => {
+                  assert.equal(ephemeral, true, '撤去案内は ephemeral で返す')
+                  replies.push(content)
+                }) as unknown as Parameters<typeof routeSlashCommandInteraction>[0],
+                {
+                  onReady: () => {},
+                  onMessage: () => {},
+                  onError: (message: string) => {
+                    logs.push({ type: 'synthetic_interaction_error', message })
+                  },
+                },
+              )
+            }
             stopController.abort()
           },
+          sendText: async () => {},
           close: async () => {},
         }
       },
-      log: () => {},
+      log(entry) {
+        logs.push(entry)
+      },
     })
 
-    const ledger = openTaskLedger(dataDir)
+    assert.equal(exitCode, 0)
+    assert.equal(replies.length, 5)
 
-    try {
-      const detail = ledger.showTask(1, { events: 0 })
-      const storedRetryNote = detail.attempts[1]?.note ?? null
-      const outputs = [
-        ...replies,
-        ...notifications,
-        detail.task.title,
-        detail.task.goal,
-        ...(storedRetryNote === null ? [] : [storedRetryNote]),
-      ]
-
-      assert.equal(exitCode, 0)
-      assert.equal(detail.task.attempt, 2)
-      assert.equal(storedRetryNote, 'retry [REDACTED]')
-      assert.ok(notifications.length > 0, 'created event が通知される')
-      assert.ok(
-        outputs.some((output) => {
-          return output.includes('[REDACTED]')
-        }),
-        outputs.join('\n'),
-      )
-
-      for (const output of outputs) {
-        assert.equal(output.includes(BOT_TOKEN), false, output)
-      }
-    } finally {
-      ledger.close()
+    for (const reply of replies) {
+      assert.equal(reply, OBSOLETE_COMMAND_REPLY)
+      assert.equal(reply.includes(BOT_TOKEN), false, reply)
     }
+    assert.equal(JSON.stringify(logs).includes(BOT_TOKEN), false)
   } finally {
+    stopController.abort()
     await fs.rm(dataDir, { recursive: true, force: true })
   }
 })

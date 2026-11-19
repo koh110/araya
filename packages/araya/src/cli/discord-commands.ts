@@ -1,10 +1,9 @@
-// araya discord <init|register|install|uninstall|run>。
+// araya discord <init|install|uninstall|run>。
 // init: 標準の設定 file（<dataDir>/.env）を作る（既存 file は上書きしない）。
-// register: slash command 定義を Discord の guild に登録する（必要なら1Password参照を事前に解決する）。
 // install: 平文 .env を既定にし、明示 option で1Password launcherを選ぶ。
-// uninstall: unit を止めて file を消す。state.json・台帳は残す。
+// uninstall: unit を止めて file を消す。state.json・agent session の SQLite は残す。
 // run: foreground で 1 度動かす（unit 稼働の確かめなし）。
-// unit の file 作成・enable・restart は人間の実行（runner と同じ運用）
+// unit の file 作成・enable・restart は人間の実行（discord install が restart まで行う）
 
 import { randomBytes } from 'node:crypto'
 import fs from 'node:fs/promises'
@@ -26,6 +25,7 @@ import {
   selectUnitEnvironment,
   unitFilePath,
   type SystemdCredentialEncryptor,
+  type SystemdOps,
 } from '../infrastructure/systemd.ts'
 import {
   createDiscordEnvFile,
@@ -34,10 +34,8 @@ import {
   OP_SERVICE_ACCOUNT_CREDENTIAL_NAME,
   OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME,
   type DiscordAuthMode,
-  type DiscordConfig,
 } from '../discord/config.ts'
 import { discordStateFilePath, readDiscordBotState } from '../discord/state.ts'
-import { registerDiscordCommands } from '../discord/gateway.ts'
 import { runDiscordBot, type DiscordBotDependencies } from '../discord/bot.ts'
 import {
   commandError,
@@ -47,9 +45,9 @@ import {
   runSystemctl,
   systemdCommandError,
   writeUnitFile,
-  type RunnerCommandConfig,
-  type RunnerCommandDependencies,
-} from './task-commands.ts'
+  type CliCommandConfig,
+  type CliCommandDependencies,
+} from './command-support.ts'
 
 const SYSTEMCTL_TIMEOUT_MS = 30_000
 const SYSTEMCTL_RESTART_TIMEOUT_MS = 90_000
@@ -69,12 +67,14 @@ const REACHABLE_MANAGER_STATES = [
 ]
 const UNIT_MISSING_PATTERN = /does not exist|not loaded|not found/iu
 const UNIT_NOT_LOADED_PATTERN = /not loaded/iu
+// 撤去した runner 機構が残した unit 名（旧 version の install が入れたもの。discord install で掃除する）
+const LEGACY_RUNNER_UNIT_NAME_PATTERN = /^araya-runner-[0-9a-f]{12}\.service$/
+const LEGACY_RUNNER_UNIT_LIST_ARG = 'araya-runner-*.service'
 
-export const DISCORD_SUBCOMMANDS = ['init', 'register', 'install', 'uninstall', 'run'] as const
+export const DISCORD_SUBCOMMANDS = ['init', 'install', 'uninstall', 'run'] as const
 
-export type DiscordCommandDependencies = RunnerCommandDependencies & {
-  // test 用に差し替える。既定は実際の gateway 登録と bot 実行
-  registerDiscordCommands?: (config: DiscordConfig) => Promise<void>
+export type DiscordCommandDependencies = CliCommandDependencies & {
+  // test 用に差し替える。既定は実際の bot 実行
   runBot?: (deps: DiscordBotDependencies) => Promise<number>
   resolveDiscordEnvRunnerEntrypoint?: () => Promise<string>
   resolveDiscordOpRunnerEntrypoint?: () => Promise<string>
@@ -88,7 +88,7 @@ function notConfiguredMessage(envFilePath: string) {
 }
 
 async function loadConfiguredOrThrow(
-  config: RunnerCommandConfig,
+  config: CliCommandConfig,
   deps: DiscordCommandDependencies,
 ) {
   const source = await loadDiscordConfig(config.dataDir, deps.env)
@@ -100,20 +100,8 @@ async function loadConfiguredOrThrow(
   return source
 }
 
-async function initDiscord(config: RunnerCommandConfig) {
+async function initDiscord(config: CliCommandConfig) {
   return await createDiscordEnvFile(config.dataDir)
-}
-
-async function registerDiscord(config: RunnerCommandConfig, deps: DiscordCommandDependencies) {
-  const source = await loadConfiguredOrThrow(config, deps)
-  await (deps.registerDiscordCommands ?? registerDiscordCommands)(source.config)
-
-  return {
-    applicationId: source.config.applicationId,
-    guildId: source.config.guildId,
-    command: 'araya',
-    subcommands: ['task list', 'task show', 'task submit', 'task cancel', 'task retry'],
-  }
 }
 
 async function validateOpServiceAccountCredential(
@@ -214,7 +202,7 @@ function parseSystemdManagerMajorVersion(stdout: string) {
 }
 
 async function requireEncryptedUserCredentialSupport(
-  ops: Awaited<ReturnType<RunnerCommandDependencies['createSystemdOps']>>,
+  ops: Awaited<ReturnType<CliCommandDependencies['createSystemdOps']>>,
   redactor: Redactor,
 ) {
   const result = await runSystemctl(
@@ -534,7 +522,7 @@ async function writeEncryptedOpServiceAccountCredential(
 }
 
 async function installDiscord(
-  config: RunnerCommandConfig,
+  config: CliCommandConfig,
   deps: DiscordCommandDependencies,
   redactor: Redactor,
   authMode: DiscordAuthMode,
@@ -543,7 +531,7 @@ async function installDiscord(
   delete systemdEnvironment[OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME]
   const ops = await deps.createSystemdOps(systemdEnvironment)
 
-  // 1. user manager に接続できることを確かめる（runner install と同じ）
+  // 1. user manager に接続できることを確かめる
   const managerState = await ops.systemctl(
     ['--user', 'is-system-running'],
     SYSTEMD_CONNECT_TIMEOUT_MS,
@@ -557,6 +545,9 @@ async function installDiscord(
       `systemd の user manager に接続できません（${state === '' ? stderr || '応答なし' : state}）`,
     )
   }
+
+  // 1b. 旧 version が install した runner unit を止めて消す（task 機構は撤去済み）
+  const removedLegacyRunnerUnits = await removeLegacyRunnerUnits(ops, deps, redactor)
 
   // 1password mode は user manager の v258+ で LoadCredentialEncrypted が必要
   if (authMode === '1password') {
@@ -615,7 +606,7 @@ async function installDiscord(
       authMode: '1password',
       dataDir: dataDirReal,
       nodePath: deps.nodePath,
-      runnerEntrypoint: opRunnerEntrypoint,
+      botEntrypoint: opRunnerEntrypoint,
       opPath,
       opCredentialFile,
       environment,
@@ -657,7 +648,7 @@ async function installDiscord(
       authMode: 'env-file',
       dataDir: dataDirReal,
       nodePath: deps.nodePath,
-      runnerEntrypoint: envRunnerEntrypoint,
+      botEntrypoint: envRunnerEntrypoint,
       envFilePath: envFile,
       environment,
     })
@@ -759,13 +750,102 @@ async function installDiscord(
     envFile,
     authMode,
     ...(opCredentialFile === undefined ? {} : { opCredentialFile }),
+    ...(removedLegacyRunnerUnits.length === 0 ? {} : { removedLegacyRunnerUnits }),
     ready,
     linger,
   }
 }
 
+// --auth-mode 省略時、既存 unit の mode を保つ（ExecStart の launcher 名で判別）。unit が無いときは null
+async function detectInstalledAuthMode(
+  config: CliCommandConfig,
+  deps: DiscordCommandDependencies,
+): Promise<DiscordAuthMode | null> {
+  const unit = discordUnitName(dataDirHash(await realpathOrResolved(config.dataDir)))
+  const unitPath = unitFilePath(deps.env, deps.homeDir, unit)
+  let content: string
+
+  try {
+    content = await fs.readFile(unitPath, 'utf8')
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+      return null
+    }
+
+    throw error
+  }
+
+  if (content.includes('discord-op-runner')) {
+    return '1password'
+  }
+
+  if (content.includes('discord-env-runner')) {
+    return 'env-file'
+  }
+
+  return null
+}
+
+// 旧 version の install が残した runner unit を止め・無効化して、unit file を消す。
+// 名前が araya-runner-<hash>.service のものだけを扱い、他の unit には触れない
+async function removeLegacyRunnerUnits(
+  ops: SystemdOps,
+  deps: DiscordCommandDependencies,
+  redactor: Redactor,
+): Promise<string[]> {
+  const listed = await ops.systemctl(
+    ['--user', 'list-unit-files', LEGACY_RUNNER_UNIT_LIST_ARG, '--no-legend', '--full'],
+    SYSTEMCTL_TIMEOUT_MS,
+  )
+
+  if (!commandSucceeded(listed)) {
+    // list 失敗は install を止めない。確認できた分だけを掃除する
+    return []
+  }
+
+  const units = listed.stdout
+    .split('\n')
+    .map((line) => {
+      return line.trim().split(/\s+/)[0] ?? ''
+    })
+    .filter((unit) => {
+      return LEGACY_RUNNER_UNIT_NAME_PATTERN.test(unit)
+    })
+
+  const removed: string[] = []
+
+  for (const unit of units) {
+    const disableArgs = ['--user', 'disable', '--now', unit]
+    const disabled = await ops.systemctl(disableArgs, SYSTEMCTL_RESTART_TIMEOUT_MS)
+
+    if (!commandSucceeded(disabled)) {
+      if (disabled.timedOut || !UNIT_MISSING_PATTERN.test(disabled.stderr)) {
+        throw systemdCommandError('systemctl', disableArgs, disabled, redactor)
+      }
+    }
+
+    const unitPath = unitFilePath(deps.env, deps.homeDir, unit)
+
+    try {
+      await fs.unlink(unitPath)
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) {
+        throw error
+      }
+    }
+
+    removed.push(unit)
+  }
+
+  if (removed.length > 0) {
+    await runSystemctl(ops, ['--user', 'daemon-reload'], SYSTEMCTL_TIMEOUT_MS, redactor)
+  }
+
+  return removed
+}
+
 async function uninstallDiscord(
-  config: RunnerCommandConfig,
+  config: CliCommandConfig,
   deps: DiscordCommandDependencies,
   redactor: Redactor,
 ) {
@@ -775,7 +855,7 @@ async function uninstallDiscord(
   const disableArgs = ['--user', 'disable', '--now', unit]
   const disabled = await ops.systemctl(disableArgs, SYSTEMCTL_RESTART_TIMEOUT_MS)
 
-  // unit file の有無にかかわらず、unit が無いための失敗だけを無視する（runner uninstall と同じ）
+  // unit file の有無にかかわらず、unit が無いための失敗だけを無視する
   if (!commandSucceeded(disabled)) {
     if (disabled.timedOut || !UNIT_MISSING_PATTERN.test(disabled.stderr)) {
       throw systemdCommandError('systemctl', disableArgs, disabled, redactor)
@@ -809,7 +889,7 @@ async function uninstallDiscord(
   return { unit, removed, stateFile: discordStateFilePath(config.dataDir) }
 }
 
-async function runForeground(config: RunnerCommandConfig, deps: DiscordCommandDependencies) {
+async function runForeground(config: CliCommandConfig, deps: DiscordCommandDependencies) {
   await loadConfiguredOrThrow(config, deps)
   const controller = new AbortController()
   function onSignal() {
@@ -843,7 +923,7 @@ async function runForeground(config: RunnerCommandConfig, deps: DiscordCommandDe
 
 export async function runDiscordCommand(
   args: string[],
-  config: RunnerCommandConfig,
+  config: CliCommandConfig,
   deps: DiscordCommandDependencies,
 ) {
   const parsed = parseCommandArgs(() => {
@@ -890,11 +970,14 @@ export async function runDiscordCommand(
     case 'init':
       body = await initDiscord(config)
       break
-    case 'register':
-      body = await registerDiscord(config, deps)
-      break
     case 'install':
-      body = await installDiscord(config, deps, redactor, requestedAuthMode ?? 'env-file')
+      // 既存 unit の mode を保つ。unit が無いときは env-file
+      body = await installDiscord(
+        config,
+        deps,
+        redactor,
+        requestedAuthMode ?? (await detectInstalledAuthMode(config, deps)) ?? 'env-file',
+      )
       break
     case 'uninstall':
       body = await uninstallDiscord(config, deps, redactor)

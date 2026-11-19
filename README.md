@@ -1,226 +1,137 @@
-# araya
+# Araya Discord bot として動かす実験用 MVP
 
-開発課題を AI agent に依頼するための CLI です。検証済みの変更を draft PR まで届け、merge は人が判断します。常駐 runner が SHIKI（Pi で作る開発 agent）を対象 repository の worktree で動かし、登録検証がすべて通った変更を Araya が commit・GitHub.com へ push し、Draft PR を作成します。Araya は merge・deploy・publish を行いません。
+## 必要になるもの
 
-実験用 MVP です。この文書では `araya` を入れてから結果を受け取るまでの手順を説明します。内部の仕組みと開発の手順は [docs/development.md](docs/development.md)、動作の詳しい定義は仕様 [docs/spec/task-ledger-and-shiki-runner.md](docs/spec/task-ledger-and-shiki-runner.md) にあります。
-
-## 必要な環境
-
-- Linux と systemd（254 以降）の user manager に到達する host。それ以外の host では `araya task` と `araya runner` は使えません。
+- Linux と systemd（254 以降）の user manager に到達する host。`araya discord` はそれ以外の host では使えません
 - Node.js 26.8 以上
-- git。作業対象の repository に worktree を作るときに使います。
-- GitHub.com の repository へ Draft PR を届けるときは GitHub CLI `gh` が必要です。runner と同じ OS user で `gh auth login` を済ませてください。GitHub Enterprise は対象外です。
-- 開発 root。Task で動かす repository は開発 root の中に必要です（既定 `~/dev`。`ARAYA_DEV_ROOT` で変えられます）。
-- Pi で使える model へのアクセス。Pi coding-agent は araya の依存 package に含まれるので、別途 `pi` を入れる必要はありません。model の認証は Pi の `/login` で設定します（API key の環境変数は使いません）。
+- git
+- Discord application と bot token（Discord developer portal で作成）。`araya discord init` が要求する settings は application_id・guild_id・channel_id・bot token・allowed user ids の 5 項目です。会話の読み書きには Bot Permissions の View Channels と Send Messages、bot を channel に参加させてください。Message Content intent（Privileged Intents）も有効にしてください
+- 会話が model を呼ぶための認証。Pi 側の `/login` を `npm run araya` の TUI で済ませます（`--help` には出しません。設定の場所は「model を選ぶ」に書きます）
+- 会話に model が必要です。model を選んで `config.json` の `agent.model` に設定してください（「model を選ぶ」）。araya 側が model を選ぶことはありません
+- 開発作業先の git repository。既定では `~/dev` にある repository を使い、agent はその repository を自分で編集します（`ARAYA_DEV_ROOT` で変えられます。「開発 root の選び方」）
+- 開発作業先が GitHub.com の repository で、agent に `gh` を使わせたいときは、bot と同じ OS user で `gh auth login` を済ませてください（「GitHub の repository へアクセスさせる」）
 
-## インストール
+## install する
 
 ```sh
-git clone https://github.com/koh110/araya
+git clone https://github.com/koh110/araya.git
 cd araya
 npm ci
 npm run deploy
 ```
 
-`npm run deploy` は、`araya` コマンドをユーザーの global prefix（既定 `~/.local`）に入れ、runner を systemd の user service として入れます。`~/.local/bin` を PATH に足してください。
-
-```sh
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-これで `araya` が使えます。入れ先を変えるときは `ARAYA_INSTALL_PREFIX` を設定して deploy を実行します。deploy の内部の動作と失敗の扱いは docs/development.md を見てください。
-
-## model を選ぶ
-
-Araya のインストール時に内蔵 Pi の app name を `araya` に設定し、program-status の `app` も `araya` と表示します。Pi の設定・認証・session は `<ARAYA_DATA_DIR>/pi`（既定 `~/.araya/pi`）に置きます。Araya は内蔵 Pi の `ARAYA_CODING_AGENT_DIR` をこの directory に設定します。
-
-Task を動かす前に、SHIKI が使う model と認証を Araya 側で設定します。checkout で `araya` を引数なしで動かすと（`npm run araya`）Pi の TUI が立ちます。
-
-1. `/login` で provider に接続する
-2. `/model` で model を選び、既定として保存する
-
-これで `npm run deploy`（または `araya runner install`）を実行すると、araya はその既定 model を設定ファイル `<dataDir>/config.json`（既定 `~/.araya/config.json`）に保存します。保存するのは設定ファイルが無いときだけです。認証情報は写さず、API は呼ばず、既存の設定ファイルは変更しません。
-
-設定ファイルは自分で書くこともできます。
-
-```json
-{
-  "development": {
-    "model": "openai/gpt-5.5"
-  }
-}
-```
-
-`model` は `<provider>/<model id>` です。`thinkingLevel` は省略できます（省略すると Pi の設定で決まります）。API key は設定ファイルに書かないでください（読みません）。設定ファイルが無いときは、model は Pi の設定で選ばれます。runner は試行を取り込むたびに設定ファイルを読むので、インストールした後に作っても反映されます。
-
-注意: 保存した後は Pi の既定 model を変えても Araya の設定には追従しません。model を切り替えるときは設定ファイルの `development.model` を更新してください。使う model が決まらない、Pi の model の一覧に無い、認証が無いときは、別の model に切り替えずに試行を `failed`（`agent_failed`、`model_unavailable`）で終わらせます。設定ファイルの詳しい規則は [docs/spec/development-model-config.md](docs/spec/development-model-config.md) を見てください。
-
-## Task を登録する
-
-```json
-{
-  "title": "README の誤字を直す",
-  "goal": "README.md の誤字を直し、ファイルを検索して置換を確認する検証コマンドを登録する",
-  "targets": ["my-app"]
-}
-```
-
-```sh
-araya task create --file task.json   # stdin から読むときは --file -
-```
-
-- `title`（200 文字まで、改行なし）と `goal`（20,000 文字まで）は必須です。
-- `targets` は SHIKI に作業 repository を探してもらうための手がかりです（開発 root からの相対 path など）。worktree の対象を限定するものではなく、どの repository で作業するかは SHIKI が判断します。SHIKI が触れる file の制限にもなりません（「注意」を見てください）。SHIKI が開発 root の下に存在しない repository を指定したときは、worktree の作成が失敗し、理由（`repository_not_found`）が SHIKI に返されます。SHIKI は別の repository を選び直せます（tool の失敗だけでは試行は終わりません）。`constraints` と `permissions` は省略できます。`permissions` は SHIKI に渡す制約情報で、Araya が検証後に行う commit・push・Draft PR の前提を解除したり、merge・deploy を許可したりしません。
-- `araya task` は runner も SHIKI も起動しません。動いている runner が数秒以内に台帳を見て、実行枠に空きがあれば取り込みます。runner が動いていないときは注意を出します（登録自体は成功します）。
-- 同じ `idempotencyKey` で同じ内容をもう一度登録すると、同じ Task を返します（`"created": false`）。入力の詳しい制限は仕様にあります。
-
-## 進捗を見る
-
-```sh
-araya task list
-araya task show <taskId>
-```
-
-Task の状態は次のとおりです。
-
-- `queued`: 待ち
-- `running`: runner が動かしている（runner が止まっている間もこの状態）
-- `completed`: SHIKI が成功し、差分のある全 worktree で登録検証が通り、GitHub.com の Draft PR まで届けた（差分なしは `no_changes` で失敗）。
-- `failed`: agent・検証・commit・push・PR 作成のいずれかが失敗、または中止された（理由は `failureReason`）。
-- `blocked`: 人の判断、GitHub CLI 認証、GitHub repository の確認などが必要（「詰まったときは」を見てください）。
-
-`task list` には runner の状態（`runner.state`: `running`・`stopped`・`not_responding`・`not_started`）も出ます。1つの runner で同時に動く SHIKI は1件までで、ほかの Task は `queued` で待ちます。
-
-`task show` は試行ごとの報告（`summary`）、使った model、evidence、途中経過を出します。試行ごとに名前（`taskKey`）があり、`taskId` とは別です。差分と検証の出力の本文は台帳に入れず、試行の状態 directory（`<dataDir>/development/<taskKey>/evidence.json`）に置き、`--full` を付けたときだけ表示します。
-
-## 結果を受け取る
-
-SHIKI の変更は試行ごとの worktree `<repository>/.worktree/araya-<taskKey>`（branch `araya/<taskKey>`）に作られます。差分のある各 repository で全検証が通ると、Araya が変更を commit し、GitHub.com の `origin` に fast-forward push して Draft PR を作成します。PR URL は `task show` の evidence に残ります。`gh` 不在・未認証、GitHub 以外の remote、Git identity 不足などでは success にせず、設定が必要な場合は `blocked` にします。Araya は merge・deploy・publish を行いません。worktree・branch・log・台帳は自動では消えません。詳しくは [Draft PR delivery 仕様](docs/spec/draft-pr-delivery.md) を見てください。
-
-## 詰まったときは
-
-`blocked` は次のどちらかです。SHIKI が `araya_request_decision` で人の判断を求めた（質問は `decisionQuestion`）、または runner が落ち続けて試行が止められた（`restart_limit`）。どちらの場合も、決めてから再実行します。
-
-```sh
-araya task retry <taskId> --note "B 方案を使う"
-```
-
-- 再実行できるのは `failed` と `blocked` の Task だけです。
-- 新しい試行は新しい taskKey を使い、worktree と branch も前回とは別になります。前回の worktree は残ります（前回の変更は持ち込みません）。
-- SHIKI が判断を求めたときは、質問への答えを `--note` に書きます（長い文字列は `--note-file`）。
-- 前回の試行が中断された場合、または Draft PR 配送で remote branch / PR が作成・更新されたか確認できない場合は、`--confirm-side-effects` が必要です。前回の worktree と GitHub の状態を確かめてから付けてください。
-- `araya task cancel <taskId>` は、待機中の試行をその場で中止し、動いている試行には中止を求めます。自動の再実行はありません。
-
-## runner を管理する
-
-runner は systemd の user service です。`npm run deploy` で入ります。unit の名前は `araya-runner-<hash>.service`（`<hash>` は data directory から決まります。`araya runner install` の出力に載ります）。
-
-- 止める: `systemctl --user stop araya-runner-<hash>.service`。これは一時停止で、動いていた試行は次に起動したときに続きから進みます。
-- 起動・再開: `systemctl --user start araya-runner-<hash>.service`。
-- 環境変数を変えたとき: `araya runner install` をやり直します。やり直すまで、runner は前の環境で動き続けます。
-- 取り除く: `araya runner uninstall`。unit を止めて消すだけで、台帳は変えません。入れ直すと続きから進みます。
-- 動作記録: `<dataDir>/logs/runner.log`（1行1件の JSON、秘密を置き換えたもの）。
-
-araya は linger を変えません。linger が無効だと、logout で runner は止まり（一時停止）、次に user manager が起動したときに続きから進みます。logout の後も動かしたいときは `loginctl enable-linger` を実行してください。runner が落ちたときは、systemd が間隔を空けて起動し直します。
-
-## Discord bot を有効にする
-
-標準の設定は `<ARAYA_DATA_DIR>/.env`（既定 `~/.araya/.env`）です。repository root ではなく Araya の data directory に置き、Bot token を Git に含めないようにします。
-
-まず設定 file を作ります。`init` は空の template を mode `0600` で作成し、既存 file は上書きしません。
+`npm run deploy` は、`araya` コマンドをユーザーの global prefix（既定 `~/.local`）に入れ、`~/.local/bin` を PATH に足してください。data directory（既定 `~/.araya`）に `.env` がある場合は、そのまま Discord bot を systemd の user service として入れます。`.env` が無い場合は unit を入れず、次の init を案内して成功で終わります。`.env` に 1Password の参照（値が `op://` で始まる行）がある場合は、`op run --env-file` で参照を解決してから `araya discord install --auth-mode 1password` を実行します（「1Password に保存した settings を使う」）。このとき PATH に 1Password CLI（`op`）が無いか `OP_SERVICE_ACCOUNT_TOKEN` が未設定なら、araya を入れ替える前に終了 code 1 で止まります。
 
 ```sh
 araya discord init
 ```
 
-`.env` を開き、Discord Developer Portal の Bot token と対象 Discord の ID を設定します。
+`araya discord init` は `<ARAYA_DATA_DIR>/.env`（mode `0600`）を作り、設定 file への link と、Discord developer portal で application を作る手順・portal に載っている settings 名・Bot Permissions・Message Content intent の名前一覧を出します。araya が Discord へ直接問い合わせて候補を選ぶことはしません。値はすべて利用者が決めます。
 
-```dotenv
-ARAYA_DISCORD_BOT_TOKEN=<discord-bot-token>
-ARAYA_DISCORD_APPLICATION_ID=<discord-application-id>
-ARAYA_DISCORD_GUILD_ID=<discord-guild-id>
-ARAYA_DISCORD_CHANNEL_ID=<discord-channel-id>
-ARAYA_DISCORD_ALLOWED_USER_IDS=<discord-user-id>
-```
-
-`ARAYA_DISCORD_ALLOWED_USER_IDS` は許可する Discord user ID をカンマ区切りで指定します。例の `<...>` は実際の値に置き換えます。この `.env` は Discord 専用で、ここに示した5つ以外の設定名は受け付けません。Application/Guild/Channel/User ID は公開 ID ですが、Bot token は秘密として扱ってください。値の一部を `op://` 参照にする場合は、1Password の節も参照してください。設定後、slash command を登録して bot service を入れます。
-
-`ARAYA_DISCORD_CHANNEL_ID` は Task 通知と継続会話の共通 channel です。ここは許可利用者だけが閲覧・投稿できる非公開の Araya 専用 channel にし、許可した利用者の通常 message は mention なしで会話に入ります。会話以外の投稿には別 channel を使ってください。別 guild/channel、許可されていない user、bot、webhook、system message は会話に入りません。本文のない投稿は無視し、Araya への mention だけの投稿には本文を入力するよう返信します。受理した投稿の応答処理中は typing indicator を更新し、処理完了後に更新を止めます。
-
-この動作には Discord の `Message Content` privileged intent が必要です。Discord Developer Portal の対象 application の Bot 設定で `Message Content Intent` を有効にしてください。この intent は `ARAYA_DISCORD_CHANNEL_ID` 単位ではなく application に付与されます。bot が見られる範囲を必要最小限にし、Araya は guild/channel/user の allowlist を通過した message 本文だけを会話へ渡します。message 本文はログへ出力しません。
-
-`reset`（または `@Araya reset`）は会話の文脈をリセットしますが、保存済みの SQLite file を消去する操作ではありません。会話は `<ARAYA_DATA_DIR>/discord/chat.sqlite` に永続化され、Bot の再起動後も続きます。既知の secret は保存前に redaction しますが、会話の transcript には Araya の生成 reply も保存されます。credential や他の機密情報を会話に投稿しないでください。
-
-実装を依頼するときは、`「この変更を実装してください」` のように明示してください。Araya は会話 agent から repository を直接変更せず、依頼を既存 Task runner に登録して Task ID を返します。実作業・検証・Draft PR は runner が行い、状態は既存の slash command と Task 通知で確認します。質問や設計相談だけでは Task を登録しません。
-
-slash command の受付 channel は従来どおり Discord 側の利用許可に従います。実行者は `ARAYA_DISCORD_ALLOWED_USER_IDS` で制限されます。
-
-### GitHub repository の read-only 参照
-
-会話では `araya_github_repository_list`（directory listing）、`araya_github_repository_search`（code search）、`araya_github_repository_read`（UTF-8 text file read）を使えます。`GH_HOST` が未設定・空・`github.com` の場合、公開 repository の list/read は認証なしの GitHub API を先に使い、認証が必要な場合は Araya bot を動かす OS user の GitHub CLI (`gh`) authorization に fallback します。`GH_HOST` が別 host の場合は `api.github.com` へ接続せず、設定された host を使う `gh api --method GET` だけで読みます。`GH_CONFIG_DIR` と `GH_HOST` は config selector として利用できますが、`GH_TOKEN` / `GITHUB_TOKEN` 等の token 環境変数は bot process と `gh` subprocess に継承しません。常駐 service から使う保存済み `gh` 認証情報は、service と同じ OS user・config path で読み取れる必要があります。対話 shell だけでなく、service の実行 user と設定で `gh auth status` を確認してください。
-
-ここに新しい per-Discord-user GitHub link や権限モデルはありません。`ARAYA_DISCORD_ALLOWED_USER_IDS` の利用者は bot の OS user が `gh` で読める repository に同じ範囲でアクセスできます。bot の `gh` identity には、その channel の利用者に見せてよい repository だけを許可してください。GitHub tool は GET のみで、repository の変更、shell、git 操作はできません。
-
-会話 transcript と GitHub / Task lookup tool result は `<ARAYA_DATA_DIR>/discord/chat.sqlite` に保存され、private repository の読み取り内容や Task の結果も残り得ます。Task の session 参照は最大24件・各2,000文字・全体12,000文字までの user / assistant 可視テキスト excerpt に限り、tool の引数・出力は含めません。既知の secrets は上限で切り詰める前に redaction しますが、すべての機密情報を検出できる保証はありません。必要な範囲だけ読み、秘密情報を channel に投稿・引用しないでください。
+`.env` を書いたら Discord bot を入れます。
 
 ```sh
-araya discord register
 araya discord install
 ```
 
-Task 操作の slash command は CLI と同じ階層です。`/araya task list`・`/araya task show`・`/araya task submit`・`/araya task cancel`・`/araya task retry` を使います。command 定義を変更した後は `araya discord register` を再実行して Discord 側を更新します。
+`araya discord install` は unit file を書いて有効化し、起動して稼働を確かめます（「Discord bot を管理する」）。`araya discord` に Linux と systemd の user manager が必要で、Linux 以外・user manager に接続できない環境では終了 code 69 で終わります。その場合 `npm run deploy` は unit を入れずに成功で終わり、`araya discord install` 単体では 69 で終わります。`araya discord run` は unit を使わない foreground の試験起動です（Ctrl+C で止まります）。unit 経由にこだわらない運用は、この `araya discord run` を systemd などの仕組みで常駐させることもできます。
 
-会話では「Task #1 の状態と判断待ちの内容を見せて」のように尋ねると、Araya が Task ledger から状態・判断質問・保存済みの安全な session excerpt を読み取って回答できます。Task 内容の読み取りは read-only で、作成・中止・再実行はしません。
+`araya discord` の失敗は理由を stderr に出し、終了 code 1 で終わります（その環境で使えない理由による失敗は 69）。`npm run deploy` は、その環境に Discord bot を入れられる host かどうかを確かめません。Linux 以外の環境でも `araya` 自体（Pi coding agent の TUI）は使えます。
 
-`.env` の値を後から変更した場合は、既存の Discord unit を再起動して読み直します。`araya discord install` を再実行すれば、設定を再検証して unit の再起動まで行います。
+## 1Password に保存した settings を使う（任意）
 
-```sh
-systemctl --user restart araya-discord-<hash>.service
-```
+Discord の settings は平文の `.env` file に保存します。1Password の Desktop アプリに保存した値（`op://` の vault/item/field の参照）を使いたい場合は、unit file に入れた service が起動するたびに 1Password CLI が `.env` の `op://` 参照を解決し、値は unit file、systemd の control command、起動する process の command line に現れません。1Password を使わない利用者が install で迷わないよう、この mode は `--auth-mode 1password` を明示したときだけ使えます。unit file には `araya discord install` を実行した環境の `OP_SERVICE_ACCOUNT_TOKEN` の値は書きません。Service Account token 自体は、systemd が管理する暗号化 credential file として保存します（「1Password Service Account を systemd credential に保存する」）。
 
-`install` は systemd user service を作成・有効化・再起動します。通常の平文 `.env` mode では systemd `LoadCredential` で設定 file を service 用 credential directory へ渡し、専用 launcher が読み込みます。Bot token は unit file の `Environment=` や起動引数には書きません。launcher は必要な Discord 設定を bot process の実行時環境へ渡し、credential directory の環境変数は引き継ぎません。設定が不完全な場合や file の権限が緩い場合は install/startup を拒否します。
+`.env` には平文の値と `op://` 参照を混ぜても、すべての項目を `op://` 参照にしても構いません（全項目が参照の `.env` を 1Password CLI 2.42.0-beta.01 の `op run --env-file` で解決できることを確認しています）。Service Account の token が読める vault に Discord settings を集約してください。
 
-service の操作は次の通りです。
+## model を選ぶ
 
-- 一時停止・再開: `systemctl --user stop|start araya-discord-<hash>.service`
-- 取り除く: `araya discord uninstall`（state.json・台帳は残します）
-- 動作記録: `<ARAYA_DATA_DIR>/logs/discord.log` と `discord-launcher.log`
-- linger は自動変更しません。logout 後も service を動かす場合は、必要に応じて `loginctl enable-linger` を実行してください。
+開発作業には model が必須です。araya 側の TUI で model を選んでから、`config.json` の `agent.model` に設定します。araya 側が model を選ぶことはありません。
 
-### 任意: 1Password CLI で Discord 設定を管理する
-
-OSS の標準設定に 1Password は必要ありません。通常は `.env` に値を直接書けます。個人・組織の運用で使う場合は、`.env` にある Discord 設定値の一部または全部を 1Password の `op://` 参照にできます。ID は公開 ID ですが、必要なら参照にして構いません。
-
-```dotenv
-ARAYA_DISCORD_BOT_TOKEN=op://<vault>/<item>/<token-field>
-ARAYA_DISCORD_APPLICATION_ID=op://<vault>/<item>/<application-id-field>
-```
-
-`.env` は通常の `NAME=value` 設定として扱います。Araya は設定値から認証方式を推測しません。slash command 登録で 1Password の参照を使うときは `op run` から起動し、常駐 service でも 1Password を使う場合は install option で明示します。
+内蔵 Pi の設定・認証・session は `<dataDir>/pi`（既定 `~/.araya/pi`）にあります。araya 側の TUI を起動して `/login` と `/model` を設定します。
 
 ```sh
-data_dir="${ARAYA_DATA_DIR:-$HOME/.araya}"
-op run --env-file="$data_dir/.env" -- araya discord register
-op run --env-file="$data_dir/.env" -- araya discord install --auth-mode 1password
+npm run araya
 ```
 
-通常の `araya discord install` は `.env` file launcher を選び、1Password CLI や Service Account を必要としません。`--auth-mode 1password` を使うには、install process の環境に `OP_SERVICE_ACCOUNT_TOKEN` を設定し、1Password CLI 2.18 以降と、`.env` の参照項目を読める Service Account を用意してください。1Password mode は systemd user manager v258 以降と `systemd-creds` が必要です。古い manager では平文保存へ fallback せず、install を拒否します。
+TUI の `/model` で model を選ぶと、選んだ provider と model id が Pi の default として `<dataDir>/pi/settings.json` に保存されます。araya 用に明示的に設定したいときは `<dataDir>/config.json` の `agent.model` に書きます。設定の詳しい定義は [docs/spec/agent-model-config.md](docs/spec/agent-model-config.md) にあります。
 
-install は token を `systemd-creds --user --with-key=auto encrypt` の stdin に渡し、暗号文だけを `~/.araya/op-service-account-token.cred`（file mode `0600`、directory mode `0700`）へ保存します。暗号鍵の値を `.env` や環境変数で別途与える必要はありません。`auto` では systemd が利用可能な TPM2 と永続ホスト鍵を使い、どちらも利用できない場合は暗号化に失敗して install を中止します。鍵はアプリのホーム directory には保存せず、systemd 管理下の TPM2 や root のみ読める `/var/lib/systemd/credential.secret` が使われます。したがって暗号文だけを別 host や OS 再install後へ移しても復号できるとは限りません。常駐 unit は `LoadCredentialEncrypted=` を使い、systemd が復号した credential を service 実行中に `$CREDENTIALS_DIRECTORY` の file として渡します。Service Account token は unit file、systemd control command の環境、bot process には渡しません。`op` CLI が `.env` を解決し、Discord 設定値だけを bot process の実行時環境へ渡します。
-
-旧形式の平文 source (`~/.config/araya/op-service-account-token`) が見つかった場合は、新しい unit の restart 成功後に、安全性を再確認して unlink します。安全に削除できない場合は warning を出します。unlink は媒体上の secure erase を保証するものではありません。systemd の unit 定義自体は `~/.config/systemd/user/` に置かれ、実行中の credential は systemd 管理の一時領域に置かれます。
-
-slash command の登録時は、`OP_SERVICE_ACCOUNT_TOKEN` が設定された環境から `op run` を起動し、`.env` の `op://` 参照を解決します。以下は既存の 1Password Connect/session/account 環境変数を外し、Araya process から Service Account token と systemd credential directory を除く例です。token の値をコマンド引数へ展開しません。
+araya が実際に使う model は、1. `<dataDir>/config.json` の `agent.model`、2. Pi が保存した default provider/model の順で決まります。指定できる model が無いまま bot の起動は続きますが、その場合会話は利用できません（「会話の仕組みとできること」）。
 
 ```sh
-data_dir="${ARAYA_DATA_DIR:-$HOME/.araya}"
-env -u OP_CONNECT_HOST -u OP_CONNECT_TOKEN -u OP_SESSION -u OP_ACCOUNT \
-  op run --env-file="$data_dir/.env" -- \
-    /usr/bin/env -u OP_SERVICE_ACCOUNT_TOKEN -u CREDENTIALS_DIRECTORY \
-    araya discord register
+# 例: openai/gpt-5.5 を model に選ぶ
+cat > ~/.araya/config.json <<'JSON'
+{
+  "agent": {
+    "model": "openai/gpt-5.5",
+    "thinkingLevel": "high"
+  }
+}
+JSON
 ```
 
-手動の `araya discord run` でも `.env` の参照を使う場合は、同様に `op run --env-file="$data_dir/.env"` から起動してください。systemd service の 1Password credential 設定については、[Service Account と 1Password CLI](https://www.1password.dev/service-accounts/use-with-1password-cli) と [op run で secret を環境変数へ渡す](https://www.1password.dev/cli/secrets-environment-variables) を参照してください。
+`model` は `<provider>/<model id>` です。`thinkingLevel` は省略できます（省略すると Pi の設定で決まります）。API key は設定ファイルに書かないでください（読みません）。設定ファイルが無いときも、Pi の default model が有効ならそれを使います。bot は起動時に設定ファイルを 1 回読みます。
+
+## 開発 root の選び方
+
+agent が作業するのは `ARAYA_DEV_ROOT`（既定 `~/dev`）の中の repository です。agent は file tool と shell で development root の repository を自分で編集し、GitHub への commit・push・PR 作成もその shell（`git`・`gh`）で行います。araya 側が worktree を作ったり、diff を集めたり、検証して commit・push を代行したりする仕組みはありません。作業の進め方は agent への依頼文で決めます。
+
+開発 root を切り替えるときは `araya discord install` を実行し直すまで、unit file の `Environment=` は前の値のままで、Discord bot は前の development root で動きます。`ARAYA_DEV_ROOT` を絶対 path で指定してください（`~` は unit file 内で展開されません）。unit file に書けるのは安全な文字だけで、`$()` のような command 展開の文字や制御文字を含む値は拒否されます。
+
+GitHub の repository を対象にするとき、bot と同じ OS user の GitHub CLI `gh` が使える環境で動かしてください（「GitHub の repository へアクセスさせる」）。
+
+## 会話で依頼する
+
+`araya discord install` で入った常駐 service として、Discord の会話が使えます。`araya discord install` の代わりに `araya discord run` で foreground の試験起動（Ctrl+C で止まる）も使えます。
+
+Discord developer portal で application を作成し、`araya discord init` の案内にしたがって settings を `.env` に設定してください（「install する」）。`.env` file に `op://` 参照を使って、Desktop アプリの Vault に保存した Discord settings を解決することもできます（「1Password に保存した settings を使う」）。
+
+### 会話の仕組みとできること
+
+- 設定 channel に発言すると、channel ごとの 1 つの Pi durable conversation（main agent session）が応答します。bot を再起動しても同じ文脈から続けます
+- main agent session には file tool（read・edit・write）と bash が付いています。development root の repository を編集し、`git`・`gh` を使って commit・push・draft PR 作成まで行えます。large な作業は Pi durable の named child session（子 session）へ依頼でき、子 session は main session と同じ file tool・bash を持ちます。araya 側の task 台帳・runner・`/araya task` slash command は撤去済みで、task の作成・進捗・実行管理は Pi durable の session に任せます
+- 古い slash command 定義が残っている guild では、実行すると「撤去されました」の応答だけ返ります。定義の消し方は「araya を更新する」にあります
+- main agent が report delivery（channel への送信依頼）を宣言した送信は、設定 channel へ届くまで再送されます
+- 送信は 1 件の message を 2000 文字ごとに分割して届けます。Discord へ出る文字列と log には既知の secret 相当の文字列を伏字（`[REDACTED]`）して書きます。channel への入力（user message・reply 待ち）も伏字します
+- 「session reset」と書いた message で channel の会話 session を作り直せます。「stop」でその channel で進行中の処理を止めることができます（queue に並んだ依頼も取り消します）
+- 会話の入力 channel は `ARAYA_DISCORD_CHANNEL_ID` に一致する専用 channel だけです。別 channel、許可されていない user、bot・webhook・system の message は無視します。Discord thread には返信しません（parent channel の reply thread には返信できます）
+- 会話は at-least-once で扱います。bot が応答途中に停止した場合、Discord 側で同じ発言がもう一度届くと応答が重複することがあります
+- model を解決できない場合（未設定・Pi の model 一覧に無い・認証が無い）や設定ファイルが不正な場合は、会話 session を開かず、channel への発言には「会話機能を利用できません」の応答が返ります。bot 自体は動き続け、理由は `<dataDir>/logs/discord.log`（`discord_chat_unavailable`）に記録されます
+
+### 会話の log と保存される文字列
+
+Pi durable の保存 transcript（`<dataDir>/agent/agent.sqlite`）に書かれた user 入力・assistant 応答・tool 呼び出しは、そのまま保存されます。transcript の文字列は secret redaction の対象ではないため、model や GitHub の credential・API token・bot token などを会話や tool 実行に投稿しないでください。araya 側の log（`<dataDir>/logs/discord.log`）は既知の secret を伏字してから書きます。
+
+## GitHub の repository へアクセスさせる
+
+Discord 会話の agent は development root の repository に対して `git` と GitHub CLI（`gh`）を bash から使えます。araya は GitHub token を受け取らず、agent・log・Discord の message に token を書かず、command の引数にも渡しません。bot process の実行時環境から `GH_TOKEN` などの GitHub token 変数を除き、`gh` が保存済みの認証状態（`gh auth login` の状態）だけを使うよう `GH_CONFIG_DIR` と `GH_HOST` selector を引き継ぎます。
+
+- 対象 repository へ access できる OS user で bot を動かしてください。`npm run deploy`（`araya discord install`）を実行した user が `gh auth login` を済ませていると、その認証状態がそのまま使えます
+- bot と同じ OS user で `gh auth status --hostname github.com` が成功することを確認してください
+- GitHub Enterprise server は対象外です。`GH_HOST` selector に対して github.com 以外の host を指定した unit install は拒否されます
+- bot process へ渡す GitHub 関連 environment は `GH_CONFIG_DIR` と `GH_HOST` selector だけです。`gh` が secret として拒否する `GITHUB_*` の変数名や、`gh` が host selector として拒否する `GH_*` の変数名は unit file に書きません。`GH_HOST` の指定がない場合は `gh` 自身の既定（github.com）が使われます
+- 開発作業の commit・push・PR 作成は agent の bash が利用者の権限で実行します。araya の組み込み検証・delivery 経路は撤去済みで、agent の実行を止める sandbox はありません（「注意」）
+
+## Discord bot を管理する
+
+Discord bot は systemd の user service です。`araya discord install`（`npm run deploy` を含む）で入ります。unit の名前は `araya-discord-<hash>.service`（`<hash>` は data directory の実 path から決まります。`araya discord install` の出力に載ります）。
+
+`araya discord install` の実行は bot の再起動を伴います。再起動が済んだことは state file で確かめます。unit の停止・再起動・起動失敗は `araya discord install` の失敗として終了 code 1 になり、`npm run deploy` の終了 code 1 にもなります。unit file は `~/.config/systemd/user/` に置かれ、起動失敗時は systemd が 5 秒間隔で起動し直します。
+
+Discord bot の起動を確かめたことは、`<dataDir>/discord/state.json` に state key（readyId・lastReadyAt・readyGeneration）として保存されます。state file に credential の値は保存しません。state file が無い・読み取れない・別の unit について記録されている場合は、起動の確かめができません。install は失敗で終わり、service 自体は起動したままになることがあります。
+
+- 止める: `systemctl --user stop araya-discord-<hash>.service`
+- 起動・再開: `systemctl --user start araya-discord-<hash>.service`
+- log を見る: `<dataDir>/logs/discord.log`（1 行 1 件の JSON、秘密を置き換えたもの）。bot の stdout と stderr は捨てます。env-file launcher を使った unit では、Discord 設定の解決に失敗したときの note が `<dataDir>/logs/discord-launcher.log` に出ます
+- 削除する: `araya discord uninstall`。unit を止めて無効にし、unit file を消します。state.json と agent session の SQLite（`<dataDir>/agent/`）は残ります。現行の araya は slash command を登録しません。古い version が登録した定義が guild に残っている場合は、「araya を更新する」の手順で消してください
+
+`araya discord install` は linger を変えません。有効な host では logout 後も bot が動き続け、linger が無効な host では logout で bot が止まります。install は、linger が無効で、その host での logout が bot を止めることを `araya discord install` の warning として出します。linger を有効にするコマンド（`loginctl enable-linger`）の自動実行はしません。実行しないまま logout すると、次に login するまで bot は止まります。`araya discord install` は systemd の user manager に接続できる環境で実行してください（`su` で切り替えた session など、user manager に接続できない session からは実行できません）。
+
+1Password mode の unit を使っている場合は、`araya discord uninstall` の後に保存された credential file（`<dataDir>/op-service-account-token.cred`）を消すかどうか確認します。unit file が入ったままの credential file を消すことはしません。
+
+環境変数を変えたとき、`araya discord install` を実行し直すまで、unit file の `Environment=` は前の値のままで、bot は前の環境で動きます。`ARAYA_DATA_DIR` を変えて `araya discord install` を実行すると、`<hash>` が変わるので別の unit（別の bot）ができ、前の bot は動き続けます。前の bot を残さないときは、前の `ARAYA_DATA_DIR` を指定して `araya discord uninstall` を実行してください。
+
+bot は stop signal を受けると、新しい依頼の受付を止め、すでに受理した処理と queue に並んでいた依頼を最後まで処理し、reply を届けてから Discord connection を閉じます。進行中の処理を打ち切ったり、queue を捨てたりはしません。queue に残る依頼を取り消すには、channel に「stop」と書いてください（進行中の処理にも中止を要求します）。bot process が stop した後に Discord へ送る処理は残らないため、bot process が stop した後に Discord へ届いた文字列は bot の stop 前に送信が済んでいた分だけです。
 
 ## araya を更新する
 
@@ -230,19 +141,57 @@ npm ci
 npm run deploy
 ```
 
-`npm run deploy` は、その環境の data directory の runner を新しいコードで入れ直して起動します。動いていた試行は一時停止の扱いで続きから進みます。
+`npm run deploy` は、その環境の data directory の Discord bot を新しいコードで入れ直して起動します。会話 session（Pi durable の SQLite）はそのまま続くので、会話の文脈は切れません。
+
+task 機構があった古い version からの更新: `araya discord install` が残った runner unit（`araya-runner-<hash>.service`）を止めて削除し、結果に `removedLegacyRunnerUnits` を表示します。`--auth-mode` を省略すると既存 unit の mode を保ちます。設定 file の `development` key も撤去済みで、`development.model` を使っていたときは `model` と `thinkingLevel` を `agent` へ移してください（移行しないと config 不正になり、error に案内が出ます）。
+
+古い version が guild に登録した slash command（`/araya task` など）の定義は、更新しても Discord 側に残ります。現行の araya は slash command を使わないので、Discord API の bulk overwrite に空の一覧を送り、この application が guild に登録した command をすべて消します（成功すると `200 []` が出ます）。token は環境変数から読み、command line には出しません。`.env` に 1Password の参照がある場合は、先頭に `op run --env-file="$data_dir/.env" --` を付けて実行してください。
+
+```sh
+data_dir="${ARAYA_DATA_DIR:-$HOME/.araya}"
+node --env-file="$data_dir/.env" --input-type=module -e '
+const env = process.env
+const url = `https://discord.com/api/v10/applications/${env.ARAYA_DISCORD_APPLICATION_ID}/guilds/${env.ARAYA_DISCORD_GUILD_ID}/commands`
+const response = await fetch(url, {
+  method: "PUT",
+  headers: { Authorization: `Bot ${env.ARAYA_DISCORD_BOT_TOKEN}`, "Content-Type": "application/json" },
+  body: "[]",
+})
+console.log(response.status, await response.text())
+'
+```
+
+data directory に残った古い version の file（`tasks.sqlite*`、`runner/`、`runtime/`、`development/`、`discord/chat.sqlite*`、`discord/chat-settings/`、`discord/runner/`、`logs/runner.log` など）は現行の araya が読まないので、使っている process が無いことを確かめてから削除できます。`discord/state.json`、`agent/`、`pi/`、`.discord-bot.lock` は現行の araya が使うので残してください。
 
 ## 注意
 
-- SHIKI と検証コマンドは sandbox 無しで、利用者の権限で動きます。開発 root の repository だけでなく、利用者が書き込める file を変更できます。
-- SHIKI には main checkout を編集せず、commit・push・PR 作成をしないよう指示しますが、sandbox・network制限はなく、prompt は強制されません。SHIKI が直接 remote を変更する可能性があります。Araya の組み込み delivery が commit・push・PR を行うのは全検証後です。Task と agent の権限を確認してから登録してください。
-- Araya は秘密とみなす値と URL の userinfo を、台帳・evidence・log に書く前に `[REDACTED]` に置き換えます。ただし完全ではありません。SHIKI の会話は Pi Durable の storage にそのまま残ります。Task の文字列に何を書いたかは確認してください。
-- データは `~/.araya`（`ARAYA_DATA_DIR` で変わります）に置かれます。アクセス権とバックアップは利用者側で管理してください。
-- SHIKI の tool は `read`・`edit`・`write`・`bash` と Araya の tool です。`grep`・`find`・`ls` はありません（bash で代用します）。
-- 試行と検証の期限は、runner が動いていた時間で数えます（一時停止の間は数えません）。`ARAYA_DEVELOPMENT_TIMEOUT_MS` と `ARAYA_VERIFICATION_TIMEOUT_MS` で変えられます。
+- agent（main session も child session も）は sandbox 無しで、bot を動かしている OS user の権限で動きます。会話で指定した repository だけでなく、利用者が書き込める file を変更でき、`git`・`gh` で remote を直接変更することもできます。commit・push・PR 作成を agent に依頼するか、人の確認を挟むかは会話の中で決めてください
+- Pi durable の保存 transcript は secret redaction の対象ではありません。credential を会話に投稿しないことが唯一の防御策です
+- 送信の重複防止は期限付きの nonce で行うため、同じ依頼の応答が稀に重複することがあります（at-least-once。exactly-once ではありません）
+- データは `~/.araya`（`ARAYA_DATA_DIR` で変わります）に置かれます。アクセス権とバックアップは利用者側で管理してください
 - 環境変数・設定ファイルの完全な一覧と、内部の仕組みは docs/development.md にあります。
 
 ## その他のコマンド
 
 - 引数なしの `araya` は Pi coding agent の TUI を起動します。`araya pi ...` は引数を Pi にそのまま渡し、`araya --help` はヘルプを表示します。
 - 未実装: 自律的な課題発見、外部ソース監視、通知連携。
+
+## 1Password Service Account を systemd credential に保存する
+
+`araya discord install --auth-mode 1password` は、実行環境の `OP_SERVICE_ACCOUNT_TOKEN` を 1Password CLI 2.18 以降で読み、`.env` を file launcher で解決する unit を作ります。Service Account 以外の認証（1Password Connect token、`OP_SESSION`、Desktop アプリの session）はこの mode では使いません。
+
+install を実行する環境に Service Account token を用意します。
+
+```sh
+export OP_SERVICE_ACCOUNT_TOKEN="$(op read 'op://<vault>/<item>/<field>')"
+data_dir="${ARAYA_DATA_DIR:-$HOME/.araya}"
+op run --env-file="$data_dir/.env" -- araya discord install --auth-mode 1password
+```
+
+通常の `araya discord install` は `.env` file launcher を選び、1Password CLI や Service Account を必要としません。`--auth-mode 1password` を使うには、install process の環境に `OP_SERVICE_ACCOUNT_TOKEN` を設定し、1Password CLI 2.18 以降と、`.env` の参照項目を読める Service Account を用意してください。1Password mode は systemd user manager v258 以降と `systemd-creds` が必要です。古い manager では平文保存へ fallback せず、install を拒否します。
+
+install は token を `systemd-creds --user --with-key=auto encrypt` の stdin に渡し、暗号文だけを `~/.araya/op-service-account-token.cred`（file mode `0600`、directory mode `0700`）へ保存します。暗号鍵の値を `.env` や環境変数で別途与える必要はありません。`auto` では systemd が利用可能な TPM2 と永続ホスト鍵を使い、どちらも利用できない場合は暗号化に失敗して install を中止します。鍵はアプリのホーム directory には保存せず、systemd 管理下の TPM2 や root のみ読める `/var/lib/systemd/credential.secret` が使われます。したがって暗号文だけを別 host や OS 再 install 後へ移しても復号できるとは限りません。常駐 unit は `LoadCredentialEncrypted=` を使い、systemd が復号した credential を service 実行中に `$CREDENTIALS_DIRECTORY` の file として渡します。Service Account token は unit file、systemd control command の環境、bot process には渡しません。`op` CLI が `.env` を解決し、Discord 設定値だけを bot process の実行時環境へ渡します。
+
+旧形式の平文 source（`~/.config/araya/op-service-account-token`）が見つかった場合は、新しい unit の restart 成功後に、安全性を再確認して unlink します。安全に削除できない場合は warning を出します。unlink は媒体上の secure erase を保証するものではありません。systemd の unit 定義自体は `~/.config/systemd/user/` に置かれ、実行中の credential は systemd 管理の一時領域に置かれます。
+
+手動の `araya discord run` で `.env` の `op://` 参照を使う場合は、`op run --env-file="$data_dir/.env"` から起動してください。systemd service の 1Password credential 設定については、[Service Account と 1Password CLI](https://www.1password.dev/service-accounts/use-with-1password-cli) と [op run で secret を環境変数へ渡す](https://www.1password.dev/cli/secrets-environment-variables) を参照してください。

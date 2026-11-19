@@ -1,6 +1,6 @@
 import type { CreateAgentSessionOptions } from '@earendil-works/pi-coding-agent'
 
-// 設定ファイルと SHIKI の実行（model の選択と、使った model の記録）で共有する、開発 agent の model の規則
+// 設定ファイルと agent session の実行（model の選択）で共有する、agent の model の規則
 
 export type ThinkingLevel = NonNullable<CreateAgentSessionOptions['thinkingLevel']>
 
@@ -10,7 +10,7 @@ export const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhig
 const THINKING_LEVELS_COVER_PI: [Exclude<ThinkingLevel, (typeof THINKING_LEVELS)[number]>] extends [never] ? true : never = true
 
 // 設定ファイルで指定した model。thinkingLevel が null なら Pi の設定に従う
-export type DevelopmentModel = {
+export type ConfigModel = {
   provider: string
   id: string
   thinkingLevel: ThinkingLevel | null

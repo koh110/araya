@@ -2,23 +2,13 @@ import { randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 
-// Discord bot の状態（<dataDir>/discord/state.json）。通知の位置と retry の待ち状態だけを持つ。
-// Task の本体は台帳（tasks.sqlite）にあり、ここには書かない。書くのは bot process だけ
+// Discord bot の状態（<dataDir>/discord/state.json）。ready 判定の情報だけを持つ。
+// 通知の配送 retry は agent host の durable task 側が持つ。書くのは bot process だけ
 
 export const DISCORD_STATE_VERSION = 1
 
-export type DiscordNotificationBackoff = {
-  // 送信に失敗した event の seq。次は この nextAttemptAtMs（壁時計 ms）以降に同じ event を送り直す
-  eventSeq: number
-  attempts: number
-  nextAttemptAtMs: number
-}
-
 export type DiscordBotState = {
   version: number
-  // 通知を送ったか、意図的に省略した最新の task_events.seq。初回は null（初回起動時、その時点の最新から始める）
-  cursor: number | null
-  backoff: DiscordNotificationBackoff | null
   // 最後に ready になったときに確かめた unit 名
   unit: string | null
   // ready になった process の識別子。旧 state には無いので読み込み時は optional
@@ -45,15 +35,6 @@ function isStateShape(value: unknown): value is DiscordBotState {
     return false
   }
 
-  if (
-    !(
-      state.cursor === null ||
-      (typeof state.cursor === 'number' && Number.isSafeInteger(state.cursor) && state.cursor >= 0)
-    )
-  ) {
-    return false
-  }
-
   if (!(state.unit === null || typeof state.unit === 'string')) {
     return false
   }
@@ -68,30 +49,7 @@ function isStateShape(value: unknown): value is DiscordBotState {
     return false
   }
 
-  if (state.backoff === null) {
-    return true
-  }
-
-  if (typeof state.backoff !== 'object' || state.backoff === null) {
-    return false
-  }
-
-  const backoff: Record<string, unknown> = {}
-
-  for (const [key, property] of Object.entries(state.backoff)) {
-    backoff[key] = property
-  }
-
-  return (
-    typeof backoff.eventSeq === 'number' &&
-    Number.isSafeInteger(backoff.eventSeq) &&
-    backoff.eventSeq >= 1 &&
-    typeof backoff.attempts === 'number' &&
-    Number.isSafeInteger(backoff.attempts) &&
-    backoff.attempts >= 1 &&
-    typeof backoff.nextAttemptAtMs === 'number' &&
-    Number.isSafeInteger(backoff.nextAttemptAtMs)
-  )
+  return true
 }
 
 // state.json が無ければ null。形が壊れているときは誤り（bot は restart policy で再起動し、人間が直す）
@@ -130,12 +88,10 @@ export function readDiscordBotState(dataDir: string) {
   return value
 }
 
-export function newState(initialUnit: string | null) {
+export function newState() {
   const state: DiscordBotState = {
     version: DISCORD_STATE_VERSION,
-    cursor: null,
-    backoff: null,
-    unit: initialUnit,
+    unit: null,
     readyId: null,
     lastReadyAt: null,
   }

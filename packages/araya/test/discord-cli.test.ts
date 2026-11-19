@@ -2,7 +2,6 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { Readable } from 'node:stream'
 import test from 'node:test'
 
 import { runCli } from '../src/cli/main.ts'
@@ -182,8 +181,8 @@ function defaultSystemctl(
     if (command === 'restart') {
       // restart が state.json を ready にする（unit process の ready 記録の代わり）
       writeDiscordBotState(installEnv.dataDir, {
-        ...newState(unit),
-        cursor: 0,
+        ...newState(),
+        unit,
         readyId: 'ready-after-restart',
         lastReadyAt: '2026-10-31T00:00:00.000Z',
       })
@@ -211,7 +210,6 @@ async function runDiscord(
     installEnv.env,
     {
       platform: 'linux',
-      stdin: Readable.from([]),
       stdout: (text) => {
         return stdout.push(text)
       },
@@ -823,6 +821,7 @@ test('discord install: 暗号化 credential と LoadCredentialEncrypted を使�
 
     assert.deepEqual(systemdCalls(fake), [
       ['systemctl', '--user', 'is-system-running', '10000'],
+      ['systemctl', '--user', 'list-unit-files', 'araya-runner-*.service', '--no-legend', '--full', '30000'],
       ['systemctl', '--user', 'show', '--property=Version', '--value', '10000'],
       ['systemctl', '--user', 'daemon-reload', '30000'],
       ['systemctl', '--user', 'show', '--property=FragmentPath', '--value', unit, '30000'],
@@ -889,6 +888,83 @@ test('discord install: --auth-mode 1password は平文 .env でも指定でき�
     assert.equal(readField(output, 'authMode'), '1password')
     assert.ok(unitText.includes(installEnv.opRunnerEntrypoint), unitText)
     assert.ok(!unitText.includes(BOT_TOKEN), unitText)
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('discord install: --auth-mode 省略時は installed 1password unit の mode を保つ', async () => {
+  const installEnv = await makeInstallEnv()
+  const unitPath = unitPathOf(installEnv, unitOf(await fs.realpath(installEnv.dataDir)))
+
+  await writeDiscordEnvReferences(installEnv)
+  await fs.mkdir(path.dirname(unitPath), { recursive: true, mode: 0o700 })
+  // umask に左右されず、legacy credential 検査が通る私有 directory にする
+  await fs.chmod(installEnv.configHome, 0o700)
+  await fs.writeFile(
+    unitPath,
+    `[Unit]\nDescription=araya Discord bot\n[Service]\nExecStart=/bin/sh ${installEnv.opRunnerEntrypoint}\n`,
+    { mode: 0o600 },
+  )
+
+  try {
+    const { output } = await runDiscord(
+      installEnv,
+      ['install'],
+      createFakeSystemd({
+        systemctl: defaultSystemctl(installEnv),
+      }),
+    )
+    const unitText = await fs.readFile(unitPath, 'utf8')
+
+    assert.equal(readField(output, 'authMode'), '1password')
+    assert.equal(readField(output, 'ready'), true)
+    assert.ok(unitText.includes(installEnv.opRunnerEntrypoint), unitText)
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('discord install: 撤去した runner 機構の残存 unit を止めて消し、env-file mode を保つ', async () => {
+  const installEnv = await makeInstallEnv()
+  const unitPath = unitPathOf(installEnv, unitOf(await fs.realpath(installEnv.dataDir)))
+  const legacyUnit = 'araya-runner-0123456789ab.service'
+  const legacyUnitPath = unitPathOf(installEnv, legacyUnit)
+
+  await writePlainDiscordEnv(installEnv)
+  await fs.mkdir(path.dirname(unitPath), { recursive: true })
+  await fs.writeFile(
+    unitPath,
+    `[Unit]\nDescription=araya Discord bot\n[Service]\nExecStart=/bin/sh ${installEnv.envRunnerEntrypoint}\n`,
+    { mode: 0o600 },
+  )
+  await fs.writeFile(
+    legacyUnitPath,
+    '[Unit]\nDescription=araya task runner\n[Service]\nExecStart=/bin/sh /old/bin/task-runner\n',
+    { mode: 0o600 },
+  )
+
+  try {
+    const fake = createFakeSystemd({
+      systemctl: defaultSystemctl(installEnv, {
+        'list-unit-files': () => {
+          return commandResult(`${legacyUnit}\tenabled\n`)
+        },
+      }),
+    })
+    const { output } = await runDiscord(installEnv, ['install'], fake)
+    const unitText = await fs.readFile(unitPath, 'utf8')
+
+    assert.equal(readField(output, 'authMode'), 'env-file')
+    assert.deepEqual(readField(output, 'removedLegacyRunnerUnits'), [legacyUnit])
+    assert.ok(unitText.includes(installEnv.envRunnerEntrypoint), unitText)
+    assert.equal(await exists(legacyUnitPath), false)
+    assert.ok(
+      systemdCalls(fake).some((call) => {
+        return call[2] === 'disable' && call[3] === '--now' && call[4] === legacyUnit
+      }),
+      JSON.stringify(systemdCalls(fake)),
+    )
   } finally {
     await fs.rm(installEnv.root, { recursive: true, force: true })
   }
@@ -1103,8 +1179,8 @@ test('discord install: restart 前の readyId を今回の ready として扱わ
   await writePlainDiscordEnv(installEnv)
   const unit = unitOf(await fs.realpath(installEnv.dataDir))
   writeDiscordBotState(installEnv.dataDir, {
-    ...newState(unit),
-    cursor: 0,
+    ...newState(),
+    unit,
     readyId: 'ready-before-restart',
     lastReadyAt: '2026-10-30T23:59:59.000Z',
   })
@@ -1200,92 +1276,6 @@ test('discord init: .env を mode 0600 で作り、内容を表示せず path �
   }
 })
 
-test('discord register: .env の平文 token から slash command を登録する', async () => {
-  const installEnv = await makeInstallEnv()
-  const fake = createFakeSystemd({})
-  const envFile = discordEnvFilePath(installEnv.dataDir)
-
-  try {
-    await fs.writeFile(
-      envFile,
-      DISCORD_CONFIG_KEYS.map((key) => {
-        return `${key}=${
-          key === 'ARAYA_DISCORD_BOT_TOKEN'
-            ? BOT_TOKEN
-            : key === 'ARAYA_DISCORD_APPLICATION_ID'
-              ? APPLICATION_ID
-              : key === 'ARAYA_DISCORD_GUILD_ID'
-                ? GUILD_ID
-                : key === 'ARAYA_DISCORD_CHANNEL_ID'
-                  ? CHANNEL_ID
-                  : USER_ID
-        }`
-      }).join('\n'),
-      { mode: 0o600 },
-    )
-    for (const key of DISCORD_CONFIG_KEYS) {
-      delete installEnv.env[key]
-    }
-    let registered: Record<string, unknown> | null = null
-    await runDiscord(installEnv, ['register'], fake, {
-      registerDiscordCommands: async (config) => {
-        registered = { ...config }
-      },
-    })
-    assert.deepEqual(registered, {
-      botToken: BOT_TOKEN,
-      applicationId: APPLICATION_ID,
-      guildId: GUILD_ID,
-      channelId: CHANNEL_ID,
-      allowedUserIds: [USER_ID],
-    })
-  } finally {
-    await fs.rm(installEnv.root, { recursive: true, force: true })
-  }
-})
-
-test('discord register: 設定（.env か環境変数）から slash command を guild に登録する', async () => {
-  const installEnv = await makeInstallEnv()
-  const fake = createFakeSystemd({})
-
-  try {
-    let registered: Record<string, unknown> | null = null
-    const { output } = await runDiscord(installEnv, ['register'], fake, {
-      registerDiscordCommands: async (config) => {
-        registered = { ...config }
-      },
-    })
-
-    assert.equal(readField(output, 'applicationId'), APPLICATION_ID)
-    assert.equal(readField(output, 'guildId'), GUILD_ID)
-    assert.equal(readField(output, 'command'), 'araya')
-    assert.deepEqual(readField(output, 'subcommands'), [
-      'task list',
-      'task show',
-      'task submit',
-      'task cancel',
-      'task retry',
-    ])
-    assert.deepEqual(registered, {
-      botToken: BOT_TOKEN,
-      applicationId: APPLICATION_ID,
-      guildId: GUILD_ID,
-      channelId: CHANNEL_ID,
-      allowedUserIds: [USER_ID],
-    })
-
-    for (const key of DISCORD_CONFIG_KEYS) {
-      delete installEnv.env[key]
-    }
-    await assert.rejects(
-      runDiscord(installEnv, ['register'], fake),
-      errorWithCode('discord_not_configured'),
-    )
-  } finally {
-    await fs.rm(installEnv.root, { recursive: true, force: true })
-  }
-})
-
 test('discord run: foreground では unit 稼働を確かめずに bot を動かし、code 1 は discord_run_failed', async () => {
   const installEnv = await makeInstallEnv()
   const fake = createFakeSystemd({})
@@ -1328,7 +1318,7 @@ test('discord run: foreground では unit 稼働を確かめずに bot を動か
   }
 })
 
-test('discord uninstall: unit file を消して daemon-reload。state.json と台帳は残す', async () => {
+test('discord uninstall: unit file を消して daemon-reload。state.json は残す', async () => {
   const installEnv = await makeInstallEnv()
   const dataDirReal = await fs.realpath(installEnv.dataDir)
   const unit = unitOf(dataDirReal)
@@ -1337,8 +1327,9 @@ test('discord uninstall: unit file を消して daemon-reload。state.json と�
   await fs.mkdir(path.dirname(unitPath), { recursive: true, mode: 0o700 })
   await fs.writeFile(unitPath, '[Unit]\n', { mode: 0o600 })
   writeDiscordBotState(installEnv.dataDir, {
-    ...newState(unit),
-    cursor: 3,
+    ...newState(),
+    unit,
+    readyId: 'ready-before-uninstall',
     lastReadyAt: '2026-10-31T00:00:00.000Z',
   })
 
@@ -1351,7 +1342,7 @@ test('discord uninstall: unit file を消して daemon-reload。state.json と�
     assert.equal(readField(output, 'removed'), true)
     assert.equal(readField(output, 'stateFile'), discordStateFilePath(installEnv.dataDir))
     assert.equal(await exists(unitPath), false)
-    assert.equal(readField(readDiscordBotState(installEnv.dataDir), 'cursor'), 3)
+    assert.equal(readField(readDiscordBotState(installEnv.dataDir), 'lastReadyAt'), '2026-10-31T00:00:00.000Z')
     assert.ok(
       systemdCalls(fake).some((entry) => {
         return entry[0] === 'systemctl' && entry[1] === '--user' && entry[2] === 'disable'

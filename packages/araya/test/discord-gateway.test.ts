@@ -1,11 +1,15 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { MessageFlags } from 'discord.js'
+
 import {
   createDiscordTypingIndicator,
   discordGatewayIntents,
   discordNotificationPayload,
   flattenDiscordCommandOptions,
+  OBSOLETE_COMMAND_REPLY,
+  wireSlashCommandInteractions,
 } from '../src/discord/gateway.ts'
 
 test('discord gateway: nonce payload は enforce_nonce を有効にする', () => {
@@ -229,4 +233,105 @@ test('discord gateway: closing the typing indicator stops an active heartbeat', 
 
   release?.()
   await pending[0]
+})
+
+type FakeCommandReply = { content: string; flags: number | undefined }
+
+function makeFakeSlashCommandInteraction(options: {
+  commandName: string
+  subcommand: string
+  leafOptions: { name: string; value: string | number }[]
+}) {
+  const replies: FakeCommandReply[] = []
+  let resolveReply: () => void
+  const replied = new Promise<void>((resolve) => {
+    resolveReply = resolve
+  })
+
+  function capture(payload: { content: string; flags?: number }) {
+    replies.push({ content: payload.content, flags: payload.flags })
+    resolveReply()
+  }
+
+  return {
+    replies,
+    replied,
+    interaction: {
+      isChatInputCommand: () => true,
+      commandName: options.commandName,
+      id: 'interaction-1',
+      user: { id: 'user-1' },
+      guildId: 'guild-1',
+      channelId: 'channel-1',
+      options: {
+        data: options.leafOptions.map((entry) => ({ type: 3, ...entry })),
+        getSubcommandGroup: (required = true) => {
+          if (required) {
+            throw new Error('subcommand group が無い interaction')
+          }
+
+          return null
+        },
+        getSubcommand: () => options.subcommand,
+      },
+      reply: async (payload: { content: string; flags?: number }) => {
+        capture(payload)
+      },
+      followUp: async (payload: { content: string; flags?: number }) => {
+        capture(payload)
+      },
+    },
+  }
+}
+
+test('discord gateway: interactionCreate 配線は撤去済み command に ephemeral の撤去案内を返し option 値を混ぜない', async () => {
+  let interactionListener: ((interaction: never) => void) | undefined
+
+  const client = {
+    on(event: 'interactionCreate', listener: (interaction: never) => void) {
+      assert.equal(event, 'interactionCreate')
+      interactionListener = listener
+    },
+  }
+  const errors: string[] = []
+
+  wireSlashCommandInteractions(
+    client as unknown as Parameters<typeof wireSlashCommandInteractions>[0],
+    {
+      onReady: () => {},
+      onMessage: () => {},
+      onError: (message: string) => {
+        errors.push(message)
+      },
+    },
+  )
+  assert.ok(
+    interactionListener !== undefined,
+    'wireSlashCommandInteractions は client.on("interactionCreate") を配線する',
+  )
+
+  const removed = makeFakeSlashCommandInteraction({
+    commandName: 'araya',
+    subcommand: 'retry',
+    leafOptions: [{ name: 'task', value: 17 }],
+  })
+  const otherCommand = makeFakeSlashCommandInteraction({
+    commandName: 'other',
+    subcommand: 'submit',
+    leafOptions: [],
+  })
+
+  interactionListener?.(removed.interaction as never)
+  await removed.replied
+  interactionListener?.(otherCommand.interaction as never)
+  await new Promise((resolve) => {
+    setTimeout(resolve, 20)
+  })
+
+  assert.deepEqual(removed.replies, [
+    { content: OBSOLETE_COMMAND_REPLY, flags: MessageFlags.Ephemeral },
+  ])
+  assert.equal(removed.replies[0]?.content.includes('17'), false)
+  assert.deepEqual(otherCommand.replies, [])
+  assert.deepEqual(errors, [])
 })
