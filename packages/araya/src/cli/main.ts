@@ -2,6 +2,7 @@ import os from 'node:os'
 
 import { parseCliArguments } from './arguments.ts'
 import { loadConfig, loadPiSdk, withPiEnvironment } from '../config/environment.ts'
+import { runHootCommand } from './hoot-commands.ts'
 import {
   createSystemdOps,
   resolveDiscordEnvRunnerEntrypoint,
@@ -49,6 +50,34 @@ function printHelp() {
   古い slash command 定義が残っている guild では、実行すると「撤去されました」の応答だけ返る。Discord 側で削除してください。
 
   araya discord は Linux と systemd（254 以降）の user manager が必要。
+
+  araya hoot status
+    HOOT（Human Out of the Loop）の goal・settings・schedule・直近の判断 run・open な proposal を表示する。
+  araya hoot goal list | add | update | pause | resume | retire
+    目的（goal）の一覧と変更。add / update は --key <key> --objective "<目的>" [--scope github:owner/repo,...] [--constraint "<制約>",...]
+    [--review-at <YYYY-MM-DD|ISO datetime|none>]（goal の review 期限。過ぎた active goal は model を呼ばず自動 paused になる）
+  araya hoot settings show | set
+    動作設定の表示・変更。set は [--enabled true|false] [--tick-minutes N] [--max-runs-per-day N] [--notify-decisions a,b,c]
+    [--precheck true|false] [--watchdog-hours N] [--digest-hour-utc N|none] [--reset-conversation-after-runs N]
+    [--goal-review-days N] [--proposal-ttl-hours N] [--max-proposal-reminders N]
+    mode は既定 dry_run（判断の記録だけ。作業は実行しない）。mode=active は dispatch mechanism ができるまで拒否します。
+  araya hoot proposal list | resolve --key <key>
+    人間の応答を待つ未解決の提案（investigate / dispatch / request_human）の一覧と解決。期限切れは expired になります。
+  araya hoot runs [--limit N]
+    判断 run の記録（decision と reason、source は model / precheck）を新しい順に表示する。
+  araya hoot reset-schedule
+    schedule をリセットする（次の tick が次の occurrence になる）。
+  araya hoot <command> [--data-dir <path>]
+    state file を読む data directory を明示する。未指定なら稼働中 bot と同じ resolution（ARAYA_DATA_DIR /
+    config file）で <ARAYA_DATA_DIR>/hoot/state.json を見る。明示指定したときだけ別の file を指す（state
+    復旧作業で unit を stop した file を確かめる用途など）。
+
+  HOOT は <ARAYA_DATA_DIR>/hoot/state.json（version 2。version 1 は読み取り時に migration します）を使い、Discord bot process の loop が
+  interval ごとに tick します。enabled=false または active goal が無ければ model も gh も呼びません。判断 run は tool を持たない専用の
+  会話で走り、観測は Araya の code が gh の read-only command で集めます。観測 fingerprint が前回と同じ occurrence では model を呼ばず
+  noop を記録し、観測に gap が 1 件でもある occurrence では precheck せず model を呼びます。watchdogHours 以内に 1 回は model で全体を
+  見ます。即時の Discord 通知は notifyDecisions（既定 request_human / invalid）だけで、他は UTC 1 日 1 回の digest にまとめます
+  （digest には open proposal の key も出るので proposal resolve --key の key はそこから使えます）。
 
 設定ファイル:
   <ARAYA_DATA_DIR>/config.json（既定: ~/.araya/config.json）
@@ -156,6 +185,30 @@ export async function runCli(
     }
 
     await runDiscordCommand(args.slice(1), config, deps)
+
+    return
+  }
+
+  // HOOT の command も独自の option を持つので、共通の引数の解析より先に振り分ける
+  if (args[0] === 'hoot') {
+    const hootArgs = args.slice(1)
+
+    if (hootArgs.includes('--help') || hootArgs.includes('-h')) {
+      printHelp()
+
+      return
+    }
+
+    const config = loadConfig(env)
+    await runHootCommand(hootArgs, {
+      dataDir: config.dataDir,
+      stdout: (text) => {
+        return console.log(text)
+      },
+      nowMs: () => {
+        return Date.now()
+      },
+    })
 
     return
   }

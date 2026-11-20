@@ -15,6 +15,7 @@ import {
   defineTask,
   defineTool,
   Harness,
+  type Conversation,
   type ConversationId,
   type EntryId,
   type EntryRecord,
@@ -497,6 +498,22 @@ export type ArayaAgentSession = {
   reset(requestId: string): Promise<void>
   stop?(): Promise<void>
   close(): Promise<void>
+  // HOOT 判断 run を 1 回走らせる。main 会話とは別の、tool を持たない専用の会話を使う
+  hootDecide?(input: HootDecideRequest): Promise<HootDecideResult>
+}
+
+export type HootDecideRequest = {
+  prompt: string
+  // 同じ requestId の submit を繰り返さないための stable key（HOOT は schedule occurrence を使う）
+  requestId: string
+  // 前に使った HOOT 会話の id（pi-durable の conversation id）。再起動後に同じ会話を続ける
+  conversationId: number | null
+  instructions: string
+}
+
+export type HootDecideResult = {
+  text: string
+  conversationId: number
 }
 
 export async function openArayaAgentHost(
@@ -571,6 +588,61 @@ export async function openArayaAgentHost(
       },
     )
     harness.resume()
+    const activeHarness = harness
+
+    // HOOT 判断 run 用の conversation。coding tool・task tool を持たないので、判断 run は file も
+    // child も変更できない。id を覚えておき、再起動後は同じ transcript を続ける
+    let hootConversation: Conversation | undefined
+
+    const startHootConversation = async () => {
+      return await activeHarness.createConversation(
+        {
+          ownership: { kind: 'ownerless' },
+        },
+        input.context,
+      )
+    }
+
+    const ensureHootConversation = async (request: HootDecideRequest) => {
+      let conversation: Conversation
+
+      if (request.conversationId === null) {
+        // 会話 reset の依頼。前の判断の続きにすると noop が自己強化するので、新しい会話から始める
+        conversation = await startHootConversation()
+      } else {
+        const cached = hootConversation
+
+        if (cached !== undefined && cached.id === request.conversationId) {
+          conversation = cached
+        } else {
+          try {
+            // hoot state に number で保存した id。pi-durable の ConversationId は branded number
+            const resumed = await activeHarness.conversation(request.conversationId as ConversationId, input.context)
+            // state の conversationId がこの storage に無い（dataDir を書き換えた等）ときは新しい会話で続ける。
+            // 失敗を繰り返させない。id の変化は tick 側が state に書き直す
+            conversation = resumed ?? (await startHootConversation())
+          } catch {
+            conversation = await startHootConversation()
+          }
+        }
+      }
+
+      hootConversation = conversation
+      // policy は毎回書き直す。古い conversation に tool が残っていても判断 run には渡さない
+      await conversation.configure(
+        {
+          instructions: request.instructions,
+          tools: [],
+          modelTools: [],
+          cwd: input.devRoot,
+          model: { provider: input.model.provider, modelId: input.model.modelId },
+          thinkingLevel: input.model.thinkingLevel,
+        },
+        input.context,
+      )
+
+      return conversation
+    }
 
     return {
       submit: async (content: string, requestId: string) => {
@@ -599,6 +671,39 @@ export async function openArayaAgentHost(
       },
       reset: async () => {
         await root.reset(undefined, input.context)
+      },
+      hootDecide: async (request: HootDecideRequest) => {
+        const conversation = await ensureHootConversation(request)
+        const settled = await (
+          await conversation.submit(
+            {
+              type: 'input',
+              content: request.prompt,
+              requestId: request.requestId,
+              whenBusy: 'reject',
+            },
+            input.context,
+          )
+        ).wait(input.context)
+
+        if (settled.status !== 'done') {
+          throw new Error('araya_hoot_unanswered')
+        }
+
+        const messages = (await conversation.context(input.context, { at: settled.answer })).messages
+        const last = messages.findLast((candidate) => {
+          return candidate.role === 'assistant'
+        })
+        const text =
+          last === undefined || last.role !== 'assistant'
+            ? ''
+            : last.content
+                .flatMap((block) => {
+                  return block.type === 'text' ? [block.text] : []
+                })
+                .join('')
+
+        return { text: input.redactor.redact(text), conversationId: conversation.id }
       },
       // main の実行中 run・queued input と、その background child まで止める
       stop: async () => {

@@ -4,7 +4,7 @@
 
 Pi SDK は import 時に環境変数から agent directory を読み、`bin/` の場所を module cache に固定します。実行時 import は `loadPiSdk(agentDir)` に集約し、最初の import より前に Araya の環境を束縛してください。Pi SDK の runtime static import を他の module に追加しないでください。回帰テストは新規 child process で、SDK が解決する `bin/` の path を検証します。親 test process が SDK を先に import すると、その module cache の binding は後から修正できません。
 
-repository の中で araya をビルド・テスト・変更する人向けの文書です。`araya` の使い方は [README.md](../README.md)、model 設定の定義は [docs/spec/agent-model-config.md](spec/agent-model-config.md)、Discord 会話の定義は [docs/spec/discord-persistent-chat.md](spec/discord-persistent-chat.md) にあります。
+repository の中で araya をビルド・テスト・変更する人向けの文書です。`araya` の使い方は [README.md](../README.md)、model 設定の定義は [docs/spec/agent-model-config.md](spec/agent-model-config.md)、Discord 会話の定義は [docs/spec/discord-persistent-chat.md](spec/discord-persistent-chat.md)、HOOT（課題発見の dry run）の定義は [docs/spec/hoot-minimal.md](spec/hoot-minimal.md) にあります。
 
 ## checkout とテスト
 
@@ -23,9 +23,10 @@ npm run typecheck
 
 `packages/araya/src/` は機能ごとに分けています。
 
-- `cli/`: 引数解析と CLI command（`araya discord init`・`install`・`uninstall`・`run`）の実行
+- `cli/`: 引数解析と CLI command（`araya discord init`・`install`・`uninstall`・`run`、`araya hoot …`）の実行
 - `config/`: 環境変数、設定ファイル、model 設定
-- `agent/`: Discord 会話の main agent、model 解決、Pi durable session host（`openArayaAgentHost()`）
+- `agent/`: Discord 会話の main agent、model 解決、Pi durable session host（`openArayaAgentHost()`）。HOOT 判断 run の tool を持たない専用 conversation もここ
+- `hoot/`: HOOT の state・schedule occurrence・read-only 観測・判断 prompt・wakeup loop
 - `discord/`: Discord gateway、会話入口、bot state、env/op launcher
 - `infrastructure/`: subprocess 実行、秘密の置換、systemd unit
 
