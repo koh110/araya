@@ -4,7 +4,7 @@
 
 Pi SDK は import 時に環境変数から agent directory を読み、`bin/` の場所を module cache に固定します。実行時 import は `loadPiSdk(agentDir)` に集約し、最初の import より前に Araya の環境を束縛してください。Pi SDK の runtime static import を他の module に追加しないでください。回帰テストは新規 child process で、SDK が解決する `bin/` の path を検証します。親 test process が SDK を先に import すると、その module cache の binding は後から修正できません。
 
-repository の中で araya をビルド・テスト・変更する人向けの文書です。`araya` の使い方は [README.md](../README.md)、model 設定の定義は [docs/spec/agent-model-config.md](spec/agent-model-config.md)、Discord 会話の定義は [docs/spec/discord-persistent-chat.md](spec/discord-persistent-chat.md)、HOOT（課題発見の dry run）の定義は [docs/spec/hoot-minimal.md](spec/hoot-minimal.md) にあります。
+repository の中で araya をビルド・テスト・変更する人向けの文書です。`araya` の使い方は [README.md](../README.md)、model 設定の定義は [docs/spec/agent-model-config.md](spec/agent-model-config.md)、Discord 会話の定義は [docs/spec/discord-persistent-chat.md](spec/discord-persistent-chat.md)、HOOT（課題発見 loop と dispatch の main 会話 inject）の定義は [docs/spec/hoot-minimal.md](spec/hoot-minimal.md) にあります。
 
 ## checkout とテスト
 
@@ -26,8 +26,8 @@ npm run typecheck
 - `cli/`: 引数解析と CLI command（`araya discord init`・`install`・`uninstall`・`run`、`araya hoot …`）の実行
 - `config/`: 環境変数、設定ファイル、model 設定
 - `agent/`: Discord 会話の main agent、model 解決、Pi durable session host（`openArayaAgentHost()`）。HOOT 判断 run の tool を持たない専用 conversation もここ
-- `hoot/`: HOOT の state・schedule occurrence・read-only 観測・判断 prompt・wakeup loop
-- `discord/`: Discord gateway、会話入口、bot state、env/op launcher
+- `hoot/`: HOOT の state・schedule occurrence・read-only 観測・判断 prompt・wakeup loop・inject request（`store.ts` の `enqueueHootInject` / `takePendingInject` / `finishHootInject`、`tick.ts` の `injectOnce()`）
+- `discord/`: Discord gateway、会話入口、bot state、env/op launcher。bot process 内の HOOT loop に `dispatchInject` を配線し、main conversation への inject を `chat.ts` の `inject()` で扱う
 - `infrastructure/`: subprocess 実行、秘密の置換、systemd unit
 
 `packages/araya/bin/` は起動 entrypoint（`cli.ts`、`discord-bot.ts`、`discord-env-runner.ts`、`discord-op-runner.ts`）です。unit file の `ExecStart` は Node.js で dist の absolute path を実行します。
@@ -95,6 +95,7 @@ Discord bot process は Pi durable の Harness を持ちます。許可された
 - task の作成・進捗・実行管理は Pi durable の session に任せます。araya 側の task 台帳・runner・side-effect gate・evidence 照合・worktree 強制・`/araya task` slash command は撤去済みです。Discord 側の境界は入口 allowlist と、channel に返す text の redaction のみです。
 - model は `resolveAgentModel()`（`src/agent/model.ts`）が config `agent.model` → Pi settings（`<dataDir>/agent/agent-settings`）→ Pi の既定の順で解決します。
 - `reset` / `stop` は Discord 入口（`src/discord/chat.ts`）で扱います。reset は main conversation を作り直し、stop は main の run・queued input・background child session へ中止を要求します。
+- HOOT の dispatch inject（Issue #31）も同じ main conversation を実行の場にします。`hoot/tick.ts` の `injectOnce()` が poll ごとに pending inject request を 1 件取り出し（`tickOnce()` の schedule gate より先）、`discord/bot.ts` の `dispatchInject` 経由で `chat.ts` の `inject()` が main conversation へ submit し、notice と answer を channel に返す。人間の message と同じ queue で直列し、stop の queue cancel 対象にはしない（受理済みの案件は消さない）。HOOT 判断 run には tool が無いので、inject が HOOT 側に tool を増やすことはない。record・settings・inject request は `<dataDir>/hoot/state.json`（version 3）に置く。
 
 ## 設定
 
@@ -114,4 +115,5 @@ schema、model の選び方、エラー時の挙動は [agent model の設定](s
 - `<dataDir>/agent/agent.sqlite` は main conversation、child session、task graph、checkpoint、tool 記録を保持します。DB・session の状態 directory・log は自動削除しません。
 - 会話には課題本文、model の応答、tool の引数と出力が含まれ得ます。transcript は log の redaction 対象ではないため、`ARAYA_DATA_DIR` と backup のアクセス権を管理してください。credential を会話に投稿しないことが唯一の防御策です。
 - agent（main も child も）は利用者の権限で sandbox なしに動き、開発 root 以外の書き込み可能 file にも触れ、`git`・`gh` で remote を直接変更できます。commit・push・PR 作成・merge かどうかは会話の中の依頼で決めます。araya 自体は merge・deploy・publish をしません。
-- 自律的な課題発見、外部ソース監視、通知連携は未実装です。
+- 課題発見の loop（HOOT）と、承認済みの dispatch を main conversation へ inject する経路は実装済み（`docs/spec/hoot-minimal.md`）。inject できる decision は `dispatch` だけ（`INJECTABLE_DECISIONS`）で、`mode=dry_run` では request を作らず、`mode=active` でも既定の `autoDispatch=false` では人間の `araya hoot dispatch --key <proposal key>` の承認が必要なまま。件数は `maxInjectsPerDay`（既定 2）と `injectCooldownMinutes`（既定 60 分）で押さえる。
+- GitHub 以外の外部ソース監視、task 台帳・worktree 作成・PR 作成との接続（inject は main conversation に 1 件の input を流すだけで、child session へ自動で依頼しない）、通知 channel の分離は未実装。inject を受けた main conversation の agent は sandbox なしで tool を持つので、境界は承認の gate・inject 文面の指示・人間の `stop` / `reset` で持つ。

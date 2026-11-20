@@ -112,6 +112,16 @@ export type DiscordChatSession = {
 
 export type DiscordChatReply = (content: string, nonce: string) => Promise<void>
 
+// HOOT が承認済みの dispatch を main 会話へ流すための input（Issue #31）。
+// 人間の message と同じ queue で直列化するので、会話の途中に別の agent が割り込まない
+export type DiscordChatInjection = {
+  content: string
+  // main 会話の submit の requestId。HOOT の inject request から作る（同じ案件を繰り返さない）
+  requestId: string
+  // 「何を自動化したか」を人間に返す 1 文
+  notice: string
+}
+
 export type DiscordChatHandlerDependencies = {
   config: DiscordConfig
   botUserId: string
@@ -122,6 +132,7 @@ export type DiscordChatHandlerDependencies = {
 
 export type DiscordChatHandler = {
   handle(message: DiscordChatMessage, reply: DiscordChatReply): Promise<void>
+  inject(injection: DiscordChatInjection, reply: DiscordChatReply): Promise<string>
   stopAccepting(): void
   drain(): Promise<void>
 }
@@ -140,18 +151,22 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
   // 受付済みで未開始の message。stop で実行中の submit とあわせて無効化する
   const queued: { message: DiscordChatMessage; reply: DiscordChatReply; cancelled: boolean }[] = []
 
-  async function send(message: DiscordChatMessage, reply: DiscordChatReply, content: string) {
+  async function sendText(reply: DiscordChatReply, messageId: string, content: string) {
     const chunks = splitDiscordChatReply(deps.redactor.redact(content))
 
     for (let index = 0; index < chunks.length; index += 1) {
       try {
-        await reply(chunks[index] ?? '', discordChatReplyNonce(message.messageId, index))
+        await reply(chunks[index] ?? '', discordChatReplyNonce(messageId, index))
       } catch (error) {
         deps.log({ type: 'discord_chat_reply_failed', errorName: errorName(error) })
 
         return
       }
     }
+  }
+
+  async function send(message: DiscordChatMessage, reply: DiscordChatReply, content: string) {
+    await sendText(reply, message.messageId, content)
   }
 
   async function process(message: DiscordChatMessage, reply: DiscordChatReply) {
@@ -236,6 +251,47 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
         await process(message, reply)
       })
       tail = operation.catch(() => {})
+
+      return operation
+    },
+    // HOOT の承認済み dispatch を main 会話へ submit し、notice と answer を Discord に返す。
+    // 人間の message と tail で直列化するので、stop の queue cancel とは別に扱う（承認済みの案件は消さない）
+    inject: async (injection: DiscordChatInjection, reply: DiscordChatReply) => {
+      if (!accepting) {
+        throw new Error('hoot_inject_unavailable: chat handler が停止中です')
+      }
+
+      if (deps.session === null) {
+        throw new Error('hoot_inject_unavailable: Discord chat session がありません')
+      }
+
+      const noticeId = `${injection.requestId}:notice`
+      const answerId = `${injection.requestId}:answer`
+      const operation = tail.then(async () => {
+        if (!accepting || deps.session === null) {
+          throw new Error('hoot_inject_unavailable: chat session を使えません')
+        }
+
+        deps.log({
+          type: 'discord_hoot_inject',
+          requestId: injection.requestId,
+          contentChars: injection.content.length,
+        })
+        // state に残った text（model・gh 由来）を main 会話に渡す前に秘密を置き換える
+        const answer = await deps.session.submit(deps.redactor.redact(injection.content), injection.requestId)
+
+        // notice と answer は別の messageId で送る（同じ messageId / chunk index だと reply nonce が重複して
+        // gateway の dedupe で answer が落ちる）
+        await sendText(reply, noticeId, injection.notice)
+        await sendText(reply, answerId, answer === '' ? '応答を生成できませんでした。' : answer)
+
+        return answer
+      })
+      // inject が失敗しても queue は止めない（tail は void を返す連鎖なので result は捨ててつなぐ）
+      tail = operation.then(
+        () => undefined,
+        () => undefined
+      )
 
       return operation
     },

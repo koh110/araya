@@ -60,7 +60,14 @@ function printHelp() {
     動作設定の表示・変更。set は [--enabled true|false] [--tick-minutes N] [--max-runs-per-day N] [--notify-decisions a,b,c]
     [--precheck true|false] [--watchdog-hours N] [--digest-hour-utc N|none] [--reset-conversation-after-runs N]
     [--goal-review-days N] [--proposal-ttl-hours N] [--max-proposal-reminders N]
-    mode は既定 dry_run（判断の記録だけ。作業は実行しない）。mode=active は dispatch mechanism ができるまで拒否します。
+    [--auto-dispatch true|false] [--max-injects-per-day N] [--inject-cooldown-minutes N]
+    mode は既定 dry_run（判断の記録だけ。作業は実行しない）。mode=active は「承認済みの dispatch proposal を main Discord 会話へ
+    inject してよい」という gate で、autoDispatch（既定 false）を true にしたときだけ HOOT 自身の判断で inject します。
+  araya hoot dispatch --key <proposal key>
+    proposal list の key を人間が承認して、main Discord 会話へ流す inject request を作る（bot process の次の poll で届く）。
+    inject してよい decision は dispatch だけ。dry_run では作りません。mode=active でも autoDispatch=false ならこの command が承認です。
+  araya hoot inject list
+    inject request（pending / injected / failed）を新しい順に表示する。失敗が重なったら proposal list で作り直す。
   araya hoot proposal list | resolve --key <key>
     人間の応答を待つ未解決の提案（investigate / dispatch / request_human）の一覧と解決。期限切れは expired になります。
   araya hoot runs [--limit N]
@@ -72,12 +79,13 @@ function printHelp() {
     config file）で <ARAYA_DATA_DIR>/hoot/state.json を見る。明示指定したときだけ別の file を指す（state
     復旧作業で unit を stop した file を確かめる用途など）。
 
-  HOOT は <ARAYA_DATA_DIR>/hoot/state.json（version 2。version 1 は読み取り時に migration します）を使い、Discord bot process の loop が
+  HOOT は <ARAYA_DATA_DIR>/hoot/state.json（version 3。version 1・2 は読み取り時に migration します）を使い、Discord bot process の loop が
   interval ごとに tick します。enabled=false または active goal が無ければ model も gh も呼びません。判断 run は tool を持たない専用の
   会話で走り、観測は Araya の code が gh の read-only command で集めます。観測 fingerprint が前回と同じ occurrence では model を呼ばず
   noop を記録し、観測に gap が 1 件でもある occurrence では precheck せず model を呼びます。watchdogHours 以内に 1 回は model で全体を
   見ます。即時の Discord 通知は notifyDecisions（既定 request_human / invalid）だけで、他は UTC 1 日 1 回の digest にまとめます
-  （digest には open proposal の key も出るので proposal resolve --key の key はそこから使えます）。
+  （digest には open proposal の key も出るので proposal resolve --key の key はそこから使えます）。inject は人間の message と同じ queue で
+  main 会話に submit し、届いたことは Discord の message にも出ます（HOOT 判断 run 自体は tool を持たない）。
 
 設定ファイル:
   <ARAYA_DATA_DIR>/config.json（既定: ~/.araya/config.json）
