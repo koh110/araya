@@ -301,6 +301,9 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
         session: chatSession,
         redactor,
         log: logSafe,
+        // Discord の message から会話 session と HOOT を操作する control command（Issue #33）
+        dataDir,
+        nowMs,
       })
       state.unit = unit
       state.readyId = readyId

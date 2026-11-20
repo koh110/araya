@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { Redactor } from '../infrastructure/redaction.ts'
+import { createDiscordControlCommands, type DiscordControlCommands } from './commands.ts'
 import type { DiscordConfig } from './config.ts'
 
 export type DiscordChatMessageMetadata = {
@@ -108,6 +109,8 @@ export type DiscordChatSession = {
   reset(requestId: string): Promise<void>
   stop?(): Promise<void>
   close?(): Promise<void>
+  // control command の status 表示用。main conversation の durable id を返す
+  describe?(): { conversationId: number | null }
 }
 
 export type DiscordChatReply = (content: string, nonce: string) => Promise<void>
@@ -128,6 +131,11 @@ export type DiscordChatHandlerDependencies = {
   session: DiscordChatSession | null
   redactor: Redactor
   log(entry: Record<string, unknown>): void
+  // control command（status / hoot ...）が読む state file の位置
+  dataDir: string
+  nowMs?(): number
+  // 省略すると createDiscordControlCommands を使う（test で差し替え可能）
+  control?: DiscordControlCommands
 }
 
 export type DiscordChatHandler = {
@@ -150,6 +158,23 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
   let tail = Promise.resolve()
   // 受付済みで未開始の message。stop で実行中の submit とあわせて無効化する
   const queued: { message: DiscordChatMessage; reply: DiscordChatReply; cancelled: boolean }[] = []
+  // 実行中の turn 数（status 表示用）
+  let processing = 0
+  const control =
+    deps.control ??
+    createDiscordControlCommands({
+      dataDir: deps.dataDir,
+      nowMs: deps.nowMs ?? ((): number => Date.now()),
+      log: deps.log,
+    })
+
+  function conversationIdOf() {
+    try {
+      return deps.session?.describe?.().conversationId ?? null
+    } catch {
+      return null
+    }
+  }
 
   async function sendText(reply: DiscordChatReply, messageId: string, content: string) {
     const chunks = splitDiscordChatReply(deps.redactor.redact(content))
@@ -186,21 +211,9 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
       return
     }
 
+    processing += 1
+
     try {
-      if (/^stop$/iu.test(content)) {
-        await deps.session.stop?.()
-        await send(message, reply, '実行中・実行待ちの作業があれば中止を要求しました')
-
-        return
-      }
-
-      if (/^reset$/iu.test(content)) {
-        await deps.session.reset(message.messageId)
-        await send(message, reply, 'この channel の会話をリセットしました')
-
-        return
-      }
-
       const answer = await deps.session.submit(
         `Discord user ${message.userId} said:\n${deps.redactor.redact(content)}`,
         message.messageId,
@@ -209,6 +222,59 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
     } catch (error) {
       deps.log({ type: 'discord_chat_turn_failed', errorName: errorName(error) })
       await send(message, reply, CHAT_ERROR_REPLY)
+    } finally {
+      processing -= 1
+    }
+  }
+
+  // control command は queue の外で処理する（会話の実行中・待ちでも常に効く制御系）
+  async function processControl(message: DiscordChatMessage, reply: DiscordChatReply, content: string) {
+    const cancelledCount = { value: 0 }
+
+    try {
+      await control.handle(content, {
+        messageId: message.messageId,
+        conversationId: conversationIdOf(),
+        runningCount: processing,
+        queuedCount: queued.length,
+        sessionAvailable: deps.session !== null,
+        send: (text): Promise<void> => sendText(reply, message.messageId, text),
+        cancelQueued: () => {
+          let cancelled = 0
+
+          for (const item of queued) {
+            if (!item.cancelled) {
+              item.cancelled = true
+              cancelled += 1
+            }
+          }
+
+          cancelledCount.value = cancelled
+
+          return cancelled
+        },
+        stopSession: async () => {
+          if (deps.session === null) {
+            return '会話 session が開いていないので、中止を要求できませんでした'
+          }
+
+          await deps.session.stop?.()
+
+          return '実行中・実行待ちの作業があれば中止を要求しました'
+        },
+        resetSession: async (requestId) => {
+          if (deps.session === null) {
+            return '会話 session が開いていないので、リセットできませんでした'
+          }
+
+          await deps.session.reset(requestId)
+
+          return 'この channel の会話をリセットしました'
+        },
+      })
+    } catch (error) {
+      deps.log({ type: 'discord_control_failed', message: errorName(error) })
+      await send(message, reply, 'command を処理できませんでした。`help` で一覧を見られます')
     }
   }
 
@@ -218,14 +284,11 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
         return Promise.resolve()
       }
 
-      // stop は実行待ちキューの外で処理し、実行中の submit を待たずに abort 要求を届ける
-      if (/^stop$/iu.test(stripDiscordBotMention(message.content, deps.botUserId))) {
-        // 受付済みで未開始の作業も合わせて無効化する
-        for (const item of queued) {
-          item.cancelled = true
-        }
+      const content = stripDiscordBotMention(message.content, deps.botUserId)
 
-        const operation = process(message, reply)
+      // stop を含む control command は実行待ちキューの外で処理し、実行中の submit を待たずに効く
+      if (control.matches(content)) {
+        const operation = processControl(message, reply, content)
         tail = tail.then(async () => {
           await operation.catch(() => {})
         })

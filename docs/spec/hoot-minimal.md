@@ -4,7 +4,7 @@
 
 HOOT は「Araya が人間の依頼を待っている時間」に、設定した目的（goal）について **観測し、次の一手を判断し、記録する** loop。判断 result は state に残り、必要なら Discord へ 1 件通知する。**HOOT の判断 run 自身には tool が無い**（model に tool を渡さず、file を書き換えず、process を起動しない）。判断 run が `dispatch` を出しても、ここで作業は始まらない。
 
-作業に繋がる導線は 1 本だけ。承認された `dispatch` を **main Discord 会話（channel ごとの main agent session）へ inject** し、実際の作業はその会話の agent が進める（Issue #31 の 1A。詳細は「main Discord 会話への inject」）。承認を作るのは人間の CLI（`araya hoot dispatch --key <proposal key>`）か `mode=active` + `autoDispatch=true` で、**既定（`autoDispatch=false`）では人間の承認が無い限り inject しない**。
+作業に繋がる導線は 1 本だけ。承認された `dispatch` を **main Discord 会話（channel ごとの main agent session）へ inject** し、実際の作業はその会話の agent が進める（Issue #31 の 1A。詳細は「main Discord 会話への inject」）。承認を作るのは人間の CLI（`araya hoot dispatch --key <proposal key>`）か Discord の control command（`hoot dispatch --key <proposal key>`）か `mode=active` + `autoDispatch=true` で、**既定（`autoDispatch=false`）では人間の承認が無い限り inject しない**。main agent session の bash から承認系 command は実行できない（「CLI」の「Discord から打つ hoot command」）。
 
 Discord bot process の中に loop として常駐し、`<dataDir>/hoot/state.json` を single source of truth にする。CLI（`araya hoot`）と同じ file を lock で共有する。
 
@@ -140,6 +140,7 @@ occurrence ごとの判断結果を `runs` に積む。判断 run には tool �
 ### request を作るのは「承認」だけ（`enqueueHootInject`）
 
 - 人間の CLI: `araya hoot dispatch --key <proposal key>`（`authorizedBy: 'human'`）。**人間の承認でも `mode=active` が必須**で、`dry_run` の間は request を作れない
+- 人間の Discord control command: channel に `hoot dispatch --key <proposal key>` と打つ（同じ `enqueueHootInject` を呼び、`authorizedBy: 'human'`。詳細は「CLI」の「Discord から打つ hoot command」）。**agent session の内側からこの承認は作れない**
 - `mode=active` + `autoDispatch=true` の judgment run が出した `dispatch` 提案（`authorizedBy: 'mode_active'`）。`autoDispatch` は既定 false なので、active でも人間の承認が無い限り request は作らない
 
 `mode=dry_run` では request を **作らない**（`enqueueHootInject` は `hoot_mode_dry_run` の誤り）。`mode=active` を `hoot_mode_unimplemented` で拒否する仕組みは廃止し、`mergeSettings` は `dry_run` / `active` をそのまま受け付ける。
@@ -227,6 +228,15 @@ araya hoot <command> ... [--data-dir <path>]
 - `proposal list` は open を全件、closed を直近 5 件表示して総数は `open N / closed M` に出す。1 件は key・status・decision・goals・reason・`created / confirmed / expires / reminders` の 3 行。`proposal resolve --key <key>` は open だけ（resolved / expired 済みの key も `hoot_proposal_not_found`）。closed を動かす導線は用意しない（proposal の life cycle は open -> resolved / expired の 1 往復だけ）
 
 `dataDir` は `araya` と同じ設定源（`ARAYA_DATA_DIR` / config file）を使う。全ての `araya hoot` subcommand は任意で `--data-dir <path>` を取れる（`options['data-dir'] ?? deps.dataDir`）: **未指定なら bot process と同じ resolution なので、`araya hoot status` は既定で稼働中 bot の `<dataDir>/hoot/state.json` を見る**。明示指定したときだけ別の file を指す（state 復旧作業で unit を stop した file を確かめる用途など）。bot process の起動・停止はしない。bot は次の tick（既定 60 秒以内）から新しい settings を読む。
+
+### Discord から打つ hoot command（control command / Issue #33）
+
+`src/discord/commands.ts` が channel の message を直接処理する。`hoot` で始まる message（予約 prefix）を quote 付きの token 列に分解し、**CLI と同じ `runHootCommand`・同じ出力**を使う（`src/cli/hoot-commands.ts` を chat 側から呼ぶ。model には渡さない）。
+
+- 会話側の command は `help` / `status`（main conversation の durable id・実行中・待ち + HOOT の `status` 出力） / `stop` / `reset` / `session reset`。queue の外で処理するので実行中でも効く（`docs/spec/discord-persistent-chat.md`）
+- `--data-dir` は Discord 側では受け付けない（`hoot_invalid_argument`。bot process の dataDir だけを正とする）
+- 失敗は `discord_control_failed` に log し、channel には `できませんでした: <error message>` を返す（成功時は `discord_control_command`）
+- **agent の自己承認を止める**: Pi durable の conversation ごとの shell 環境に `ARAYA_AGENT_SESSION=1` を入れる（`src/infrastructure/agent-session.ts`。bot process 自身の env は汚さない）。`araya hoot` の **CLI 入口**（`src/cli/main.ts`）が `assertHumanHootInvocation` で `dispatch` / `settings set` / `goal add・update・pause・resume・retire` / `proposal resolve` / `reset-schedule` を `hoot_agent_session_blocked` で拒否する（`status` / `goal list` / `proposal list` / `settings show` / `inject list` / `runs` は allowed）。guard は CLI 入口だけにかける（`runHootCommand` 内側に入れると in-process の test や bot 自身の control command 経路まで巻き込む）。したがって Discord の control command は目印の有無に関わらず効き、承認は人間の手からだけ出る
 
 ## 実装済みの歯止め
 

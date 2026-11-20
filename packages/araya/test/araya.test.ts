@@ -10,13 +10,14 @@ import { loadConfig } from '../src/config/environment.ts'
 import { parseCliArguments } from '../src/cli/arguments.ts'
 import { runCli } from '../src/cli/main.ts'
 import { readAllProcessEnvironment, readProcessEnvironment } from './config.ts'
+import { ARAYA_AGENT_SESSION_ENV } from '../src/infrastructure/agent-session.ts'
 import { createFakeSystemd } from './support/fake-systemd.ts'
 
-async function runArayaCliWithoutPiBinary(args: string[]) {
+async function runArayaCliWithoutPiBinary(args: string[], extraEnv: Record<string, string> = {}) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-no-pi-cli-test-'))
   const cliPath = fileURLToPath(new URL('../bin/cli.ts', import.meta.url))
   const child = spawn(process.execPath, [cliPath, ...args], {
-    env: { ...readAllProcessEnvironment(), HOME: dir, PATH: dir },
+    env: { ...readAllProcessEnvironment(), HOME: dir, PATH: dir, ...extraEnv },
     stdio: 'pipe',
   })
   const stdout: string[] = []
@@ -291,4 +292,35 @@ test('CLI: Pi SDK はグローバル pi command なしで使える', async () =>
   assert.equal(result.code, 0)
   assert.match(stdout.trim(), /^\d+\.\d+\.\d+$/)
   assert.equal(stderr, '')
+})
+
+test('hoot CLI: agent session の shell 目印があると承認系 command は exit 1 で拒否し、読み取りは通る', async () => {
+  const marker = { [ARAYA_AGENT_SESSION_ENV]: '1' }
+
+  const denied = await runArayaCliWithoutPiBinary(['hoot', 'dispatch', '--key', 'proposal-key'], marker)
+  assert.equal(denied.result.code, 1)
+  assert.match(denied.stderr, /hoot_agent_session_blocked/u)
+  assert.match(denied.stderr, /Discord/u)
+
+  const deniedSettings = await runArayaCliWithoutPiBinary(
+    ['hoot', 'settings', 'set', '--enabled', 'true', '--mode', 'active'],
+    marker,
+  )
+  assert.equal(deniedSettings.result.code, 1)
+  assert.match(deniedSettings.stderr, /hoot_agent_session_blocked/u)
+
+  // 読み取りは agent にも許可する（status で状態を説明できる）
+  const status = await runArayaCliWithoutPiBinary(['hoot', 'status'], marker)
+  assert.equal(status.result.code, 0)
+  assert.match(status.stdout, /enabled: false/u)
+
+  // 目印が無い（人間の shell）则是同じ command が通る
+  const humanDeniedForMissingProposal = await runArayaCliWithoutPiBinary([
+    'hoot',
+    'dispatch',
+    '--key',
+    'proposal-key',
+  ])
+  assert.equal(humanDeniedForMissingProposal.result.code, 1)
+  assert.doesNotMatch(humanDeniedForMissingProposal.stderr, /hoot_agent_session_blocked/u)
 })

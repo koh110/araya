@@ -156,7 +156,7 @@ export function buildInjectPrompt(input: InjectPromptInput): { content: string; 
   const goals = input.goals.slice(0, MAX_GOALS)
   const authorized =
     request.authorizedBy === 'human'
-      ? `人間が \`araya hoot dispatch --key ${proposal.key}\` で承認しました（${request.authorizedAt}）`
+      ? `人間が承認しました（CLI の \`araya hoot dispatch --key ${proposal.key}\` / Discord の \`hoot dispatch --key ${proposal.key}\` のいずれか、${request.authorizedAt}）`
       : `mode=active + autoDispatch により自動承認されました（${request.authorizedAt}）`
 
   const content = `HOOT dispatch の承認済み案件（inject request: ${request.key}）

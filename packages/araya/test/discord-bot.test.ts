@@ -24,6 +24,9 @@ async function createInertChatSession() {
     async submit() {
       return ''
     },
+    describe: () => {
+      return { conversationId: 1 }
+    },
     async reset() {},
     async close() {},
   }
@@ -196,6 +199,9 @@ test('discord bot: 指定 channel の mention なし投稿を会話 session に�
       verifyUnit: false,
       createChatSession: async function createChatSession() {
         return {
+          describe: () => {
+            return { conversationId: 1 }
+          },
           async submit(content, requestId) {
             submissions.push({ content, requestId })
 
@@ -452,6 +458,9 @@ test('discord bot: shutdown は進行中の chat reply を送ってから gatewa
       verifyUnit: false,
       createChatSession: async function createChatSession() {
         return {
+          describe: () => {
+            return { conversationId: 2 }
+          },
           async submit() {
             return await new Promise<string>((resolve) => {
               releaseSubmit = resolve
@@ -562,6 +571,9 @@ test('discord bot: HOOT state が有効なら wakeup loop を走らせて判断�
       },
       createChatSession: async () => {
         return {
+          describe: () => {
+            return { conversationId: 3 }
+          },
           async submit(content, requestId) {
             submissions.push({ content, requestId })
 
@@ -716,6 +728,9 @@ test('discord bot: CLI で承認した HOOT dispatch を main 会話 session に
       }),
       createChatSession: async () => {
         return {
+          describe: () => {
+            return { conversationId: 4 }
+          },
           async submit(content, requestId) {
             submissions.push({ content, requestId })
 
@@ -808,6 +823,183 @@ test('discord bot: CLI で承認した HOOT dispatch を main 会話 session に
     assert.equal(state.injectRequests[0]?.attempts, 1)
     // autoDispatch=false なので判断 run から新しい request は増えていない
     assert.equal(state.runs[0]?.decision, 'wait')
+  } finally {
+    stopController.abort()
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('discord bot: Discord の hoot dispatch 承認を同じ process の poll が拾って main 会話に inject する', async () => {
+  const dataDir = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-command-inject-test-')),
+  )
+  const stopController = new AbortController()
+  const submissions: { content: string; requestId: string }[] = []
+  const notices: { content: string; nonce: string }[] = []
+  const logs: Record<string, unknown>[] = []
+
+  try {
+    await setGoal(dataDir, {
+      key: 'github-scan',
+      objective: 'open issue と draft PR を拾う',
+      scope: ['github:koh110/araya'],
+    })
+    // autoDispatch は off（人間の承認だけで inject する）
+    await updateSettings(dataDir, { enabled: true, tickMinutes: 5, mode: 'active' })
+
+    const proposalKey = proposalKeyOf({ goalKeys: ['github-scan'], decision: 'dispatch' })
+    await upsertProposal(dataDir, {
+      key: proposalKey,
+      decision: 'dispatch',
+      goalKeys: ['github-scan'],
+      reason: 'draft PR 1 件を続行すべきか判断したい',
+      occurrenceKey: 'hoot:2026-11-20T08:00:00.000Z',
+      nowMs: Date.parse('2026-11-20T08:00:00.000Z'),
+    })
+    assert.equal((await readHootState(dataDir)).injectRequests.length, 0)
+
+    const exitCode = await runDiscordBot({
+      dataDir,
+      env: {
+        ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
+        ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
+        ARAYA_DISCORD_GUILD_ID: GUILD_ID,
+        ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
+        ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
+        HOME: dataDir,
+      },
+      stopSignal: stopController.signal,
+      verifyUnit: false,
+      hootPollMs: 100,
+      hootRunCommand: async () => ({
+        exitCode: 0,
+        signal: null,
+        stdout: '[]',
+        stderr: '',
+        stdoutBytes: 2,
+        stderrBytes: 0,
+        terminationReason: undefined,
+        terminationConfirmed: true,
+      }),
+      createChatSession: async () => {
+        return {
+          describe: () => {
+            return { conversationId: 9 }
+          },
+          async submit(content, requestId) {
+            submissions.push({ content, requestId })
+
+            return 'HOOT 案件を進めました'
+          },
+          async reset() {},
+          async close() {},
+          async hootDecide() {
+            return {
+              text: 'HOOT 判断:\nDECISION: wait\nREASON: 次に 1 件進める',
+              conversationId: 44,
+            }
+          },
+        }
+      },
+      createGateway: async (_config, handlers) => {
+        return {
+          async connect() {
+            await handlers.onReady('998877665544332211')
+            // 人間の承认は Discord の message から打つ（CLI を叩きに行かない）
+            await handlers.onMessage(
+              {
+                messageId: 'command-hoot-dispatch',
+                guildId: GUILD_ID,
+                channelId: CHANNEL_ID,
+                userId: USER_ID,
+                isBot: false,
+                isWebhook: false,
+                isSystem: false,
+                mentionsBot: false,
+                content: `hoot dispatch --key ${proposalKey}`,
+              },
+              async (content, nonce) => {
+                notices.push({ content, nonce })
+              }
+            )
+            await handlers.onMessage(
+              {
+                messageId: 'command-hoot-status',
+                guildId: GUILD_ID,
+                channelId: CHANNEL_ID,
+                userId: USER_ID,
+                isBot: false,
+                isWebhook: false,
+                isSystem: false,
+                mentionsBot: false,
+                content: 'status',
+              },
+              async (content, nonce) => {
+                notices.push({ content, nonce })
+              }
+            )
+
+            const deadline = Date.now() + 8_000
+
+            while (
+              !notices.some((entry) => {
+                return entry.content.includes('HOOT 案件を進めました')
+              }) && Date.now() < deadline
+            ) {
+              await new Promise((resolve) => {
+                setTimeout(resolve, 50)
+              })
+            }
+
+            stopController.abort()
+          },
+          async sendText(content, nonce) {
+            notices.push({ content, nonce })
+          },
+          async close() {},
+        }
+      },
+      log: (entry) => {
+        logs.push(entry)
+      },
+    })
+
+    assert.equal(exitCode, 0)
+    const dump = JSON.stringify(logs)
+    assert.match(dump, /"type":"discord_control_command"/u)
+    assert.match(dump, /"type":"hoot_inject_delivered"/u)
+
+    // 承認は state に human として残る
+    const state = await readHootState(dataDir)
+    assert.equal(state.injectRequests.length, 1)
+    assert.equal(state.injectRequests[0]?.authorizedBy, 'human')
+    assert.equal(state.injectRequests[0]?.status, 'injected')
+    assert.equal(state.settings.autoDispatch, false)
+
+    // control command は model に渡さず、inject だけが main 会話へ入る
+    assert.equal(submissions.length, 1)
+    const injectSubmission = submissions[0]
+    assert.equal(injectSubmission?.requestId, `hoot-inject:${proposalKey}:1:attempt:1`)
+    assert.match(injectSubmission?.content ?? '', /open issue と draft PR を拾う/u)
+    assert.match(injectSubmission?.content ?? '', /破壊的な操作は、この承認では許可されていません/u)
+
+    const replies = notices.map((entry) => {
+      return entry.content
+    })
+    // 1: 承認の ack / 2: status 画面 / 3: inject notice / 4: main 会話の answer
+    assert.match(replies.join('\n'), /inject request を作りました: hoot-inject:/u)
+    assert.match(replies.join('\n'), /main conversation #9/u)
+    assert.match(replies.join('\n'), /HOOT dispatch を main 会話に渡しました/u)
+    assert.match(replies.join('\n'), /HOOT 案件を進めました/u)
+    const noticeNonce = notices.find((entry) => {
+      return entry.content.includes('HOOT dispatch を main 会話に渡しました')
+    })?.nonce
+    const answerNonce = notices.find((entry) => {
+      return entry.content === 'HOOT 案件を進めました'
+    })?.nonce
+    assert.notEqual(noticeNonce, undefined)
+    assert.notEqual(answerNonce, undefined)
+    assert.notEqual(noticeNonce, answerNonce)
   } finally {
     stopController.abort()
     await fs.rm(dataDir, { recursive: true, force: true })

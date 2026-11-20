@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
+import fs from 'node:fs/promises'
 import test from 'node:test'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import {
   createDiscordChatHandler,
@@ -10,7 +13,12 @@ import {
   type DiscordChatMessageMetadata,
 } from '../src/discord/chat.ts'
 import { createRedactor } from '../src/infrastructure/redaction.ts'
+import { readHootState, upsertProposal } from '../src/hoot/store.ts'
 import type { DiscordConfig } from '../src/discord/config.ts'
+
+// control command は state file を読むので deps に dataDir が必要（この test の既存ケースは
+// HOOT を触らないので、存在しなくて readHootState は default state を返すだけ）
+const chatDataDir = join(tmpdir(), 'araya-discord-chat-control-test')
 
 const config: DiscordConfig = {
   botToken: 'synthetic-token',
@@ -93,6 +101,7 @@ test('discord chat: 許可 channel の mention なし message を redaction 後�
   await createDiscordChatHandler({
     config,
     botUserId: '12345678901234567',
+    dataDir: chatDataDir,
     redactor: createRedactor(['secret-token']),
     session: {
       submit: async (content, requestId) => {
@@ -136,6 +145,7 @@ test('discord chat: mention なしの空本文は無視し、mention だけな�
   const handler = createDiscordChatHandler({
     config,
     botUserId: '12345678901234567',
+    dataDir: chatDataDir,
     redactor: createRedactor([]),
     session: {
       submit: async (content) => {
@@ -172,6 +182,7 @@ test('discord chat: reset command は Pi session を reset し model には送�
   await createDiscordChatHandler({
     config,
     botUserId: '12345678901234567',
+    dataDir: chatDataDir,
     redactor: createRedactor([]),
     session: {
       submit: async () => {
@@ -205,6 +216,7 @@ test('discord chat: 会話ターンは到着順に直列化する', async () => 
   const handler = createDiscordChatHandler({
     config,
     botUserId: '12345678901234567',
+    dataDir: chatDataDir,
     redactor: createRedactor([]),
     session: {
       submit: async (content) => {
@@ -257,6 +269,7 @@ test('discord chat: stopAccepting は受付を止めても進行中のturnをdra
   const handler = createDiscordChatHandler({
     config,
     botUserId: '12345678901234567',
+    dataDir: chatDataDir,
     redactor: createRedactor([]),
     session: {
       submit: async (content) => {
@@ -299,6 +312,7 @@ test('discord chat: stop は受付済みで未開始のキュー内 message を�
   const handler = createDiscordChatHandler({
     config,
     botUserId: '12345678901234567',
+    dataDir: chatDataDir,
     redactor: createRedactor([]),
     session: {
       submit: async (content) => {
@@ -355,6 +369,7 @@ test('discord chat: HOOT inject は人間の message と同じ session・queue �
   const handler = createDiscordChatHandler({
     config,
     botUserId: '12345678901234567',
+    dataDir: chatDataDir,
     redactor: createRedactor(['hoot-secret']),
     session: {
       submit: async (content, requestId) => {
@@ -421,6 +436,7 @@ test('discord chat: session が無い / stop 後の HOOT inject は hoot_inject_
   const noSession = createDiscordChatHandler({
     config,
     botUserId: '12345678901234567',
+    dataDir: chatDataDir,
     redactor: createRedactor([]),
     session: null,
     log: () => {},
@@ -437,6 +453,7 @@ test('discord chat: session が無い / stop 後の HOOT inject は hoot_inject_
   const stopped = createDiscordChatHandler({
     config,
     botUserId: '12345678901234567',
+    dataDir: chatDataDir,
     redactor: createRedactor([]),
     session: {
       submit: async () => {
@@ -465,6 +482,7 @@ test('discord chat: HOOT inject の submit が失敗しても queue は止まら
   const handler = createDiscordChatHandler({
     config,
     botUserId: '12345678901234567',
+    dataDir: chatDataDir,
     redactor: createRedactor([]),
     session: {
       submit: async (content) => {
@@ -504,4 +522,169 @@ test('discord chat: HOOT inject の submit が失敗しても queue は止まら
   assert.equal(submitted.length, 2)
   assert.match(replies[0] ?? '', /answer after inject failure/u)
   await handler.drain()
+})
+
+test('discord chat: control command は実行中のターンを待たずに応答し model には送らない', async () => {
+  let releaseTurn: (() => void) | undefined
+  const turnGate = new Promise<void>((resolve) => {
+    releaseTurn = resolve
+  })
+  const submitted: string[] = []
+  const replies: string[] = []
+  const handler = createDiscordChatHandler({
+    config,
+    botUserId: '12345678901234567',
+    dataDir: chatDataDir,
+    redactor: createRedactor([]),
+    session: {
+      submit: async (content) => {
+        submitted.push(content)
+        await turnGate
+
+        return '長い作業の応答'
+      },
+      reset: async () => {},
+      describe: () => {
+        return { conversationId: 42 }
+      },
+    },
+    log: () => {},
+  })
+
+  const turn = handler.handle(
+    { ...message, messageId: '92345678901234571', content: '長い作業をして' },
+    async (content) => {
+      replies.push(content)
+    },
+  )
+  // submit が始まるまで待つ（= 会話実行中）
+  await new Promise((resolve) => {
+    setTimeout(resolve, 20)
+  })
+
+  await handler.handle(
+    { ...message, messageId: '92345678901234572', content: 'status' },
+    async (content) => {
+      replies.push(content)
+    },
+  )
+
+  assert.equal(replies.length, 1, 'status は実行中でも queue を待たずに応答する')
+  assert.match(replies[0] ?? '', /main conversation #42 \/ 実行中 1 \/ 待ち 0/u)
+  assert.deepEqual(submitted, ['Discord user 42345678901234567 said:\n長い作業をして'])
+
+  releaseTurn?.()
+  await turn
+  await handler.drain()
+  assert.equal(replies.length, 2)
+  assert.match(replies[1] ?? '', /長い作業の応答/u)
+})
+
+test('discord chat: session reset と書いた message も reset として扱う', async () => {
+  const resetRequestIds: (string | undefined)[] = []
+  const replies: string[] = []
+  let submitCount = 0
+
+  await createDiscordChatHandler({
+    config,
+    botUserId: '12345678901234567',
+    dataDir: chatDataDir,
+    redactor: createRedactor([]),
+    session: {
+      submit: async () => {
+        submitCount += 1
+
+        return 'unexpected'
+      },
+      reset: async (requestId?: string) => {
+        resetRequestIds.push(requestId)
+      },
+    },
+    log: () => {},
+  }).handle(
+    { ...message, mentionsBot: true, messageId: '92345678901234573', content: '<@12345678901234567> session reset' },
+    async (content) => {
+      replies.push(content)
+    },
+  )
+
+  assert.deepEqual(resetRequestIds, ['92345678901234573'])
+  assert.equal(submitCount, 0)
+})
+
+test('discord chat: hoot dispatch を Discord から送ると inject request が pending になる', async () => {
+  const dataDir = await fs.realpath(await fs.mkdtemp(join(tmpdir(), 'araya-chat-hoot-test-')))
+  const replies: string[] = []
+  const submitted: string[] = []
+  const handler = createDiscordChatHandler({
+    config,
+    botUserId: '12345678901234567',
+    dataDir,
+    redactor: createRedactor([]),
+    nowMs: () => {
+      return Date.parse('2026-11-20T09:00:00.000Z')
+    },
+    session: {
+      submit: async (content) => {
+        submitted.push(content)
+
+        return '会話の応答'
+      },
+      reset: async () => {},
+    },
+    log: () => {},
+  })
+
+  await handler.handle(
+    { ...message, messageId: '92345678901234574', content: 'hoot goal add --key araya-quality --objective "diff を見る"' },
+    async (content) => {
+      replies.push(content)
+    },
+  )
+  await handler.handle(
+    { ...message, messageId: '92345678901234575', content: 'hoot settings set --enabled true --mode active' },
+    async (content) => {
+      replies.push(content)
+    },
+  )
+  await upsertProposal(dataDir, {
+    key: 'dispatch-proposal',
+    decision: 'dispatch',
+    goalKeys: ['araya-quality'],
+    reason: 'draft PR の diff を渡す',
+    occurrenceKey: 'hoot:2026-11-20T09:00:00.000Z',
+    nowMs: Date.parse('2026-11-20T09:00:00.000Z'),
+  })
+
+  await handler.handle(
+    { ...message, messageId: '92345678901234576', content: 'hoot dispatch --key dispatch-proposal' },
+    async (content) => {
+      replies.push(content)
+    },
+  )
+
+  const state = await readHootState(dataDir)
+  assert.equal(state.injectRequests.length, 1)
+  assert.equal(state.injectRequests[0]?.authorizedBy, 'human')
+  assert.equal(state.injectRequests[0]?.status, 'pending')
+  assert.match(replies.join('\n'), /hoot-inject:dispatch-proposal:1/u)
+  assert.equal(submitted.length, 0, 'control command は model に渡さない')
+
+  // session が無ても HOOT の操作は効く
+  const offline = createDiscordChatHandler({
+    config,
+    botUserId: '12345678901234567',
+    dataDir,
+    redactor: createRedactor([]),
+    session: null,
+    log: () => {},
+  })
+  const offlineReplies: string[] = []
+  await offline.handle(
+    { ...message, messageId: '92345678901234577', content: 'hoot inject list' },
+    async (content) => {
+      offlineReplies.push(content)
+    },
+  )
+  assert.match(offlineReplies.join('\n'), /\[pending\] dispatch proposal=dispatch-proposal/u)
 })
