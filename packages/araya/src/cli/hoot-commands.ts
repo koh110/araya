@@ -459,8 +459,8 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
     if (enqueued.request === null) {
       const reason = enqueued.skipped ?? 'unknown'
       const guidance: Record<string, string> = {
-        cooldown: '前の inject からの cooldown 中です（araya hoot settings set --inject-cooldown-minutes <分>）',
-        daily_limit: '1 UTC 日の inject 上限です（araya hoot settings set --max-injects-per-day <件数>）',
+        cooldown: '前の inject からの cooldown 中です（araya hoot settings set --inject-cooldown-minutes <分> / Discord の /hoot settings set inject-cooldown-minutes:<分>）',
+        daily_limit: '1 UTC 日の inject 上限です（araya hoot settings set --max-injects-per-day <件数> / Discord の /hoot settings set max-injects-per-day:<件数>）',
         already_pending: '同じ proposal への inject がまだ未完了です（araya hoot inject list）',
         auto_dispatch_off: 'autoDispatch=false では人間の dispatch だけが inject されます',
       }
@@ -489,7 +489,9 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
     const state = await readHootState(dataDir)
 
     if (state.injectRequests.length === 0) {
-      deps.stdout(`inject request の記録はありません（araya hoot dispatch --key <proposal key> で作ります。保持は直近 ${MAX_INJECTS_KEPT} 件）`)
+      deps.stdout(
+        `inject request の記録はありません（araya hoot dispatch --key <proposal key> / Discord の /hoot dispatch key:<proposal key> で作ります。保持は直近 ${MAX_INJECTS_KEPT} 件）`
+      )
 
       return
     }

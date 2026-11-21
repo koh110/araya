@@ -1,15 +1,20 @@
 // discord.js との接続。型Importだけにして discord.js の実行時 import は関内に行う（CLI 起動や test で load しない）
 // gateway interface を関数にすることで bot.ts の loop を fake で test できる
 
-import type { ChatInputCommandInteraction, GuildTextBasedChannel, Interaction } from 'discord.js'
+import type {
+  ApplicationCommandDataResolvable,
+  ChatInputCommandInteraction,
+  GuildTextBasedChannel,
+  Interaction,
+} from 'discord.js'
 import { type DiscordConfig } from './config.ts'
 import { isDiscordChatMessageAllowed, type DiscordChatMessage } from './chat.ts'
+import { isArayaCommandName, REMOVED_COMMAND_REPLY, type SlashCommand } from './slash.ts'
 
-// slash command の interaction を handler に渡すための形（task 機構の撤去後も guild に残った定義への応答に使う）
-export const ARAYA_COMMAND_NAME = 'araya'
-
+// slash command の interaction を handler に渡すための形（command 名は slash.ts の ARAYA_COMMAND_NAMES）
 export type DiscordCommandRequest = {
   interactionId: string
+  commandName: string
   userId: string
   guildId: string | null
   channelId: string | null
@@ -32,6 +37,8 @@ export type DiscordGatewayHandlers = {
 export type DiscordGateway = {
   connect(): Promise<void>
   sendText(content: string, nonce: string): Promise<void>
+  // guild への slash command 登録（bulk overwrite。同じ定義を何度流しても置き換えになる）
+  registerCommands(commands: readonly SlashCommand[]): Promise<number>
   close(): Promise<void>
 }
 
@@ -168,9 +175,8 @@ export function flattenDiscordCommandOptions(entries: readonly InteractionOption
   return options
 }
 
-// task 機構の撤去後に返す案内（静的な text）。routeSlashCommandInteraction の実経路で test する
-export const OBSOLETE_COMMAND_REPLY =
-  'araya の slash command は撤去されました。Discord 側の command 定義は guild から削除してください'
+// task 機構の撤去後に返す案内（slash.ts の 1 つの text を共有する）。routeSlashCommandInteraction の実経路で test する
+export { REMOVED_COMMAND_REPLY as OBSOLETE_COMMAND_REPLY } from './slash.ts'
 
 // slash command interaction の実処理。createDiscordGateway の client.on('interactionCreate') は
 // この function を呼ぶだけ。handler 不在時は ephemeral の撤去案内を返し、throw しない
@@ -178,7 +184,7 @@ export async function routeSlashCommandInteraction(
   interaction: Interaction,
   handlers: DiscordGatewayHandlers,
 ) {
-  if (!interaction.isChatInputCommand() || interaction.commandName !== ARAYA_COMMAND_NAME) {
+  if (!interaction.isChatInputCommand() || !isArayaCommandName(interaction.commandName)) {
     return
   }
 
@@ -212,7 +218,7 @@ export async function routeSlashCommandInteraction(
 
   if (!handlers.onInteraction) {
     try {
-      await reply(OBSOLETE_COMMAND_REPLY)
+      await reply(REMOVED_COMMAND_REPLY)
     } catch (error: unknown) {
       handlers.onError(errorMessage(error))
     }
@@ -224,6 +230,7 @@ export async function routeSlashCommandInteraction(
     await handlers.onInteraction(
       {
         interactionId: commandInteraction.id,
+        commandName: commandInteraction.commandName,
         userId: commandInteraction.user.id,
         guildId: commandInteraction.guildId,
         channelId: commandInteraction.channelId,
@@ -349,6 +356,20 @@ export async function createDiscordGateway(
       }
 
       await channel.send(discordNotificationPayload(content, nonce))
+    },
+    // guild 配下の command を bulk overwrite で登録する（bot startup から呼ぶ）。同じ定義を何度流しても置き換え。
+    // client.application が null（ready 前）なら error。呼び出し側で log して会話機能は続ける
+    registerCommands: async (commands) => {
+      if (client.application === null) {
+        throw new Error('discord_application_unavailable: client.application がありません（ready 後に登録してください）')
+      }
+
+      const registered = await client.application.commands.set(
+        commands as unknown as readonly ApplicationCommandDataResolvable[],
+        config.guildId,
+      )
+
+      return registered.size
     },
     close: async () => {
       typingIndicator.close()

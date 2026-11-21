@@ -11,10 +11,12 @@ import { collectSecretValues, createRedactor } from '../infrastructure/redaction
 import { dataDirHash, discordUnitName } from '../infrastructure/systemd.ts'
 import { loadDiscordConfig, type DiscordConfig } from './config.ts'
 import {
+  CHAT_UNAVAILABLE_REPLY,
   createDiscordChatHandler,
   splitDiscordChatReply,
   type DiscordChatHandler,
 } from './chat.ts'
+import { ARAYA_SLASH_COMMANDS, validateArayaSlashCommands } from './slash.ts'
 import { createDefaultArayaAgentSession, type ArayaAgentSession } from '../agent/host.ts'
 import { createHootLoop } from '../hoot/tick.ts'
 import type { ObservationDependencies } from '../hoot/observe.ts'
@@ -312,9 +314,40 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
       // install の ready 判定は state file を読む
       writeDiscordBotState(dataDir, state)
       logSafe({ type: 'discord_ready', unit })
+
+      // channel からの操作は slash command に統一する（Issue #33）。guild へ bulk overwrite で登録し、
+      // 失敗しても会話機能は止めない（command が出ない状態は log で見られる）
+      void (async () => {
+        const problems = validateArayaSlashCommands(ARAYA_SLASH_COMMANDS)
+
+        if (problems.length > 0) {
+          logSafe({ type: 'discord_commands_invalid', problems: problems.slice(0, 10) })
+
+          return
+        }
+
+        try {
+          const registered = await gateway.registerCommands(ARAYA_SLASH_COMMANDS)
+          logSafe({ type: 'discord_commands_registered', commands: registered })
+        } catch (error) {
+          logError('discord_commands_register_failed', error)
+        }
+      })()
     },
     onMessage: async (message, reply) => {
       await chatHandlerRef.current?.handle(message, reply)
+    },
+    // slash command（/araya ... / /hoot ...）。queue を通さないので会話の実行中でも効く
+    onInteraction: async (request, reply) => {
+      const chatHandler = chatHandlerRef.current
+
+      if (chatHandler === null) {
+        await reply(CHAT_UNAVAILABLE_REPLY).catch(() => undefined)
+
+        return
+      }
+
+      await chatHandler.handleCommand(request, reply)
     },
     onError: (message) => {
       logSafe({ type: 'discord_error', message: redactor.redact(message).slice(0, 500) })

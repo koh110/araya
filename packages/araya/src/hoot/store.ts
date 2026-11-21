@@ -680,7 +680,7 @@ export async function enqueueHootInject(
     if (state.settings.mode !== 'active') {
       throw hootError(
         'hoot_mode_dry_run',
-        'mode が dry_run の間は main 会話への inject を作りません（araya hoot settings set --mode active）'
+        'mode が dry_run の間は main 会話への inject を作りません（araya hoot settings set --mode active / Discord の /hoot settings set mode:active）'
       )
     }
 

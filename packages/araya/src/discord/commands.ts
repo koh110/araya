@@ -1,18 +1,20 @@
-// Discord の message から会話 session と HOOT を操作する control command（Issue #33）。
-// 人間の message を model に渡すのではなく、bot process の code が直接処理する。
-// 実行待ち queue の外で走るので、会話の実行中・待ち状態でも常に効く
+// Discord の slash command から会話 session と HOOT を操作する control plane（Issue #33）。
+// channel からの操作は slash command に統一する（message 解析はしない。解析は Discord が行う）。
+// interaction は queue の外で処理するので、会話の実行中・待ち状態でも常に効く。
+// 人間の interaction だけがこの function 群に到達するので、HOOT の承認は agent 経由ではない
 import { runHootCommand } from '../cli/hoot-commands.ts'
+import { HOOT_COMMAND_NAME, REMOVED_COMMAND_REPLY, REMOVED_TASK_SUBCOMMANDS, SESSION_COMMAND_NAME } from './slash.ts'
+import type { DiscordCommandRequest } from './gateway.ts'
 
 export type DiscordControlSend = (content: string) => Promise<void>
 
 export type DiscordControlContext = {
-  messageId: string
   // main conversation の durable id（session が未開なら null）
   conversationId: number | null
   runningCount: number
   queuedCount: number
   sessionAvailable: boolean
-  // 応答は chat handler 側で redaction・分割・nonce 付きで channel に送る
+  // 応答は chat handler 側で redaction・分割して ephemeral に送る
   send: DiscordControlSend
   // 受付済みで未開始の message を無効化し、件数を返す
   cancelQueued(): number
@@ -27,107 +29,196 @@ export type DiscordControlDependencies = {
 }
 
 export type DiscordControlCommands = {
-  matches(content: string): boolean
-  handle(content: string, context: DiscordControlContext): Promise<void>
+  handle(request: DiscordCommandRequest, context: DiscordControlContext): Promise<void>
 }
 
 export const DISCORD_CONTROL_USAGE = [
-  'Discord control command:',
-  '  help            … この一覧',
-  '  status          … 会話 session と HOOT の状態（1 画面）',
-  '  stop            … 実行中の submit と実行待ちの作業へ中止を要求',
-  '  reset           … この channel の会話を作り直す（`session reset` でも同じ）',
-  '  hoot status     … HOOT の状態（goal / proposal / inject queue / 歯止め）',
-  '  hoot goal list  … goal 一覧（追加は hoot goal add --key <key> --objective "<目的>" [--scope github:owner/repo]）',
-  '  hoot proposal list … 提案一覧',
-  '  hoot dispatch --key <proposal key> … 承認済みの dispatch を main 会話へ inject する承認',
-  '  hoot inject list … inject request の状態',
-  '  hoot runs       … 判断 run の記録',
-  '  hoot settings set --enabled true|false --mode dry_run|active --auto-dispatch true|false … 設定変更',
-  '  hoot proposal resolve --key <key> / hoot reset-schedule',
-  '（hoot の後は `araya hoot` と同じ引数で動きます。--data-dir は Discord からは指定できません）',
+  'Discord slash command（ephemeral であなただけに見えます。text message はそのまま会話として model に渡ります）:',
+  '  /araya status  … 会話 session と HOOT の状態（1 画面）',
+  '  /araya stop    … 実行中の submit と実行待ちの依頼へ中止を要求',
+  '  /araya reset   … この channel の会話を作り直す（inject 済みの文脈も切れる）',
+  '  /araya help    … この一覧',
+  '  /hoot status   … HOOT の状態（goal / proposal / inject queue / 歯止め）',
+  '  /hoot dispatch key:<proposal key> … 承認済みの dispatch を main 会話へ inject する承認',
+  '  /hoot inject list … inject request の状態',
+  '  /hoot runs     … 判断 run の記録',
+  '  /hoot goal list / pause / resume / retire key:<key> … goal の一覧と status 変更',
+  '  /hoot goal add key:<key> objective:<1 文> [scope:github:owner/repo,...] [constraint:...] [review-at:YYYY-MM-DD|none]',
+  '  /hoot goal update key:<key> … 指定した field だけ更新（未指定は現状維持）',
+  '  /hoot proposal list / resolve key:<key> … 提案の一覧と解決済み化',
+  '  /hoot settings show / set … 設定（enabled・mode・auto-dispatch・max-injects-per-day・inject-cooldown-minutes など）',
+  '  /hoot reset-schedule … schedule だけ戻す（run 記録・settings・proposals・inject request は保つ）',
+  '（HOOT の承認・goal・設定の変更は人間専用です。agent session の内側から araya hoot の書き込み command は拒否されます）',
 ].join('\n')
 
-// bot mention を落とした先頭がこれに一致する message だけ control plane に流す。
-// help / status / stop / reset は message 全体が一致しなければ会話本文として model に渡す。
-// `hoot` は予約 prefix（この語で始まる message は hoot の引数として解析する）
-const SESSION_CONTROL_PATTERN = /^(?:help|status|stop|reset|session[ \t]+reset)$/iu
-const HOOT_CONTROL_PATTERN = /^hoot(?=[ \t]|$)/iu
+// hoot command の option を CLI の引数配列へ変換する対応表。Discord 側は option 名だけを渡す
+const HOOT_TOP_SUBCOMMANDS = new Set(['status', 'dispatch', 'runs', 'reset-schedule'])
+const HOOT_GOAL_SUBCOMMANDS = new Set(['list', 'add', 'update', 'pause', 'resume', 'retire'])
+const HOOT_SETTINGS_SUBCOMMANDS = new Set(['show', 'set'])
+const HOOT_PROPOSAL_SUBCOMMANDS = new Set(['list', 'resolve'])
+const HOOT_INJECT_SUBCOMMANDS = new Set(['list'])
+const HOOT_SETTINGS_FLAGS = [
+  'enabled',
+  'mode',
+  'tick-minutes',
+  'max-runs-per-day',
+  'notify-decisions',
+  'precheck',
+  'watchdog-hours',
+  'digest-hour-utc',
+  'reset-conversation-after-runs',
+  'goal-review-days',
+  'proposal-ttl-hours',
+  'max-proposal-reminders',
+  'auto-dispatch',
+  'max-injects-per-day',
+  'inject-cooldown-minutes',
+] as const
+
+const MAX_CONTROL_ARGUMENT_CHARS = 4_000
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
 
-// "..." / '...' を 1 引数として扱う。quote が閉じていなければ誤り
-export function tokenizeDiscordArguments(text: string): string[] {
-  const tokens: string[] = []
-  let current = ''
-  let quote: '"' | "'" | null = null
-
-  for (const character of text) {
-    if (quote !== null) {
-      if (character === quote) {
-        quote = null
-      } else {
-        current += character
-      }
-
-      continue
-    }
-
-    if (character === '"' || character === "'") {
-      quote = character
-
-      continue
-    }
-
-    if (/\s/u.test(character)) {
-      if (current !== '') {
-        tokens.push(current)
-        current = ''
-      }
-
-      continue
-    }
-
-    current += character
-  }
-
-  if (quote !== null) {
-    throw new Error('hoot_invalid_argument: quote を閉じてください')
-  }
-
-  if (current !== '') {
-    tokens.push(current)
-  }
-
-  return tokens
+function invalid(message: string) {
+  return new Error(`hoot_invalid_argument: ${message}`)
 }
 
-export function createDiscordControlCommands(deps: DiscordControlDependencies): DiscordControlCommands {
-  function matches(content: string) {
-    const trimmed = content.trim()
+function optionValue(options: DiscordCommandRequest['options'], name: string) {
+  const value = options[name]
 
-    return SESSION_CONTROL_PATTERN.test(trimmed) || HOOT_CONTROL_PATTERN.test(trimmed)
+  if (value === undefined) {
+    return undefined
   }
 
-  // hoot の引数列を作る。--data-dir は bot process の dataDir だけを正とする
-  function hootArgumentsOf(content: string) {
-    const rest = content.trim().slice('hoot'.length).trim()
+  if (typeof value === 'boolean') {
+    return value ? 'true' : 'false'
+  }
 
-    if (rest.length > 1200) {
-      throw new Error('hoot_invalid_argument: 長すぎます（1200 文字以内で送ってください）')
+  return String(value)
+}
+
+function requiredOptionValue(options: DiscordCommandRequest['options'], name: string, where: string) {
+  const value = optionValue(options, name)
+
+  if (value === undefined || value.trim() === '') {
+    throw invalid(`${where} は ${name} が必要です`)
+  }
+
+  return value
+}
+
+function pushFlag(args: string[], options: DiscordCommandRequest['options'], name: string) {
+  const value = optionValue(options, name)
+
+  if (value === undefined) {
+    return
+  }
+
+  args.push(`--${name}`, value)
+}
+
+// Discord の option を `araya hoot` と同じ引数列にする。--data-dir は Discord からは渡れない
+// （option 定義に無いが、万一来ても拒否して bot process の dataDir を正とする）
+export function hootArgumentsOf(request: DiscordCommandRequest): string[] {
+  const options = request.options ?? {}
+
+  if (optionValue(options, 'data-dir') !== undefined) {
+    throw invalid('Discord から --data-dir は指定できません（bot process の dataDir を使います）')
+  }
+
+  const group = (request.subcommandGroup ?? '').toLowerCase()
+  const subcommand = (request.subcommand ?? '').toLowerCase()
+
+  if (group === '') {
+    if (!HOOT_TOP_SUBCOMMANDS.has(subcommand)) {
+      throw invalid(`/hoot ${subcommand} は知りません（/araya help で一覧）`)
     }
 
-    const args = tokenizeDiscordArguments(rest)
+    if (subcommand === 'dispatch') {
+      return ['dispatch', '--key', requiredOptionValue(options, 'key', '/hoot dispatch')]
+    }
 
-    if (args.some((arg) => arg === '--data-dir' || arg.startsWith('--data-dir='))) {
-      throw new Error('hoot_invalid_argument: Discord からは --data-dir を指定できません（bot process の dataDir を使います）')
+    return [subcommand]
+  }
+
+  if (group === 'goal') {
+    if (!HOOT_GOAL_SUBCOMMANDS.has(subcommand)) {
+      throw invalid(`/hoot goal ${subcommand} は知りません（list / add / update / pause / resume / retire）`)
+    }
+
+    const args = ['goal', subcommand]
+
+    if (subcommand === 'list') {
+      return args
+    }
+
+    args.push('--key', requiredOptionValue(options, 'key', `/hoot goal ${subcommand}`))
+
+    if (subcommand === 'add' || subcommand === 'update') {
+      if (subcommand === 'add') {
+        args.push('--objective', requiredOptionValue(options, 'objective', '/hoot goal add'))
+      } else {
+        pushFlag(args, options, 'objective')
+      }
+
+      pushFlag(args, options, 'scope')
+      pushFlag(args, options, 'constraint')
+      pushFlag(args, options, 'review-at')
     }
 
     return args
   }
 
+  if (group === 'settings') {
+    if (!HOOT_SETTINGS_SUBCOMMANDS.has(subcommand)) {
+      throw invalid(`/hoot settings ${subcommand} は知りません（show / set）`)
+    }
+
+    const args = ['settings', subcommand]
+
+    if (subcommand === 'show') {
+      return args
+    }
+
+    for (const flag of HOOT_SETTINGS_FLAGS) {
+      pushFlag(args, options, flag)
+    }
+
+    if (args.length === 2) {
+      throw invalid('/hoot settings set は 1 つ以上の field が必要です')
+    }
+
+    return args
+  }
+
+  if (group === 'proposal') {
+    if (!HOOT_PROPOSAL_SUBCOMMANDS.has(subcommand)) {
+      throw invalid(`/hoot proposal ${subcommand} は知りません（list / resolve）`)
+    }
+
+    const args = ['proposal', subcommand]
+
+    if (subcommand === 'resolve') {
+      args.push('--key', requiredOptionValue(options, 'key', '/hoot proposal resolve'))
+    }
+
+    return args
+  }
+
+  if (group === 'inject') {
+    if (!HOOT_INJECT_SUBCOMMANDS.has(subcommand)) {
+      throw invalid(`/hoot inject ${subcommand} は知りません（list）`)
+    }
+
+    return ['inject', 'list']
+  }
+
+  throw invalid(`/hoot ${group} は知りません（/araya help で一覧）`)
+}
+
+export function createDiscordControlCommands(deps: DiscordControlDependencies): DiscordControlCommands {
   async function runHoot(args: readonly string[]) {
     const lines: string[] = []
 
@@ -142,61 +233,99 @@ export function createDiscordControlCommands(deps: DiscordControlDependencies): 
     return lines.join('\n')
   }
 
-  async function handle(content: string, context: DiscordControlContext) {
-    const trimmed = content.trim()
-    const collapsed = trimmed.replace(/[ \t]+/gu, ' ').toLowerCase()
+  function commandLabel(request: DiscordCommandRequest) {
+    const group = request.subcommandGroup ?? ''
+    const subcommand = request.subcommand ?? ''
 
-    if (collapsed === 'help') {
-      deps.log({ type: 'discord_control_command', command: 'help' })
-      await context.send(DISCORD_CONTROL_USAGE)
+    return `${request.commandName} ${group} ${subcommand}`.replace(/\s+/gu, ' ').trim().slice(0, 200)
+  }
 
-      return
-    }
+  async function handle(request: DiscordCommandRequest, context: DiscordControlContext) {
+    const commandName = (request.commandName ?? '').toLowerCase()
+    const subcommand = (request.subcommand ?? '').toLowerCase()
 
-    if (collapsed === 'status') {
-      deps.log({ type: 'discord_control_command', command: 'status' })
-      const session =
-        context.conversationId === null
-          ? '会話 session は開けていません（agent session がありません）'
-          : `会話: main conversation #${context.conversationId.toString()} / 実行中 ${context.runningCount.toString()} / 待ち ${context.queuedCount.toString()}`
-      let hootText: string
+    if (commandName === SESSION_COMMAND_NAME) {
+      // guild に古い /araya task ... の定義が残っている人へは、打った subcommand を示す撤去案内を返す
+      if ((request.subcommandGroup ?? '').toLowerCase() === 'task' || (REMOVED_TASK_SUBCOMMANDS as readonly string[]).includes(subcommand)) {
+        deps.log({ type: 'discord_control_command', command: `araya (removed) ${subcommand}` })
+        await context.send(REMOVED_COMMAND_REPLY)
 
-      try {
-        hootText = await runHoot(['status'])
-      } catch (error) {
-        deps.log({ type: 'discord_control_failed', command: 'status', message: errorMessage(error).slice(0, 500) })
-        hootText = `HOOT の状態を読めませんでした: ${errorMessage(error)}`
+        return
       }
 
-      await context.send(`${session}\n\n${hootText}`)
+      if (subcommand === 'help') {
+        deps.log({ type: 'discord_control_command', command: 'araya help' })
+        await context.send(DISCORD_CONTROL_USAGE)
+
+        return
+      }
+
+      if (subcommand === 'status') {
+        deps.log({ type: 'discord_control_command', command: 'araya status' })
+        const session =
+          context.conversationId === null
+            ? '会話 session は開けていません（agent session がありません）'
+            : `会話: main conversation #${context.conversationId.toString()} / 実行中 ${context.runningCount.toString()} / 待ち ${context.queuedCount.toString()}`
+        let hootText: string
+
+        try {
+          hootText = await runHoot(['status'])
+        } catch (error) {
+          deps.log({ type: 'discord_control_failed', command: 'araya status', message: errorMessage(error).slice(0, 500) })
+          hootText = `HOOT の状態を読めませんでした: ${errorMessage(error)}`
+        }
+
+        await context.send(`${session}\n\n${hootText}`)
+
+        return
+      }
+
+      if (subcommand === 'stop') {
+        const cancelled = context.cancelQueued()
+        const text = await context.stopSession()
+        deps.log({ type: 'discord_control_command', command: 'araya stop', cancelled })
+        await context.send(cancelled > 0 ? `${text}（実行待ち ${cancelled.toString()} 件を取り消しました）` : text)
+
+        return
+      }
+
+      if (subcommand === 'reset') {
+        // interaction id を durable submit の requestId にする（同じ interaction を繰り返さない）
+        const text = await context.resetSession(request.interactionId)
+        deps.log({ type: 'discord_control_command', command: 'araya reset' })
+        await context.send(text)
+
+        return
+      }
+
+      deps.log({ type: 'discord_control_failed', command: `araya ${subcommand}` })
+      await context.send(`できませんでした: /araya ${subcommand} は知りません（/araya help で一覧）`)
 
       return
     }
 
-    if (collapsed === 'stop') {
-      const cancelled = context.cancelQueued()
-      const text = await context.stopSession()
-      deps.log({ type: 'discord_control_command', command: 'stop', cancelled })
-      await context.send(cancelled > 0 ? `${text}（実行待ち ${cancelled.toString()} 件を取り消しました）` : text)
+    if (commandName !== HOOT_COMMAND_NAME) {
+      deps.log({ type: 'discord_control_failed', command: commandName.slice(0, 200) })
+      await context.send('できませんでした: /araya か /hoot を使ってください')
 
       return
     }
 
-    if (collapsed === 'reset' || collapsed === 'session reset') {
-      const text = await context.resetSession(context.messageId)
-      deps.log({ type: 'discord_control_command', command: 'reset' })
-      await context.send(text)
-
-      return
-    }
-
-    const args: string[] = []
+    const label = commandLabel(request)
+    let args: string[]
 
     try {
-      args.push(...hootArgumentsOf(trimmed))
+      args = hootArgumentsOf(request)
     } catch (error) {
-      deps.log({ type: 'discord_control_failed', command: 'hoot', message: errorMessage(error).slice(0, 500) })
+      deps.log({ type: 'discord_control_failed', command: label, message: errorMessage(error).slice(0, 500) })
       await context.send(`できませんでした: ${errorMessage(error)}`)
+
+      return
+    }
+
+    if (args.join(' ').length > MAX_CONTROL_ARGUMENT_CHARS) {
+      deps.log({ type: 'discord_control_failed', command: label, message: 'too_long' })
+      await context.send('できませんでした: 入力が長すぎます')
 
       return
     }
@@ -208,7 +337,7 @@ export function createDiscordControlCommands(deps: DiscordControlDependencies): 
     } catch (error) {
       deps.log({
         type: 'discord_control_failed',
-        command: `hoot ${args.join(' ')}`.slice(0, 200),
+        command: label,
         message: errorMessage(error).slice(0, 500),
       })
       await context.send(`できませんでした: ${errorMessage(error)}`)
@@ -216,9 +345,9 @@ export function createDiscordControlCommands(deps: DiscordControlDependencies): 
       return
     }
 
-    deps.log({ type: 'discord_control_command', command: `hoot ${args.join(' ')}`.slice(0, 200) })
+    deps.log({ type: 'discord_control_command', command: label, args: args.join(' ').slice(0, 200) })
     await context.send(output === '' ? '出力はありません' : output)
   }
 
-  return { matches, handle }
+  return { handle }
 }

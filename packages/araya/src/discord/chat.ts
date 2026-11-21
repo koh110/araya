@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import type { Redactor } from '../infrastructure/redaction.ts'
 import { createDiscordControlCommands, type DiscordControlCommands } from './commands.ts'
 import type { DiscordConfig } from './config.ts'
+import type { DiscordCommandRequest } from './gateway.ts'
 
 export type DiscordChatMessageMetadata = {
   guildId: string | null
@@ -115,6 +116,9 @@ export type DiscordChatSession = {
 
 export type DiscordChatReply = (content: string, nonce: string) => Promise<void>
 
+// slash command の応答（ephemeral）。nonce は不要なので本文だけ渡す
+export type DiscordCommandReply = (content: string) => Promise<void>
+
 // HOOT が承認済みの dispatch を main 会話へ流すための input（Issue #31）。
 // 人間の message と同じ queue で直列化するので、会話の途中に別の agent が割り込まない
 export type DiscordChatInjection = {
@@ -140,12 +144,14 @@ export type DiscordChatHandlerDependencies = {
 
 export type DiscordChatHandler = {
   handle(message: DiscordChatMessage, reply: DiscordChatReply): Promise<void>
+  // slash command（/araya ... / /hoot ...）を queue の外で処理する。会話の実行中でも効く
+  handleCommand(request: DiscordCommandRequest, reply: DiscordCommandReply): Promise<void>
   inject(injection: DiscordChatInjection, reply: DiscordChatReply): Promise<string>
   stopAccepting(): void
   drain(): Promise<void>
 }
 
-const CHAT_UNAVAILABLE_REPLY =
+export const CHAT_UNAVAILABLE_REPLY =
   '現在、Araya の会話機能を利用できません。管理者は discord.log を確認してください。'
 const CHAT_ERROR_REPLY = '会話の処理に失敗しました。内容を短くして再度お試しください。'
 
@@ -227,74 +233,109 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
     }
   }
 
-  // control command は queue の外で処理する（会話の実行中・待ちでも常に効く制御系）
-  async function processControl(message: DiscordChatMessage, reply: DiscordChatReply, content: string) {
+  // slash command は queue の外で処理する（会話の実行中・待ちでも常に効く制御系）
+  async function processCommand(request: DiscordCommandRequest, reply: DiscordCommandReply) {
     const cancelledCount = { value: 0 }
+    // 応答は ephemeral（command を打った人だけに見える）。長い output は 2000 字で切って followUp する
+    const send = async (text: string) => {
+      for (const chunk of splitDiscordChatReply(deps.redactor.redact(text))) {
+        try {
+          await reply(chunk)
+        } catch (error) {
+          deps.log({ type: 'discord_command_reply_failed', errorName: errorName(error) })
 
-    try {
-      await control.handle(content, {
-        messageId: message.messageId,
-        conversationId: conversationIdOf(),
-        runningCount: processing,
-        queuedCount: queued.length,
-        sessionAvailable: deps.session !== null,
-        send: (text): Promise<void> => sendText(reply, message.messageId, text),
-        cancelQueued: () => {
-          let cancelled = 0
-
-          for (const item of queued) {
-            if (!item.cancelled) {
-              item.cancelled = true
-              cancelled += 1
-            }
-          }
-
-          cancelledCount.value = cancelled
-
-          return cancelled
-        },
-        stopSession: async () => {
-          if (deps.session === null) {
-            return '会話 session が開いていないので、中止を要求できませんでした'
-          }
-
-          await deps.session.stop?.()
-
-          return '実行中・実行待ちの作業があれば中止を要求しました'
-        },
-        resetSession: async (requestId) => {
-          if (deps.session === null) {
-            return '会話 session が開いていないので、リセットできませんでした'
-          }
-
-          await deps.session.reset(requestId)
-
-          return 'この channel の会話をリセットしました'
-        },
-      })
-    } catch (error) {
-      deps.log({ type: 'discord_control_failed', message: errorName(error) })
-      await send(message, reply, 'command を処理できませんでした。`help` で一覧を見られます')
+          return
+        }
+      }
     }
+
+    await control.handle(request, {
+      conversationId: conversationIdOf(),
+      runningCount: processing,
+      queuedCount: queued.length,
+      sessionAvailable: deps.session !== null,
+      send,
+      cancelQueued: () => {
+        let cancelled = 0
+
+        for (const item of queued) {
+          if (!item.cancelled) {
+            item.cancelled = true
+            cancelled += 1
+          }
+        }
+
+        cancelledCount.value = cancelled
+
+        return cancelled
+      },
+      stopSession: async () => {
+        if (deps.session === null) {
+          return '会話 session が開いていないので、中止を要求できませんでした'
+        }
+
+        await deps.session.stop?.()
+
+        return '実行中・実行待ちの作業があれば中止を要求しました'
+      },
+      resetSession: async (requestId) => {
+        if (deps.session === null) {
+          return '会話 session が開いていないので、リセットできませんでした'
+        }
+
+        await deps.session.reset(requestId)
+
+        return 'この channel の会話をリセットしました'
+      },
+    })
   }
 
   return {
+    // slash command の interaction。allowlist 検証と redaction は chat と同じ規則にする
+    handleCommand: async (request: DiscordCommandRequest, reply: DiscordCommandReply) => {
+      const allowed = isDiscordChatMessageAllowed(
+        {
+          guildId: request.guildId,
+          channelId: request.channelId ?? '',
+          userId: request.userId,
+          isBot: false,
+          isWebhook: false,
+          isSystem: false,
+          mentionsBot: false,
+        },
+        deps.config,
+      )
+
+      if (!allowed) {
+        deps.log({ type: 'discord_command_denied', commandName: request.commandName, userId: request.userId })
+
+        try {
+          await reply('この command を使える channel / user ではありません。')
+        } catch {
+          // 応答を送れない状況では何もしない（log 済み）
+        }
+
+        return
+      }
+
+      const operation = processCommand(request, reply).catch((error: unknown) => {
+        deps.log({ type: 'discord_control_failed', message: errorName(error) })
+
+        return reply('command を処理できませんでした。/araya help で一覧を見られます。').catch(() => undefined)
+      })
+      // shutdown の drain が command の最中も待つ（stop / reset の途中で process を切らない）
+      tail = tail.then(async () => {
+        await operation
+      })
+
+      await operation
+    },
     handle: (message: DiscordChatMessage, reply: DiscordChatReply) => {
       if (!accepting || !isDiscordChatMessageAllowed(message, deps.config)) {
         return Promise.resolve()
       }
 
       const content = stripDiscordBotMention(message.content, deps.botUserId)
-
-      // stop を含む control command は実行待ちキューの外で処理し、実行中の submit を待たずに効く
-      if (control.matches(content)) {
-        const operation = processControl(message, reply, content)
-        tail = tail.then(async () => {
-          await operation.catch(() => {})
-        })
-
-        return operation
-      }
 
       const item: (typeof queued)[number] = { message, reply, cancelled: false }
       queued.push(item)
