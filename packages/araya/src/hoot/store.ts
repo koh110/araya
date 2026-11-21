@@ -15,8 +15,17 @@ import {
   GOAL_REVIEW_DAYS_MIN,
   HOOT_DECISIONS,
   HOOT_STATE_VERSION,
+  HOOT_STATE_VERSION_INJECT,
   HOOT_STATE_VERSION_PRECHECK,
+  INJECTABLE_DECISIONS,
+  INJECT_COOLDOWN_MINUTES_MAX,
+  INJECT_COOLDOWN_MINUTES_MIN,
   MAX_GOALS,
+  MAX_INJECTS_KEPT,
+  MAX_INJECTS_PER_DAY_MAX,
+  MAX_INJECTS_PER_DAY_MIN,
+  MAX_INJECT_ATTEMPTS,
+  MAX_INJECT_ERROR_CHARS,
   MAX_OPEN_PROPOSALS,
   MAX_PROPOSALS_KEPT,
   MAX_PROPOSAL_EVIDENCE_KEYS,
@@ -33,8 +42,11 @@ import {
   WATCHDOG_HOURS_MAX,
   WATCHDOG_HOURS_MIN,
   hootError,
+  injectKeyOf,
+  injectRequestIdOf,
   isHootStateShape,
   isHootStateShapeV1,
+  isHootStateShapeV2,
   isSettingsShape,
   isSettingsShapeV1,
   reviewPassed,
@@ -42,11 +54,14 @@ import {
   type HootDecision,
   type HootGoal,
   type HootGoalInput,
+  type HootInjectAuthorizer,
+  type HootInjectRequest,
   type HootProposal,
   type HootRun,
   type HootSettings,
   type HootState,
   type HootStateV1,
+  type HootStateV2,
   defaultSettings,
   defaultState,
   isoUtc,
@@ -96,15 +111,48 @@ export async function readHootState(dataDir: string): Promise<HootState> {
     return value
   }
 
-  // version 1 の file は読み取り時に v2 へ寄せる（書かない）。次の updateHootState で v2 で保存される
+  // version 2 の file は読み取り時に v3 へ寄せる（書かない）。次の updateHootState で v3 で保存される
+  if (isHootStateShapeV2(value)) {
+    return migrateStateV2(value)
+  }
+
+  // version 1 は v2 を経由して v3 に寄せる
   if (isHootStateShapeV1(value) && isSettingsShapeV1(value.settings)) {
-    return migrateStateV1(value, Date.now())
+    return migrateStateV2(migrateStateV1(value, Date.now()))
   }
 
   throw hootError('hoot_state_invalid', `${filePath} が HOOT state の形ではありません`)
 }
 
-function migrateStateV1(state: HootStateV1, nowMs: number): HootState {
+// version 2 -> 3。inject 用の settings が無ければ既定を埋める。時刻から値を作らないので read ごとに動かない
+function migrateStateV2(state: HootStateV2): HootState {
+  const defaults = defaultSettings()
+  const raw = state.settings as unknown as Record<string, unknown>
+
+  return {
+    version: HOOT_STATE_VERSION,
+    settings: {
+      ...defaults,
+      ...state.settings,
+      autoDispatch: typeof raw.autoDispatch === 'boolean' ? raw.autoDispatch : defaults.autoDispatch,
+      maxInjectsPerDay:
+        typeof raw.maxInjectsPerDay === 'number' && Number.isInteger(raw.maxInjectsPerDay)
+          ? raw.maxInjectsPerDay
+          : defaults.maxInjectsPerDay,
+      injectCooldownMinutes:
+        typeof raw.injectCooldownMinutes === 'number' && Number.isInteger(raw.injectCooldownMinutes)
+          ? raw.injectCooldownMinutes
+          : defaults.injectCooldownMinutes,
+    },
+    goals: state.goals,
+    loop: state.loop,
+    runs: state.runs,
+    proposals: state.proposals,
+    injectRequests: [],
+  }
+}
+
+function migrateStateV1(state: HootStateV1, nowMs: number): HootStateV2 {
   const settings = defaultSettings()
   settings.enabled = state.settings.enabled
   settings.mode = state.settings.mode
@@ -117,7 +165,7 @@ function migrateStateV1(state: HootStateV1, nowMs: number): HootState {
     : [...DEFAULT_NOTIFY_DECISIONS]
 
   return {
-    version: HOOT_STATE_VERSION,
+    version: HOOT_STATE_VERSION_INJECT,
     settings,
     goals: state.goals.map((goal) => {
       return { ...goal, reviewAt: migratedReviewAt(state, goal, settings.goalReviewDays, nowMs) }
@@ -217,14 +265,8 @@ export function mergeSettings(current: HootSettings, patch: Partial<HootSettings
       throw hootError('hoot_settings_invalid', "mode は 'dry_run' または 'active' にしてください")
     }
 
-    // 判断 run には tool が無い。dispatch を実行する mechanism ができるまで active にはできない
-    if (patch.mode === 'active') {
-      throw hootError(
-        'hoot_mode_unimplemented',
-        'mode=active は未実装です（判断の記録ではなく作業を実行する path がまだ無い）。dry_run のまま使ってください'
-      )
-    }
-
+    // active は「承認された dispatch を main Discord 会話へ inject してよい」を意味する（Issue #31）。
+    // 既定の autoDispatch=false では人間の `araya hoot dispatch` が無い限り inject しない
     next.mode = patch.mode
   }
 
@@ -312,6 +354,24 @@ export function mergeSettings(current: HootSettings, patch: Partial<HootSettings
   if (patch.maxProposalReminders !== undefined) {
     assertBoundedInt(patch.maxProposalReminders, MAX_PROPOSAL_REMINDERS_MIN, MAX_PROPOSAL_REMINDERS_MAX, 'maxProposalReminders')
     next.maxProposalReminders = patch.maxProposalReminders
+  }
+
+  if (patch.autoDispatch !== undefined) {
+    if (typeof patch.autoDispatch !== 'boolean') {
+      throw hootError('hoot_settings_invalid', 'autoDispatch は true / false にしてください')
+    }
+
+    next.autoDispatch = patch.autoDispatch
+  }
+
+  if (patch.maxInjectsPerDay !== undefined) {
+    assertBoundedInt(patch.maxInjectsPerDay, MAX_INJECTS_PER_DAY_MIN, MAX_INJECTS_PER_DAY_MAX, 'maxInjectsPerDay')
+    next.maxInjectsPerDay = patch.maxInjectsPerDay
+  }
+
+  if (patch.injectCooldownMinutes !== undefined) {
+    assertBoundedInt(patch.injectCooldownMinutes, INJECT_COOLDOWN_MINUTES_MIN, INJECT_COOLDOWN_MINUTES_MAX, 'injectCooldownMinutes')
+    next.injectCooldownMinutes = patch.injectCooldownMinutes
   }
 
   return next
@@ -599,6 +659,183 @@ export async function resolveProposal(dataDir: string, key: string, nowMs = Date
     proposal.updatedAt = isoUtc(nowMs)
 
     return proposal
+  })
+}
+
+// ---- main Discord 会話への inject request（Issue #31）----
+// ここに tool は無い。pending を作るのは承認（人間の CLI か mode=active + autoDispatch）で、
+// 実行（main 会話への submit）は bot process だけが行う
+
+export type HootInjectSkip = 'cooldown' | 'daily_limit' | 'auto_dispatch_off' | 'already_pending'
+
+export type HootInjectEnqueue = {
+  request: HootInjectRequest | null
+  skipped: HootInjectSkip | null
+}
+
+export async function enqueueHootInject(
+  dataDir: string,
+  input: { proposalKey: string; authorizedBy: HootInjectAuthorizer; nowMs: number }
+): Promise<HootInjectEnqueue> {
+  return await updateHootState(dataDir, (state): HootInjectEnqueue => {
+    if (state.settings.mode !== 'active') {
+      throw hootError(
+        'hoot_mode_dry_run',
+        'mode が dry_run の間は main 会話への inject を作りません（araya hoot settings set --mode active）'
+      )
+    }
+
+    const key = input.proposalKey.trim()
+    const proposal = state.proposals.find((entry) => {
+      return entry.key === key
+    })
+
+    if (proposal === undefined) {
+      throw hootError('hoot_proposal_not_found', `proposal key ${key} がありません`)
+    }
+
+    if (proposal.status !== 'open') {
+      throw hootError('hoot_proposal_not_found', `proposal key ${key} は open ではありません（status: ${proposal.status}）`)
+    }
+
+    if (!INJECTABLE_DECISIONS.includes(proposal.decision)) {
+      throw hootError(
+        'hoot_inject_not_injectable',
+        `proposal ${key} の decision ${proposal.decision} は inject できません（${INJECTABLE_DECISIONS.join(' / ')} だけ）`
+      )
+    }
+
+    if (input.authorizedBy === 'mode_active' && !state.settings.autoDispatch) {
+      return { request: null, skipped: 'auto_dispatch_off' }
+    }
+
+    const sameProposal = state.injectRequests.filter((entry) => {
+      return entry.proposalKey === proposal.key
+    })
+
+    // 同じ proposal への submit が未完了のうちに重ねて流さない
+    if (sameProposal.some((entry) => {
+      return entry.status === 'pending'
+    })) {
+      return { request: null, skipped: 'already_pending' }
+    }
+
+    const nowIso = isoUtc(input.nowMs)
+    const cooldownMinutes = state.settings.injectCooldownMinutes
+
+    if (cooldownMinutes > 0) {
+      const createdAts = state.injectRequests
+        .map((entry) => {
+          return parseIso(entry.createdAt)
+        })
+        .filter((entry) => {
+          return entry !== null
+        })
+
+      if (createdAts.length > 0) {
+        const lastAt = Math.max(...createdAts)
+
+        if (lastAt + cooldownMinutes * 60_000 > input.nowMs) {
+          return { request: null, skipped: 'cooldown' }
+        }
+      }
+    }
+
+    const day = utcDayKey(input.nowMs)
+    const todayCount = state.injectRequests.filter((entry) => {
+      const createdAt = parseIso(entry.createdAt)
+
+      return createdAt !== null && utcDayKey(createdAt) === day
+    }).length
+
+    if (todayCount >= state.settings.maxInjectsPerDay) {
+      return { request: null, skipped: 'daily_limit' }
+    }
+
+    const request: HootInjectRequest = {
+      key: injectKeyOf(proposal.key, sameProposal.length + 1),
+      proposalKey: proposal.key,
+      goalKeys: [...proposal.goalKeys],
+      decision: proposal.decision,
+      authorizedBy: input.authorizedBy,
+      authorizedAt: nowIso,
+      status: 'pending',
+      requestId: injectRequestIdOf(injectKeyOf(proposal.key, sameProposal.length + 1), 1),
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      attempts: 0,
+      injectedAt: null,
+      lastError: null,
+    }
+    state.injectRequests.push(request)
+
+    if (state.injectRequests.length > MAX_INJECTS_KEPT) {
+      // pending を残して terminal（injected / failed）を古い順に落とす
+      const dropIndex = state.injectRequests.findIndex((entry) => {
+        return entry.status !== 'pending'
+      })
+      state.injectRequests.splice(dropIndex < 0 ? 0 : dropIndex, 1)
+    }
+
+    return { request, skipped: null }
+  })
+}
+
+// pending を 1 件取り出して attempts を 1 増やす。取り出しと実行の間に crash しても
+// attempts が MAX_INJECT_ATTEMPTS に達すれば二度と選ばれない（無限再試行をしない）
+export async function takePendingInject(dataDir: string, nowMs: number) {
+  return await updateHootState(dataDir, (state) => {
+    const candidates = state.injectRequests
+      .filter((entry) => {
+        return entry.status === 'pending' && entry.attempts < MAX_INJECT_ATTEMPTS
+      })
+      .sort((left, right) => {
+        return (parseIso(left.createdAt) ?? 0) - (parseIso(right.createdAt) ?? 0)
+      })
+    const candidate = candidates[0]
+
+    if (candidate === undefined) {
+      return null as HootInjectRequest | null
+    }
+
+    candidate.attempts += 1
+    candidate.updatedAt = isoUtc(nowMs)
+    candidate.requestId = injectRequestIdOf(candidate.key, candidate.attempts)
+
+    return { ...candidate } satisfies HootInjectRequest
+  })
+}
+
+export async function finishHootInject(
+  dataDir: string,
+  key: string,
+  input: { ok: boolean; nowMs: number; error?: string }
+) {
+  return await updateHootState(dataDir, (state) => {
+    const request = state.injectRequests.find((entry) => {
+      return entry.key === key
+    })
+
+    if (request === undefined) {
+      throw hootError('hoot_inject_not_found', `inject request ${key} がありません`)
+    }
+
+    const nowIso = isoUtc(input.nowMs)
+    request.updatedAt = nowIso
+    request.attempts = Math.max(1, request.attempts)
+
+    if (input.ok) {
+      request.status = 'injected'
+      request.injectedAt = nowIso
+      request.lastError = null
+    } else {
+      // attempts が上限に達していれば pending に戻さない（CLI で新しい承認を作り直せる）
+      request.status = request.attempts >= MAX_INJECT_ATTEMPTS ? 'failed' : 'pending'
+      request.lastError = (input.error ?? 'inject 失敗').slice(0, MAX_INJECT_ERROR_CHARS)
+      request.injectedAt = null
+    }
+
+    return { ...request } satisfies HootInjectRequest
   })
 }
 

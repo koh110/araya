@@ -7,9 +7,12 @@ import { createHash } from 'node:crypto'
 
 import type { Redactor } from '../infrastructure/redaction.ts'
 import { collectGitHubObservations, type HootObservation, type ObservationDependencies } from './observe.ts'
-import { HOOT_CONVERSATION_INSTRUCTIONS, PROMPT_RECENT_RUNS, buildDecisionPrompt } from './prompt.ts'
+import { HOOT_CONVERSATION_INSTRUCTIONS, PROMPT_RECENT_RUNS, buildDecisionPrompt, buildInjectPrompt } from './prompt.ts'
 import {
   HOOT_DECISIONS,
+  INJECTABLE_DECISIONS,
+  MAX_INJECT_ATTEMPTS,
+  MAX_INJECT_ERROR_CHARS,
   MAX_REASON_CHARS,
   MAX_SUMMARY_CHARS,
   PROPOSAL_DECISIONS,
@@ -27,20 +30,25 @@ import {
   utcHour,
   type HootDecision,
   type HootGoal,
+  type HootInjectRequest,
   type HootProposal,
   type HootRun,
   type HootSettings,
   type HootState,
 } from './model.ts'
 import {
+  enqueueHootInject,
+  finishHootInject,
   pauseExpiredGoals,
   readHootState,
   recordHootDigest,
   recordHootRun,
   setHootConversationId,
+  takePendingInject,
   takeProposalReminder,
   updateHootState,
   upsertProposal,
+  type HootInjectSkip,
 } from './store.ts'
 
 export const HOOT_TICK_POLL_MS = 60_000
@@ -62,11 +70,21 @@ export type HootDecideResult = {
   conversationId: number
 }
 
+// main Discord 会話への inject。bot process が chatHandler 経由で実装する（tool を持つのは main 会話だけ）
+export type HootInjectInput = {
+  content: string
+  notice: string
+  requestId: string
+  proposalKey: string
+  injectKey: string
+}
+
 export type HootTickDeps = {
   dataDir: string
   devRoot: string
   decide: (input: HootDecideInput) => Promise<HootDecideResult>
   deliver?: (text: string, nonce: string) => Promise<void>
+  dispatchInject?: (input: HootInjectInput) => Promise<void>
   redactor: Redactor
   log: (entry: Record<string, unknown>) => void
   nowMs: () => number
@@ -75,6 +93,12 @@ export type HootTickDeps = {
   runCommand?: ObservationDependencies['runCommand']
   observationTimeoutMs?: number
 }
+
+export type HootInjectOutcome =
+  | { kind: 'nothing' }
+  | { kind: 'injected'; injectKey: string; proposalKey: string; attempts: number }
+  | { kind: 'failed'; injectKey: string; proposalKey: string; attempts: number; message: string }
+  | { kind: 'unavailable'; injectKey: string; message: string }
 
 export type HootTickOutcome =
   | { kind: 'disabled' }
@@ -98,6 +122,8 @@ export type HootTickOutcome =
       decision: HootDecision
       notified: boolean
       proposalKey: string | null
+      injectKey: string | null
+      injectSkipped: HootInjectSkip | null
       remindersSent: number
       digestSent: boolean
     }
@@ -112,10 +138,7 @@ function noticeNonce(occurrenceKey: string) {
 }
 
 export function buildHootNotice(run: HootRun, settings: HootSettings) {
-  const dispatchedNote =
-    run.decision === 'investigate' || run.decision === 'dispatch'
-      ? `mode: ${settings.mode}（提案の記録だけ。作業は実行していません）`
-      : `mode: ${settings.mode}`
+  const dispatchedNote = dispatchNoteOf(run.decision, settings)
   const lines = [
     `HOOT 判断 [${run.decision}] ${run.plannedAt}`,
     `REASON: ${run.reason}`,
@@ -132,6 +155,25 @@ export function buildHootNotice(run: HootRun, settings: HootSettings) {
   }
 
   return lines.join('\n').slice(0, HOOT_NOTICE_MAX_CHARS)
+}
+
+// dispatch が何を意味するかを通知に書く（mode と autoDispatch で変わる）
+function dispatchNoteOf(decision: HootDecision, settings: HootSettings) {
+  if (decision !== 'dispatch' && decision !== 'investigate') {
+    return `mode: ${settings.mode}`
+  }
+
+  if (settings.mode === 'dry_run') {
+    return 'mode: dry_run（提案の記録だけ。作業は実行していません）'
+  }
+
+  if (decision === 'investigate') {
+    return 'mode: active（investigate は提案のまま。HOOT 自身が調査を走ることはありません）'
+  }
+
+  return settings.autoDispatch
+    ? 'mode: active + autoDispatch（次の poll で main Discord 会話へ inject します）'
+    : 'mode: active（`araya hoot dispatch --key <proposal key>` で承認すると main Discord 会話へ inject します）'
 }
 
 function buildReviewPauseNotice(goal: HootGoal) {
@@ -322,6 +364,151 @@ export function createHootLoop(deps: HootTickDeps) {
     deps.log({ type: 'hoot_digest', day, runs: runs.length, openProposals: openProposals.length, sent })
 
     return sent
+  }
+
+  // pending inject request を 1 件 main Discord 会話へ渡す。schedule の occurrence とは独立に動く
+  // （人間が承認した案件を次の tick まで待たない）
+  async function injectOnce(): Promise<HootInjectOutcome> {
+    const state = await readHootState(deps.dataDir)
+
+    if (!state.settings.enabled) {
+      return { kind: 'nothing' }
+    }
+
+    const now = deps.nowMs()
+    const taken = await takePendingInject(deps.dataDir, now)
+
+    if (taken === null) {
+      return { kind: 'nothing' }
+    }
+
+    if (deps.dispatchInject === undefined) {
+      const settled = await finishHootInject(deps.dataDir, taken.key, {
+        ok: false,
+        nowMs: deps.nowMs(),
+        error: 'hoot_inject_unavailable: main 会話を持つ Discord bot process で実行してください',
+      })
+      deps.log({ type: 'hoot_inject_unavailable', injectKey: taken.key, attempts: settled.attempts })
+
+      if (settled.status === 'failed') {
+        await notify(
+          [
+            `HOOT dispatch の inject をできませんでした（proposal: ${taken.proposalKey} / attempt ${settled.attempts}）。main 会話を持つ Discord bot process で動かしてください`,
+            `araya hoot inject list で状態を確認し、必要なら araya hoot dispatch --key ${taken.proposalKey} で新しい承認を作り直してください`,
+          ].join('\n'),
+          noticeNonce(`inject-unavailable:${taken.key}`)
+        )
+      }
+
+      return {
+        kind: 'unavailable',
+        injectKey: taken.key,
+        message: settled.lastError ?? 'hoot_inject_unavailable',
+      }
+    }
+
+    // prompt を作るための proposal・goal を取り出し後に読み直す（tick 本体や CLI の変更を反映する）
+    const fresh = await readHootState(deps.dataDir)
+    const proposal = fresh.proposals.find((entry) => {
+      return entry.key === taken.proposalKey
+    })
+
+    if (proposal === undefined) {
+      const settled = await finishHootInject(deps.dataDir, taken.key, {
+        ok: false,
+        nowMs: deps.nowMs(),
+        error: `hoot_proposal_not_found: proposal ${taken.proposalKey} が state から消えました`,
+      })
+      deps.log({ type: 'hoot_inject_proposal_missing', injectKey: taken.key, proposalKey: taken.proposalKey })
+
+      if (settled.status === 'failed') {
+        await notify(
+          [
+            `HOOT dispatch の inject をできませんでした（proposal: ${taken.proposalKey} が state から消えました / attempt ${settled.attempts}）`,
+            `araya hoot proposal list / araya hoot inject list で状態を確認してください`,
+          ].join('\n'),
+          noticeNonce(`inject-proposal-missing:${taken.key}`)
+        )
+      }
+
+      return {
+        kind: 'failed',
+        injectKey: taken.key,
+        proposalKey: taken.proposalKey,
+        attempts: settled.attempts,
+        message: settled.lastError ?? 'hoot_proposal_not_found',
+      }
+    }
+
+    const goals = taken.goalKeys
+      .map((key) => {
+        return fresh.goals.find((goal) => {
+          return goal.key === key
+        })
+      })
+      .filter((goal) => {
+        return goal !== undefined
+      }) as HootGoal[]
+    const { content, notice } = buildInjectPrompt({ goals, proposal, request: taken })
+
+    try {
+      await deps.dispatchInject({
+        content,
+        notice,
+        requestId: taken.requestId,
+        proposalKey: taken.proposalKey,
+        injectKey: taken.key,
+      })
+    } catch (error) {
+      const message = deps.redactor.redact(errorMessage(error)).slice(0, MAX_INJECT_ERROR_CHARS)
+      const settled = await finishHootInject(deps.dataDir, taken.key, {
+        ok: false,
+        nowMs: deps.nowMs(),
+        error: message,
+      })
+      deps.log({
+        type: 'hoot_inject_failed',
+        injectKey: taken.key,
+        proposalKey: taken.proposalKey,
+        attempts: settled.attempts,
+        status: settled.status,
+        message,
+      })
+
+      if (settled.status === 'failed') {
+        await notify(
+          [
+            `HOOT dispatch の inject に失敗しました（proposal: ${taken.proposalKey} / attempt ${settled.attempts}）`,
+            `error: ${message}`,
+            `araya hoot inject list で状態を確認し、必要なら araya hoot dispatch --key ${taken.proposalKey} で新しい承認を作り直してください`,
+          ].join('\n'),
+          noticeNonce(`inject-failed:${taken.key}`)
+        )
+      }
+
+      return {
+        kind: 'failed',
+        injectKey: taken.key,
+        proposalKey: taken.proposalKey,
+        attempts: settled.attempts,
+        message,
+      }
+    }
+
+    const settled = await finishHootInject(deps.dataDir, taken.key, {
+      ok: true,
+      nowMs: deps.nowMs(),
+    })
+    deps.log({
+      type: 'hoot_inject',
+      injectKey: taken.key,
+      proposalKey: taken.proposalKey,
+      authorizedBy: taken.authorizedBy,
+      attempts: settled.attempts,
+      contentChars: content.length,
+    })
+
+    return { kind: 'injected', injectKey: taken.key, proposalKey: taken.proposalKey, attempts: settled.attempts }
   }
 
   async function tickOnce(): Promise<HootTickOutcome> {
@@ -587,6 +774,34 @@ export function createHootLoop(deps: HootTickDeps) {
         }
       }
 
+      // mode=active + autoDispatch のときだけ、dispatch 判断を inject request にする（Issue #31）。
+      // dry_run・autoDispatch=false では人間の CLI 承認が無い限り main 会話に流さない
+      let injectKey: string | null = null
+      let injectSkipped: HootInjectSkip | null = null
+
+      if (
+        settings.mode === 'active' &&
+        settings.autoDispatch &&
+        INJECTABLE_DECISIONS.includes(parsed.decision) &&
+        proposalKey !== null
+      ) {
+        const enqueued = await enqueueHootInject(deps.dataDir, {
+          proposalKey,
+          authorizedBy: 'mode_active',
+          nowMs: decidedAtMs,
+        })
+        injectKey = enqueued.request?.key ?? null
+        injectSkipped = enqueued.skipped
+
+        deps.log({
+          type: enqueued.request === null ? 'hoot_inject_skipped' : 'hoot_inject_queued',
+          occurrenceKey,
+          proposalKey,
+          injectKey: enqueued.request?.key ?? null,
+          skipped: injectSkipped,
+        })
+      }
+
       const shouldNotify = settings.notifyDecisions.includes(parsed.decision)
 
       if (shouldNotify) {
@@ -613,6 +828,8 @@ export function createHootLoop(deps: HootTickDeps) {
         decision: run.decision,
         notified: shouldNotify,
         proposalKey,
+        injectKey,
+        injectSkipped,
         remindersSent,
         digestSent,
       }
@@ -661,6 +878,13 @@ export function createHootLoop(deps: HootTickDeps) {
 
   async function run() {
     while (!controller.signal.aborted) {
+      // inject は schedule より先に処理する（承認済みの案件を次の occurrence まで待たない）
+      try {
+        await injectOnce()
+      } catch (error) {
+        deps.log({ type: 'hoot_inject_poll_failed', message: deps.redactor.redact(errorMessage(error)).slice(0, 500) })
+      }
+
       try {
         await tickOnce()
       } catch (error) {
@@ -675,7 +899,7 @@ export function createHootLoop(deps: HootTickDeps) {
     controller.abort()
   }
 
-  return { tickOnce, run, stop }
+  return { tickOnce, injectOnce, run, stop }
 }
 
 function hasOpenProposals(state: HootState) {

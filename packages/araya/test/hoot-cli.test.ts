@@ -116,6 +116,12 @@ test('hoot cli: 引数の解析（positional と --key value、新しい flag）
     '24',
     '--max-proposal-reminders',
     '1',
+    '--auto-dispatch',
+    'true',
+    '--max-injects-per-day',
+    '3',
+    '--inject-cooldown-minutes',
+    '15',
   ])
   assert.deepEqual(settingsFlags.positionals, ['settings', 'set'])
   assert.deepEqual(settingsFlags.options, {
@@ -127,6 +133,9 @@ test('hoot cli: 引数の解析（positional と --key value、新しい flag）
     'goal-review-days': '14',
     'proposal-ttl-hours': '24',
     'max-proposal-reminders': '1',
+    'auto-dispatch': 'true',
+    'max-injects-per-day': '3',
+    'inject-cooldown-minutes': '15',
   })
 
   assert.throws(
@@ -225,9 +234,17 @@ test('hoot cli: status / goal add / update / pause / settings set / runs が sta
     assert.match(settings.output, /enabled: true/u)
     assert.match(settings.output, /tickMinutes: 10/u)
 
-    const modeActive = await fixture.run(['settings', 'set', '--mode', 'active'])
-    assert.equal(modeActive.ok, false)
-    assert.match(modeActive.message, /dry_run/u)
+    // Issue #31: mode=active は「承認された dispatch を main 会話へ inject してよい」 gate。autoDispatch の既定は false
+    const modeActive = await fixture.run(['settings', 'set', '--mode', 'active', '--max-injects-per-day', '1'])
+    assert.equal(modeActive.ok, true)
+    assert.match(modeActive.output, /mode: active/u)
+    assert.match(modeActive.output, /autoDispatch: false/u)
+    assert.match(modeActive.output, /maxInjectsPerDay: 1/u)
+    assert.match(modeActive.output, /injectCooldownMinutes: 60/u)
+
+    const badInjectSetting = await fixture.run(['settings', 'set', '--max-injects-per-day', '11'])
+    assert.equal(badInjectSetting.ok, false)
+    assert.match(badInjectSetting.message, /hoot_settings_invalid/u)
 
     const state = await readHootState(fixture.dataDir)
     assert.equal(state.settings.enabled, true)
@@ -241,6 +258,11 @@ test('hoot cli: status / goal add / update / pause / settings set / runs が sta
     assert.equal(state.settings.goalReviewDays, 14)
     assert.equal(state.settings.proposalTtlHours, 24)
     assert.equal(state.settings.maxProposalReminders, 1)
+    assert.equal(state.settings.mode, 'active')
+    assert.equal(state.settings.autoDispatch, false)
+    assert.equal(state.settings.maxInjectsPerDay, 1)
+    assert.equal(state.settings.injectCooldownMinutes, 60)
+    assert.deepEqual(state.injectRequests, [])
     assert.equal('notifyNoop' in state.settings, false)
     assert.equal(state.goals[0]?.status, 'paused')
     assert.equal(state.goals[0]?.reviewAt, '2026-12-01T00:00:00.000Z')
@@ -784,6 +806,124 @@ test('hoot cli: 壊れた state file に対して restore の手順を誤りに�
     assert.equal(failed.ok, false)
     assert.match(failed.message, /hoot_state_invalid/u)
     assert.match(failed.message, /hoot\/state\.json/u)
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot cli: dispatch --key は inject request を作り、inject list / status に出す（dry_run では拒否）', async () => {
+  const fixture = await makeHootCliFixture()
+  const dispatchKey = proposalKeyOf({ goalKeys: ['araya-quality'], decision: 'dispatch' })
+  const investigateKey = proposalKeyOf({ goalKeys: ['araya-quality'], decision: 'investigate' })
+
+  try {
+    const added = await fixture.run(['goal', 'add', '--key', 'araya-quality', '--objective', 'open issue と draft PR を拾う'])
+    assert.equal(added.ok, true)
+    const goals = (await readHootState(fixture.dataDir)).goals
+
+    await writeHootState(fixture.dataDir, {
+      ...defaultState(),
+      goals,
+      proposals: [
+        proposalFixture(dispatchKey, { decision: 'dispatch', reason: 'draft PR 1 件を続行すべきか判断したい' }),
+        proposalFixture(investigateKey, { decision: 'investigate', reason: 'test workflow の実行を確認する' }),
+      ],
+    })
+
+    // dry_run（既定）では request さえ作らない
+    const dryRun = await fixture.run(['dispatch', '--key', dispatchKey])
+    assert.equal(dryRun.ok, false)
+    assert.match(dryRun.message, /hoot_mode_dry_run/u)
+
+    const enabled = await fixture.run(['settings', 'set', '--enabled', 'true', '--mode', 'active'])
+    assert.equal(enabled.ok, true)
+
+    const noKey = await fixture.run(['dispatch'])
+    assert.equal(noKey.ok, false)
+    assert.match(noKey.message, /--key/u)
+
+    const missing = await fixture.run(['dispatch', '--key', 'hoot-prop-missing'])
+    assert.equal(missing.ok, false)
+    assert.match(missing.message, /hoot_proposal_not_found/u)
+
+    // inject してよい decision は dispatch だけ
+    const notInjectable = await fixture.run(['dispatch', '--key', investigateKey])
+    assert.equal(notInjectable.ok, false)
+    assert.match(notInjectable.message, /hoot_inject_not_injectable/u)
+
+    const queued = await fixture.run(['dispatch', '--key', dispatchKey])
+    assert.equal(queued.ok, true)
+    assert.match(queued.output, /inject request を作りました/u)
+    assert.match(queued.output, new RegExp(`proposal: ${dispatchKey} \\[dispatch\\]`, 'u'))
+
+    // 同じ proposal に pending の間は重ねない
+    const again = await fixture.run(['dispatch', '--key', dispatchKey])
+    assert.equal(again.ok, true)
+    assert.match(again.output, /inject request を作りませんでした（already_pending）/u)
+
+    const list = await fixture.run(['inject', 'list'])
+    assert.equal(list.ok, true)
+    assert.match(list.output, /hoot-inject:/u)
+    assert.match(list.output, /\[pending\]/u)
+    assert.match(list.output, /authorized: human/u)
+
+    const badInjectSubcommand = await fixture.run(['inject', 'drop'])
+    assert.equal(badInjectSubcommand.ok, false)
+    assert.match(badInjectSubcommand.message, /inject の subcommand は list/u)
+
+    const status = await fixture.run(['status'])
+    assert.equal(status.ok, true)
+    assert.match(status.output, /inject requests: pending 1 \/ injected 0 \/ failed 0/u)
+    assert.match(status.output, /araya hoot dispatch --key <proposal key>/u)
+    assert.match(status.output, new RegExp(`proposal=${dispatchKey}`, 'u'))
+
+    let state = await readHootState(fixture.dataDir)
+    assert.equal(state.injectRequests.length, 1)
+    assert.equal(state.injectRequests[0]?.authorizedBy, 'human')
+    assert.equal(state.injectRequests[0]?.status, 'pending')
+
+    // CLI で作った承認を bot loop が main 会話へ渡す（CLI -> loop のつながり）
+    const injectInputs: { content: string; notice: string; requestId: string }[] = []
+    const loop = createHootLoop({
+      dataDir: fixture.dataDir,
+      devRoot: fixture.root,
+      redactor: createRedactor(collectSecretValues({})),
+      decide: async () => {
+        return { text: 'DECISION: noop\nREASON: inject だけ', conversationId: 5 }
+      },
+      deliver: async () => {},
+      dispatchInject: async (input) => {
+        injectInputs.push({ content: input.content, notice: input.notice, requestId: input.requestId })
+      },
+      log: () => {},
+      nowMs: () => {
+        return Date.parse(HOOT_NOW_ISO)
+      },
+      env: {},
+      runCommand: async () => ({
+        exitCode: 0,
+        signal: null,
+        stdout: '[]',
+        stderr: '',
+        stdoutBytes: 2,
+        stderrBytes: 0,
+        terminationReason: undefined,
+        terminationConfirmed: true,
+      }),
+    })
+
+    const injected = await loop.injectOnce()
+    assert.equal(injected.kind, 'injected')
+    assert.equal(injectInputs.length, 1)
+    assert.match(injectInputs[0]?.content ?? '', /open issue と draft PR を拾う/u)
+    assert.match(injectInputs[0]?.content ?? '', new RegExp(`araya hoot dispatch --key ${dispatchKey}`, 'u'))
+    assert.match(injectInputs[0]?.notice ?? '', /人間の承認/u)
+
+    state = await readHootState(fixture.dataDir)
+    assert.equal(state.injectRequests[0]?.status, 'injected')
+
+    const afterInject = await fixture.run(['inject', 'list'])
+    assert.match(afterInject.output, /\[injected\]/u)
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }

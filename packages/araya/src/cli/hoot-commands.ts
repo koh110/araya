@@ -5,7 +5,13 @@ import {
   DEFAULT_MAX_RUNS_PER_DAY,
   DEFAULT_TICK_MINUTES,
   HOOT_DECISIONS,
+  INJECT_COOLDOWN_MINUTES_MAX,
+  INJECT_COOLDOWN_MINUTES_MIN,
   MAX_GOALS,
+  MAX_INJECTS_KEPT,
+  MAX_INJECTS_PER_DAY_MAX,
+  MAX_INJECTS_PER_DAY_MIN,
+  MAX_INJECT_ATTEMPTS,
   MAX_RUNS_KEPT,
   TICK_MINUTES_MAX,
   TICK_MINUTES_MIN,
@@ -14,11 +20,13 @@ import {
   type HootDecision,
   type HootGoal,
   type HootGoalStatus,
+  type HootInjectRequest,
   type HootProposal,
   type HootSettings,
   type HootState,
 } from '../hoot/model.ts'
 import {
+  enqueueHootInject,
   readHootState,
   resolveProposal,
   resetSchedule,
@@ -160,6 +168,16 @@ function proposalLine(proposal: HootProposal) {
   ].join('\n')
 }
 
+function injectLine(request: HootInjectRequest) {
+  const error = request.lastError === null ? '' : ` / lastError: ${request.lastError}`
+
+  return [
+    `- ${request.key} [${request.status}] ${request.decision} proposal=${request.proposalKey} goals=${request.goalKeys.join(', ') || '（なし）'}`,
+    `  authorized: ${request.authorizedBy} @ ${request.authorizedAt} / attempts: ${request.attempts}/${MAX_INJECT_ATTEMPTS}`,
+    `  injectedAt: ${request.injectedAt ?? '（まだ）'}${error}`,
+  ].join('\n')
+}
+
 function nextOccurrenceOf(state: HootState, nowMs: number) {
   const lastOccurrenceAt = parseIso(state.loop.lastOccurrenceAt)
   const plannedAt = lastOccurrenceAt === null ? nowMs : lastOccurrenceAt + state.settings.tickMinutes * 60_000
@@ -181,10 +199,17 @@ export function formatHootStatus(state: HootState, nowMs: number, dataDir: strin
   const lines = [
     `state file: ${hootStateFilePath(dataDir)}`,
     `enabled: ${settings.enabled}`,
-    `mode: ${settings.mode}（dry_run では判断の記録だけ。作業は実行しません）`,
+    `mode: ${settings.mode}（${
+      settings.mode === 'dry_run'
+        ? '判断の記録だけ。main 会話への inject は作りません'
+        : settings.autoDispatch
+          ? 'autoDispatch=true: dispatch 判断を inject request にします'
+          : 'dispatch は `araya hoot dispatch --key <proposal key>` の承認後に inject します'
+    }）`,
     `tickMinutes: ${settings.tickMinutes} / maxRunsPerDay: ${settings.maxRunsPerDay}`,
     `notifyDecisions: ${settings.notifyDecisions.join(', ')} / precheck: ${settings.precheckObservation} / watchdogHours: ${settings.watchdogHours}`,
     `digestHourUtc: ${settings.digestHourUtc ?? 'none'} / resetConversationAfterRuns: ${settings.resetConversationAfterRuns} / goalReviewDays: ${settings.goalReviewDays}`,
+    `inject: autoDispatch=${settings.autoDispatch} / maxInjectsPerDay=${settings.maxInjectsPerDay} / cooldown=${settings.injectCooldownMinutes}分`,
     `active goals: ${active.length}/${state.goals.length}（max ${MAX_GOALS}）`,
     ...state.goals.map(goalLine),
     `lastOccurrenceAt: ${state.loop.lastOccurrenceAt ?? '（なし）'}`,
@@ -201,6 +226,20 @@ export function formatHootStatus(state: HootState, nowMs: number, dataDir: strin
   if (openProposals.length > 0) {
     lines.push(`open proposals: ${openProposals.length}`)
     lines.push(...openProposals.map(proposalLine))
+  }
+
+  if (state.injectRequests.length > 0) {
+    const pending = state.injectRequests.filter((request) => {
+      return request.status === 'pending'
+    }).length
+    const injected = state.injectRequests.filter((request) => {
+      return request.status === 'injected'
+    }).length
+
+    lines.push(
+      `inject requests: pending ${pending} / injected ${injected} / failed ${state.injectRequests.length - pending - injected}（保持 ${MAX_INJECTS_KEPT} 件）`
+    )
+    lines.push(...state.injectRequests.slice(-3).map(injectLine))
   }
 
   if (lastRun !== undefined) {
@@ -227,6 +266,9 @@ function settingsSummary(settings: HootSettings) {
     `resetConversationAfterRuns: ${settings.resetConversationAfterRuns}（この model run 数で HOOT 会話を新しくする）`,
     `goalReviewDays: ${settings.goalReviewDays}（新しい goal の review 期限。0 で無期限）`,
     `proposalTtlHours: ${settings.proposalTtlHours} / maxProposalReminders: ${settings.maxProposalReminders}`,
+    `autoDispatch: ${settings.autoDispatch}（mode=active のとき dispatch 判断を自動で inject するか。既定 false）`,
+    `maxInjectsPerDay: ${settings.maxInjectsPerDay}（1 UTC 日の inject 上限、人間の承認も数える。0 で止め、${MAX_INJECTS_PER_DAY_MIN}〜${MAX_INJECTS_PER_DAY_MAX}）`,
+    `injectCooldownMinutes: ${settings.injectCooldownMinutes}（前の inject からの cooldown。0 で無効、${INJECT_COOLDOWN_MINUTES_MIN}〜${INJECT_COOLDOWN_MINUTES_MAX}）`,
   ].join('\n')
 }
 
@@ -350,6 +392,9 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
         goalReviewDays: integerOf('goal-review-days', options['goal-review-days']),
         proposalTtlHours: integerOf('proposal-ttl-hours', options['proposal-ttl-hours']),
         maxProposalReminders: integerOf('max-proposal-reminders', options['max-proposal-reminders']),
+        autoDispatch: booleanOf('auto-dispatch', options['auto-dispatch']),
+        maxInjectsPerDay: integerOf('max-injects-per-day', options['max-injects-per-day']),
+        injectCooldownMinutes: integerOf('inject-cooldown-minutes', options['inject-cooldown-minutes']),
       })
       deps.stdout(`settings を更新しました:\n${settingsSummary(settings)}`)
 
@@ -400,6 +445,66 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
     throw new Error('hoot_invalid_argument: proposal の subcommand は list / resolve')
   }
 
+  if (command === 'dispatch') {
+    if (key === undefined || key === '') {
+      throw new Error('hoot_invalid_argument: araya hoot dispatch --key <proposal key>')
+    }
+
+    const enqueued = await enqueueHootInject(dataDir, {
+      proposalKey: key,
+      authorizedBy: 'human',
+      nowMs: deps.nowMs(),
+    })
+
+    if (enqueued.request === null) {
+      const reason = enqueued.skipped ?? 'unknown'
+      const guidance: Record<string, string> = {
+        cooldown: '前の inject からの cooldown 中です（araya hoot settings set --inject-cooldown-minutes <分>）',
+        daily_limit: '1 UTC 日の inject 上限です（araya hoot settings set --max-injects-per-day <件数>）',
+        already_pending: '同じ proposal への inject がまだ未完了です（araya hoot inject list）',
+        auto_dispatch_off: 'autoDispatch=false では人間の dispatch だけが inject されます',
+      }
+
+      deps.stdout(`inject request を作りませんでした（${reason}）\n  ${guidance[reason] ?? ''}`.trimEnd())
+
+      return
+    }
+
+    deps.stdout(
+      [
+        `inject request を作りました: ${enqueued.request.key}`,
+        `  proposal: ${enqueued.request.proposalKey} [${enqueued.request.decision}] goals=${enqueued.request.goalKeys.join(', ') || '（なし）'}`,
+        '  Discord bot process が次の poll で main 会話に渡します（bot が動いていないと pending のままです）',
+      ].join('\n')
+    )
+
+    return
+  }
+
+  if (command === 'inject') {
+    if (subcommand !== undefined && subcommand !== 'list') {
+      throw new Error('hoot_invalid_argument: inject の subcommand は list')
+    }
+
+    const state = await readHootState(dataDir)
+
+    if (state.injectRequests.length === 0) {
+      deps.stdout(`inject request の記録はありません（araya hoot dispatch --key <proposal key> で作ります。保持は直近 ${MAX_INJECTS_KEPT} 件）`)
+
+      return
+    }
+
+    deps.stdout(
+      state.injectRequests
+        .slice(-20)
+        .reverse()
+        .map(injectLine)
+        .join('\n')
+    )
+
+    return
+  }
+
   if (command === 'runs') {
     const state = await readHootState(dataDir)
     const limit = integerOf('limit', options.limit) ?? 10
@@ -433,6 +538,6 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
   }
 
   throw new Error(
-    `hoot_invalid_argument: 不明な command: ${command}（status / goal / settings / proposal / runs / reset-schedule、記録の保持は直近 ${MAX_RUNS_KEPT} 件）`
+    `hoot_invalid_argument: 不明な command: ${command}（status / goal / settings / proposal / dispatch / inject / runs / reset-schedule、記録の保持は直近 ${MAX_RUNS_KEPT} 件）`
   )
 }

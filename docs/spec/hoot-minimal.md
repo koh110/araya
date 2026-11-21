@@ -1,28 +1,33 @@
-# HOOT 最小形（Human Out of the Loop / wakeup dry run）
+# HOOT 最小形（Human Out of the Loop / wakeup loop と dispatch の inject）
 
 ## 概要
 
-HOOT は「Araya が人間の依頼を待っている時間」に、設定した目的（goal）について **観測し、次の一手を判断し、記録する** loop。現行の実装は P0（dry run）で、判断 result を state に残し、必要なら Discord へ 1 件通知する。**判断にしたがって作業を開始することはない**（model に tool を渡さず、file を書き換えず、process を起動しない）。
+HOOT は「Araya が人間の依頼を待っている時間」に、設定した目的（goal）について **観測し、次の一手を判断し、記録する** loop。判断 result は state に残り、必要なら Discord へ 1 件通知する。**HOOT の判断 run 自身には tool が無い**（model に tool を渡さず、file を書き換えず、process を起動しない）。判断 run が `dispatch` を出しても、ここで作業は始まらない。
+
+作業に繋がる導線は 1 本だけ。承認された `dispatch` を **main Discord 会話（channel ごとの main agent session）へ inject** し、実際の作業はその会話の agent が進める（Issue #31 の 1A。詳細は「main Discord 会話への inject」）。承認を作るのは人間の CLI（`araya hoot dispatch --key <proposal key>`）か `mode=active` + `autoDispatch=true` で、**既定（`autoDispatch=false`）では人間の承認が無い限り inject しない**。
 
 Discord bot process の中に loop として常駐し、`<dataDir>/hoot/state.json` を single source of truth にする。CLI（`araya hoot`）と同じ file を lock で共有する。
 
-model を呼ぶかどうか・人間に何を返すかは、可能な限り **deterministic な code 側**で決める（観測 fingerprint の precheck、watchdog、daily limit、提案の保持と期限、goal の review 期限、通知の allowlist、digest）。model に「働きすぎないこと」を判断させない。
+model を呼ぶかどうか・人間に何を返すか・main 会話へ何を流すかは、可能な限り **deterministic な code 側**で決める（観測 fingerprint の precheck、watchdog、daily limit、提案の保持と期限、goal の review 期限、通知の allowlist、digest、inject の gate（`mode` / `autoDispatch` / `INJECTABLE_DECISIONS` / cooldown / daily limit / attempts 上限））。model に「働きすぎないこと」を判断させない。
 
 ## state と file
 
 ```text
-<ARAYA_DATA_DIR>/hoot/state.json   # goals・settings・schedule・判断 run・proposals の記録
+<ARAYA_DATA_DIR>/hoot/state.json   # goals・settings・schedule・判断 run・proposals・inject request の記録
 <ARAYA_DATA_DIR>/hoot/.state.lock  # proper-lockfile（bot loop と CLI の read-modify-write を直列化）
 ```
 
-- state の `version` は **2**。version 1 の `state.json` は **読み取り時に v2 へ migration する**（読みのみ。次の `updateHootState` で v2 で保存される）。migration が埋めるもの:
-  - goal の `reviewAt`（基準は **file 内容**・v1 の `loop.lastRunAt` と goal の `updatedAt` の新しい方 + `settings.goalReviewDays`。read のたびに期限が前進しない。最後に走った時刻から `goalReviewDays` をとっくに過ぎている goal は、次の tick で自動 paused になって resume / retire を問う形になる）
-  - `loop.lastModelRunAt`（v1 の `lastRunAt` を継ぐ）・`loop.lastDigestAt`・`loop.conversationRuns`（0）・`loop.goalFingerprints`（`{}`）
-  - 既存 `runs` の `source: 'model'`
-  - `proposals: []`
-  - settings は新しい項目を既定値で埋める。`notifyNoop` は廃止で、`notifyNoop=true` なら `notifyDecisions` に `noop` を 1 本足す（`false`・**key 欠落**は既定の allowlist。型が違う値は v1 の形として受け付けない）
+- state の `version` は **3**（`HOOT_STATE_VERSION`）。version 2・version 1 の `state.json` は **読み取り時に v3 へ寄せる**（read だけで書き込まない。次の `updateHootState` で v3 で保存される）。
+  - **v2（`HOOT_STATE_VERSION_INJECT=2`）-> v3 は idempotent で、値を作らない**: `injectRequests: []` を埋め、inject 用の settings（`autoDispatch` / `maxInjectsPerDay` / `injectCooldownMinutes`）が無いときだけ既定を入れる。goal・loop・runs・proposals はそのまま。時刻から決める値も足さない（read のたびに動く値が生まれない）。v2 まで使っていた file は読み直しても inject は走らない（`injectRequests` が空で `autoDispatch` は既定 false）
+  - **v1（`HOOT_STATE_VERSION_PRECHECK=1`）は v2 を経由して v3** に寄せる。v1 から埋めるもの:
+    - goal の `reviewAt`（基準は **file 内容**・v1 の `loop.lastRunAt` と goal の `updatedAt` の新しい方 + `settings.goalReviewDays`。read のたびに期限が前進しない。最後に走った時刻から `goalReviewDays` をとっくに過ぎている goal は、次の tick で自動 paused になって resume / retire を問う形になる）
+    - `loop.lastModelRunAt`（v1 の `lastRunAt` を継ぐ）・`loop.lastDigestAt`・`loop.conversationRuns`（0）・`loop.goalFingerprints`（`{}`）
+    - 既存 `runs` の `source: 'model'`
+    - `proposals: []`（続けて v2 -> v3 で `injectRequests: []`）
+    - settings は新しい項目を既定値で埋める。`notifyNoop` は廃止で、`notifyNoop=true` なら `notifyDecisions` に `noop` を 1 本足す（`false`・**key 欠落**は既定の allowlist。型が違う値は v1 の形として受け付けない）
 - state は JSON 1 件。壊れた file は **復旧せず** `hoot_state_invalid` の誤りとして表面化する（黙って初期化しない）。restore は unit stop → file 差し替え → unit start。
-- 判断 run の記録（`runs`）は直近 200 件だけ保つ（`MAX_RUNS_KEPT`）。proposals は直近 50 件（`MAX_PROPOSALS_KEPT`。closed を古い順に落として open を残す）。open な proposal は最大 10 件（`MAX_OPEN_PROPOSALS`）。
+- 判断 run の記録（`runs`）は直近 200 件だけ保つ（`MAX_RUNS_KEPT`）。proposals は直近 50 件（`MAX_PROPOSALS_KEPT`。closed を古い順に落として open を残す）。open な proposal は最大 10 件（`MAX_OPEN_PROPOSALS`）。inject request（`injectRequests`）は直近 20 件（`MAX_INJECTS_KEPT`。terminal（`injected` / `failed`）を古い順に落とし、terminal が無いときだけ oldest pending を落とす）。
+- v3 の検証（`isHootStateShape`）は `injectRequests` が 20 件以内で、request が `key` / `proposalKey` / `goalKeys` / `decision` / `authorizedBy`（`human` / `mode_active`）/ `authorizedAt` / `status`（`pending` / `injected` / `failed`） / `requestId` / `createdAt` / `updatedAt` / `attempts` / `injectedAt` / `lastError`（`MAX_INJECT_ERROR_CHARS` = 300 文字まで）の形であることを要求する。形が違う file は migration せず `hoot_state_invalid`。
 - 書き込みは `state.json.<rand>.tmp` → rename（atomic）。directory は `0700`、file は `0600`。
 - 会話 transcript は HOOT の JSON には含めない。HOOT 専用の Pi durable conversation id（number）だけ保存し、main の Discord 会話とは別に opens する。
 
@@ -30,8 +35,8 @@ model を呼ぶかどうか・人間に何を返すかは、可能な限り **de
 
 | key | default | 意味 |
 | --- | --- | --- |
-| `enabled` | `false` | false の間は model も gh も呼ばない（tick gate を抜けない） |
-| `mode` | `dry_run` | `active` は未実装。設定しようすると `hoot_mode_unimplemented` で拒否する |
+| `enabled` | `false` | false の間は model も gh も呼ばない（tick gate を抜けない）。**inject の poll も走らない**（pending request を作らず submit しない） |
+| `mode` | `dry_run` | `dry_run` は判断の記録だけ（inject request を**作らない**。`enqueueHootInject` は `hoot_mode_dry_run`）。`active` は「承認済みの dispatch を main 会話へ inject してよい」を意味する（**`hoot_mode_unimplemented` での拒否は廃止**）。`active` でも既定は `autoDispatch=false` で、人間の `araya hoot dispatch` の承認が無い限り inject しない |
 | `tickMinutes` | `60` | schedule occurrence の間隔（5〜1440） |
 | `maxRunsPerDay` | `8` | UTC 1 日あたりの判断 run 上限（1〜48）。**model を呼んだ run だけ**を数える。precheck の noop は budget を使わない |
 | `notifyDecisions` | `["request_human", "invalid"]` | 即時 Discord に送る decision の allowlist。`noop` / `wait` 等は digest に出す（`notifyNoop` は撤去） |
@@ -42,6 +47,9 @@ model を呼ぶかどうか・人間に何を返すかは、可能な限り **de
 | `goalReviewDays` | `30` | 新しい goal に自動で入れる review 期限の日数（0〜365。0 で無期限） |
 | `proposalTtlHours` | `72` | 未応答の proposal を open で保持する期限（1〜720） |
 | `maxProposalReminders` | `3` | 1 件の proposal への再提醒の上限（0〜10。0 で送らない） |
+| `autoDispatch` | `false` | `mode=active` のとき `dispatch` 判断を自動で inject request にするか。false の間は自動承認しない（request を作るのは人間の CLI だけ） |
+| `maxInjectsPerDay` | `2` | UTC 1 日に inject request を作る上限（0〜10）。**人間の承認で作った分も数える**。0 で request を作らない |
+| `injectCooldownMinutes` | `60` | 直前の inject request の `createdAt` からの cooldown（0〜1440 分）。0 で無効 |
 
 ## goal
 
@@ -68,7 +76,7 @@ interval poll（既定 60 秒、`HOOT_TICK_POLL_MS`）で tick するが、run �
 - 起動していなかった間に過ぎた occurrence は **catch-up しない**。now 以下の最新の occurrence 1 件だけ走り、飛ばした件数は `missedOccurrences`（最大 1000）に記録する。
 - 同じ occurrence key の run が既にあれば再実行しない（schedule 更新前に crash した場合も、run 記録を見て schedule だけ進めて `occurrence_recorded` で終える）。
 - precheck の noop run も occurrence を 1 件消費する（model を呼ばなくても schedule は前に進む）。
-- tick が run に進まない理由（`disabled` / `no_active_goal` / `not_due` / `failure_cooldown` / `daily_limit` / `occurrence_recorded` / `already_running`）は `HootTickOutcome.kind` として返す。model も gh も呼ばない。review 期限超過で goal を paused にした tick は `goals_review_paused` で終わり、ここで model も gh も呼ばない。run した tick の kind は `ran`（model を呼んだ）と `prechecked_noop`（呼ばなかった）で、どちらも `remindersSent` / `digestSent` を返す。
+- tick が run に進まない理由（`disabled` / `no_active_goal` / `not_due` / `failure_cooldown` / `daily_limit` / `occurrence_recorded` / `already_running`）は `HootTickOutcome.kind` として返す。model も gh も呼ばない。review 期限超過で goal を paused にした tick は `goals_review_paused` で終わり、ここで model も gh も呼ばない。run した tick の kind は `ran`（model を呼んだ）と `prechecked_noop`（呼ばなかった）で、どちらも `remindersSent` / `digestSent` を返し、`ran` は加えて `injectKey` / `injectSkipped`（`autoDispatch` で request を作れたか、作れなかった理由）を返す。inject の poll（`injectOnce`）はこれらの gate より **先に**走る（schedule が動かなくても承認済みの案件は出る。「main Discord 会話への inject」）。
 
 ## 観測（Araya の deterministic code）
 
@@ -100,10 +108,11 @@ interval poll（既定 60 秒、`HOOT_TICK_POLL_MS`）で tick するが、run �
 - 会話 id は state に保存し、restart 後も同じ会話を続ける。main の Discord 会話と同じ transcript にはしない（`ownership: { kind: 'ownerless' }` で、main の background child にもしない）。
 - `resetConversationAfterRuns`（既定 24）件の model run で HOOT 判断会話を新しくする（`loop.conversationRuns` が基準。noop の判断が積み重なって会話が自分を強化することを防ぐ）。reset は `hoot_conversation_reset` に log する。
 - 判断 text が書けなかった run は **run として記録しない**（`araya_hoot_unanswered` で失敗扱い）。連続失敗数と cooldown は state に durable に持つ。
+- `mode` の扱いは prompt にも書く（`buildDecisionPrompt` の modeNote）。`dry_run` は「dispatch・investigate は提案として記録するだけで、実行しません」と明示し、`active` は mode 名だけを出す。自動 inject するかは `autoDispatch` が決め、model には決めさせない。
 
 ## 記録（HootRun）
 
-occurrence ごとの判断結果を `runs` に積む。P0 では dispatch しないので `dispatched` は常に false。
+occurrence ごとの判断結果を `runs` に積む。判断 run には tool が無いので `dispatched` は常に false のまま（inject を走らせた事実は `injectRequests` 側に記録し、`runs` には写さない）。
 
 `occurrenceKey` / `source`（`model` / `precheck`） / `plannedAt` / `decidedAt` / `decision` / `reason` / `summary` / `goalKeys` / `missedOccurrences` / `dispatched` / `observedRepos` / `observationGaps`
 
@@ -113,7 +122,7 @@ occurrence ごとの判断結果を `runs` に積む。P0 では dispatch しな
 
 ## proposals（人間が応答すべき pending）
 
-`investigate` / `dispatch` / `request_human`（`PROPOSAL_DECISIONS`）は `state.proposals` に **open な pending** として残す。実行はしない（`dispatch` も提案だけ）。人間が応答・却下するまで残り続ける。
+`investigate` / `dispatch` / `request_human`（`PROPOSAL_DECISIONS`）は `state.proposals` に **open な pending** として残す。proposal 自体は実行しない（`dispatch` も、承認して inject request を作るまでは提案だけ）。人間が応答・却下するまで残り続ける。
 
 - `key` は sha256 16 hex の `decision | goal keys`（goal key は sort した集合）。**観測 fingerprint は key に含めない**（title を fingerprint に含まないのと同じ理由で、観測の細かい変化では key を増やさない。変化の証拠は occurrence key 側に残す）。
 - 同じ goal 集合・同じ decision の open 提案は **1 件に寄せる**。新しい occurrence で同じ decision が出た **再確認**は `reason` / `updatedAt` / `evidenceOccurrenceKeys` だけ更新し、**`expiresAt` と `reminders` は変えない**（期限と提醒回数は人間が応答するまで据え置く。`evidenceOccurrenceKeys` は最大 10 件 `MAX_PROPOSAL_EVIDENCE_KEYS`）。
@@ -122,11 +131,63 @@ occurrence ごとの判断結果を `runs` に積む。P0 では dispatch しな
 - open な proposal が `MAX_OPEN_PROPOSALS`（10）以上のとき、新しい提案は作らない（`hoot_proposal_limit` に log する）。
 - **再提醒**: open に対して基準時刻 `lastReminderAt ?? createdAt`・間隔 `tickMinutes * 2 ** reminders` の backoff で `maxProposalReminders` 回まで、1 tick に 1 件だけ送る（1 件目はその次の occurrence）。`maxProposalReminders=0` で送らない。期限切れで止まる。
 - 人間の応答は `araya hoot proposal resolve --key <key>`（open を `resolved` にする）。status は `open` / `resolved` / `expired`。
+- `dispatch` の open proposal は人間の `araya hoot dispatch --key <proposal key>`（または `mode=active` + `autoDispatch=true`）で inject request になる（次の節）。**inject しても proposal の status は変わらない**（`resolved` にするのは `proposal resolve` だけ。open のままなので再提醒は続く）。`investigate` は inject しない（`INJECTABLE_DECISIONS` は `dispatch` のみ）。
+
+## main Discord 会話への inject（dispatch の実行経路 / 1A）
+
+`dispatch` を実行するのは main Discord 会話（channel ごとの main agent session）だけ。HOOT 判断 run に tool は渡さないまま、**承認された dispatch だけ**を main 会話の input として流す。経路は `src/hoot/store.ts`（request の生成）→ `src/hoot/tick.ts` の `injectOnce()` → `src/discord/bot.ts` の `dispatchInject` → `src/discord/chat.ts` の `inject()`（main 会話の `session.submit`）。
+
+### request を作るのは「承認」だけ（`enqueueHootInject`）
+
+- 人間の CLI: `araya hoot dispatch --key <proposal key>`（`authorizedBy: 'human'`）。**人間の承認でも `mode=active` が必須**で、`dry_run` の間は request を作れない
+- `mode=active` + `autoDispatch=true` の judgment run が出した `dispatch` 提案（`authorizedBy: 'mode_active'`）。`autoDispatch` は既定 false なので、active でも人間の承認が無い限り request は作らない
+
+`mode=dry_run` では request を **作らない**（`enqueueHootInject` は `hoot_mode_dry_run` の誤り）。`mode=active` を `hoot_mode_unimplemented` で拒否する仕組みは廃止し、`mergeSettings` は `dry_run` / `active` をそのまま受け付ける。
+
+審査（1 件ずつ。誤りは throw、歯止めは skip）:
+
+- proposal が無い・`open` でない → `hoot_proposal_not_found`
+- `INJECTABLE_DECISIONS`（**`dispatch` のみ**。`investigate` は proposal のまま。HOOT 自身が調査を走ることはない）でない decision → `hoot_inject_not_injectable`
+- `authorizedBy: 'mode_active'` なのに `autoDispatch=false` → skip `auto_dispatch_off`
+- 同じ proposal への pending がまだ未完了 → skip `already_pending`（同じ案件を重ねて流さない）
+- 直前の inject request の `createdAt` から `injectCooldownMinutes`（既定 60 分）内 → skip `cooldown`
+- その UTC 日に作った inject request 数が `maxInjectsPerDay`（既定 2）以上 → skip `daily_limit`（**人間の承認で作った分も数える**。0 で request を作らない）
+
+skip は誤りにせず `{ request: null, skipped }` で返し、CLI は理由と settings の案内を stdout に出す（終了は成功）。request key は `hoot-inject:<proposal key>:<n>`（同じ proposal を人間が再次承認すると `n` が増える）。submit の stable key は `requestId = <key>:attempt:<attempt 分>`（`injectRequestIdOf`）。
+
+歯止めは request を **作る** ときに効く。既に pending の分は submit 時に再チェックしない（作った分は次の poll で出る）。
+
+### 実行は bot process だけ（`injectOnce`）
+
+- bot loop の `run()` は poll（既定 60 秒、`HOOT_TICK_POLL_MS`）ごとに **schedule の gate（`tickOnce`）より先に** `injectOnce()` を 1 回走る。承認済みの案件を次の occurrence まで待たない。`enabled=false` の poll では inject も走らない。
+- `takePendingInject` が oldest-first で **1 件**取り出して `attempts += 1` し、`requestId` を attempt 分に書き換える。`attempts` が `MAX_INJECT_ATTEMPTS`（2）に達した request は二度と選ばれない（取り出しと実行の間に crash しても無限に再試行しない）。
+- `src/hoot/prompt.ts` の `buildInjectPrompt({ goals, proposal, request })` で `content` と `notice` を作る（取り出した **後に** state を読み直して proposal・goal を揃える）。bot process は `dispatchInject` で main 会話の `chatHandler.inject()` に繋ぐ。
+- `chatHandler.inject()` は **人間の message と同じ queue（tail）で直列化**される（会話の途中に別の agent が割り込まない）。state に残った text（model・gh 由来）を **submit 前に redaction** して `session.submit(content, requestId)` を 1 回呼び、その後に **notice（何を自動化したかの 1 文）と main 会話の answer の 2 件を Discord へ返す**（reply は redaction して 2000 文字刻み。notice と answer は別の messageId にする。同じ messageId / chunk index だと reply nonce が重複して gateway の dedupe で answer が落ちる）。inject が失敗しても tail の連鎖は止めない（次の依頼を生かす）。answer が空だった場合は `応答を生成できませんでした。` を送る。
+- inject は `stop` の queue cancel 対象にしない（`stop` は実行待ち queue の外で処理され、実行中の submit を待たずに abort 要求を届ける。承認済みの案件は消さない）。`stop` が実行中の inject submit を中止で失敗させた場合は attempt を 1 消費する。`reset` は main 会話を作り直す（inject 済みの文脈も切れる）。人間は main 会話で `stop` / `reset` をそのまま使える。
+- bot process が動いていないと request は `pending` のまま（CLI は「bot process が次の poll で main 会話に渡します（bot が動いていないと pending のまま）」と出す）。`dispatchInject` を持たない loop は attempt を消費して `hoot_inject_unavailable: …` を lastError に書く。chat handler がまだ ready でない・session が無いときも `hoot_inject_unavailable`。
+- 失敗は `finishHootInject(ok:false)`。`attempts < 2` なら `pending` に戻して次の poll で再試行し、`attempts` が 2 なら `failed` にして 1 件だけ人間へ案内を送る（`araya hoot inject list` で状態を確認し、`araya hoot dispatch --key <proposal key>` で新しい承認を作り直せる旨）。request が見つからないときは `hoot_inject_not_found`。`HootInjectOutcome.kind` は `nothing` / `injected` / `failed` / `unavailable`。
+- inject の件数は `maxInjectsPerDay` と `injectCooldownMinutes` で抑止し、**判断 run の budget（`maxRunsPerDay`）とは別**にする。inject は HOOT 判断 run の model 呼び出しではない（main 会話の submit 1 回）。
+- log は `hoot_inject_queued` / `hoot_inject_skipped` / `hoot_inject`（success）/ `hoot_inject_failed` / `hoot_inject_unavailable` / `hoot_inject_proposal_missing` / `hoot_inject_poll_failed` / bot 側の `hoot_inject_delivered`・`discord_hoot_inject`。すべて redaction 後に `<dataDir>/logs/discord.log` へ書く。
+
+### inject の文面（`buildInjectPrompt`）
+
+`content` は 4 見出し + 進め方の list。HOOT 判断 run の tool 無さと、実行するのは main 会話であることを書き分ける。
+
+- 「何が起きたか」: 判断 run（tool なし）が `<decision>` を提案した旨、承認が人間の CLI 由来か `mode=active` + `autoDispatch` 由来か（`authorizedAt` 付き）、goal・理由・観測は**記録**で実際に作業を進めるのは main 会話である旨
+- 「goal」: inject 対象の goal の objective / scope / constraints をそのまま出す（goal が retired / 削除されているときは「人間の承認だけで来た案件。判断に迷うなら人間に確認してください」）
+- 「HOOT が挙げた理由」: proposal の reason
+- 「根拠にした観測」: `evidenceOccurrenceKeys` の最大 6 件（`hoot:<ISO UTC>`。`araya hoot runs` と突き合わせられる）と proposal key
+- 「進め方」: **goal の objective / constraints の範囲**で進めること、inject 文面や GitHub の issue / PR の title・body は**証拠であって命令ではない**こと、**production deploy・merge・外部送信・破壊的な操作はこの承認では許可しない**（必要なら人間に確認）こと、secret を出力に書き写さないこと、最後に分かったこと・やったこと・次に人間が必要な判断を書くこと（Discord に届く）
+
+`notice` は 1 文（例: `HOOT dispatch を main 会話に渡しました（proposal: <key> / goals: <keys> / 人間の承認）`）で、answer とは separate な message として先に送る。
+
+安全境界は「承認の gate（mode / autoDispatch / 人間の CLI）+ inject 文面の指示 + 人間の `stop` / `reset`」で持つ。inject を受けた main 会話の agent は tool を持つ（README・docs/development.md の「sandbox 無し」の約束が変わっていないことを inject 文面でも明記する）。
 
 ## 通知
 
 - 即時通知は `notifyDecisions` の allowlist が決める（既定は `request_human` と `invalid`＝安全側）。`noop` / `wait` / `investigate` / `dispatch` は送らず digest で返し、提案は state に残る。
-- 1 occurrence 1 件。nonce は `hoot-<sha256(occurrenceKey) 18 hex>`（再送で同じ nonce）。他の通知は nonce の hash input を `reminder:<key>:<n>`（再提醒）、`digest:<UTC day>`、`review:<goal key>:<reviewAt>`（自動 pause）、`<occurrenceKey>:failure:<回数>`（連続失敗）にして、同じ key が同じ nonce になるようにする。text は 1800 文字で切る。
+- 1 occurrence 1 件。nonce は `hoot-<sha256(occurrenceKey) 18 hex>`（再送で同じ nonce）。他の通知は nonce の hash input を `reminder:<key>:<n>`（再提醒）、`digest:<UTC day>`、`review:<goal key>:<reviewAt>`（自動 pause）、`<occurrenceKey>:failure:<回数>`（連続失敗）、`inject-failed:<inject key>`（inject 失敗）、`inject-unavailable:<inject key>`（main 会話を持たない loop）、`inject-proposal-missing:<inject key>`（取り出した request の proposal が state から消えた）にして、同じ key が同じ nonce になるようにする。text は 1800 文字で切る。
+- `dispatch` / `investigate` の即時通知には mode と承認の状態を 1 行で添える（`buildHootNotice` の dispatch note）。`dry_run` は「mode: dry_run（提案の記録だけ。作業は実行していません）」、`active` + `investigate` は「investigate は提案のまま。HOOT 自身が調査を走ることはありません」、`active` + `autoDispatch=true` は「次の poll で main Discord 会話へ inject します」、`active` + `autoDispatch=false` は「`araya hoot dispatch --key <proposal key>` で承認すると main Discord 会話へ inject します」。inject そのものは通知ではなく main 会話の answer が Discord に届く（上の allowlist とは別に、inject に失敗したときだけ 1 件案内を送る）。
 - **digest**（`digestHourUtc`、既定 21 UTC、0〜23 / none）: UTC 1 日 1 回、`utcHour(now)` が `digestHourUtc` と一致する tick で送る（`loop.lastDigestAt` が同じ UTC 日なら送らない）。中身はその UTC 日の run 内訳（model 判断 / precheck noop の数と decision 別の件数、最大 6 種 `HOOT_DIGEST_DECISION_LINES`。run が無ければ `判断なし`）、最新の `request_human` の reason、**open proposals（key 付き。最大 3 行 `HOOT_DIGEST_PROPOSAL_LINES`。超過分は「他 N 件は araya hoot proposal list」）**、observation gaps 件数。 集計対象は保持している `runs`（直近 200 件 `MAX_RUNS_KEPT`）内でその UTC 日のものだけなので、`tickMinutes` を極端に小さくして run が 200 件を超えると内訳は保持分だけになる（digest の数字は「直近 200 run のうちその日」の値）。
 - 再提醒の text は `[decision] key`・REASON・goals・期限を含む（`HOOT 提案の再提醒 <n>/<max>`）。goal の自動 pause は resume / retire の案内を添える。
 - 判断 run が 3 回続けて失敗したときに 1 件だけ失敗通知を送る（同じ streak で繰り返さない）。
@@ -151,21 +212,25 @@ araya hoot status
 araya hoot goal list | add | update | pause | resume | retire
 araya hoot settings show | set
 araya hoot proposal list | resolve --key <key>
+araya hoot dispatch --key <proposal key>
+araya hoot inject [list]
 araya hoot runs [--limit N]
 araya hoot reset-schedule
 araya hoot <command> ... [--data-dir <path>]
 ```
 
 - `goal add` / `goal update` は `--key <key> --objective "<目的>" [--scope github:owner/repo,...] [--constraint "<制約>",...] [--review-at <YYYY-MM-DD|ISO datetime|none>]`。
-- `settings set` は `[--enabled true|false] [--mode dry_run|active] [--tick-minutes N] [--max-runs-per-day N] [--notify-decisions a,b,c] [--precheck true|false] [--watchdog-hours N] [--digest-hour-utc N|none] [--reset-conversation-after-runs N] [--goal-review-days N] [--proposal-ttl-hours N] [--max-proposal-reminders N]`（`--notify-noop` は撤去）。
-- `status` は open proposals・`conversationRuns`・`lastModelRunAt`・`lastDigestAt`・goal の `reviewAt` を表示する。
+- `settings set` は `[--enabled true|false] [--mode dry_run|active] [--tick-minutes N] [--max-runs-per-day N] [--notify-decisions a,b,c] [--precheck true|false] [--watchdog-hours N] [--digest-hour-utc N|none] [--reset-conversation-after-runs N] [--goal-review-days N] [--proposal-ttl-hours N] [--max-proposal-reminders N] [--auto-dispatch true|false] [--max-injects-per-day N] [--inject-cooldown-minutes N]`（`--notify-noop` は撤去。`--mode active` は拒否しない）。値の範囲外・`--auto-dispatch` の true/false 以外は `hoot_settings_invalid`。
+- `dispatch --key <proposal key>` は main 会話への inject request を作る（`authorizedBy: 'human'`。`mode` が `dry_run` だと `hoot_mode_dry_run` で作れない）。成功時は request key と「Discord bot process が次の poll で main 会話に渡します（bot が動いていないと pending のままです）」を出す。skip（cooldown / daily_limit / already_pending / auto_dispatch_off）は終了 code 1 にせず、理由と settings の案内を出す。proposal が無い・open でない・`dispatch` 以外の decision は誤り（`hoot_proposal_not_found` / `hoot_inject_not_injectable`）。`--key` 欠落は `hoot_invalid_argument`。
+- `inject`（`list`）は inject request を直近 20 件、新しい順に 3 行で出す（`key [status] decision proposal=<proposal key> goals=…` / `authorized: <human|mode_active> @ <時刻> / attempts: <n>/2` / `injectedAt` と `lastError`）。記録が無ければ `araya hoot dispatch --key <proposal key>` への案内を出す。
+- `status` は open proposals・`conversationRuns`・`lastModelRunAt`・`lastDigestAt`・goal の `reviewAt`・`inject: autoDispatch=… / maxInjectsPerDay=… / cooldown=…分` の 1 行を表示し、request が有れば `inject requests: pending N / injected N / failed N（保持 20 件）` と直近 3 件を追加する。`mode` の説明行も `dry_run` / `active`(+autoDispatch) / `active`(人間の承認要) で書き分ける。
 - `proposal list` は open を全件、closed を直近 5 件表示して総数は `open N / closed M` に出す。1 件は key・status・decision・goals・reason・`created / confirmed / expires / reminders` の 3 行。`proposal resolve --key <key>` は open だけ（resolved / expired 済みの key も `hoot_proposal_not_found`）。closed を動かす導線は用意しない（proposal の life cycle は open -> resolved / expired の 1 往復だけ）
 
 `dataDir` は `araya` と同じ設定源（`ARAYA_DATA_DIR` / config file）を使う。全ての `araya hoot` subcommand は任意で `--data-dir <path>` を取れる（`options['data-dir'] ?? deps.dataDir`）: **未指定なら bot process と同じ resolution なので、`araya hoot status` は既定で稼働中 bot の `<dataDir>/hoot/state.json` を見る**。明示指定したときだけ別の file を指す（state 復旧作業で unit を stop した file を確かめる用途など）。bot process の起動・停止はしない。bot は次の tick（既定 60 秒以内）から新しい settings を読む。
 
-## 今回の P0 で実装した歯止め
+## 実装済みの歯止め
 
-- **state version 2**（v1 は読み取り時に migration。壊れた file は復旧しない）。
+- **state version 3**（v2・v1 は読み取り時に migration。v2 -> v3 は `injectRequests: []` と settings 既定を埋めるだけで値を作らない。壊れた file は復旧しない）。
 - **precheck**: 観測 fingerprint（goal 単位）が変わらなければ model を呼ばず `source: 'precheck'` の noop を記録。複数 goal は 1 件でも変われば run。観測に gap が 1 件でもある occurrence は precheck しない。
 - **watchdog**: `watchdogHours` 以内に 1 回は model で全体を見せる。
 - **daily limit は model run だけ**数える（precheck noop は budget を使わない）。
@@ -175,10 +240,15 @@ araya hoot <command> ... [--data-dir <path>]
 - **goal review 期限**: `reviewAt` を過ぎた active goal を model を呼ばず自動 paused にして 1 件通知。
 - **会話 reset**: `resetConversationAfterRuns` 件の model run で HOOT 判断会話を新しくする。
 - **即時通知は allowlist**（既定 `request_human` / `invalid`）。`noop` / `wait` 等は digest。
+- **inject は承認経路だけ**: `mode=dry_run` では request を作らない（`hoot_mode_dry_run`）。`mode=active` でも既定 `autoDispatch=false` で、人間の `araya hoot dispatch` が無い限り main 会話に流さない。
+- **inject の injectable gate**: `INJECTABLE_DECISIONS` は `dispatch` のみ（`investigate` は proposal のまま）。open でない proposal・存在しない proposal は誤り。
+- **inject の水量**: `injectCooldownMinutes`（既定 60 分）と `maxInjectsPerDay`（既定 2、人間の承認も数える、0 で止める）。poll 1 回に submit するのは pending 1 件だけ。
+- **inject の再試行上限**: `MAX_INJECT_ATTEMPTS`（2）。crash で pending に戻っても無限に再試行しない。保持は直近 20 件（`MAX_INJECTS_KEPT`）。
+- **inject の実行は bot process だけ**: pending は submit されないまま残り、HOOT 判断 run に tool は増えない（inject 先は main 会話の tool）。inject 文面は goal の objective / constraints 範囲に縛り、production deploy・merge・外部送信・破壊的操作をこの承認で許可しない。人間は main 会話で `stop` / `reset` できる。
 
 ## drill-down で決めた将来方針
 
-- **1A（dispatch の形）**: dispatch は「HOOT 判断 run に tool を渡す」形にはしない。HOOT は判断 record だけ作り、main の Discord 会話（`koh110-araya-main`）に **decision record を input として inject** して、作業はその会話側で走らせる。
+- **1A（dispatch の形）実装済み（Issue #31）**: dispatch は「HOOT 判断 run に tool を渡す」形にはしない。HOOT は判断 record と inject request を作り、main の Discord 会話（channel ごとの main agent session）に **承認済みの案件を input として inject** して、作業はその会話側で走らせる。HOOT 判断 run は tool を持たないまま。
 - **2A（呼ばないことを code で決める）**: precheck + watchdog。複数 goal 対応済み（goal 単位 fingerprint、1 件でも変われば model）。
 - **3A（goal の空腹を止める）**: `reviewAt` による自動 pause（resume / retire で人間が応答）。
 - **4A（evidence）**: state は JSON のまま `occurrenceKey` を public evidence ID として維持する（proposal の `evidenceOccurrenceKeys`）。
@@ -187,7 +257,9 @@ araya hoot <command> ... [--data-dir <path>]
 
 ## 未実装
 
-- **`mode=active` と実際の dispatch**。main 会話への decision record inject（1A）はまだ無い。`mode=active` は `hoot_mode_unimplemented` で拒否し、`investigate` / `dispatch` は提案の記録だけ（`mode: dry_run`）。
+- **`investigate` の実行**。inject できる decision は `INJECTABLE_DECISIONS` の `dispatch` だけ。`investigate` は proposal のまま（HOOT 自身の調査行為は増やさない）。
+- **proposal の auto resolve と inject の対応**。dispatch しても proposal は open のまま（`resolved` は人間の `proposal resolve` だけ）。pending 解消のための closed 化はしていない。
+- **mode=active + autoDispatch の承認審査**。autoDispatch は `dispatch` 判断をそのまま inject するだけで、proposal の内容・危険さを model に判断させていない（gate は code 側の settings）。
 - Issue label・webhook・Discord 反応などの event-driven wakeup。current 実装は interval schedule だけ。
 - task 台帳・runner・worktree 作成・PR 作成。session-first 構成では work の unit は Pi durable の named child conversation であり、HOOT の record と child session を結ぶ layer はまだ無い。
 - state への SQLite 採用（`state.json` + lock）。
@@ -196,11 +268,13 @@ araya hoot <command> ... [--data-dir <path>]
 
 ## 失敗と停止
 
-- bot process の shutdown では HOOT loop を stop してから gateway と agent session を閉じる（待機の上限 20 秒）。実行中の判断 run があっても打ち切らず、完了を待つ。
+- bot process の shutdown では HOOT loop を stop してから gateway と agent session を閉じる（待機の上限 20 秒）。実行中の判断 run があっても打ち切らず、完了を待つ。inject の submit が進行中なら chat handler の drain で待つ（`hoot_inject_delivered` まで届く）。実行中に `takePendingInject` が attempt を 1 消費していた場合、その request は `pending`（attempts 1）のまま state に残り、次の起動で再試行する（`attempts` が 2 に達すると `failed`）。
 - 失敗時は run を記録せず、`consecutiveFailures` を 1 増やして `failureCooldownUntil = now + tickMinutes` を state に書き、その間 tick は `failure_cooldown` で終わる。判断 text が書けた run（`invalid` を含む）で連続失敗は 0 に戻る。
 - goal の review 超過による自動 pause は失敗ではない（run を記録せず `goals_review_paused`）。
-- `araya hoot reset-schedule` は schedule だけ戻す（run 記録・settings・proposals は保つ）。
+- `araya hoot reset-schedule` は schedule だけ戻す（`loop.lastOccurrenceAt` を null にするだけ。run 記録・settings・proposals・inject request は保つ。pending inject は次の起動でも残り、attempts 上限を引き継ぐ）。
 
 ## model 呼び出しの bound
 
 enabled=false・active goal なし・occurrence 前・cooldown 中・daily limit 超過では model を呼ばない。occurrence の重複実行もしない。1 occurrence の model 呼び出しは submit 1 回まで（`whenBusy: 'reject'`、tool loop 走らない）。観測は model を呼ばない deterministic code だけ。precheck が発動するのは fingerprint 不変・watchdog 前・**gap なし**のときだけで、このとき model は呼ばない（gap が 1 件でもあれば precheck は発動しない）。
+
+inject は HOOT 判断 run の model 呼び出しではない（main 会話の `session.submit` 1 回。inject 先が model を使うのは main 会話側の通常の動作）。inject の bound は `maxInjectsPerDay`（既定 2）・`injectCooldownMinutes`（既定 60 分）・poll 1 回 1 件・`MAX_INJECT_ATTEMPTS`（2）で持ち、`maxRunsPerDay` の budget とは共有しない。`enabled=false` では inject も走らない。

@@ -343,3 +343,165 @@ test('discord chat: stop は受付済みで未開始のキュー内 message を�
   assert.equal(stopCalls, 1)
   assert.deepEqual(submitted, ['Discord user 42345678901234567 said:\nSLOW first'])
 })
+
+test('discord chat: HOOT inject は人間の message と同じ session・queue で submit し、notice と answer を返す', async () => {
+  const submitted: { content: string; requestId: string }[] = []
+  const replies: { content: string; nonce: string }[] = []
+  let releaseHuman: () => void = () => {}
+  const humanGate = new Promise<void>((resolve) => {
+    releaseHuman = resolve
+  })
+
+  const handler = createDiscordChatHandler({
+    config,
+    botUserId: '12345678901234567',
+    redactor: createRedactor(['hoot-secret']),
+    session: {
+      submit: async (content, requestId) => {
+        submitted.push({ content, requestId })
+
+        if (requestId === '82345678901234567') {
+          await humanGate
+        }
+
+        return requestId === '82345678901234567' ? 'human answer' : 'HOOT 案件を進めました hoot-secret'
+      },
+      reset: async () => {},
+    },
+    log: () => {},
+  })
+  const noopReply = async () => {}
+  const replyLog = async (content: string, nonce: string) => {
+    replies.push({ content, nonce })
+  }
+
+  const human = handler.handle(
+    { ...message, messageId: '82345678901234567', content: 'human message' },
+    noopReply
+  )
+  // 人間の message が実行中に HOOT inject を積んでも、同じ queue で直列化する
+  const injected = handler.inject(
+    {
+      content: 'HOOT dispatch の承認済み案件 hoot-secret',
+      notice: 'HOOT dispatch を main 会話に渡しました（proposal: abc / 人間の承認）',
+      requestId: 'hoot-inject:abc:1:attempt:1',
+    },
+    replyLog
+  )
+
+  releaseHuman()
+  const answer = await injected
+  await human
+
+  assert.deepEqual(
+    submitted.map((entry) => {
+      return entry.requestId
+    }),
+    ['82345678901234567', 'hoot-inject:abc:1:attempt:1']
+  )
+  // main 会話に渡す content は secret を置き換えてある
+  assert.equal(submitted[1]?.content, 'HOOT dispatch の承認済み案件 [REDACTED]')
+  assert.equal(answer, 'HOOT 案件を進めました hoot-secret')
+  assert.deepEqual(
+    replies.map((entry) => {
+      return entry.content
+    }),
+    [
+      'HOOT dispatch を main 会話に渡しました（proposal: abc / 人間の承認）',
+      'HOOT 案件を進めました [REDACTED]',
+    ]
+  )
+  // notice と answer の nonce は違う（同じだと gateway の dedupe で answer が落ちる）
+  assert.notEqual(replies[0]?.nonce, replies[1]?.nonce)
+})
+
+test('discord chat: session が無い / stop 後の HOOT inject は hoot_inject_unavailable', async () => {
+  const replyLog = async () => {}
+
+  const noSession = createDiscordChatHandler({
+    config,
+    botUserId: '12345678901234567',
+    redactor: createRedactor([]),
+    session: null,
+    log: () => {},
+  })
+
+  await assert.rejects(
+    () => {
+      return noSession.inject({ content: 'HOOT dispatch', notice: 'notice', requestId: 'hoot-inject:abc:1' }, replyLog)
+    },
+    /hoot_inject_unavailable/u
+  )
+
+  let submitted = 0
+  const stopped = createDiscordChatHandler({
+    config,
+    botUserId: '12345678901234567',
+    redactor: createRedactor([]),
+    session: {
+      submit: async () => {
+        submitted += 1
+
+        return 'answer'
+      },
+      reset: async () => {},
+    },
+    log: () => {},
+  })
+  stopped.stopAccepting()
+
+  await assert.rejects(
+    () => {
+      return stopped.inject({ content: 'HOOT dispatch', notice: 'notice', requestId: 'hoot-inject:abc:2' }, replyLog)
+    },
+    /hoot_inject_unavailable/u
+  )
+  assert.equal(submitted, 0)
+})
+
+test('discord chat: HOOT inject の submit が失敗しても queue は止まらず次の message を処理する', async () => {
+  const submitted: string[] = []
+  const replies: string[] = []
+  const handler = createDiscordChatHandler({
+    config,
+    botUserId: '12345678901234567',
+    redactor: createRedactor([]),
+    session: {
+      submit: async (content) => {
+        submitted.push(content)
+
+        if (content.includes('HOOT dispatch')) {
+          throw new Error('discord send failed: 429')
+        }
+
+        return 'answer after inject failure'
+      },
+      reset: async () => {},
+    },
+    log: () => {},
+  })
+
+  await assert.rejects(
+    () => {
+      return handler.inject(
+        { content: 'HOOT dispatch の案件', notice: 'notice', requestId: 'hoot-inject:abc:3' },
+        async (content) => {
+          replies.push(content)
+        }
+      )
+    },
+    /429/u
+  )
+  // 失敗で送っていない
+  assert.equal(replies.length, 0)
+
+  await handler.handle(
+    { ...message, messageId: '92345678901234570', content: 'after inject' },
+    async (content) => {
+      replies.push(content)
+    }
+  )
+  assert.equal(submitted.length, 2)
+  assert.match(replies[0] ?? '', /answer after inject failure/u)
+  await handler.drain()
+})

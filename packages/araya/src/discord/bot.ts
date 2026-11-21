@@ -375,6 +375,35 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
 
           await settlement.gateway.sendText(text, nonce)
         },
+        // Issue #31（1A）: 承認済みの dispatch を main Discord 会話へ submit する。HOOT 判断 run 側には
+        // tool が無く、作業を実行するのはこの main 会話だけ。人間の message と同じ queue で直列化する
+        dispatchInject: async (input) => {
+          const handler = chatHandlerRef.current
+
+          if (handler === null) {
+            throw new Error('hoot_inject_unavailable: chat handler がまだ ready ではありません')
+          }
+
+          const settlement = await gatewayReady
+
+          if (!settlement.ok) {
+            throw settlement.error
+          }
+
+          const answer = await handler.inject(
+            { content: input.content, requestId: input.requestId, notice: input.notice },
+            async (text, nonce) => {
+              await settlement.gateway.sendText(text, nonce)
+            }
+          )
+
+          logSafe({
+            type: 'hoot_inject_delivered',
+            injectKey: input.injectKey,
+            proposalKey: input.proposalKey,
+            answerChars: answer.length,
+          })
+        },
         redactor,
         // HOOT の log entry は gh・model 由来の text を含む。書く前に秘密を置き換える
         log: (entry) => {
