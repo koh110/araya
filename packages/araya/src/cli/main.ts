@@ -3,6 +3,7 @@ import os from 'node:os'
 import { parseCliArguments } from './arguments.ts'
 import { loadConfig, loadPiSdk, withPiEnvironment } from '../config/environment.ts'
 import { runHootCommand } from './hoot-commands.ts'
+import { assertHumanHootInvocation } from '../infrastructure/agent-session.ts'
 import {
   createSystemdOps,
   resolveDiscordEnvRunnerEntrypoint,
@@ -208,6 +209,8 @@ export async function runCli(
     }
 
     const config = loadConfig(env)
+    // agent session の bash tool from の実行はここで止める（agent が自分の dispatch を承認できないようにする）
+    assertHumanHootInvocation(hootArgs, env ?? process.env)
     await runHootCommand(hootArgs, {
       dataDir: config.dataDir,
       stdout: (text) => {

@@ -113,7 +113,7 @@ export type HootInjectRequest = {
   authorizedBy: HootInjectAuthorizer
   authorizedAt: string
   status: HootInjectStatus
-  // main 会話の submit の requestId（同じ request を繰り返さないための stable key）
+  // main 会話の submit の dedupe key（`key` と同じ。attempt を含まない。同じ dispatch を 2 度走らせない）
   requestId: string
   createdAt: string
   updatedAt: string
@@ -475,11 +475,9 @@ export function injectKeyOf(proposalKey: string, index: number) {
   return `hoot-inject:${proposalKey}:${index}`
 }
 
-// 同じ attempt を繰り返さないための requestId。attempt は store が数える
-export function injectRequestIdOf(key: string, attempt: number) {
-  return `${key}:attempt:${attempt}`
-}
-
+// 同じ attempt を繰り返さないための requestId。attempt を含まない（上の key そのまま）。
+// 同じ key で 2 回 submit しても Pi durable は 1 回だけ実行し、記録済みの answer を返す。失敗 retry
+// の回数は attempts 側で数える
 export function pendingInjectsOf(state: HootState) {
   return state.injectRequests.filter((request) => {
     return request.status === 'pending' && request.attempts < MAX_INJECT_ATTEMPTS

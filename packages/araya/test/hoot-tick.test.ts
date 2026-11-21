@@ -9,7 +9,6 @@ import { readHootState, setGoalStatus, writeHootState } from '../src/hoot/store.
 import {
   MAX_INJECT_ATTEMPTS,
   defaultState,
-  injectRequestIdOf,
   proposalKeyOf,
   type HootGoal,
   type HootInjectRequest,
@@ -1047,7 +1046,7 @@ function pendingInjectFixture(overrides: Partial<HootInjectRequest> = {}): HootI
 
   return {
     key,
-    requestId: injectRequestIdOf(key, 1),
+    requestId: key,
     proposalKey: DISPATCH_PROPOSAL_KEY,
     decision: 'dispatch',
     goalKeys: ['araya-quality'],
@@ -1256,7 +1255,11 @@ test('hoot tick: inject の失敗は retry して next poll で status を戻せ
         return notice.text.includes('inject に失敗しました')
       }))
       assert.ok(retry.notices.some((notice) => {
-        return notice.text.includes('araya hoot dispatch --key ' + DISPATCH_PROPOSAL_KEY)
+        return notice.text.includes('hoot dispatch --key ' + DISPATCH_PROPOSAL_KEY)
+      }))
+      // 同じ dedupe key の再試行なので、人間が打ち直すまで同じ案件は自動で再実行しない旨を出す
+      assert.ok(retry.notices.some((notice) => {
+        return notice.text.includes('同じ案件は自動で再実行しません')
       }))
       retryState = await retry.readState()
       assert.equal(retryState.injectRequests[0]?.status, 'failed')

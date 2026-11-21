@@ -1,0 +1,369 @@
+import assert from 'node:assert/strict'
+import fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { test } from 'node:test'
+import {
+  DISCORD_CONTROL_USAGE,
+  createDiscordControlCommands,
+  hootArgumentsOf,
+  type DiscordControlContext,
+} from '../src/discord/commands.ts'
+import { ARAYA_SLASH_COMMANDS, HOOT_COMMAND, validateArayaSlashCommands } from '../src/discord/slash.ts'
+import { readHootState, setGoal, updateSettings, upsertProposal } from '../src/hoot/store.ts'
+
+function fakeContext(options: { dataDir?: string } = {}) {
+  const sends: string[] = []
+  const context: DiscordControlContext & { sends: string[] } = {
+    conversationId: 41,
+    runningCount: 1,
+    queuedCount: 2,
+    sessionAvailable: true,
+    sends,
+    send: async (content) => {
+      sends.push(content)
+    },
+    cancelQueued: () => 3,
+    stopSession: async () => '実行中・実行待ちの作業があれば中止を要求しました',
+    resetSession: async (requestId) => `reset ${requestId}`,
+  }
+
+  return context
+}
+
+function hootRequest(
+  input: {
+    group?: string
+    subcommand: string
+    options?: Record<string, string | number | boolean>
+  },
+) {
+  return {
+    interactionId: 'interaction-2',
+    commandName: 'hoot',
+    userId: 'user-1',
+    guildId: 'guild-1',
+    channelId: 'channel-1',
+    subcommandGroup: input.group ?? null,
+    subcommand: input.subcommand,
+    options: input.options ?? {},
+  }
+}
+
+test('slash command 定義は Discord の constraints を満たす', () => {
+  assert.deepEqual(validateArayaSlashCommands(ARAYA_SLASH_COMMANDS), [])
+  assert.deepEqual(
+    ARAYA_SLASH_COMMANDS.map((command) => command.name),
+    ['araya', 'hoot'],
+  )
+  assert.deepEqual(
+    HOOT_COMMAND.options.map((entry) => entry.name),
+    ['status', 'dispatch', 'runs', 'inject', 'goal', 'settings', 'proposal', 'reset-schedule'],
+  )
+})
+
+test('slash command 定義の壊れを validateArayaSlashCommands が拾う', () => {
+  const problems = validateArayaSlashCommands([
+    {
+      name: 'Bad Name',
+      description: '',
+      options: [
+        {
+          type: 2,
+          name: 'goal',
+          description: 'goal',
+          options: [{ type: 1, name: 'add', description: 'add', options: [{ name: 'x'.repeat(40), description: 'o', type: 3 }] }],
+        },
+      ],
+    },
+  ])
+
+  assert.equal(problems.length >= 3, true, JSON.stringify(problems))
+  assert.equal(
+    problems.some((problem) => {
+      return problem.includes('command name')
+    }),
+    true,
+  )
+  assert.equal(
+    problems.some((problem) => {
+      return problem.includes('option name')
+    }),
+    true,
+  )
+})
+
+test('/hoot の option を araya hoot と同じ引数列へ変換する', () => {
+  assert.deepEqual(hootArgumentsOf(hootRequest({ subcommand: 'status' })), ['status'])
+  assert.deepEqual(hootArgumentsOf(hootRequest({ subcommand: 'runs' })), ['runs'])
+  assert.deepEqual(hootArgumentsOf(hootRequest({ subcommand: 'reset-schedule' })), ['reset-schedule'])
+  assert.deepEqual(hootArgumentsOf(hootRequest({ subcommand: 'dispatch', options: { key: 'abc' } })), [
+    'dispatch',
+    '--key',
+    'abc',
+  ])
+  assert.deepEqual(hootArgumentsOf(hootRequest({ group: 'inject', subcommand: 'list' })), ['inject', 'list'])
+  assert.deepEqual(hootArgumentsOf(hootRequest({ group: 'proposal', subcommand: 'list' })), ['proposal', 'list'])
+  assert.deepEqual(hootArgumentsOf(hootRequest({ group: 'proposal', subcommand: 'resolve', options: { key: 'abc' } })), [
+    'proposal',
+    'resolve',
+    '--key',
+    'abc',
+  ])
+  assert.deepEqual(
+    hootArgumentsOf(
+      hootRequest({
+        group: 'goal',
+        subcommand: 'add',
+        options: {
+          key: 'ship-pr34',
+          objective: 'PR #34 を review して merge する',
+          scope: 'github:koh110/araya,github:koh110/araya',
+          constraint: 'deploy は human gate,token を log に出さない',
+          'review-at': '2026-07-31',
+        },
+      }),
+    ),
+    [
+      'goal',
+      'add',
+      '--key',
+      'ship-pr34',
+      '--objective',
+      'PR #34 を review して merge する',
+      '--scope',
+      'github:koh110/araya,github:koh110/araya',
+      '--constraint',
+      'deploy は human gate,token を log に出さない',
+      '--review-at',
+      '2026-07-31',
+    ],
+  )
+  // update は指定した field だけ渡す（未指定は CLI 側で現状維持）
+  assert.deepEqual(
+    hootArgumentsOf(hootRequest({ group: 'goal', subcommand: 'update', options: { key: 'k', objective: '新しい目的' } })),
+    ['goal', 'update', '--key', 'k', '--objective', '新しい目的'],
+  )
+  assert.deepEqual(hootArgumentsOf(hootRequest({ group: 'goal', subcommand: 'pause', options: { key: 'k' } })), [
+    'goal',
+    'pause',
+    '--key',
+    'k',
+  ])
+  assert.deepEqual(hootArgumentsOf(hootRequest({ group: 'settings', subcommand: 'show' })), ['settings', 'show'])
+  // boolean option は CLI の 'true' / 'false'、integer は string にする
+  assert.deepEqual(
+    hootArgumentsOf(
+      hootRequest({
+        group: 'settings',
+        subcommand: 'set',
+        options: { enabled: true, mode: 'dry_run', 'max-injects-per-day': 2, 'auto-dispatch': false },
+      }),
+    ),
+    ['settings', 'set', '--enabled', 'true', '--mode', 'dry_run', '--auto-dispatch', 'false', '--max-injects-per-day', '2'],
+  )
+})
+
+test('unknown subcommand・必須 option 欠落・data-dir は hoot_invalid_argument', () => {
+  assert.throws(
+    () => {
+      hootArgumentsOf(hootRequest({ subcommand: 'delete-everything' }))
+    },
+    /hoot_invalid_argument/u,
+  )
+  assert.throws(
+    () => {
+      hootArgumentsOf(hootRequest({ group: 'goal', subcommand: 'explode' }))
+    },
+    /hoot_invalid_argument/u,
+  )
+  assert.throws(
+    () => {
+      hootArgumentsOf(hootRequest({ subcommand: 'dispatch', options: {} }))
+    },
+    /hoot_invalid_argument: \/hoot dispatch は key が必要です/u,
+  )
+  assert.throws(
+    () => {
+      hootArgumentsOf(hootRequest({ group: 'goal', subcommand: 'add', options: { key: 'k' } }))
+    },
+    /objective が必要です/u,
+  )
+  assert.throws(
+    () => {
+      hootArgumentsOf(hootRequest({ group: 'settings', subcommand: 'set', options: {} }))
+    },
+    /1 つ以上の field が必要/u,
+  )
+  assert.throws(
+    () => {
+      hootArgumentsOf(hootRequest({ subcommand: 'status', options: { 'data-dir': '/tmp/other' } }))
+    },
+    /--data-dir は指定できません/u,
+  )
+})
+
+test('Discord control command: /araya の help・status・stop・reset', async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-control-'))
+
+  try {
+    const logs: Record<string, unknown>[] = []
+    const control = createDiscordControlCommands({
+      dataDir,
+      nowMs: (): number => Date.parse('2026-06-30T09:00:00.000Z'),
+      log: (entry) => {
+        logs.push(entry)
+      },
+    })
+    const context = fakeContext({ dataDir })
+
+    await control.handle(
+      { interactionId: 'i1', commandName: 'araya', userId: 'u', guildId: 'g', channelId: 'c', subcommandGroup: null, subcommand: 'help', options: {} },
+      context,
+    )
+    assert.equal(context.sends[0]?.includes('/hoot dispatch'), true)
+    assert.equal(context.sends[0]?.includes('/araya reset'), true)
+
+    await control.handle(
+      { interactionId: 'i2', commandName: 'araya', userId: 'u', guildId: 'g', channelId: 'c', subcommandGroup: null, subcommand: 'status', options: {} },
+      context,
+    )
+    assert.match(context.sends[1] ?? '', /main conversation #41/u)
+    assert.match(context.sends[1] ?? '', /state file:/u)
+
+    await control.handle(
+      { interactionId: 'i3', commandName: 'araya', userId: 'u', guildId: 'g', channelId: 'c', subcommandGroup: null, subcommand: 'stop', options: {} },
+      context,
+    )
+    assert.match(context.sends[2] ?? '', /中止を要求/u)
+    assert.match(context.sends[2] ?? '', /実行待ち 3 件/u)
+
+    await control.handle(
+      { interactionId: 'i4', commandName: 'araya', userId: 'u', guildId: 'g', channelId: 'c', subcommandGroup: null, subcommand: 'reset', options: {} },
+      context,
+    )
+    assert.equal(context.sends[3], 'reset i4')
+
+    assert.deepEqual(
+      logs.map((entry) => {
+        return entry.command
+      }),
+      ['araya help', 'araya status', 'araya stop', 'araya reset'],
+    )
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('Discord control command: 知らない subcommand はエラー応答と discord_control_failed', async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-control-'))
+
+  try {
+    const logs: Record<string, unknown>[] = []
+    const control = createDiscordControlCommands({
+      dataDir,
+      nowMs: (): number => Date.parse('2026-06-30T09:00:00.000Z'),
+      log: (entry) => {
+        logs.push(entry)
+      },
+    })
+    const context = fakeContext({ dataDir })
+
+    await control.handle(
+      { interactionId: 'i5', commandName: 'araya', userId: 'u', guildId: 'g', channelId: 'c', subcommandGroup: null, subcommand: 'deploy', options: {} },
+      context,
+    )
+    assert.match(context.sends[0] ?? '', /知りません/u)
+    assert.equal(logs[0]?.type, 'discord_control_failed')
+
+    await control.handle(
+      { interactionId: 'i6', commandName: 'other', userId: 'u', guildId: 'g', channelId: 'c', subcommandGroup: null, subcommand: 'status', options: {} },
+      context,
+    )
+    assert.match(context.sends[1] ?? '', /\/araya か \/hoot/u)
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('Discord control command: /hoot dispatch は bot process の dataDir で inject request を作る', async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-control-'))
+
+  try {
+    const logs: Record<string, unknown>[] = []
+    const control = createDiscordControlCommands({
+      dataDir,
+      nowMs: (): number => Date.parse('2026-06-30T09:00:00.000Z'),
+      log: (entry) => {
+        logs.push(entry)
+      },
+    })
+    await setGoal(
+      dataDir,
+      { key: 'watch-ci', objective: 'CI の失敗を追跡する', scope: ['github:koh110/araya'], constraints: [] },
+      { replace: true },
+    )
+    // dispatch の承認は mode=active が前提（dry_run では inject を作らない）
+    await updateSettings(dataDir, { mode: 'active' })
+    await upsertProposal(dataDir, {
+      key: 'abc',
+      decision: 'dispatch',
+      goalKeys: ['watch-ci'],
+      reason: 'CI が失敗しています',
+      occurrenceKey: 'hoot:2026-06-30T08:00:00.000Z',
+      nowMs: Date.parse('2026-06-30T08:00:00.000Z'),
+    })
+
+    const context = fakeContext({ dataDir })
+    await control.handle(hootRequest({ subcommand: 'dispatch', options: { key: 'abc' } }), context)
+
+    assert.match(context.sends[0] ?? '', /inject request/iu, JSON.stringify(context.sends))
+    const written = await readHootState(dataDir)
+    assert.equal(written.injectRequests.length, 1)
+    assert.equal(written.injectRequests[0]?.authorizedBy, 'human')
+    assert.equal(written.injectRequests[0]?.requestId, 'hoot-inject:abc:1')
+    assert.equal(
+      logs.some((entry) => {
+        return entry.type === 'discord_control_command' && String(entry.command).includes('hoot dispatch')
+      }),
+      true,
+    )
+    // 同じ key をもう一度承認しようすると CLI 側の guard で断られる（同じ案件を繰り返さない）
+    await control.handle(hootRequest({ subcommand: 'dispatch', options: { key: 'abc' } }), context)
+    assert.match(context.sends[1] ?? '', /hoot_inject_exists|pending|すでに/u, JSON.stringify(context.sends[1]))
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('/hoot status・inject list・runs は bot process の dataDir を読む（session が無くても動く）', async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-control-'))
+
+  try {
+    const control = createDiscordControlCommands({
+      dataDir,
+      nowMs: (): number => Date.parse('2026-06-30T09:00:00.000Z'),
+      log: () => {},
+    })
+    const context = fakeContext({ dataDir })
+    context.conversationId = null
+    context.sessionAvailable = false
+
+    await control.handle(hootRequest({ subcommand: 'status' }), context)
+    assert.match(context.sends[0] ?? '', /state file:/u)
+
+    await control.handle(hootRequest({ group: 'inject', subcommand: 'list' }), context)
+    assert.match(context.sends[1] ?? '', /inject request/iu, JSON.stringify(context.sends[1]))
+
+    await control.handle(hootRequest({ subcommand: 'runs' }), context)
+    assert.match(context.sends[2] ?? '', /run/iu)
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('usage には slash command 形と人間専用の注意を書く', () => {
+  assert.equal(DISCORD_CONTROL_USAGE.includes('/araya help'), true)
+  assert.equal(DISCORD_CONTROL_USAGE.includes('/hoot settings'), true)
+  assert.equal(DISCORD_CONTROL_USAGE.includes('人間専用'), true)
+})
