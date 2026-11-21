@@ -685,6 +685,7 @@ test('discord bot: HOOT state が有効なら wakeup loop を走らせて判断�
             return {
               text: '観測: open issue 0 件\nDECISION: request_human\nREASON: 優先順位を確認してください',
               conversationId: 42,
+              conversationReads: { calls: 0, entries: 0, chars: 0 },
             }
           },
         }
@@ -843,6 +844,7 @@ test('discord bot: CLI で承認した HOOT dispatch を main 会話 session に
             return {
               text: 'HOOT 判断:\nDECISION: wait\nREASON: 次に 1 件進める',
               conversationId: 43,
+              conversationReads: { calls: 0, entries: 0, chars: 0 },
             }
           },
         }
@@ -999,6 +1001,7 @@ test('discord bot: Discord の /hoot dispatch 承認を同じ process の poll �
             return {
               text: 'HOOT 判断:\nDECISION: wait\nREASON: 次に 1 件進める',
               conversationId: 44,
+              conversationReads: { calls: 0, entries: 0, chars: 0 },
             }
           },
         }

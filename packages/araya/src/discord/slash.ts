@@ -96,6 +96,10 @@ const SETTINGS_SET_OPTIONS: SlashOption[] = [
   integerOption('proposal-ttl-hours', 'open proposal の期限（時間）'),
   integerOption('max-proposal-reminders', 'open proposal の再提醒の上限（回）'),
   booleanOption('auto-dispatch', 'mode=active のとき dispatch を自動 inject する'),
+  booleanOption(
+    'conversation-read',
+    'true で HOOT 判断 run に main 会話 transcript を読む read-only tool が入る（既定 false）'
+  ),
   integerOption('max-injects-per-day', '1 UTC 日の inject 上限（人間の承認も含む）'),
   integerOption('inject-cooldown-minutes', 'inject 同士の間隔（分）'),
 ]

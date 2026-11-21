@@ -46,7 +46,7 @@ export const DISCORD_CONTROL_USAGE = [
   '  /hoot goal add key:<key> objective:<1 文> [scope:github:owner/repo,...] [constraint:...] [review-at:YYYY-MM-DD|none]',
   '  /hoot goal update key:<key> … 指定した field だけ更新（未指定は現状維持）',
   '  /hoot proposal list / resolve key:<key> … 提案の一覧と解決済み化',
-  '  /hoot settings show / set … 設定（enabled・mode・auto-dispatch・max-injects-per-day・inject-cooldown-minutes など）',
+  '  /hoot settings show / set … 設定（enabled・mode・auto-dispatch・conversation-read・max-injects-per-day・inject-cooldown-minutes など）',
   '  /hoot reset-schedule … schedule だけ戻す（run 記録・settings・proposals・inject request は保つ）',
   '（HOOT の承認・goal・設定の変更は人間専用です。agent session の内側から araya hoot の書き込み command は拒否されます）',
 ].join('\n')
@@ -71,6 +71,7 @@ const HOOT_SETTINGS_FLAGS = [
   'proposal-ttl-hours',
   'max-proposal-reminders',
   'auto-dispatch',
+  'conversation-read',
   'max-injects-per-day',
   'inject-cooldown-minutes',
 ] as const

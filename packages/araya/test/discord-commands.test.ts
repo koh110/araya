@@ -157,10 +157,23 @@ test('/hoot の option を araya hoot と同じ引数列へ変換する', () => 
       hootRequest({
         group: 'settings',
         subcommand: 'set',
-        options: { enabled: true, mode: 'dry_run', 'max-injects-per-day': 2, 'auto-dispatch': false },
+        options: { enabled: true, mode: 'dry_run', 'max-injects-per-day': 2, 'auto-dispatch': false, 'conversation-read': true },
       }),
     ),
-    ['settings', 'set', '--enabled', 'true', '--mode', 'dry_run', '--auto-dispatch', 'false', '--max-injects-per-day', '2'],
+    [
+      'settings',
+      'set',
+      '--enabled',
+      'true',
+      '--mode',
+      'dry_run',
+      '--auto-dispatch',
+      'false',
+      '--conversation-read',
+      'true',
+      '--max-injects-per-day',
+      '2',
+    ],
   )
 })
 

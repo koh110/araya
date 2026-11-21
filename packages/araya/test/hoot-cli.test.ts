@@ -84,7 +84,8 @@ function runFixture(occurrenceKey: string, overrides: Partial<HootRun> = {}): Ho
     dispatched: false,
     observedRepos: ['koh110/araya'],
     observationGaps: [],
-    ...overrides,
+        conversationReads: { calls: 0, entries: 0, chars: 0 },
+...overrides,
   }
 }
 
@@ -924,6 +925,52 @@ test('hoot cli: dispatch --key は inject request を作り、inject list / stat
 
     const afterInject = await fixture.run(['inject', 'list'])
     assert.match(afterInject.output, /\[injected\]/u)
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot cli: settings set --conversation-read で tool の on/off を表示し、runs は read 実績を出す', async () => {
+  const fixture = await makeHootCliFixture()
+
+  try {
+    const parsed = parseHootArguments(['settings', 'set', '--conversation-read', 'true'])
+    assert.deepEqual(parsed.options, { 'conversation-read': 'true' })
+
+    const initial = await fixture.run(['status'])
+    assert.match(initial.output, /conversationRead: false/u)
+
+    const enabled = await fixture.run(['settings', 'set', '--conversation-read', 'true'])
+    assert.equal(enabled.ok, true)
+    assert.match(enabled.output, /conversationRead: true/u)
+    assert.equal((await readHootState(fixture.dataDir)).settings.conversationRead, true)
+
+    const invalid = await fixture.run(['settings', 'set', '--conversation-read', 'yes'])
+    assert.equal(invalid.ok, false)
+    assert.match(invalid.message, /--conversation-read は true か false/u)
+
+    // read を使った run と使っていない run を並べて表示する
+    const state = await readHootState(fixture.dataDir)
+    await writeHootState(fixture.dataDir, {
+      ...state,
+      runs: [
+        runFixture('hoot:2026-11-19T08:00:00.000Z', {
+          conversationReads: { calls: 2, entries: 9, chars: 2_400 },
+          decision: 'wait',
+          reason: 'main 会話で人間の変更を取り消すと確認した',
+        }),
+        runFixture('hoot:2026-11-19T08:05:00.000Z', { decision: 'noop', reason: '変化なし' }),
+      ],
+    })
+
+    const runs = await fixture.run(['runs'])
+    assert.match(runs.output, /reads: 2 calls \/ 9 entries \/ 2400 chars/u)
+    assert.equal(runs.output.match(/reads: /gu)?.length ?? 0, 1)
+
+    const status = await fixture.run(['status'])
+    assert.match(status.output, /conversationRead: true/u)
+    // status の last run は read を使っていない run（0 件）
+    assert.match(status.output, /conversation reads: 0 calls \/ 0 entries \/ 0 chars/u)
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }

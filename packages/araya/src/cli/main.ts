@@ -62,6 +62,7 @@ function printHelp() {
     [--precheck true|false] [--watchdog-hours N] [--digest-hour-utc N|none] [--reset-conversation-after-runs N]
     [--goal-review-days N] [--proposal-ttl-hours N] [--max-proposal-reminders N]
     [--auto-dispatch true|false] [--max-injects-per-day N] [--inject-cooldown-minutes N]
+    [--conversation-read true|false]（true で HOOT 判断 run に main Discord 会話の transcript を読む read-only tool が入る。既定 false）
     mode は既定 dry_run（判断の記録だけ。作業は実行しない）。mode=active は「承認済みの dispatch proposal を main Discord 会話へ
     inject してよい」という gate で、autoDispatch（既定 false）を true にしたときだけ HOOT 自身の判断で inject します。
   araya hoot dispatch --key <proposal key>

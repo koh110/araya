@@ -7,8 +7,9 @@ import { createHash } from 'node:crypto'
 
 import type { Redactor } from '../infrastructure/redaction.ts'
 import { collectGitHubObservations, type HootObservation, type ObservationDependencies } from './observe.ts'
-import { HOOT_CONVERSATION_INSTRUCTIONS, PROMPT_RECENT_RUNS, buildDecisionPrompt, buildInjectPrompt } from './prompt.ts'
+import { PROMPT_RECENT_RUNS, buildDecisionPrompt, buildInjectPrompt, hootConversationInstructions } from './prompt.ts'
 import {
+  EMPTY_CONVERSATION_READS,
   HOOT_DECISIONS,
   INJECTABLE_DECISIONS,
   MAX_INJECT_ATTEMPTS,
@@ -23,6 +24,7 @@ import {
   isoUtc,
   parseDecision,
   parseIso,
+  conversationReadsOf,
   proposalKeyOf,
   reviewPassed,
   tickMinutesOf,
@@ -63,11 +65,15 @@ export type HootDecideInput = {
   requestId: string
   conversationId: number | null
   instructions: string
+  // settings.conversationRead。true のときだけ判断会話に main 会話を読む read-only tool が入る
+  conversationRead: boolean
 }
 
 export type HootDecideResult = {
   text: string
   conversationId: number
+  // 判断 run が tool を使った実績。host 以外（test・fake）は省略できる
+  conversationReads?: { calls: number; entries: number; chars: number }
 }
 
 // main Discord 会話への inject。bot process が chatHandler 経由で実装する（tool を持つのは main 会話だけ）
@@ -637,6 +643,7 @@ export function createHootLoop(deps: HootTickDeps) {
             return repo.repo
           }),
           observationGaps: [],
+          conversationReads: { ...EMPTY_CONVERSATION_READS },
         }
         const recorded = await recordHootRun(deps.dataDir, run)
 
@@ -688,7 +695,8 @@ export function createHootLoop(deps: HootTickDeps) {
         prompt,
         requestId: occurrenceKey,
         conversationId: reuseConversation ? state.loop.conversationId : null,
-        instructions: HOOT_CONVERSATION_INSTRUCTIONS,
+        instructions: hootConversationInstructions(settings.conversationRead),
+        conversationRead: settings.conversationRead,
       })
       const parsed = parseDecision(decided.text)
       const decidedAtMs = deps.nowMs()
@@ -704,12 +712,18 @@ export function createHootLoop(deps: HootTickDeps) {
           return goal.key
         }),
         missedOccurrences: Math.min(1000, missedOccurrences),
-        // 判断 run には tool が無い。P0 では dispatch・investigate も提案の記録だけ
+        // 判断 run 自身は dispatch しない。P0 では dispatch・investigate も提案の記録だけ
         dispatched: false,
         observedRepos: observation.repos.map((repo) => {
           return repo.repo
         }),
         observationGaps: gaps.slice(0, 12),
+        // 判断 run が main 会話を読んだ実績。tool を使わなかった run は 0
+        conversationReads: conversationReadsOf(
+          decided.conversationReads?.calls ?? 0,
+          decided.conversationReads?.entries ?? 0,
+          decided.conversationReads?.chars ?? 0
+        ),
       }
       const recorded = await recordHootRun(deps.dataDir, run)
 

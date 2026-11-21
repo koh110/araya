@@ -80,7 +80,8 @@ function runFixture(occurrenceKey: string, decidedAt: string, overrides: Partial
     dispatched: false,
     observedRepos: [],
     observationGaps: [],
-    ...overrides,
+        conversationReads: { calls: 0, entries: 0, chars: 0 },
+...overrides,
   }
 }
 
@@ -1710,6 +1711,150 @@ test('hoot store: version 2 の state file は読み取り時に v3 へ寄す（
     }
     assert.equal(saved.version, HOOT_STATE_VERSION)
     assert.equal(saved.settings.autoDispatch, false)
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot store: version 3 の state file は migration で conversationRead と conversationReads を得る', async () => {
+  const fixture = await makeHootFixture()
+
+  try {
+    // 旧 process が書いた version 3（conversationRead も conversationReads も無い）をそのまま置く
+    const legacyRun = {
+      occurrenceKey: 'hoot:2026-11-19T08:00:00.000Z',
+      plannedAt: '2026-11-19T08:00:00.000Z',
+      decidedAt: '2026-11-19T08:00:01.000Z',
+      source: 'model',
+      decision: 'noop',
+      reason: '変化なし',
+      summary: '',
+      goalKeys: [],
+      missedOccurrences: 0,
+      dispatched: false,
+      observedRepos: [],
+      observationGaps: [],
+    }
+    const legacyState = {
+      version: 3,
+      settings: {
+        enabled: true,
+        mode: 'active',
+        tickMinutes: 15,
+        maxRunsPerDay: 4,
+        notifyDecisions: ['dispatch', 'request_human'],
+        precheckObservation: true,
+        watchdogHours: 6,
+        digestHourUtc: null,
+        resetConversationAfterRuns: 20,
+        goalReviewDays: 14,
+        proposalTtlHours: 72,
+        maxProposalReminders: 2,
+        autoDispatch: true,
+        maxInjectsPerDay: 3,
+        injectCooldownMinutes: 30,
+      },
+      goals: [],
+      runs: [legacyRun],
+      proposals: [],
+      injectRequests: [],
+      loop: {
+        lastOccurrenceAt: null,
+        lastRunAt: null,
+        conversationId: 9,
+        conversationRuns: 1,
+        consecutiveFailures: 0,
+        failureCooldownUntil: null,
+        goalFingerprints: {},
+        lastModelRunAt: null,
+        lastDigestAt: null,
+      },
+    }
+    await fs.mkdir(path.join(fixture.dataDir, 'hoot'), { recursive: true })
+    await fs.writeFile(hootStateFilePath(fixture.dataDir), JSON.stringify(legacyState), 'utf8')
+
+    const state = await readHootState(fixture.dataDir)
+    assert.equal(state.version, HOOT_STATE_VERSION)
+    // 新しい permission は既定で off。旧 file の enabled / mode はそのまま保つ
+    assert.equal(state.settings.conversationRead, false)
+    assert.equal(state.settings.enabled, true)
+    assert.equal(state.settings.mode, 'active')
+    assert.equal(state.settings.autoDispatch, true)
+    assert.deepEqual(state.runs[0]?.conversationReads, { calls: 0, entries: 0, chars: 0 })
+    assert.equal(state.loop.conversationId, 9)
+
+    // 読み取りだけでは file を書き換えない（古い process と混ぜても壊さない）
+    const before = JSON.parse(await fs.readFile(hootStateFilePath(fixture.dataDir), 'utf8')) as { version: number }
+    assert.equal(before.version, 3)
+
+    // 人間が tool を有効化する update で version 4 として保存される
+    const updated = await updateSettings(fixture.dataDir, { conversationRead: true })
+    assert.equal(updated.conversationRead, true)
+    const after = JSON.parse(await fs.readFile(hootStateFilePath(fixture.dataDir), 'utf8')) as {
+      version: number
+      runs: { conversationReads?: { calls: number } }[]
+    }
+    assert.equal(after.version, HOOT_STATE_VERSION)
+    assert.equal(after.runs[0]?.conversationReads?.calls, 0)
+    assert.equal((await readHootState(fixture.dataDir)).settings.conversationRead, true)
+
+    // 無効化も元に戻せる
+    const disabled = await updateSettings(fixture.dataDir, { conversationRead: false })
+    assert.equal(disabled.conversationRead, false)
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot store: conversationRead settings の validation と per-run の read 記録', async () => {
+  const fixture = await makeHootFixture()
+
+  try {
+    const state = await readHootState(fixture.dataDir)
+    assert.equal(state.settings.conversationRead, false)
+
+    await assert.rejects(
+      async () => {
+        return await updateSettings(fixture.dataDir, { conversationRead: 'yes' as unknown as boolean })
+      },
+      /hoot_settings_invalid: conversationRead/u
+    )
+
+    // 判断 run の tool 使用実績は run ごとに記録し、次の run に引き継がない
+    await recordHootRun(fixture.dataDir, {
+      occurrenceKey: 'hoot:2026-11-19T08:00:00.000Z',
+      plannedAt: '2026-11-19T08:00:00.000Z',
+      decidedAt: '2026-11-19T08:00:01.000Z',
+      source: 'model',
+      decision: 'wait',
+      reason: 'main 会話を確認した',
+      summary: '',
+      goalKeys: [],
+      missedOccurrences: 0,
+      dispatched: false,
+      observedRepos: [],
+      observationGaps: [],
+      conversationReads: { calls: 3, entries: 12, chars: 4_200 },
+    })
+    await recordHootRun(fixture.dataDir, {
+      occurrenceKey: 'hoot:2026-11-19T08:05:00.000Z',
+      plannedAt: '2026-11-19T08:05:00.000Z',
+      decidedAt: '2026-11-19T08:05:01.000Z',
+      source: 'model',
+      decision: 'noop',
+      reason: '変化なし',
+      summary: '',
+      goalKeys: [],
+      missedOccurrences: 0,
+      dispatched: false,
+      observedRepos: [],
+      observationGaps: [],
+      conversationReads: { calls: 0, entries: 0, chars: 0 },
+    })
+
+    const after = await readHootState(fixture.dataDir)
+    assert.deepEqual(after.runs[0]?.conversationReads, { calls: 3, entries: 12, chars: 4_200 })
+    assert.deepEqual(after.runs[1]?.conversationReads, { calls: 0, entries: 0, chars: 0 })
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
