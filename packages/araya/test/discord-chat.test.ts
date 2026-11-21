@@ -399,7 +399,7 @@ test('discord chat: HOOT inject は人間の message と同じ session・queue �
     {
       content: 'HOOT dispatch の承認済み案件 hoot-secret',
       notice: 'HOOT dispatch を main 会話に渡しました（proposal: abc / 人間の承認）',
-      requestId: 'hoot-inject:abc:1:attempt:1',
+      requestId: 'hoot-inject:abc:1',
     },
     replyLog
   )
@@ -412,7 +412,7 @@ test('discord chat: HOOT inject は人間の message と同じ session・queue �
     submitted.map((entry) => {
       return entry.requestId
     }),
-    ['82345678901234567', 'hoot-inject:abc:1:attempt:1']
+    ['82345678901234567', 'hoot-inject:abc:1']
   )
   // main 会話に渡す content は secret を置き換えてある
   assert.equal(submitted[1]?.content, 'HOOT dispatch の承認済み案件 [REDACTED]')

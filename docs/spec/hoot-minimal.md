@@ -154,19 +154,19 @@ occurrence ごとの判断結果を `runs` に積む。判断 run には tool �
 - 直前の inject request の `createdAt` から `injectCooldownMinutes`（既定 60 分）内 → skip `cooldown`
 - その UTC 日に作った inject request 数が `maxInjectsPerDay`（既定 2）以上 → skip `daily_limit`（**人間の承認で作った分も数える**。0 で request を作らない）
 
-skip は誤りにせず `{ request: null, skipped }` で返し、CLI は理由と settings の案内を stdout に出す（終了は成功）。request key は `hoot-inject:<proposal key>:<n>`（同じ proposal を人間が再次承認すると `n` が増える）。submit の stable key は `requestId = <key>:attempt:<attempt 分>`（`injectRequestIdOf`）。
+skip は誤りにせず `{ request: null, skipped }` で返し、CLI は理由と settings の案内を stdout に出す（終了は成功）。request key は `hoot-inject:<proposal key>:<n>`（同じ proposal を人間が再次承認すると `n` が増える）。**submit の dedupe key はこの key そのまま（`requestId = key`。attempt を含まない）**: 同じ key で 2 回 submit しても Pi durable は run を 1 回しか走らせず、記録済みの submission を返す（test で固定: 同じ requestId の 2 度目の submit は model を呼ばず同じ answer を返す）。これで poll の再試行・restart 後の再 poll が同じ dispatch で main 会話を 2 度走らせない。channel へ送る notice / answer の nonce も attempt なし（`<key>:notice` / `<key>:answer`）なので、送信前に crash した case は次の attempt が同じ 1 文と answer を 1 度だけ送り、送信済みの case は gateway の nonce dedupe で重複が落ちる。
 
 歯止めは request を **作る** ときに効く。既に pending の分は submit 時に再チェックしない（作った分は次の poll で出る）。
 
 ### 実行は bot process だけ（`injectOnce`）
 
 - bot loop の `run()` は poll（既定 60 秒、`HOOT_TICK_POLL_MS`）ごとに **schedule の gate（`tickOnce`）より先に** `injectOnce()` を 1 回走る。承認済みの案件を次の occurrence まで待たない。`enabled=false` の poll では inject も走らない。
-- `takePendingInject` が oldest-first で **1 件**取り出して `attempts += 1` し、`requestId` を attempt 分に書き換える。`attempts` が `MAX_INJECT_ATTEMPTS`（2）に達した request は二度と選ばれない（取り出しと実行の間に crash しても無限に再試行しない）。
+- `takePendingInject` が oldest-first で **1 件**取り出して `attempts += 1` する（`requestId` は attempt を含まないので書き換えない）。`attempts` が `MAX_INJECT_ATTEMPTS`（2）に達した request は二度と選ばれない（取り出しと実行の間に crash しても無限に再試行しない）。
 - `src/hoot/prompt.ts` の `buildInjectPrompt({ goals, proposal, request })` で `content` と `notice` を作る（取り出した **後に** state を読み直して proposal・goal を揃える）。bot process は `dispatchInject` で main 会話の `chatHandler.inject()` に繋ぐ。
 - `chatHandler.inject()` は **人間の message と同じ queue（tail）で直列化**される（会話の途中に別の agent が割り込まない）。state に残った text（model・gh 由来）を **submit 前に redaction** して `session.submit(content, requestId)` を 1 回呼び、その後に **notice（何を自動化したかの 1 文）と main 会話の answer の 2 件を Discord へ返す**（reply は redaction して 2000 文字刻み。notice と answer は別の messageId にする。同じ messageId / chunk index だと reply nonce が重複して gateway の dedupe で answer が落ちる）。inject が失敗しても tail の連鎖は止めない（次の依頼を生かす）。answer が空だった場合は `応答を生成できませんでした。` を送る。
-- inject は `stop` の queue cancel 対象にしない（`stop` は実行待ち queue の外で処理され、実行中の submit を待たずに abort 要求を届ける。承認済みの案件は消さない）。`stop` が実行中の inject submit を中止で失敗させた場合は attempt を 1 消費する。`reset` は main 会話を作り直す（inject 済みの文脈も切れる）。人間は main 会話で `stop` / `reset` をそのまま使える。
+- inject は `stop` の queue cancel 対象にしない（`stop` は実行待ち queue の外で処理され、実行中の submit を待たずに abort 要求を届ける。承認済みの案件は消さない）。`stop` が実行中の inject submit を中止で失敗させても attempt を 1 消費するだけで、**同じ key の再 submit は durable 側が 1 回に束ねる**ため次の attempt は abort 済みの記録を返すだけ（同じ作業を自動でやり直さない）。やり直すときは人間が `hoot dispatch --key <proposal key>` を打ち直す（新しい `n` の request になる）。`reset` は main 会話を作り直す（inject 済みの文脈も切れる）。人間は main 会話で `stop` / `reset` をそのまま使える。
 - bot process が動いていないと request は `pending` のまま（CLI は「bot process が次の poll で main 会話に渡します（bot が動いていないと pending のまま）」と出す）。`dispatchInject` を持たない loop は attempt を消費して `hoot_inject_unavailable: …` を lastError に書く。chat handler がまだ ready でない・session が無いときも `hoot_inject_unavailable`。
-- 失敗は `finishHootInject(ok:false)`。`attempts < 2` なら `pending` に戻して次の poll で再試行し、`attempts` が 2 なら `failed` にして 1 件だけ人間へ案内を送る（`araya hoot inject list` で状態を確認し、`araya hoot dispatch --key <proposal key>` で新しい承認を作り直せる旨）。request が見つからないときは `hoot_inject_not_found`。`HootInjectOutcome.kind` は `nothing` / `injected` / `failed` / `unavailable`。
+- 失敗は `finishHootInject(ok:false)`。`attempts < 2` なら `pending` に戻して次の poll で再試行し、`attempts` が 2 なら `failed` にして 1 件だけ人間へ案内を送る（`hoot inject list`（CLI か Discord）で状態を確認し、`hoot dispatch --key <proposal key>` で新しい承認を作り直せる旨。submit まで到達していた失敗は同じ dedupe key の再試行なので、人間が打ち直さない限り同じ案件は自動で再実行しない）。**submit 前の失敗**（chat handler が停止中・session が無い `hoot_inject_unavailable`）は durable な submission を作らないので、次の attempt で本物の再試行が走る。request が見つからないときは `hoot_inject_not_found`。`HootInjectOutcome.kind` は `nothing` / `injected` / `failed` / `unavailable`。
 - inject の件数は `maxInjectsPerDay` と `injectCooldownMinutes` で抑止し、**判断 run の budget（`maxRunsPerDay`）とは別**にする。inject は HOOT 判断 run の model 呼び出しではない（main 会話の submit 1 回）。
 - log は `hoot_inject_queued` / `hoot_inject_skipped` / `hoot_inject`（success）/ `hoot_inject_failed` / `hoot_inject_unavailable` / `hoot_inject_proposal_missing` / `hoot_inject_poll_failed` / bot 側の `hoot_inject_delivered`・`discord_hoot_inject`。すべて redaction 後に `<dataDir>/logs/discord.log` へ書く。
 
@@ -278,7 +278,7 @@ araya hoot <command> ... [--data-dir <path>]
 
 ## 失敗と停止
 
-- bot process の shutdown では HOOT loop を stop してから gateway と agent session を閉じる（待機の上限 20 秒）。実行中の判断 run があっても打ち切らず、完了を待つ。inject の submit が進行中なら chat handler の drain で待つ（`hoot_inject_delivered` まで届く）。実行中に `takePendingInject` が attempt を 1 消費していた場合、その request は `pending`（attempts 1）のまま state に残り、次の起動で再試行する（`attempts` が 2 に達すると `failed`）。
+- bot process の shutdown では HOOT loop を stop してから gateway と agent session を閉じる（待機の上限 20 秒）。実行中の判断 run があっても打ち切らず、完了を待つ。inject の submit が進行中なら chat handler の drain で待つ（`hoot_inject_delivered` まで届く）。実行中に `takePendingInject` が attempt を 1 消費していた場合、その request は `pending`（attempts 1）のまま state に残り、次の起動で同じ dedupe key で再試行する（submit まで届いていた場合は durable 側が記録済みの submission を返すだけ。`attempts` が 2 に達すると `failed`）。
 - 失敗時は run を記録せず、`consecutiveFailures` を 1 増やして `failureCooldownUntil = now + tickMinutes` を state に書き、その間 tick は `failure_cooldown` で終わる。判断 text が書けた run（`invalid` を含む）で連続失敗は 0 に戻る。
 - goal の review 超過による自動 pause は失敗ではない（run を記録せず `goals_review_paused`）。
 - `araya hoot reset-schedule` は schedule だけ戻す（`loop.lastOccurrenceAt` を null にするだけ。run 記録・settings・proposals・inject request は保つ。pending inject は次の起動でも残り、attempts 上限を引き継ぐ）。

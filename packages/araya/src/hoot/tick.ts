@@ -173,13 +173,13 @@ function dispatchNoteOf(decision: HootDecision, settings: HootSettings) {
 
   return settings.autoDispatch
     ? 'mode: active + autoDispatch（次の poll で main Discord 会話へ inject します）'
-    : 'mode: active（`araya hoot dispatch --key <proposal key>` で承認すると main Discord 会話へ inject します）'
+    : 'mode: active（araya hoot dispatch --key <proposal key>（CLI）か Discord の `hoot dispatch --key <proposal key>` で承認すると main Discord 会話へ inject します）'
 }
 
 function buildReviewPauseNotice(goal: HootGoal) {
   return [
     `HOOT goal review: ${goal.key} を自動 paused にしました（reviewAt ${goal.reviewAt}）`,
-    '続けるには `araya hoot goal resume --key ' + goal.key + '`、終わらせるなら `araya hoot goal retire --key ' + goal.key + '`',
+    '続けるには araya hoot goal resume --key ' + goal.key + '（Discord なら `hoot goal resume --key ' + goal.key + '`）、終わらせるなら araya hoot goal retire --key ' + goal.key + '（`hoot goal retire --key ' + goal.key + '`）',
   ].join('\n').slice(0, HOOT_NOTICE_MAX_CHARS)
 }
 
@@ -394,7 +394,7 @@ export function createHootLoop(deps: HootTickDeps) {
         await notify(
           [
             `HOOT dispatch の inject をできませんでした（proposal: ${taken.proposalKey} / attempt ${settled.attempts}）。main 会話を持つ Discord bot process で動かしてください`,
-            `araya hoot inject list で状態を確認し、必要なら araya hoot dispatch --key ${taken.proposalKey} で新しい承認を作り直してください`,
+            `hoot inject list（CLI か Discord）で状態を確認し、必要なら hoot dispatch --key ${taken.proposalKey} で新しい承認を作り直してください（同じ案件は自動で再実行しません）`,
           ].join('\n'),
           noticeNonce(`inject-unavailable:${taken.key}`)
         )
@@ -480,7 +480,7 @@ export function createHootLoop(deps: HootTickDeps) {
           [
             `HOOT dispatch の inject に失敗しました（proposal: ${taken.proposalKey} / attempt ${settled.attempts}）`,
             `error: ${message}`,
-            `araya hoot inject list で状態を確認し、必要なら araya hoot dispatch --key ${taken.proposalKey} で新しい承認を作り直してください`,
+            `hoot inject list（CLI か Discord）で状態を確認し、必要なら hoot dispatch --key ${taken.proposalKey} で新しい承認を作り直してください（同じ案件は自動で再実行しません）`,
           ].join('\n'),
           noticeNonce(`inject-failed:${taken.key}`)
         )

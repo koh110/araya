@@ -979,7 +979,7 @@ test('discord bot: Discord の hoot dispatch 承認を同じ process の poll �
     // control command は model に渡さず、inject だけが main 会話へ入る
     assert.equal(submissions.length, 1)
     const injectSubmission = submissions[0]
-    assert.equal(injectSubmission?.requestId, `hoot-inject:${proposalKey}:1:attempt:1`)
+    assert.equal(injectSubmission?.requestId, `hoot-inject:${proposalKey}:1`)
     assert.match(injectSubmission?.content ?? '', /open issue と draft PR を拾う/u)
     assert.match(injectSubmission?.content ?? '', /破壊的な操作は、この承認では許可されていません/u)
 

@@ -41,7 +41,7 @@ import {
   MAX_RUNS_KEPT,
   defaultSettings,
   defaultState,
-  injectRequestIdOf,
+  injectKeyOf,
   isoUtc,
   proposalKeyOf,
   reviewPassed,
@@ -1453,7 +1453,7 @@ test('hoot store: inject request は mode gate・cooldown・daily limit・pendin
     assert.equal(request?.authorizedBy, 'human')
     assert.equal(request?.decision, 'dispatch')
     assert.deepEqual(request?.goalKeys, ['quality'])
-    assert.equal(request?.requestId, injectRequestIdOf(request?.key ?? '', 1))
+    assert.equal(request?.requestId, request?.key)
 
     // 同じ proposal に pending の間は重ねて作らない
     const again = await enqueueHootInject(fixture.dataDir, {
@@ -1487,11 +1487,13 @@ test('hoot store: inject request は mode gate・cooldown・daily limit・pendin
       /hoot_inject_not_injectable/
     )
 
-    // take は attempts を 1 増やし、requestId は attempts ごとに変わる
+    // take は attempts を 1 増やす。requestId は attempt を含まないので、再試行でも同じ dedupe key
+    // （Pi durable が同じ dispatch を 2 度走らせない）
     const taken = await takePendingInject(fixture.dataDir, Date.parse('2026-11-20T02:10:00.000Z'))
     assert.equal(taken?.key, request?.key)
     assert.equal(taken?.attempts, 1)
-    assert.equal(taken?.requestId, injectRequestIdOf(request?.key ?? '', 1))
+    assert.equal(taken?.requestId, request?.key)
+    assert.equal(taken?.requestId, request?.requestId)
 
     // 失敗はまだ上限（2 attempt）に達していないので pending に戻す
     const failedOnce = await finishHootInject(fixture.dataDir, request?.key ?? '', {
@@ -1505,7 +1507,7 @@ test('hoot store: inject request は mode gate・cooldown・daily limit・pendin
 
     const takenAgain = await takePendingInject(fixture.dataDir, Date.parse('2026-11-20T02:12:00.000Z'))
     assert.equal(takenAgain?.attempts, 2)
-    assert.equal(takenAgain?.requestId, injectRequestIdOf(request?.key ?? '', 2))
+    assert.equal(takenAgain?.requestId, request?.key)
 
     // 上限に達した失敗は failed。failed は next poll で選ばれない
     const failedTwice = await finishHootInject(fixture.dataDir, request?.key ?? '', {
@@ -1586,7 +1588,7 @@ test('hoot store: inject request は直近保持で prune しても pending を�
     for (let index = 0; index < MAX_INJECTS_KEPT; index += 1) {
       old.push({
         key: `hoot-inject:old:${index}`,
-        requestId: injectRequestIdOf(`hoot-inject:old:${index}`, 1),
+        requestId: `hoot-inject:old:${index}`,
         proposalKey: `hoot-prop-old:${index}`,
         decision: 'dispatch',
         goalKeys: ['quality'],

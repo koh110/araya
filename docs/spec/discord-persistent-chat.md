@@ -10,7 +10,7 @@
 - 会話入力は mention なしで受け付ける。bot mention は本文から落とす。
 - **control command** は message 全体（mention を落として trim した後）が次のいずれかに一致する入力で、model には渡さず bot process の code が直接処理する: `help` / `status` / `stop` / `reset` / `session reset` / `hoot ...`（`hoot` は予約 prefixで、この語で始まる message は `araya hoot` と同じ引数として解析する。一致する command がない場合は human 向けのエラー応答になり model には渡さない）。`help` は command 一覧、`status` は main conversation（durable id・実行中・待ち）と HOOT 状態、`stop` はその channel の進行中処理（実行中の submit・queue 待ち・background child session）への中止要求、`reset` / `session reset` は main conversation の作り直し、`hoot ...` は HOOT の state 操作（`status` / `goal` / `settings` / `proposal` / `dispatch` / `inject` / `runs` / `reset-schedule`）を指す。
 - control command は queue（tail）の外で処理するので、会話の実行中・待ち状態でも常に効く。allowlist gate の内側だけで処理し、応答は通常の reply と同じ redaction・分割・nonce を通す。`--data-dir` は Discord から受け付けない（bot process の dataDir だけを正とする）。
-- 人間の message 以外の入力として、HOOT が承認済みの `dispatch` を **inject request** として同じ main conversation に submit する（`docs/spec/hoot-minimal.md` の「main Discord 会話への inject」）。inject は入口 allowlist を通らない唯一の input で、gate は HOOT 側（`mode` / `autoDispatch` / 人間の `hoot dispatch` 承認）が持つ。inject の requestId は `hoot-inject:<proposal key>:<n>:attempt:<回数>`（1 案件 1 attempt につき 1 回だけ submit する stable key）。
+- 人間の message 以外の入力として、HOOT が承認済みの `dispatch` を **inject request** として同じ main conversation に submit する（`docs/spec/hoot-minimal.md` の「main Discord 会話への inject」）。inject は入口 allowlist を通らない唯一の input で、gate は HOOT 側（`mode` / `autoDispatch` / 人間の `hoot dispatch` 承認）が持つ。inject の dedupe key（requestId）は `hoot-inject:<proposal key>:<n>`（attempt を含まない。同じ key の再 submit は Pi durable が 1 回に束ねて記録済みの answer を返すので、同じ案件で main 会話を 2 度走らせない）。channel への notice / answer の nonce も `<key>:notice` / `<key>:answer` の attempt なし key で送る。
 - 同じ message id の再送は期限付き nonce で抑止するが、保証は at-least-once まで（bot が応答途中で停止した場合、応答が重複することがある）。
 
 ## 会話 session と tool
@@ -33,7 +33,7 @@
 
 - bot は gateway 接続・ready・reply 送信を fake gateway でテストできる構造にする（実 Discord を test で使わない）。
 - 処理中は channel 単位の typing indicator heartbeat を共有し、処理完了で止める。
-- stop signal では新しい受付を止め、受理済みの turn（実行中の submit と queue の item）を gateway 接続中に drain して送ってから gateway を閉じる。実行中の submit を打ち切ったり queue を捨てたりしない。stop 後の送信 retry はしない。実行中の submit へ中止を要求し、queue の item を取り消すのは Discord の「stop」message（受理済みで未開始の作業を無効化し、`session.stop()` で background child session へ中止を要求する）。Discord の「stop」は queue の外で処理するので、queue に積まれた HOOT inject は cancel 対象にしない（承認済みの案件は消さない。実行中の inject submit には中止が伝わり、その場合は attempt を 1 消費して再試行側で扱う）。
+- stop signal では新しい受付を止め、受理済みの turn（実行中の submit と queue の item）を gateway 接続中に drain して送ってから gateway を閉じる。実行中の submit を打ち切ったり queue を捨てたりしない。stop 後の送信 retry はしない。実行中の submit へ中止を要求し、queue の item を取り消すのは Discord の「stop」message（受理済みで未開始の作業を無効化し、`session.stop()` で background child session へ中止を要求する）。Discord の「stop」は queue の外で処理するので、queue に積まれた HOOT inject は cancel 対象にしない（承認済みの案件は消さない。実行中の inject submit には中止が伝わり、attempt を 1 消費する。ただし同じ dedupe key の再 submit は durable 側が 1 回に束ねるので、abort した案件を自動でやり直しはしない。やり直すのは人間が `hoot dispatch --key <proposal key>` を打ち直したとき）。
 - 会話 session の open 失敗は bot の起動を止めない（log と利用不可応答で表面化する）。
 - shutdown は新しい会話入力の受付を止め、受理済み turn と reply を gateway 接続中に drain してから閉じる。
 - 撤去済み slash command への interaction には、option を含まない静的な撤去 message を ephemeral で返すだけとする。Discord 側の command 定義削除は行わない。

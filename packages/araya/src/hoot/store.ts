@@ -43,7 +43,6 @@ import {
   WATCHDOG_HOURS_MIN,
   hootError,
   injectKeyOf,
-  injectRequestIdOf,
   isHootStateShape,
   isHootStateShapeV1,
   isHootStateShapeV2,
@@ -760,7 +759,7 @@ export async function enqueueHootInject(
       authorizedBy: input.authorizedBy,
       authorizedAt: nowIso,
       status: 'pending',
-      requestId: injectRequestIdOf(injectKeyOf(proposal.key, sameProposal.length + 1), 1),
+      requestId: injectKeyOf(proposal.key, sameProposal.length + 1),
       createdAt: nowIso,
       updatedAt: nowIso,
       attempts: 0,
@@ -782,7 +781,9 @@ export async function enqueueHootInject(
 }
 
 // pending を 1 件取り出して attempts を 1 増やす。取り出しと実行の間に crash しても
-// attempts が MAX_INJECT_ATTEMPTS に達すれば二度と選ばれない（無限再試行をしない）
+// attempts が MAX_INJECT_ATTEMPTS に達すれば二度と選ばれない（無限再試行をしない）。
+// requestId は attempt を含まないまま据え置く: 同じ key での再 submit は Pi durable 側が 1 回に
+// 束ねるので、同じ dispatch で main 会話を 2 度走らせない（retry 回数は attempts だけで数える）
 export async function takePendingInject(dataDir: string, nowMs: number) {
   return await updateHootState(dataDir, (state) => {
     const candidates = state.injectRequests
@@ -800,7 +801,6 @@ export async function takePendingInject(dataDir: string, nowMs: number) {
 
     candidate.attempts += 1
     candidate.updatedAt = isoUtc(nowMs)
-    candidate.requestId = injectRequestIdOf(candidate.key, candidate.attempts)
 
     return { ...candidate } satisfies HootInjectRequest
   })

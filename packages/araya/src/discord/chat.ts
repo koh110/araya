@@ -328,6 +328,9 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
         throw new Error('hoot_inject_unavailable: Discord chat session がありません')
       }
 
+      // requestId（dedupe key）は attempt を含まない。同じ案件の再試行では Pi durable が記録済みの
+      // answer を返すだけなので、notice / answer の nonce も attempt なしで送る（crash 後の再試行で
+      // channel に同じ 1 文・同じ answer を 2 度流さない）
       const noticeId = `${injection.requestId}:notice`
       const answerId = `${injection.requestId}:answer`
       const operation = tail.then(async () => {
