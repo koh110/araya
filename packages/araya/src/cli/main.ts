@@ -3,6 +3,7 @@ import os from 'node:os'
 import { parseCliArguments } from './arguments.ts'
 import { loadConfig, loadPiSdk, withPiEnvironment } from '../config/environment.ts'
 import { runHootCommand } from './hoot-commands.ts'
+import { assertHumanHootInvocation } from '../infrastructure/agent-session.ts'
 import {
   createSystemdOps,
   resolveDiscordEnvRunnerEntrypoint,
@@ -61,6 +62,7 @@ function printHelp() {
     [--precheck true|false] [--watchdog-hours N] [--digest-hour-utc N|none] [--reset-conversation-after-runs N]
     [--goal-review-days N] [--proposal-ttl-hours N] [--max-proposal-reminders N]
     [--auto-dispatch true|false] [--max-injects-per-day N] [--inject-cooldown-minutes N]
+    [--conversation-read true|false]（true で HOOT 判断 run に main Discord 会話の transcript を読む read-only tool が入る。既定 false）
     mode は既定 dry_run（判断の記録だけ。作業は実行しない）。mode=active は「承認済みの dispatch proposal を main Discord 会話へ
     inject してよい」という gate で、autoDispatch（既定 false）を true にしたときだけ HOOT 自身の判断で inject します。
   araya hoot dispatch --key <proposal key>
@@ -208,6 +210,8 @@ export async function runCli(
     }
 
     const config = loadConfig(env)
+    // agent session の bash tool from の実行はここで止める（agent が自分の dispatch を承認できないようにする）
+    assertHumanHootInvocation(hootArgs, env ?? process.env)
     await runHootCommand(hootArgs, {
       dataDir: config.dataDir,
       stdout: (text) => {

@@ -192,3 +192,83 @@ test('agent host: deliverReport 失敗後は durable state から同じ nonce �
     await removeAgentFixture(fixture)
   }
 })
+
+test('agent host: main 会話の shell には agent session の目印が入る（HOOT 承認を agent 自分で実行できないようにする）', async () => {
+  const fixture = await makeAgentFixture()
+  const models = await createFauxModels(fixture)
+
+  try {
+    models.script((view) => {
+      if (view.toolResults.length === 0) {
+        return toolCall('bash', { command: 'printf "marker=%s" "$ARAYA_AGENT_SESSION"' })
+      }
+
+      return answer(view.toolResults.at(-1)?.text ?? '')
+    })
+
+    const host = await openArayaAgentHost({
+      dataDir: fixture.dataDir,
+      devRoot: fixture.devRoot,
+      models: models.runtime,
+      model: { provider: models.model.provider, modelId: models.model.id, thinkingLevel: 'medium' },
+      redactor: createRedactor(['secret-value']),
+      deliverReport: async () => {},
+      context: BACKGROUND_CONTEXT,
+    })
+
+    try {
+      const text = await host.submit('MARKER-CHECK', 'marker-message-1')
+      // 目印は tool の shell 에만 들어간다（bot process 自身の env は汚さない）
+      assert.equal(text, 'marker=1')
+      assert.equal(process.env.ARAYA_AGENT_SESSION, undefined)
+      // control command の status 表示用の conversation id が取れる
+      const described = host.describe()
+      assert.equal(typeof described.conversationId, 'number')
+    } finally {
+      await host.close()
+    }
+  } finally {
+    await removeAgentFixture(fixture)
+  }
+})
+
+test('agent host: 同じ requestId の submit は durable で 1 回だけ走り、記録済みの answer を返す（inject 再試行が重複作業にならない）', async () => {
+  const fixture = await makeAgentFixture()
+  const models = await createFauxModels(fixture)
+  let modelRuns = 0
+
+  try {
+    models.script(() => {
+      modelRuns += 1
+
+      return answer('inject 応答')
+    })
+
+    const host = await openArayaAgentHost({
+      dataDir: fixture.dataDir,
+      devRoot: fixture.devRoot,
+      models: models.runtime,
+      model: { provider: models.model.provider, modelId: models.model.id, thinkingLevel: 'medium' },
+      redactor: createRedactor(['secret-value']),
+      deliverReport: async () => {},
+      context: BACKGROUND_CONTEXT,
+    })
+
+    try {
+      const first = await host.submit('INJECT-CASE', 'hoot-inject:hoot-prop-abc:1')
+      // 同じ dedupe key での再 submit（poll の再試行・restart 後の再.poll）は model を走らせない
+      const second = await host.submit('INJECT-CASE-RETRY', 'hoot-inject:hoot-prop-abc:1')
+      // key が違えば別案件として走る
+      const other = await host.submit('INJECT-CASE-2', 'hoot-inject:hoot-prop-abc:2')
+
+      assert.equal(first, 'inject 応答')
+      assert.equal(second, 'inject 応答')
+      assert.equal(other, 'inject 応答')
+      assert.equal(modelRuns, 2)
+    } finally {
+      await host.close()
+    }
+  } finally {
+    await removeAgentFixture(fixture)
+  }
+})

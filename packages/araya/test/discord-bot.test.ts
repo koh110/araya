@@ -24,6 +24,9 @@ async function createInertChatSession() {
     async submit() {
       return ''
     },
+    describe: () => {
+      return { conversationId: 1 }
+    },
     async reset() {},
     async close() {},
   }
@@ -50,6 +53,46 @@ function makeRemovedCommandInteraction(
       },
       getSubcommand: () => {
         return subcommand
+      },
+    },
+    reply: async (payload: { content: string; flags: number }) => {
+      record(payload.content, (payload.flags & 64) === 64)
+    },
+    followUp: async (payload: { content: string }) => {
+      record(payload.content, false)
+    },
+  }
+}
+
+// Discord がくれる ChatInputCommandInteraction の fake（slash command の test で使う）
+function makeSlashInteraction(
+  input: {
+    commandName: string
+    subcommand: string
+    group?: string | null
+    options?: { name: string; value: string }[]
+    id?: string
+  },
+  record: (content: string, ephemeral: boolean) => void,
+) {
+  return {
+    isChatInputCommand: () => {
+      return true
+    },
+    commandName: input.commandName,
+    id: input.id ?? `${input.commandName}-${input.subcommand}`,
+    user: { id: USER_ID },
+    guildId: GUILD_ID,
+    channelId: CHANNEL_ID,
+    options: {
+      data: (input.options ?? []).map((option) => {
+        return { name: option.name, type: 3, value: option.value }
+      }),
+      getSubcommandGroup: () => {
+        return input.group ?? null
+      },
+      getSubcommand: () => {
+        return input.subcommand
       },
     },
     reply: async (payload: { content: string; flags: number }) => {
@@ -99,6 +142,9 @@ test('discord bot: 別 process が同じ dataDir を使用中なら2つ目は起
             stopController.abort()
           },
           sendText: async () => {},
+          async registerCommands() {
+            return 2
+          },
           close: async () => {},
         }
       },
@@ -158,6 +204,9 @@ test('discord bot: crash 後に残った stale process lock を回収する', as
             stopController.abort()
           },
           sendText: async () => {},
+          async registerCommands() {
+            return 2
+          },
           close: async () => {},
         }
       },
@@ -181,6 +230,7 @@ test('discord bot: 指定 channel の mention なし投稿を会話 session に�
   const replies: string[] = []
   let resetCount = 0
   let closeCount = 0
+  const registeredCommands: { name: string }[][] = []
 
   try {
     const exitCode = await runDiscordBot({
@@ -196,6 +246,9 @@ test('discord bot: 指定 channel の mention なし投稿を会話 session に�
       verifyUnit: false,
       createChatSession: async function createChatSession() {
         return {
+          describe: () => {
+            return { conversationId: 1 }
+          },
           async submit(content, requestId) {
             submissions.push({ content, requestId })
 
@@ -231,23 +284,30 @@ test('discord bot: 指定 channel の mention なし投稿を会話 session に�
               },
               reply,
             )
-            await handlers.onMessage(
+            // 会話を操作する command は slash command（text message の reset は会話として model に渡る）
+            await handlers.onInteraction?.(
               {
-                messageId: 'chat-message-2',
+                interactionId: 'interaction-reset',
+                commandName: 'araya',
+                userId: USER_ID,
                 guildId: GUILD_ID,
                 channelId: CHANNEL_ID,
-                userId: USER_ID,
-                isBot: false,
-                isWebhook: false,
-                isSystem: false,
-                mentionsBot: false,
-                content: 'reset',
+                subcommandGroup: null,
+                subcommand: 'reset',
+                options: {},
               },
               reply,
             )
             stopController.abort()
           },
           async sendText() {},
+          async registerCommands(commands) {
+            registeredCommands.push(commands.map((command) => {
+              return { name: command.name }
+            }))
+
+            return commands.length
+          },
           async close() {},
         }
       },
@@ -261,13 +321,20 @@ test('discord bot: 指定 channel の mention なし投稿を会話 session に�
     assert.deepEqual(replies, ['会話を続けています。', 'この channel の会話をリセットしました'])
     assert.equal(resetCount, 1)
     assert.equal(closeCount, 1)
+    assert.equal(registeredCommands.length, 1)
+    assert.deepEqual(
+      registeredCommands[0]?.map((command) => {
+        return command.name
+      }),
+      ['araya', 'hoot'],
+    )
   } finally {
     stopController.abort()
     await fs.rm(dataDir, { recursive: true, force: true })
   }
 })
 
-test('discord bot: 会話 session 初期化に失敗すると会話利用不可を返し、task handler は gateway に渡さない', async () => {
+test('discord bot: 会話 session 初期化に失敗すると会話利用不可を返し、slash command には session 未開を返す', async () => {
   const dataDir = await fs.realpath(
     await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-chat-unavailable-test-')),
   )
@@ -314,9 +381,25 @@ test('discord bot: 会話 session 初期化に失敗すると会話利用不可�
               captureChatReply,
             )
             interactionHandlerSeen = handlers.onInteraction
+            await handlers.onInteraction?.(
+              {
+                interactionId: 'interaction-status',
+                commandName: 'araya',
+                userId: USER_ID,
+                guildId: GUILD_ID,
+                channelId: CHANNEL_ID,
+                subcommandGroup: null,
+                subcommand: 'status',
+                options: {},
+              },
+              captureChatReply,
+            )
             stopController.abort()
           },
           async sendText() {},
+          async registerCommands() {
+            return 2
+          },
           async close() {},
         }
       },
@@ -332,7 +415,13 @@ test('discord bot: 会話 session 初期化に失敗すると会話利用不可�
       }),
       '会話機能の利用不可を返信する',
     )
-    assert.equal(interactionHandlerSeen, undefined, 'bot は task の interaction handler を gateway に渡さない')
+    assert.equal(typeof interactionHandlerSeen, 'function', 'bot は slash command handler を gateway に渡す')
+    assert.ok(
+      chatReplies.some((content) => {
+        return content.includes('会話 session は開けていません')
+      }),
+      'agent session が無いことは /araya status に書く',
+    )
     assert.ok(
       logs.some((entry) => {
         return entry.type === 'discord_chat_unavailable'
@@ -379,9 +468,8 @@ test('discord bot: 撤去済み slash command の返信と log に bot token を
           connect: async () => {
             handlers.onReady()
 
-            // 撤去応答は production の routeSlashCommandInteraction をそのまま通す。
-            // bot が interaction handler を渡さないことが撤去 reply の条件
-            assert.equal(handlers.onInteraction, undefined, 'bot は task handler を gateway に渡さない')
+            // 撤去応答は production の routeSlashCommandInteraction -> bot の handler をそのまま通す
+            assert.equal(typeof handlers.onInteraction, 'function', 'bot は slash command handler を gateway に渡す')
 
             for (const subcommand of ['submit', 'cancel', 'retry', 'list', 'show']) {
               await routeSlashCommandInteraction(
@@ -389,18 +477,29 @@ test('discord bot: 撤去済み slash command の返信と log に bot token を
                   assert.equal(ephemeral, true, '撤去案内は ephemeral で返す')
                   replies.push(content)
                 }) as unknown as Parameters<typeof routeSlashCommandInteraction>[0],
-                {
-                  onReady: () => {},
-                  onMessage: () => {},
-                  onError: (message: string) => {
-                    logs.push({ type: 'synthetic_interaction_error', message })
-                  },
-                },
+                handlers,
               )
             }
+
+            // handler を渡さない古い gateway 配線でも撤去案内は返る
+            await routeSlashCommandInteraction(
+              makeRemovedCommandInteraction('spawn', (content) => {
+                replies.push(content)
+              }) as unknown as Parameters<typeof routeSlashCommandInteraction>[0],
+              {
+                onReady: () => {},
+                onMessage: () => {},
+                onError: (message: string) => {
+                  logs.push({ type: 'synthetic_interaction_error', message })
+                },
+              },
+            )
             stopController.abort()
           },
           sendText: async () => {},
+          async registerCommands() {
+            return 2
+          },
           close: async () => {},
         }
       },
@@ -410,7 +509,7 @@ test('discord bot: 撤去済み slash command の返信と log に bot token を
     })
 
     assert.equal(exitCode, 0)
-    assert.equal(replies.length, 5)
+    assert.equal(replies.length, 6)
 
     for (const reply of replies) {
       assert.equal(reply, OBSOLETE_COMMAND_REPLY)
@@ -452,6 +551,9 @@ test('discord bot: shutdown は進行中の chat reply を送ってから gatewa
       verifyUnit: false,
       createChatSession: async function createChatSession() {
         return {
+          describe: () => {
+            return { conversationId: 2 }
+          },
           async submit() {
             return await new Promise<string>((resolve) => {
               releaseSubmit = resolve
@@ -492,6 +594,9 @@ test('discord bot: shutdown は進行中の chat reply を送ってから gatewa
             })
           },
           async sendText() {},
+          async registerCommands() {
+            return 2
+          },
           async close() {
             gatewayClosed = true
           },
@@ -562,6 +667,9 @@ test('discord bot: HOOT state が有効なら wakeup loop を走らせて判断�
       },
       createChatSession: async () => {
         return {
+          describe: () => {
+            return { conversationId: 3 }
+          },
           async submit(content, requestId) {
             submissions.push({ content, requestId })
 
@@ -577,6 +685,7 @@ test('discord bot: HOOT state が有効なら wakeup loop を走らせて判断�
             return {
               text: '観測: open issue 0 件\nDECISION: request_human\nREASON: 優先順位を確認してください',
               conversationId: 42,
+              conversationReads: { calls: 0, entries: 0, chars: 0 },
             }
           },
         }
@@ -613,6 +722,9 @@ test('discord bot: HOOT state が有効なら wakeup loop を走らせて判断�
           },
           async sendText(content, nonce) {
             notices.push({ content, nonce })
+          },
+          async registerCommands() {
+            return 2
           },
           async close() {},
         }
@@ -716,6 +828,9 @@ test('discord bot: CLI で承認した HOOT dispatch を main 会話 session に
       }),
       createChatSession: async () => {
         return {
+          describe: () => {
+            return { conversationId: 4 }
+          },
           async submit(content, requestId) {
             submissions.push({ content, requestId })
 
@@ -729,6 +844,7 @@ test('discord bot: CLI で承認した HOOT dispatch を main 会話 session に
             return {
               text: 'HOOT 判断:\nDECISION: wait\nREASON: 次に 1 件進める',
               conversationId: 43,
+              conversationReads: { calls: 0, entries: 0, chars: 0 },
             }
           },
         }
@@ -769,6 +885,9 @@ test('discord bot: CLI で承認した HOOT dispatch を main 会話 session に
           async sendText(content, nonce) {
             notices.push({ content, nonce })
           },
+          async registerCommands() {
+            return 2
+          },
           async close() {},
         }
       },
@@ -808,6 +927,170 @@ test('discord bot: CLI で承認した HOOT dispatch を main 会話 session に
     assert.equal(state.injectRequests[0]?.attempts, 1)
     // autoDispatch=false なので判断 run から新しい request は増えていない
     assert.equal(state.runs[0]?.decision, 'wait')
+  } finally {
+    stopController.abort()
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('discord bot: Discord の /hoot dispatch 承認を同じ process の poll が拾って main 会話に inject する', async () => {
+  const dataDir = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-command-inject-test-')),
+  )
+  const stopController = new AbortController()
+  const submissions: { content: string; requestId: string }[] = []
+  const notices: { content: string; nonce: string }[] = []
+  const logs: Record<string, unknown>[] = []
+
+  try {
+    await setGoal(dataDir, {
+      key: 'github-scan',
+      objective: 'open issue と draft PR を拾う',
+      scope: ['github:koh110/araya'],
+    })
+    // autoDispatch は off（人間の承認だけで inject する）
+    await updateSettings(dataDir, { enabled: true, tickMinutes: 5, mode: 'active' })
+
+    const proposalKey = proposalKeyOf({ goalKeys: ['github-scan'], decision: 'dispatch' })
+    await upsertProposal(dataDir, {
+      key: proposalKey,
+      decision: 'dispatch',
+      goalKeys: ['github-scan'],
+      reason: 'draft PR 1 件を続行すべきか判断したい',
+      occurrenceKey: 'hoot:2026-11-20T08:00:00.000Z',
+      nowMs: Date.parse('2026-11-20T08:00:00.000Z'),
+    })
+    assert.equal((await readHootState(dataDir)).injectRequests.length, 0)
+
+    const exitCode = await runDiscordBot({
+      dataDir,
+      env: {
+        ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
+        ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
+        ARAYA_DISCORD_GUILD_ID: GUILD_ID,
+        ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
+        ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
+        HOME: dataDir,
+      },
+      stopSignal: stopController.signal,
+      verifyUnit: false,
+      hootPollMs: 100,
+      hootRunCommand: async () => ({
+        exitCode: 0,
+        signal: null,
+        stdout: '[]',
+        stderr: '',
+        stdoutBytes: 2,
+        stderrBytes: 0,
+        terminationReason: undefined,
+        terminationConfirmed: true,
+      }),
+      createChatSession: async () => {
+        return {
+          describe: () => {
+            return { conversationId: 9 }
+          },
+          async submit(content, requestId) {
+            submissions.push({ content, requestId })
+
+            return 'HOOT 案件を進めました'
+          },
+          async reset() {},
+          async close() {},
+          async hootDecide() {
+            return {
+              text: 'HOOT 判断:\nDECISION: wait\nREASON: 次に 1 件進める',
+              conversationId: 44,
+              conversationReads: { calls: 0, entries: 0, chars: 0 },
+            }
+          },
+        }
+      },
+      createGateway: async (_config, handlers) => {
+        return {
+          async connect() {
+            await handlers.onReady('998877665544332211')
+            // 人間の承認は Discord の slash command から打つ（CLI を叩きに行かない）
+            await routeSlashCommandInteraction(
+              makeSlashInteraction(
+                { commandName: 'hoot', subcommand: 'dispatch', options: [{ name: 'key', value: proposalKey }] },
+                (content) => {
+                  notices.push({ content, nonce: 'interaction-dispatch' })
+                },
+              ) as unknown as Parameters<typeof routeSlashCommandInteraction>[0],
+              handlers,
+            )
+            await routeSlashCommandInteraction(
+              makeSlashInteraction({ commandName: 'araya', subcommand: 'status' }, (content) => {
+                notices.push({ content, nonce: 'interaction-status' })
+              }) as unknown as Parameters<typeof routeSlashCommandInteraction>[0],
+              handlers,
+            )
+
+            const deadline = Date.now() + 8_000
+
+            while (
+              !notices.some((entry) => {
+                return entry.content.includes('HOOT 案件を進めました')
+              }) && Date.now() < deadline
+            ) {
+              await new Promise((resolve) => {
+                setTimeout(resolve, 50)
+              })
+            }
+
+            stopController.abort()
+          },
+          async sendText(content, nonce) {
+            notices.push({ content, nonce })
+          },
+          async registerCommands() {
+            return 2
+          },
+          async close() {},
+        }
+      },
+      log: (entry) => {
+        logs.push(entry)
+      },
+    })
+
+    assert.equal(exitCode, 0)
+    const dump = JSON.stringify(logs)
+    assert.match(dump, /"type":"discord_control_command"/u)
+    assert.match(dump, /"type":"hoot_inject_delivered"/u)
+
+    // 承認は state に human として残る
+    const state = await readHootState(dataDir)
+    assert.equal(state.injectRequests.length, 1)
+    assert.equal(state.injectRequests[0]?.authorizedBy, 'human')
+    assert.equal(state.injectRequests[0]?.status, 'injected')
+    assert.equal(state.settings.autoDispatch, false)
+
+    // control command は model に渡さず、inject だけが main 会話へ入る
+    assert.equal(submissions.length, 1)
+    const injectSubmission = submissions[0]
+    assert.equal(injectSubmission?.requestId, `hoot-inject:${proposalKey}:1`)
+    assert.match(injectSubmission?.content ?? '', /open issue と draft PR を拾う/u)
+    assert.match(injectSubmission?.content ?? '', /破壊的な操作は、この承認では許可されていません/u)
+
+    const replies = notices.map((entry) => {
+      return entry.content
+    })
+    // 1: 承認の ack / 2: status 画面 / 3: inject notice / 4: main 会話の answer
+    assert.match(replies.join('\n'), /inject request を作りました: hoot-inject:/u)
+    assert.match(replies.join('\n'), /main conversation #9/u)
+    assert.match(replies.join('\n'), /HOOT dispatch を main 会話に渡しました/u)
+    assert.match(replies.join('\n'), /HOOT 案件を進めました/u)
+    const noticeNonce = notices.find((entry) => {
+      return entry.content.includes('HOOT dispatch を main 会話に渡しました')
+    })?.nonce
+    const answerNonce = notices.find((entry) => {
+      return entry.content === 'HOOT 案件を進めました'
+    })?.nonce
+    assert.notEqual(noticeNonce, undefined)
+    assert.notEqual(answerNonce, undefined)
+    assert.notEqual(noticeNonce, answerNonce)
   } finally {
     stopController.abort()
     await fs.rm(dataDir, { recursive: true, force: true })

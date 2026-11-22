@@ -17,6 +17,7 @@ import {
   HOOT_STATE_VERSION,
   HOOT_STATE_VERSION_INJECT,
   HOOT_STATE_VERSION_PRECHECK,
+  HOOT_STATE_VERSION_PRE_CONVERSATION_READ,
   INJECTABLE_DECISIONS,
   INJECT_COOLDOWN_MINUTES_MAX,
   INJECT_COOLDOWN_MINUTES_MIN,
@@ -43,14 +44,15 @@ import {
   WATCHDOG_HOURS_MIN,
   hootError,
   injectKeyOf,
-  injectRequestIdOf,
   isHootStateShape,
   isHootStateShapeV1,
   isHootStateShapeV2,
+  isHootStateShapeV3,
   isSettingsShape,
   isSettingsShapeV1,
   reviewPassed,
   utcDayKey,
+  EMPTY_CONVERSATION_READS,
   type HootDecision,
   type HootGoal,
   type HootGoalInput,
@@ -62,6 +64,7 @@ import {
   type HootState,
   type HootStateV1,
   type HootStateV2,
+  type HootStateV3,
   defaultSettings,
   defaultState,
   isoUtc,
@@ -111,26 +114,53 @@ export async function readHootState(dataDir: string): Promise<HootState> {
     return value
   }
 
-  // version 2 の file は読み取り時に v3 へ寄せる（書かない）。次の updateHootState で v3 で保存される
-  if (isHootStateShapeV2(value)) {
-    return migrateStateV2(value)
+  // version 3 の file は読み取り時に v4 へ寄せる（書かない）。次の updateHootState で v4 で保存される
+  if (isHootStateShapeV3(value)) {
+    return migrateStateV3(value)
   }
 
-  // version 1 は v2 を経由して v3 に寄せる
+  // version 2 の file は v3 を経由して v4 に寄せる
+  if (isHootStateShapeV2(value)) {
+    return migrateStateV3(migrateStateV2(value))
+  }
+
+  // version 1 は v2・v3 を経由して v4 に寄せる
   if (isHootStateShapeV1(value) && isSettingsShapeV1(value.settings)) {
-    return migrateStateV2(migrateStateV1(value, Date.now()))
+    return migrateStateV3(migrateStateV2(migrateStateV1(value, Date.now())))
   }
 
   throw hootError('hoot_state_invalid', `${filePath} が HOOT state の形ではありません`)
 }
 
-// version 2 -> 3。inject 用の settings が無ければ既定を埋める。時刻から値を作らないので read ごとに動かない
-function migrateStateV2(state: HootStateV2): HootState {
-  const defaults = defaultSettings()
+// version 3 -> 4。conversationRead の settings と run の参照記録が無くても読めるようにする
+function migrateStateV3(state: HootStateV3): HootState {
   const raw = state.settings as unknown as Record<string, unknown>
 
   return {
     version: HOOT_STATE_VERSION,
+    settings: {
+      ...state.settings,
+      conversationRead:
+        typeof raw.conversationRead === 'boolean' ? raw.conversationRead : defaultSettings().conversationRead,
+    },
+    goals: state.goals,
+    loop: state.loop,
+    runs: state.runs.map((run) => {
+      return { ...run, conversationReads: { ...EMPTY_CONVERSATION_READS } }
+    }),
+    proposals: state.proposals,
+    injectRequests: state.injectRequests,
+  }
+}
+
+// version 2 -> 3。inject 用の settings が無ければ既定を埋める。時刻から値を作らないので read ごとに動かない
+// 返す型は v3 の形（conversationRead と conversationReads は migrateStateV3 で埋める）
+function migrateStateV2(state: HootStateV2): HootStateV3 {
+  const defaults = defaultSettings()
+  const raw = state.settings as unknown as Record<string, unknown>
+
+  return {
+    version: HOOT_STATE_VERSION_PRE_CONVERSATION_READ,
     settings: {
       ...defaults,
       ...state.settings,
@@ -153,6 +183,7 @@ function migrateStateV2(state: HootStateV2): HootState {
 }
 
 function migrateStateV1(state: HootStateV1, nowMs: number): HootStateV2 {
+  // v1 の run には conversationReads が無い。isRunShapeV3 で通る（v4 への埋めは migrateStateV3）
   const settings = defaultSettings()
   settings.enabled = state.settings.enabled
   settings.mode = state.settings.mode
@@ -268,6 +299,16 @@ export function mergeSettings(current: HootSettings, patch: Partial<HootSettings
     // active は「承認された dispatch を main Discord 会話へ inject してよい」を意味する（Issue #31）。
     // 既定の autoDispatch=false では人間の `araya hoot dispatch` が無い限り inject しない
     next.mode = patch.mode
+  }
+
+  if (patch.conversationRead !== undefined) {
+    if (typeof patch.conversationRead !== 'boolean') {
+      throw hootError('hoot_settings_invalid', 'conversationRead は true / false にしてください')
+    }
+
+    // 判断 run に main Discord 会話を読む read-only tool を渡すかどうか。true でも tool は読むだけで、
+    // 会話への submit・file 編集・HOOT state 変更はできない
+    next.conversationRead = patch.conversationRead
   }
 
   if (patch.tickMinutes !== undefined) {
@@ -681,7 +722,7 @@ export async function enqueueHootInject(
     if (state.settings.mode !== 'active') {
       throw hootError(
         'hoot_mode_dry_run',
-        'mode が dry_run の間は main 会話への inject を作りません（araya hoot settings set --mode active）'
+        'mode が dry_run の間は main 会話への inject を作りません（araya hoot settings set --mode active / Discord の /hoot settings set mode:active）'
       )
     }
 
@@ -760,7 +801,7 @@ export async function enqueueHootInject(
       authorizedBy: input.authorizedBy,
       authorizedAt: nowIso,
       status: 'pending',
-      requestId: injectRequestIdOf(injectKeyOf(proposal.key, sameProposal.length + 1), 1),
+      requestId: injectKeyOf(proposal.key, sameProposal.length + 1),
       createdAt: nowIso,
       updatedAt: nowIso,
       attempts: 0,
@@ -782,7 +823,9 @@ export async function enqueueHootInject(
 }
 
 // pending を 1 件取り出して attempts を 1 増やす。取り出しと実行の間に crash しても
-// attempts が MAX_INJECT_ATTEMPTS に達すれば二度と選ばれない（無限再試行をしない）
+// attempts が MAX_INJECT_ATTEMPTS に達すれば二度と選ばれない（無限再試行をしない）。
+// requestId は attempt を含まないまま据え置く: 同じ key での再 submit は Pi durable 側が 1 回に
+// 束ねるので、同じ dispatch で main 会話を 2 度走らせない（retry 回数は attempts だけで数える）
 export async function takePendingInject(dataDir: string, nowMs: number) {
   return await updateHootState(dataDir, (state) => {
     const candidates = state.injectRequests
@@ -800,7 +843,6 @@ export async function takePendingInject(dataDir: string, nowMs: number) {
 
     candidate.attempts += 1
     candidate.updatedAt = isoUtc(nowMs)
-    candidate.requestId = injectRequestIdOf(candidate.key, candidate.attempts)
 
     return { ...candidate } satisfies HootInjectRequest
   })

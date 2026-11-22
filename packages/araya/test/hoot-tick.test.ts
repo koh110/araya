@@ -9,7 +9,6 @@ import { readHootState, setGoalStatus, writeHootState } from '../src/hoot/store.
 import {
   MAX_INJECT_ATTEMPTS,
   defaultState,
-  injectRequestIdOf,
   proposalKeyOf,
   type HootGoal,
   type HootInjectRequest,
@@ -77,7 +76,16 @@ async function makeHootLoopFixture(input: {
   proposals?: HootProposal[]
   injectRequests?: HootInjectRequest[]
   loop?: Partial<HootState['loop']>
-  decide?: (request: { prompt: string; conversationId: number | null }) => Promise<{ text: string; conversationId: number }>
+  decide?: (request: {
+    prompt: string
+    conversationId: number | null
+    conversationRead: boolean
+    instructions: string
+  }) => Promise<{
+    text: string
+    conversationId: number
+    conversationReads?: { calls: number; entries: number; chars: number }
+  }>
   command?: (args: readonly string[]) => BoundedProcessResult
   inject?: (input: HootInjectInput) => Promise<void>
   env?: Record<string, string | undefined>
@@ -103,7 +111,13 @@ async function makeHootLoopFixture(input: {
 
   const logs: Record<string, unknown>[] = []
   const notices: { text: string; nonce: string }[] = []
-  const decideInputs: { prompt: string; requestId: string; conversationId: number | null }[] = []
+  const decideInputs: {
+    prompt: string
+    requestId: string
+    conversationId: number | null
+    conversationRead: boolean
+    instructions: string
+  }[] = []
   const injectInputs: HootInjectInput[] = []
   const commandCalls: string[][] = []
 
@@ -117,10 +131,19 @@ async function makeHootLoopFixture(input: {
         prompt: request.prompt,
         requestId: request.requestId,
         conversationId: request.conversationId,
+        conversationRead: request.conversationRead,
+        instructions: request.instructions,
       })
 
       if (input.decide !== undefined) {
-        return await input.decide({ prompt: request.prompt, conversationId: request.conversationId })
+        const decided = await input.decide({
+          prompt: request.prompt,
+          conversationId: request.conversationId,
+          conversationRead: request.conversationRead,
+          instructions: request.instructions,
+        })
+
+        return decided
       }
 
       return {
@@ -395,6 +418,7 @@ test('hoot tick: 1 日の model run 上限を超えると model を呼ばない'
         dispatched: false,
         observedRepos: [],
         observationGaps: [],
+        conversationReads: { calls: 0, entries: 0, chars: 0 },
       },
     ],
   })
@@ -1047,7 +1071,7 @@ function pendingInjectFixture(overrides: Partial<HootInjectRequest> = {}): HootI
 
   return {
     key,
-    requestId: injectRequestIdOf(key, 1),
+    requestId: key,
     proposalKey: DISPATCH_PROPOSAL_KEY,
     decision: 'dispatch',
     goalKeys: ['araya-quality'],
@@ -1256,7 +1280,11 @@ test('hoot tick: inject の失敗は retry して next poll で status を戻せ
         return notice.text.includes('inject に失敗しました')
       }))
       assert.ok(retry.notices.some((notice) => {
-        return notice.text.includes('araya hoot dispatch --key ' + DISPATCH_PROPOSAL_KEY)
+        return notice.text.includes('hoot dispatch --key ' + DISPATCH_PROPOSAL_KEY)
+      }))
+      // 同じ dedupe key の再試行なので、人間が打ち直すまで同じ案件は自動で再実行しない旨を出す
+      assert.ok(retry.notices.some((notice) => {
+        return notice.text.includes('同じ案件は自動で再実行しません')
       }))
       retryState = await retry.readState()
       assert.equal(retryState.injectRequests[0]?.status, 'failed')
@@ -1295,5 +1323,76 @@ test('hoot tick: run() は schedule の gate より先に pending inject を処�
     assert.equal((await fixture.readState()).injectRequests[0]?.status, 'injected')
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot tick: settings.conversationRead で decide に on/off と instructions を渡り、read 実績を run に残す', async () => {
+  const reads = { calls: 2, entries: 7, chars: 1_200 }
+  const onFixture = await makeHootLoopFixture({
+    settings: { enabled: true, tickMinutes: 5, conversationRead: true },
+    goals: [goalFixture()],
+    decide: async () => {
+      return {
+        text: 'HOOT 判断:\nDECISION: wait\nREASON: main 会話で確認した',
+        conversationId: 7,
+        conversationReads: reads,
+      }
+    },
+  })
+
+  try {
+    const outcome = await onFixture.loop.tickOnce()
+    assert.equal(outcome.kind, 'ran')
+    const input = onFixture.decideInputs.at(0)
+    assert.equal(input?.conversationRead, true)
+    // tool が入ることを model に伝える instructions を選ぶ
+    assert.match(input?.instructions ?? '', /read_conversation/u)
+
+    const state = await readHootState(onFixture.dataDir)
+    assert.equal(state.settings.conversationRead, true)
+    // decide が返した実績を run に記録する
+    assert.deepEqual(state.runs.at(-1)?.conversationReads, reads)
+  } finally {
+    await fs.rm(onFixture.root, { recursive: true, force: true })
+  }
+
+  const offFixture = await makeHootLoopFixture({
+    settings: { enabled: true, tickMinutes: 5 },
+    goals: [goalFixture()],
+  })
+
+  try {
+    const outcome = await offFixture.loop.tickOnce()
+    assert.equal(outcome.kind, 'ran')
+    const input = offFixture.decideInputs.at(0)
+    assert.equal(input?.conversationRead, false)
+    assert.doesNotMatch(input?.instructions ?? '', /read_conversation/u)
+
+    const state = await readHootState(offFixture.dataDir)
+    assert.equal(state.settings.conversationRead, false)
+    assert.deepEqual(state.runs.at(-1)?.conversationReads, { calls: 0, entries: 0, chars: 0 })
+  } finally {
+    await fs.rm(offFixture.root, { recursive: true, force: true })
+  }
+
+  // precheck run（model を呼ばない）は read 実績 0
+  const precheckFixture = await makeHootLoopFixture({
+    settings: { enabled: true, tickMinutes: 5, conversationRead: true },
+    goals: [goalFixture()],
+  })
+
+  try {
+    const first = await precheckFixture.loop.tickOnce()
+    assert.equal(first.kind, 'ran')
+    precheckFixture.setNow('2026-11-19T09:05:00.000Z')
+    const second = await precheckFixture.loop.tickOnce()
+    assert.equal(second.kind, 'prechecked_noop')
+
+    const state = await readHootState(precheckFixture.dataDir)
+    const prechecked = state.runs.at(-1)
+    assert.equal(prechecked?.source, 'precheck')
+    assert.deepEqual(prechecked?.conversationReads, { calls: 0, entries: 0, chars: 0 })
+  } finally {
+    await fs.rm(precheckFixture.root, { recursive: true, force: true })
   }
 })

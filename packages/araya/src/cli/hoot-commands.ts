@@ -210,6 +210,7 @@ export function formatHootStatus(state: HootState, nowMs: number, dataDir: strin
     `notifyDecisions: ${settings.notifyDecisions.join(', ')} / precheck: ${settings.precheckObservation} / watchdogHours: ${settings.watchdogHours}`,
     `digestHourUtc: ${settings.digestHourUtc ?? 'none'} / resetConversationAfterRuns: ${settings.resetConversationAfterRuns} / goalReviewDays: ${settings.goalReviewDays}`,
     `inject: autoDispatch=${settings.autoDispatch} / maxInjectsPerDay=${settings.maxInjectsPerDay} / cooldown=${settings.injectCooldownMinutes}分`,
+    `conversationRead: ${settings.conversationRead}（判断 run が main 会話 transcript を read_conversation で読めるか）`,
     `active goals: ${active.length}/${state.goals.length}（max ${MAX_GOALS}）`,
     ...state.goals.map(goalLine),
     `lastOccurrenceAt: ${state.loop.lastOccurrenceAt ?? '（なし）'}`,
@@ -243,10 +244,13 @@ export function formatHootStatus(state: HootState, nowMs: number, dataDir: strin
   }
 
   if (lastRun !== undefined) {
+    const reads = lastRun.conversationReads
+
     lines.push(
       `last run: ${lastRun.decidedAt} ${lastRun.decision} — ${lastRun.reason}`,
       `  observed: ${lastRun.observedRepos.join(', ') || '（なし）'}`,
-      `  gaps: ${lastRun.observationGaps.join(' / ') || '（なし）'}`
+      `  gaps: ${lastRun.observationGaps.join(' / ') || '（なし）'}`,
+      `  conversation reads: ${reads.calls} calls / ${reads.entries} entries / ${reads.chars} chars`
     )
   }
 
@@ -267,6 +271,7 @@ function settingsSummary(settings: HootSettings) {
     `goalReviewDays: ${settings.goalReviewDays}（新しい goal の review 期限。0 で無期限）`,
     `proposalTtlHours: ${settings.proposalTtlHours} / maxProposalReminders: ${settings.maxProposalReminders}`,
     `autoDispatch: ${settings.autoDispatch}（mode=active のとき dispatch 判断を自動で inject するか。既定 false）`,
+    `conversationRead: ${settings.conversationRead}（true で判断 run に main 会話 transcript を読む read-only tool が入る。既定 false）`,
     `maxInjectsPerDay: ${settings.maxInjectsPerDay}（1 UTC 日の inject 上限、人間の承認も数える。0 で止め、${MAX_INJECTS_PER_DAY_MIN}〜${MAX_INJECTS_PER_DAY_MAX}）`,
     `injectCooldownMinutes: ${settings.injectCooldownMinutes}（前の inject からの cooldown。0 で無効、${INJECT_COOLDOWN_MINUTES_MIN}〜${INJECT_COOLDOWN_MINUTES_MAX}）`,
   ].join('\n')
@@ -393,6 +398,7 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
         proposalTtlHours: integerOf('proposal-ttl-hours', options['proposal-ttl-hours']),
         maxProposalReminders: integerOf('max-proposal-reminders', options['max-proposal-reminders']),
         autoDispatch: booleanOf('auto-dispatch', options['auto-dispatch']),
+        conversationRead: booleanOf('conversation-read', options['conversation-read']),
         maxInjectsPerDay: integerOf('max-injects-per-day', options['max-injects-per-day']),
         injectCooldownMinutes: integerOf('inject-cooldown-minutes', options['inject-cooldown-minutes']),
       })
@@ -459,8 +465,8 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
     if (enqueued.request === null) {
       const reason = enqueued.skipped ?? 'unknown'
       const guidance: Record<string, string> = {
-        cooldown: '前の inject からの cooldown 中です（araya hoot settings set --inject-cooldown-minutes <分>）',
-        daily_limit: '1 UTC 日の inject 上限です（araya hoot settings set --max-injects-per-day <件数>）',
+        cooldown: '前の inject からの cooldown 中です（araya hoot settings set --inject-cooldown-minutes <分> / Discord の /hoot settings set inject-cooldown-minutes:<分>）',
+        daily_limit: '1 UTC 日の inject 上限です（araya hoot settings set --max-injects-per-day <件数> / Discord の /hoot settings set max-injects-per-day:<件数>）',
         already_pending: '同じ proposal への inject がまだ未完了です（araya hoot inject list）',
         auto_dispatch_off: 'autoDispatch=false では人間の dispatch だけが inject されます',
       }
@@ -489,7 +495,9 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
     const state = await readHootState(dataDir)
 
     if (state.injectRequests.length === 0) {
-      deps.stdout(`inject request の記録はありません（araya hoot dispatch --key <proposal key> で作ります。保持は直近 ${MAX_INJECTS_KEPT} 件）`)
+      deps.stdout(
+        `inject request の記録はありません（araya hoot dispatch --key <proposal key> / Discord の /hoot dispatch key:<proposal key> で作ります。保持は直近 ${MAX_INJECTS_KEPT} 件）`
+      )
 
       return
     }
@@ -521,8 +529,12 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
       shown
         .map((run) => {
           const gaps = run.observationGaps.length > 0 ? ` gaps: ${run.observationGaps.join(' / ')}` : ''
+          const reads =
+            run.conversationReads.calls > 0
+              ? `\n  reads: ${run.conversationReads.calls} calls / ${run.conversationReads.entries} entries / ${run.conversationReads.chars} chars`
+              : ''
 
-          return `${run.decidedAt} ${run.decision} [${run.occurrenceKey}]\n  reason: ${run.reason}${gaps}`
+          return `${run.decidedAt} ${run.decision} [${run.occurrenceKey}]\n  reason: ${run.reason}${gaps}${reads}`
         })
         .join('\n')
     )

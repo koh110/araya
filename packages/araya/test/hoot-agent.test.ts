@@ -8,7 +8,7 @@ import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
 
 import { openArayaAgentHost, type ArayaAgentSession } from '../src/agent/host.ts'
 import { createRedactor } from '../src/infrastructure/redaction.ts'
-import { HOOT_CONVERSATION_INSTRUCTIONS } from '../src/hoot/prompt.ts'
+import { HOOT_CONVERSATION_INSTRUCTIONS, HOOT_CONVERSATION_READ_INSTRUCTIONS } from '../src/hoot/prompt.ts'
 import { answer, createFauxModels, toolCall } from './support/faux-shiki.ts'
 
 async function makeHootAgentFixture() {
@@ -78,6 +78,7 @@ test('hoot agent host: hootDecide は専用 conversation で走り、main 会話
         requestId: 'hoot:2026-11-19T09:00:00.000Z',
         conversationId: null,
         instructions: HOOT_CONVERSATION_INSTRUCTIONS,
+        conversationRead: false,
       })
       assert.match(decided.text, /DECISION: investigate/u)
       assert.match(decided.text, /REASON: open issue 1 件を調べたい/u)
@@ -90,6 +91,7 @@ test('hoot agent host: hootDecide は専用 conversation で走り、main 会話
         requestId: 'hoot:2026-11-19T10:00:00.000Z',
         conversationId: decided.conversationId,
         instructions: HOOT_CONVERSATION_INSTRUCTIONS,
+        conversationRead: false,
       })
       assert.equal(again.conversationId, decided.conversationId)
 
@@ -143,6 +145,7 @@ test('hoot agent host: HOOT 会話に tool を登録しないので、model が 
         requestId: 'hoot:2026-11-19T11:00:00.000Z',
         conversationId: null,
         instructions: HOOT_CONVERSATION_INSTRUCTIONS,
+        conversationRead: false,
       })
       settledText = decided.text
     } catch (error) {
@@ -201,6 +204,7 @@ test('hoot agent host: reopen 後も hootDecide は state に覚えた conversat
         requestId: 'hoot:2026-11-19T12:00:00.000Z',
         conversationId: null,
         instructions: HOOT_CONVERSATION_INSTRUCTIONS,
+        conversationRead: false,
       })
       conversationId = decided.conversationId
       // answer 内の秘密は host の redactor 置き換えて返す（HOOT state と Discord には秘密を書かない）
@@ -218,6 +222,7 @@ test('hoot agent host: reopen 後も hootDecide は state に覚えた conversat
         requestId: 'hoot:2026-11-19T13:00:00.000Z',
         conversationId,
         instructions: HOOT_CONVERSATION_INSTRUCTIONS,
+        conversationRead: false,
       })
       assert.equal(decided.conversationId, conversationId)
     } finally {
@@ -260,6 +265,7 @@ test('hoot agent host: conversationId null で依頼すると新しい会話に�
         requestId: 'hoot:2026-11-19T14:00:00.000Z',
         conversationId: null,
         instructions: HOOT_CONVERSATION_INSTRUCTIONS,
+        conversationRead: false,
       })
       // 同じ id を渡す continuation は前の観測 marker を継ぐ（自己強化する会話の形）
       const continued = await decideOf(session)({
@@ -267,6 +273,7 @@ test('hoot agent host: conversationId null で依頼すると新しい会話に�
         requestId: 'hoot:2026-11-19T15:00:00.000Z',
         conversationId: first.conversationId,
         instructions: HOOT_CONVERSATION_INSTRUCTIONS,
+        conversationRead: false,
       })
       assert.equal(continued.conversationId, first.conversationId)
       // 同じ会話の continuation: model が見せる context は前の turn を含む会話が続き（faux の view は会話の最初の user message を返す）
@@ -278,11 +285,267 @@ test('hoot agent host: conversationId null で依頼すると新しい会話に�
         requestId: 'hoot:2026-11-19T16:00:00.000Z',
         conversationId: null,
         instructions: HOOT_CONVERSATION_INSTRUCTIONS,
+        conversationRead: false,
       })
       assert.notEqual(reset.conversationId, first.conversationId)
       // 新しい会話は新しい user message から始まる。前の判断（A）と同じ会話の続きにしない = noop の連鎖を model に見せない
       assert.match(prompts.at(2) ?? '', /hoot-reset-C/u)
       assert.doesNotMatch(prompts.at(2) ?? '', /hoot-reset-A/u)
+    } finally {
+      await session.close()
+    }
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot agent host: settings.conversationRead=true の run は read_conversation で main 会話 transcript を読む（読み取り専用・redact 済み）', async () => {
+  const fixture = await makeHootAgentFixture()
+  const models = await createFauxModels(fixture)
+  const readTexts: string[] = []
+
+  try {
+    models.script((view) => {
+      if (!view.prompt.includes('HOOT 判断 tick')) {
+        // model の answer は durable transcript に素の text で残る（submit の返り値だけ redact される）
+        return answer('main の answer: token=secret-value-123')
+      }
+
+      const reads = view.toolResults.filter((result) => {
+        return result.toolName === 'read_conversation'
+      })
+
+      if (reads.length === 0) {
+        return toolCall('read_conversation', { limit: 5 })
+      }
+
+      readTexts.push(reads.at(-1)?.text ?? '')
+
+      // 判断会話に main 会話を読む tool 以外の tool は無い。bash を要求しても file は作らない
+      const others = view.toolResults.filter((result) => {
+        return result.toolName !== 'read_conversation'
+      })
+
+      if (others.length === 0) {
+        return toolCall('bash', { command: 'touch hoot-side-effect.txt' })
+      }
+
+      return answer('DECISION: wait\nREASON: main 会話で人間の変更を取り消すと確認した')
+    })
+
+    const session = await openArayaAgentHost({
+      dataDir: fixture.dataDir,
+      devRoot: fixture.devRoot,
+      models: models.runtime,
+      model: { provider: models.model.provider, modelId: models.model.id, thinkingLevel: 'medium' },
+      redactor: createRedactor(['secret-value-123']),
+      deliverReport: async () => {},
+      context: BACKGROUND_CONTEXT,
+    })
+
+    try {
+      await session.submit('channel の発言: PR #34 の merge は人間の承認後に', 'main-request-read')
+
+      const decided = await decideOf(session)({
+        prompt: hootPrompt('hoot-read-1'),
+        requestId: 'hoot:2026-11-19T17:00:00.000Z',
+        conversationId: null,
+        instructions: HOOT_CONVERSATION_READ_INSTRUCTIONS,
+        conversationRead: true,
+      })
+
+      assert.match(decided.text, /DECISION: wait/u)
+      const readText = readTexts[0] ?? ''
+      assert.match(readText, /main 会話 transcript/u)
+      assert.match(readText, /user: channel の発言: PR #34/u)
+      assert.match(readText, /assistant: main の answer/u)
+      // durable transcript に残る秘密は tool の出力でも伏せる
+      assert.ok(!readText.includes('secret-value-123'), `read_conversation output must be redacted: ${readText}`)
+      assert.equal(decided.conversationReads.calls, 1)
+      assert.ok(decided.conversationReads.entries >= 2)
+      assert.ok(decided.conversationReads.chars > 0)
+      // read_conversation 以外の tool は判断会話に無いので side effect は起きない
+      assert.deepEqual(await fs.readdir(fixture.devRoot), [])
+    } finally {
+      await session.close()
+    }
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot agent host: settings.conversationRead=false なら read_conversation は使えず read 実績は 0', async () => {
+  const fixture = await makeHootAgentFixture()
+  const models = await createFauxModels(fixture)
+  const refusals: string[] = []
+
+  try {
+    models.script((view) => {
+      if (!view.prompt.includes('HOOT 判断 tick')) {
+        return answer('main の answer')
+      }
+
+      if (view.toolResults.length === 0) {
+        return toolCall('read_conversation', { limit: 3 })
+      }
+
+      refusals.push(
+        view.toolResults
+          .map((result) => {
+            return `${result.toolName}:${result.isError}`
+          })
+          .join(',')
+      )
+
+      return answer('DECISION: noop\nREASON: main 会話を読めない')
+    })
+
+    const session = await openArayaAgentHost({
+      dataDir: fixture.dataDir,
+      devRoot: fixture.devRoot,
+      models: models.runtime,
+      model: { provider: models.model.provider, modelId: models.model.id, thinkingLevel: 'medium' },
+      redactor: createRedactor([]),
+      deliverReport: async () => {},
+      context: BACKGROUND_CONTEXT,
+    })
+
+    try {
+      await session.submit('channel の発言: 読ませない', 'main-request-no-read')
+      const decided = await decideOf(session)({
+        prompt: hootPrompt('hoot-no-read'),
+        requestId: 'hoot:2026-11-19T18:00:00.000Z',
+        conversationId: null,
+        instructions: HOOT_CONVERSATION_INSTRUCTIONS,
+        conversationRead: false,
+      })
+
+      assert.equal(decided.conversationReads.calls, 0)
+      assert.equal(decided.conversationReads.entries, 0)
+      assert.equal(decided.conversationReads.chars, 0)
+      // tool を要求されても判断会話に read_conversation は無い（結果の誤りか unknown tool で終わる）
+      assert.ok(
+        refusals.length === 0 || refusals[0] === undefined || refusals[0].includes('read_conversation:true'),
+        JSON.stringify(refusals)
+      )
+    } finally {
+      await session.close()
+    }
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot agent host: read_conversation は 1 判断 run の回数上限で止まり、使った実績を数える', async () => {
+  const fixture = await makeHootAgentFixture()
+  const models = await createFauxModels(fixture)
+  const lastReadTexts: string[] = []
+
+  try {
+    models.script((view) => {
+      if (!view.prompt.includes('HOOT 判断 tick')) {
+        return answer('main の answer')
+      }
+
+      const reads = view.toolResults.filter((result) => {
+        return result.toolName === 'read_conversation'
+      })
+
+      // 上限（4 回）を超える 5 件目を要求して止める
+      if (reads.length < 5) {
+        return toolCall('read_conversation', { limit: 2 })
+      }
+
+      lastReadTexts.push(reads.at(-1)?.text ?? '')
+
+      return answer('DECISION: noop\nREASON: 上限に達した')
+    })
+
+    const session = await openArayaAgentHost({
+      dataDir: fixture.dataDir,
+      devRoot: fixture.devRoot,
+      models: models.runtime,
+      model: { provider: models.model.provider, modelId: models.model.id, thinkingLevel: 'medium' },
+      redactor: createRedactor([]),
+      deliverReport: async () => {},
+      context: BACKGROUND_CONTEXT,
+    })
+
+    try {
+      for (let index = 0; index < 8; index += 1) {
+        await session.submit(`channel の発言 ${index}`, `main-request-cap-${index}`)
+      }
+
+      const decided = await decideOf(session)({
+        prompt: hootPrompt('hoot-read-cap'),
+        requestId: 'hoot:2026-11-19T19:00:00.000Z',
+        conversationId: null,
+        instructions: HOOT_CONVERSATION_READ_INSTRUCTIONS,
+        conversationRead: true,
+      })
+
+      assert.equal(decided.conversationReads.calls, 4)
+      assert.ok(decided.conversationReads.entries >= 8)
+      assert.ok(decided.conversationReads.chars <= 8_000)
+      assert.match(lastReadTexts[0] ?? '', /上限 4 回/u)
+    } finally {
+      await session.close()
+    }
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot agent host: read_conversation は registry に登録しても main 会話の model には使えない（HOOT 判断会話だけ）', async () => {
+  const fixture = await makeHootAgentFixture()
+  const models = await createFauxModels(fixture)
+  const mainToolResults: string[] = []
+
+  try {
+    models.script((view) => {
+      if (!view.prompt.includes('HOOT 判断 tick')) {
+        if (view.toolResults.length === 0) {
+          return toolCall('read_conversation', { limit: 5 })
+        }
+
+        mainToolResults.push(
+          view.toolResults
+            .map((result) => {
+              return `${result.toolName}:${result.isError}`
+            })
+            .join(','),
+        )
+
+        return answer('main は read_conversation を使えない')
+      }
+
+      return answer('DECISION: noop\nREASON: 判断会話だけがこの tool を持てる')
+    })
+
+    const session = await openArayaAgentHost({
+      dataDir: fixture.dataDir,
+      devRoot: fixture.devRoot,
+      models: models.runtime,
+      model: { provider: models.model.provider, modelId: models.model.id, thinkingLevel: 'medium' },
+      redactor: createRedactor([]),
+      deliverReport: async () => {},
+      context: BACKGROUND_CONTEXT,
+    })
+
+    try {
+      const answered = await session.submit('channel の発言: main から tool を試す', 'main-request-tool-denied')
+      assert.match(answered, /main は read_conversation を使えない/u)
+      // main 会話の tools / modelTools は coding tool と task tool だけ。registry にある tool でも選べない
+      assert.match(mainToolResults[0] ?? '', /read_conversation:true/u)
+
+      const decided = await decideOf(session)({
+        prompt: hootPrompt('hoot-only-tool'),
+        requestId: 'hoot:2026-11-19T20:00:00.000Z',
+        conversationId: null,
+        instructions: HOOT_CONVERSATION_INSTRUCTIONS,
+        conversationRead: false,
+      })
+      assert.equal(decided.conversationReads.calls, 0)
     } finally {
       await session.close()
     }

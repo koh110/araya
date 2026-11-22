@@ -5,11 +5,13 @@
 
 import { createHash } from 'node:crypto'
 
-export const HOOT_STATE_VERSION = 3
+export const HOOT_STATE_VERSION = 4
 // v1（goal review・precheck・proposal 以前）の file を読み替えるための migration 用 version
 export const HOOT_STATE_VERSION_PRECHECK = 1
 // v2（inject request 以前）の file を読み替えるための migration 用 version
 export const HOOT_STATE_VERSION_INJECT = 2
+// v3（main 会話を読む tool の settings と run の参照記録以前）の file を読み替えるための migration 用 version
+export const HOOT_STATE_VERSION_PRE_CONVERSATION_READ = 3
 
 export const HOOT_GOAL_KEY_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/u
 export const HOOT_GOAL_KEY_RULE = 'lowercase alphanumeric with `-` separators, 1-64 characters'
@@ -63,6 +65,9 @@ export const INJECT_COOLDOWN_MINUTES_MAX = 1440
 export const DEFAULT_INJECT_COOLDOWN_MINUTES = 60
 export const MAX_INJECT_ERROR_CHARS = 300
 
+// 判断 run が main Discord 会話の transcript を読む tool（read_conversation）の settings gate
+export const DEFAULT_CONVERSATION_READ = false
+
 export type HootMode = 'dry_run' | 'active'
 export type HootGoalStatus = 'active' | 'paused' | 'retired'
 
@@ -113,7 +118,7 @@ export type HootInjectRequest = {
   authorizedBy: HootInjectAuthorizer
   authorizedAt: string
   status: HootInjectStatus
-  // main 会話の submit の requestId（同じ request を繰り返さないための stable key）
+  // main 会話の submit の dedupe key（`key` と同じ。attempt を含まない。同じ dispatch を 2 度走らせない）
   requestId: string
   createdAt: string
   updatedAt: string
@@ -162,6 +167,8 @@ export type HootSettings = {
   maxProposalReminders: number
   // mode=active のとき、dispatch 判断を自動で inject request にするか。既定 false（人間の承認が要る）
   autoDispatch: boolean
+  // 判断 run に main 会話 transcript を読む read-only tool（read_conversation）を渡すか。既定 false
+  conversationRead: boolean
   // 1 UTC 日に main 会話へ inject してよい件数。0 で自動 inject を止める（人間の承認も数える）
   maxInjectsPerDay: number
   // 前の inject request からの cooldown（分）。0 で無効
@@ -186,6 +193,25 @@ export type HootRun = {
   dispatched: boolean
   observedRepos: string[]
   observationGaps: string[]
+  // read_conversation で main 会話 transcript を参照した量（tool を使わなかった run は 0）
+  conversationReads: HootConversationReads
+}
+
+// 判断 run 1 回の tool 参照の実績（監査用。hoot runs と /hoot runs に出す）
+export type HootConversationReads = {
+  calls: number
+  entries: number
+  chars: number
+}
+
+export const EMPTY_CONVERSATION_READS: HootConversationReads = { calls: 0, entries: 0, chars: 0 }
+
+export function conversationReadsOf(calls: number, entries: number, chars: number): HootConversationReads {
+  return {
+    calls: Math.max(0, Math.trunc(calls)),
+    entries: Math.max(0, Math.trunc(entries)),
+    chars: Math.max(0, Math.trunc(chars)),
+  }
 }
 
 export type HootLoopState = {
@@ -298,6 +324,7 @@ export function defaultSettings(): HootSettings {
     proposalTtlHours: DEFAULT_PROPOSAL_TTL_HOURS,
     maxProposalReminders: DEFAULT_MAX_PROPOSAL_REMINDERS,
     autoDispatch: false,
+    conversationRead: DEFAULT_CONVERSATION_READ,
     maxInjectsPerDay: DEFAULT_MAX_INJECTS_PER_DAY,
     injectCooldownMinutes: DEFAULT_INJECT_COOLDOWN_MINUTES,
   }
@@ -475,11 +502,9 @@ export function injectKeyOf(proposalKey: string, index: number) {
   return `hoot-inject:${proposalKey}:${index}`
 }
 
-// 同じ attempt を繰り返さないための requestId。attempt は store が数える
-export function injectRequestIdOf(key: string, attempt: number) {
-  return `${key}:attempt:${attempt}`
-}
-
+// 同じ attempt を繰り返さないための requestId。attempt を含まない（上の key そのまま）。
+// 同じ key で 2 回 submit しても Pi durable は 1 回だけ実行し、記録済みの answer を返す。失敗 retry
+// の回数は attempts 側で数える
 export function pendingInjectsOf(state: HootState) {
   return state.injectRequests.filter((request) => {
     return request.status === 'pending' && request.attempts < MAX_INJECT_ATTEMPTS
@@ -570,6 +595,7 @@ function isSettingsShapeBase(value: unknown) {
     isBoundedInt(value.proposalTtlHours, PROPOSAL_TTL_HOURS_MIN, PROPOSAL_TTL_HOURS_MAX) &&
     isBoundedInt(value.maxProposalReminders, MAX_PROPOSAL_REMINDERS_MIN, MAX_PROPOSAL_REMINDERS_MAX) &&
     (value.autoDispatch === undefined || typeof value.autoDispatch === 'boolean') &&
+    (value.conversationRead === undefined || typeof value.conversationRead === 'boolean') &&
     (value.maxInjectsPerDay === undefined ||
       isBoundedInt(value.maxInjectsPerDay, MAX_INJECTS_PER_DAY_MIN, MAX_INJECTS_PER_DAY_MAX)) &&
     (value.injectCooldownMinutes === undefined ||
@@ -581,7 +607,8 @@ export function isSettingsShapeV2(value: unknown): value is HootSettingsV2 {
   return isSettingsShapeBase(value)
 }
 
-export function isSettingsShape(value: unknown): value is HootSettings {
+// version 3 の settings（inject 用 field は必須、conversationRead は無い）
+export function isSettingsShapeV3(value: unknown): value is HootSettingsV3 {
   if (!isSettingsShapeBase(value)) {
     return false
   }
@@ -593,6 +620,14 @@ export function isSettingsShape(value: unknown): value is HootSettings {
     isBoundedInt(candidate.maxInjectsPerDay, MAX_INJECTS_PER_DAY_MIN, MAX_INJECTS_PER_DAY_MAX) &&
     isBoundedInt(candidate.injectCooldownMinutes, INJECT_COOLDOWN_MINUTES_MIN, INJECT_COOLDOWN_MINUTES_MAX)
   )
+}
+
+export function isSettingsShape(value: unknown): value is HootSettings {
+  if (!isSettingsShapeV3(value)) {
+    return false
+  }
+
+  return typeof (value as Record<string, unknown>).conversationRead === 'boolean'
 }
 
 function isInjectShape(value: unknown): value is HootInjectRequest {
@@ -646,11 +681,37 @@ function isRunShapeBase(value: unknown): value is HootRun {
 }
 
 function isRunShape(value: unknown): value is HootRun {
+  if (!isRunShapeV3(value)) {
+    return false
+  }
+
+  return isConversationReads((value as Record<string, unknown>).conversationReads)
+}
+
+// version 2・3 の run（conversationReads が無い）
+function isRunShapeV3(value: unknown): value is Omit<HootRun, 'conversationReads'> {
   if (!isRunShapeBase(value)) {
     return false
   }
 
   return value.source === 'model' || value.source === 'precheck'
+}
+
+function isConversationReads(value: unknown): value is HootConversationReads {
+  if (!isRecord(value)) {
+    return false
+  }
+
+  const reads = value as Record<string, unknown>
+
+  return (
+    Number.isInteger(reads.calls) &&
+    (reads.calls as number) >= 0 &&
+    Number.isInteger(reads.entries) &&
+    (reads.entries as number) >= 0 &&
+    Number.isInteger(reads.chars) &&
+    (reads.chars as number) >= 0
+  )
 }
 
 function isProposalShape(value: unknown): value is HootProposal {
@@ -722,8 +783,8 @@ export type HootStateV1 = {
   runs: Omit<HootRun, 'source'>[]
 }
 
-// version 2（precheck・proposal・goal review あり、inject request なし）。v3 への migration 入力
-export type HootSettingsV2 = Omit<HootSettings, 'autoDispatch' | 'maxInjectsPerDay' | 'injectCooldownMinutes'>
+// version 2（precheck・proposal・goal review あり、inject request なし）。v4 への migration 入力
+export type HootSettingsV2 = Omit<HootSettings, 'autoDispatch' | 'maxInjectsPerDay' | 'injectCooldownMinutes' | 'conversationRead'>
 
 export type HootStateV2 = {
   version: number
@@ -732,6 +793,19 @@ export type HootStateV2 = {
   loop: HootLoopState
   runs: HootRun[]
   proposals: HootProposal[]
+}
+
+// version 3（inject request あり、conversationRead と run の conversationReads が無い）
+export type HootSettingsV3 = Omit<HootSettings, 'conversationRead'>
+
+export type HootStateV3 = {
+  version: number
+  settings: HootSettingsV3
+  goals: HootGoal[]
+  loop: HootLoopState
+  runs: Omit<HootRun, 'conversationReads'>[]
+  proposals: HootProposal[]
+  injectRequests: HootInjectRequest[]
 }
 
 export function isHootStateShapeV1(value: unknown): value is HootStateV1 {
@@ -752,8 +826,12 @@ export function isHootStateShapeV1(value: unknown): value is HootStateV1 {
   )
 }
 
-// goals・loop・runs・proposals の形は v2 と同じ。settings の検証だけ version で変える
-function isStateBodyShape(value: Record<string, unknown>, settingsOk: (candidate: unknown) => boolean) {
+// goals・loop・runs・proposals の形は version ごとに異なるので settings と runs の検査を受け取る
+function isStateBodyShape(
+  value: Record<string, unknown>,
+  settingsOk: (candidate: unknown) => boolean,
+  runsOk: (candidate: unknown) => boolean
+) {
   const loop = value.loop
 
   return (
@@ -768,20 +846,41 @@ function isStateBodyShape(value: Record<string, unknown>, settingsOk: (candidate
     isBoundedInt(loop.conversationRuns, 0, 100000) &&
     isGoalFingerprints(loop.goalFingerprints) &&
     Array.isArray(value.runs) &&
-    value.runs.every(isRunShape) &&
+    value.runs.every(runsOk) &&
     Array.isArray(value.proposals) &&
     value.proposals.length <= MAX_PROPOSALS_KEPT &&
     value.proposals.every(isProposalShape)
   )
 }
 
-// version 2（inject request のない state file）。version 3 の migration 入力に使う
+function isInjectRequestsShape(value: unknown) {
+  return (
+    Array.isArray(value) &&
+    value.length <= MAX_INJECTS_KEPT &&
+    value.every(isInjectShape)
+  )
+}
+
+// version 2（inject request のない state file）。migration 入力に使う
 export function isHootStateShapeV2(value: unknown): value is HootStateV2 {
   if (!isRecord(value) || value.version !== HOOT_STATE_VERSION_INJECT) {
     return false
   }
 
-  return isStateBodyShape(value, isSettingsShapeV2)
+  return isStateBodyShape(value, isSettingsShapeV2, isRunShapeV3)
+}
+
+// version 3（inject request あり、conversationRead 以前）
+export function isHootStateShapeV3(value: unknown): value is HootStateV3 {
+  if (!isRecord(value) || value.version !== HOOT_STATE_VERSION_PRE_CONVERSATION_READ) {
+    return false
+  }
+
+  if (!isStateBodyShape(value, isSettingsShapeV3, isRunShapeV3)) {
+    return false
+  }
+
+  return isInjectRequestsShape(value.injectRequests)
 }
 
 export function isHootStateShape(value: unknown): value is HootState {
@@ -789,15 +888,11 @@ export function isHootStateShape(value: unknown): value is HootState {
     return false
   }
 
-  if (!isStateBodyShape(value, isSettingsShape)) {
+  if (!isStateBodyShape(value, isSettingsShape, isRunShape)) {
     return false
   }
 
-  return (
-    Array.isArray(value.injectRequests) &&
-    value.injectRequests.length <= MAX_INJECTS_KEPT &&
-    value.injectRequests.every(isInjectShape)
-  )
+  return isInjectRequestsShape(value.injectRequests)
 }
 
 export type DecisionParse = {
