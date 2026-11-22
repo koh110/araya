@@ -8,9 +8,15 @@ import {
   discordGatewayIntents,
   discordNotificationPayload,
   flattenDiscordCommandOptions,
+  handleDiscordMessageCreate,
   OBSOLETE_COMMAND_REPLY,
   wireSlashCommandInteractions,
+  type DiscordGatewayHandlers,
+  type DiscordMessageCreateEvent,
+  type DiscordTypingChannel,
 } from '../src/discord/gateway.ts'
+import type { DiscordChatMessage, DiscordChatMessageMetadata } from '../src/discord/chat.ts'
+import type { DiscordConfig } from '../src/discord/config.ts'
 
 test('discord gateway: nonce payload は enforce_nonce を有効にする', () => {
   assert.deepEqual(discordNotificationPayload('Task update', 'nonce-1'), {
@@ -334,4 +340,165 @@ test('discord gateway: interactionCreate 配線は撤去済み command に ephem
   assert.equal(removed.replies[0]?.content.includes('17'), false)
   assert.deepEqual(otherCommand.replies, [])
   assert.deepEqual(errors, [])
+})
+
+const gatewayConfig: DiscordConfig = {
+  botToken: 'synthetic-token',
+  applicationId: '12345678901234567',
+  guildId: '22345678901234567',
+  channelId: '32345678901234567',
+  allowedUserIds: ['42345678901234567'],
+}
+
+function makeFakeMessageCreate(options: {
+  id: string
+  channelId?: string
+  userId?: string
+  isBot?: boolean
+  isSystem?: boolean
+  content?: string
+}): DiscordMessageCreateEvent {
+  return {
+    id: options.id,
+    guildId: gatewayConfig.guildId,
+    channelId: options.channelId ?? gatewayConfig.channelId,
+    author: { id: options.userId ?? '42345678901234567', bot: options.isBot ?? false },
+    webhookId: null,
+    system: options.isSystem ?? false,
+    mentions: { users: { has: () => false } },
+    content: options.content ?? 'hello',
+    inGuild: () => true,
+    channel: {
+      isTextBased: () => true,
+      sendTyping: async () => {},
+    },
+    reply: async () => ({}),
+  }
+}
+
+const fakeTypingIndicator = {
+  run: async <T>(_target: DiscordTypingChannel, operation: () => Promise<T> | T): Promise<T> => {
+    return await operation()
+  },
+  close: () => {},
+}
+
+function makeGatewayHandlerCapture() {
+  const messages: DiscordChatMessage[] = []
+  const ignored: { metadata: DiscordChatMessageMetadata & { messageId: string }; failures: string[] }[] = []
+  const errors: string[] = []
+  const handlers: DiscordGatewayHandlers = {
+    onReady: () => {},
+    onMessage: (message) => {
+      messages.push(message)
+    },
+    onError: (message) => {
+      errors.push(message)
+    },
+    onIgnored: (metadata, failures) => {
+      ignored.push({ metadata, failures })
+    },
+  }
+
+  return { messages, ignored, errors, handlers }
+}
+
+test('discord gateway: 許可条件に落ちる message は onIgnored に messageId と failures を渡し本文を渡さない', () => {
+  const capture = makeGatewayHandlerCapture()
+  const message = makeFakeMessageCreate({
+    id: '92345678901234611',
+    channelId: '62345678901234567',
+    content: '別 channel の投稿',
+  })
+
+  handleDiscordMessageCreate(message, gatewayConfig, capture.handlers, fakeTypingIndicator, '12345678901234567')
+
+  assert.equal(capture.ignored.length, 1)
+  assert.equal(capture.ignored[0]?.metadata.messageId, '92345678901234611')
+  assert.equal(capture.ignored[0]?.metadata.channelId, '62345678901234567')
+  assert.deepEqual(capture.ignored[0]?.failures, ['channel_mismatch'])
+  assert.deepEqual(capture.messages, [])
+  assert.equal(JSON.stringify(capture.ignored).includes('別 channel の投稿'), false)
+})
+
+test('discord gateway: 許可された message は onMessage に渡り onIgnored を呼ばない', () => {
+  const capture = makeGatewayHandlerCapture()
+  const message = makeFakeMessageCreate({ id: '92345678901234612', content: 'hello' })
+
+  handleDiscordMessageCreate(message, gatewayConfig, capture.handlers, fakeTypingIndicator, '12345678901234567')
+
+  assert.deepEqual(capture.ignored, [])
+  assert.equal(capture.messages.length, 1)
+  assert.equal(capture.messages[0]?.messageId, '92345678901234612')
+  assert.equal(capture.messages[0]?.content, 'hello')
+  assert.equal(capture.messages[0]?.mentionsBot, false)
+})
+
+test('discord gateway: bot 自身の message echo は onIgnored / onMessage を呼ばず黙って捨てる', () => {
+  const capture = makeGatewayHandlerCapture()
+  const message = makeFakeMessageCreate({
+    id: '92345678901234613',
+    userId: '12345678901234567',
+    isBot: true,
+    content: 'Araya の返信 echo',
+  })
+
+  handleDiscordMessageCreate(message, gatewayConfig, capture.handlers, fakeTypingIndicator, '12345678901234567')
+
+  assert.deepEqual(capture.ignored, [])
+  assert.deepEqual(capture.messages, [])
+})
+
+test('discord gateway: Araya 自身の user id の message は onIgnored に failures を積まない', () => {
+  const capture = makeGatewayHandlerCapture()
+  const message = makeFakeMessageCreate({ id: '92345678901234614', userId: '42345678901234567' })
+
+  handleDiscordMessageCreate(message, gatewayConfig, capture.handlers, fakeTypingIndicator, '42345678901234567')
+
+  assert.deepEqual(capture.ignored, [])
+  assert.deepEqual(capture.messages, [])
+})
+
+test('discord gateway: onIgnored を持たない handlers でも許可外 message で throw しない', () => {
+  const errors: string[] = []
+
+  handleDiscordMessageCreate(
+    makeFakeMessageCreate({ id: '92345678901234615', userId: '72345678901234567' }),
+    gatewayConfig,
+    {
+      onReady: () => {},
+      onMessage: () => {},
+      onError: (message) => {
+        errors.push(message)
+      },
+    },
+    fakeTypingIndicator,
+    '12345678901234567',
+  )
+  assert.deepEqual(errors, [])
+})
+
+test('discord gateway: onMessage の失敗は onError に message を渡す', async () => {
+  const errors: string[] = []
+  const handlers: DiscordGatewayHandlers = {
+    onReady: () => {},
+    onMessage: () => {
+      throw new Error('model submit failed')
+    },
+    onError: (message) => {
+      errors.push(message)
+    },
+  }
+
+  handleDiscordMessageCreate(
+    makeFakeMessageCreate({ id: '92345678901234616' }),
+    gatewayConfig,
+    handlers,
+    fakeTypingIndicator,
+    '12345678901234567',
+  )
+  await new Promise((resolve) => {
+    setTimeout(resolve, 20)
+  })
+  assert.deepEqual(errors, ['model submit failed'])
 })

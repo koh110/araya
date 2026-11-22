@@ -1096,3 +1096,128 @@ test('discord bot: Discord の /hoot dispatch 承認を同じ process の poll �
     await fs.rm(dataDir, { recursive: true, force: true })
   }
 })
+
+test('discord bot: gateway の onIgnored は discord_message_ignored を messageId と failures 付きで log に書く', async () => {
+  const dataDir = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-ignored-test-')),
+  )
+  const stopController = new AbortController()
+  const logs: Record<string, unknown>[] = []
+
+  try {
+    const exitCode = await runDiscordBot({
+      dataDir,
+      env: {
+        ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
+        ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
+        ARAYA_DISCORD_GUILD_ID: GUILD_ID,
+        ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
+        ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
+      },
+      stopSignal: stopController.signal,
+      verifyUnit: false,
+      sleep: async () => {},
+      createChatSession: createInertChatSession,
+      createGateway: async (_config, handlers) => {
+        return {
+          connect: async () => {
+            handlers.onReady('998877665544332211')
+            handlers.onIgnored?.(
+              {
+                guildId: GUILD_ID,
+                channelId: '62345678901234567',
+                userId: USER_ID,
+                isBot: false,
+                isWebhook: false,
+                isSystem: false,
+                mentionsBot: false,
+                messageId: '92345678901234621',
+              },
+              ['channel_mismatch'],
+            )
+            stopController.abort()
+          },
+          sendText: async () => {},
+          async registerCommands() {
+            return 2
+          },
+          close: async () => {},
+        }
+      },
+      log(entry) {
+        logs.push(entry)
+      },
+    })
+
+    assert.equal(exitCode, 0)
+    const ignored = logs.filter((entry) => {
+      return entry.type === 'discord_message_ignored'
+    })
+    assert.equal(ignored.length, 1)
+    assert.equal(ignored[0]?.messageId, '92345678901234621')
+    assert.deepEqual(ignored[0]?.failures, ['channel_mismatch'])
+    assert.equal(ignored[0]?.userId, USER_ID)
+    assert.equal(ignored[0]?.content, undefined, 'ignored entry に本文を含めない')
+    assert.equal(JSON.stringify(logs).includes(BOT_TOKEN), false)
+  } finally {
+    stopController.abort()
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('discord bot: discord.log の各行は ts timestamp を持つ', async () => {
+  const dataDir = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-ts-test-')),
+  )
+  const stopController = new AbortController()
+
+  try {
+    // log を inject しない → production の fileLogger が dataDir/logs/discord.log へ書く
+    const exitCode = await runDiscordBot({
+      dataDir,
+      env: {
+        ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
+        ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
+        ARAYA_DISCORD_GUILD_ID: GUILD_ID,
+        ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
+        ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
+      },
+      stopSignal: stopController.signal,
+      verifyUnit: false,
+      sleep: async () => {},
+      createChatSession: createInertChatSession,
+      createGateway: async (_config, handlers) => {
+        return {
+          connect: async () => {
+            handlers.onReady('998877665544332211')
+            stopController.abort()
+          },
+          sendText: async () => {},
+          async registerCommands() {
+            return 2
+          },
+          close: async () => {},
+        }
+      },
+    })
+
+    assert.equal(exitCode, 0)
+    const raw = await fs.readFile(path.join(dataDir, 'logs', 'discord.log'), 'utf8')
+    const entries = raw
+      .trim()
+      .split('\n')
+      .filter((line) => {
+        return line !== ''
+      })
+      .map((line) => JSON.parse(line))
+    assert.ok(entries.length > 0, 'discord.log に entry が書かれている')
+
+    for (const entry of entries) {
+      assert.equal(typeof entry.ts, 'string')
+      assert.match(entry.ts, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u)
+    }
+  } finally {
+    stopController.abort()
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
