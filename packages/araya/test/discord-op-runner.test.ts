@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { execFileSync, spawnSync } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url'
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const opRunnerSource = path.join(packageRoot, 'bin', 'discord-op-runner.ts')
 const discordConfigSource = path.join(packageRoot, 'src', 'discord', 'config.ts')
+const childLauncherSource = path.join(packageRoot, 'src', 'infrastructure', 'child-launcher.ts')
 const TEST_SERVICE_TOKEN = 'synthetic-service-account-token'
 
 function fakeOpScript(opRecordPath: string) {
@@ -89,7 +90,7 @@ await writeFile(${JSON.stringify(botRecordPath)}, JSON.stringify({
 `
 }
 
-async function makeFixture() {
+async function makeFixture(botScript?: string) {
   const root = await fs.realpath(
     await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-op-runner-test-')),
   )
@@ -97,6 +98,7 @@ async function makeFixture() {
   const packageDir = path.join(root, 'package')
   const packageBinDir = path.join(packageDir, 'bin')
   const packageConfigDir = path.join(packageDir, 'src', 'discord')
+  const packageInfrastructureDir = path.join(packageDir, 'src', 'infrastructure')
   const credentialsDirectory = path.join(root, 'credentials')
   const opPath = path.join(root, 'bin', 'op')
   const opRunnerPath = path.join(packageBinDir, 'discord-op-runner.ts')
@@ -108,12 +110,14 @@ async function makeFixture() {
   await fs.mkdir(dataDir, { recursive: true })
   await fs.mkdir(packageBinDir, { recursive: true })
   await fs.mkdir(packageConfigDir, { recursive: true })
+  await fs.mkdir(packageInfrastructureDir, { recursive: true })
   await fs.mkdir(path.dirname(opPath), { recursive: true })
   await fs.mkdir(credentialsDirectory, { recursive: true })
   await fs.writeFile(path.join(packageDir, 'package.json'), '{"type":"module"}\n', 'utf8')
   await fs.copyFile(opRunnerSource, opRunnerPath)
   await fs.copyFile(discordConfigSource, path.join(packageConfigDir, 'config.ts'))
-  await fs.writeFile(botPath, fakeBotScript(botRecordPath), 'utf8')
+  await fs.copyFile(childLauncherSource, path.join(packageInfrastructureDir, 'child-launcher.ts'))
+  await fs.writeFile(botPath, botScript ?? fakeBotScript(botRecordPath), 'utf8')
   await fs.writeFile(opPath, fakeOpScript(opRecordPath), { mode: 0o700 })
   await fs.writeFile(credentialPath, `${TEST_SERVICE_TOKEN}\n`, { mode: 0o400 })
   await fs.writeFile(
@@ -196,30 +200,17 @@ test('discord-op-runner: LoadCredential token を op run にだけ渡し、Araya
       invocationId: string
     } = JSON.parse(await fs.readFile(fixture.botRecordPath, 'utf8'))
 
-    assert.deepEqual(opRecord, {
-      args: [
-        'run',
-        '--env-file',
-        path.join(fixture.dataDir, '.env'),
-        '--',
-        '/usr/bin/env',
-        '-u',
-        'CREDENTIALS_DIRECTORY',
-        '-u',
-        'OP_CONNECT_HOST',
-        '-u',
-        'OP_CONNECT_TOKEN',
-        '-u',
-        'OP_SESSION',
-        '-u',
-        'OP_ACCOUNT',
-        '-u',
-        'OP_SERVICE_ACCOUNT_TOKEN',
-        process.execPath,
-        fixture.botPath,
-        '--data-dir',
-        fixture.dataDir,
-      ],
+    const { args: opArgs, ...opSecurity } = opRecord
+    const strippedNames = [
+      'CREDENTIALS_DIRECTORY',
+      'OP_CONNECT_HOST',
+      'OP_CONNECT_TOKEN',
+      'OP_SESSION',
+      'OP_ACCOUNT',
+      'OP_SERVICE_ACCOUNT_TOKEN',
+    ]
+
+    assert.deepEqual(opSecurity, {
       tokenPresent: true,
       tokenMatchesCredential: true,
       tokenInArgs: false,
@@ -231,6 +222,33 @@ test('discord-op-runner: LoadCredential token を op run にだけ渡し、Araya
       awsSecretPresent: false,
       githubTokenPresent: false,
     })
+    // op run は bot を起動せず「.env を解決して env を printed する」だけの process になった（#36）
+    assert.deepEqual(opArgs.slice(0, 19), [
+      'run',
+      '--env-file',
+      path.join(fixture.dataDir, '.env'),
+      '--',
+      '/usr/bin/env',
+      '-u',
+      'CREDENTIALS_DIRECTORY',
+      '-u',
+      'OP_CONNECT_HOST',
+      '-u',
+      'OP_CONNECT_TOKEN',
+      '-u',
+      'OP_SESSION',
+      '-u',
+      'OP_ACCOUNT',
+      '-u',
+      'OP_SERVICE_ACCOUNT_TOKEN',
+      process.execPath,
+      '-e',
+    ])
+    const resolverScript = opArgs[19] ?? ''
+    const strippedArg = opArgs[20] ?? ''
+    assert.match(resolverScript, /ARAYA_RESOLVED_ENV/u)
+    assert.equal(strippedArg, strippedNames.join(','))
+    assert.ok(!opArgs.includes(fixture.botPath), 'op run の args に bot を含まない')
     assert.deepEqual(botRecord, {
       args: ['--data-dir', fixture.dataDir],
       botToken: 'resolved-by-op',
@@ -357,6 +375,156 @@ test('discord-op-runner: credential file が他ユーザーに読める場合は
     assert.ok(result.stderr.includes('credential'))
     assert.ok(!result.stderr.includes(TEST_SERVICE_TOKEN))
     await assert.rejects(fs.access(fixture.opRecordPath))
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+// #36: runner（unit の main process）が bot より先に死ぬと、KillMode=control-group の systemd は
+// 残った bot を SIGKILL して drain を途中で潰す。runner が bot の終了を待つことを実証する。
+function drainingBotScript(startPath: string, stopPath: string) {
+  return `import { writeFile } from 'node:fs/promises'
+
+await writeFile(${JSON.stringify(startPath)}, JSON.stringify({
+  pid: process.pid,
+  botToken: process.env.ARAYA_DISCORD_BOT_TOKEN,
+  serviceTokenPresent: process.env.OP_SERVICE_ACCOUNT_TOKEN !== undefined,
+}), 'utf8')
+
+const keepAlive = setInterval(() => {}, 100)
+
+process.on('SIGTERM', () => {
+  clearInterval(keepAlive)
+
+  // bot 側の drain（reply 送信と close）を 250 ms 真似する
+  setTimeout(() => {
+    void writeFile(${JSON.stringify(stopPath)}, JSON.stringify({ receivedSigterm: true }), 'utf8')
+      .then(() => {
+        process.exit(0)
+      })
+  }, 250)
+})
+
+await new Promise(() => {})
+`
+}
+
+async function waitForFile(filePath: string, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs
+
+  while (Date.now() < deadline) {
+    try {
+      await fs.access(filePath)
+      return true
+    } catch {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25)
+      })
+    }
+  }
+
+  return false
+}
+
+test('discord-op-runner: SIGTERM を bot に伝えて bot の drain が終わるまで待ってから 0 で終了する', async () => {
+  const startPath = path.join(os.tmpdir(), `araya-op-bot-start-${process.pid}.json`)
+  const stopPath = path.join(os.tmpdir(), `araya-op-bot-stop-${process.pid}.json`)
+  await fs.rm(startPath, { force: true })
+  await fs.rm(stopPath, { force: true })
+  const fixture = await makeFixture(drainingBotScript(startPath, stopPath))
+
+  try {
+    const child = spawn(
+      process.execPath,
+      [fixture.opRunnerPath, '--data-dir', fixture.dataDir, '--op-path', fixture.opPath],
+      { env: { ...fixture.env, ARAYA_LAUNCHER_STOP_WAIT_MS: '5000' } },
+    )
+    let stderr = ''
+    child.stderr?.setEncoding('utf8')
+    child.stderr?.on('data', (chunk) => {
+      stderr += chunk
+    })
+
+    assert.ok(await waitForFile(startPath, 15_000), 'bot が起動して env を受け取った')
+    const sigtermAt = Date.now()
+    child.kill('SIGTERM')
+    const code = await new Promise<number | null>((resolve) => {
+      child.once('exit', (exitCode) => {
+        resolve(exitCode)
+      })
+    })
+
+    assert.equal(code, 0, stderr)
+    assert.ok(await waitForFile(stopPath, 2_000), 'bot は SIGTERM を受けて drain を完走した')
+    assert.ok(Date.now() - sigtermAt >= 200, 'runner は bot より先に死んでいない')
+    assert.ok(!stderr.includes('SIGKILL'), 'drain 完了には SIGKILL 不要')
+  } finally {
+    await fs.rm(startPath, { force: true })
+    await fs.rm(stopPath, { force: true })
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('discord-op-runner: SIGTERM を無視して居座る bot は stop wait 後に SIGKILL して 1 で終了する', async () => {
+  const startPath = path.join(os.tmpdir(), `araya-op-stuck-start-${process.pid}.json`)
+  const stuckScript = `import { writeFile } from 'node:fs/promises'
+
+await writeFile(${JSON.stringify(startPath)}, JSON.stringify({ pid: process.pid }), 'utf8')
+process.on('SIGTERM', () => {})
+setInterval(() => {}, 100)
+`
+  const fixture = await makeFixture(stuckScript)
+
+  try {
+    const child = spawn(
+      process.execPath,
+      [fixture.opRunnerPath, '--data-dir', fixture.dataDir, '--op-path', fixture.opPath],
+      { env: { ...fixture.env, ARAYA_LAUNCHER_STOP_WAIT_MS: '400' } },
+    )
+    let stderr = ''
+    child.stderr?.setEncoding('utf8')
+    child.stderr?.on('data', (chunk) => {
+      stderr += chunk
+    })
+
+    assert.ok(await waitForFile(startPath, 15_000), 'bot が起動した')
+    const sigtermAt = Date.now()
+    child.kill('SIGTERM')
+    const code = await new Promise<number | null>((resolve) => {
+      child.once('exit', (exitCode) => {
+        resolve(exitCode)
+      })
+    })
+
+    assert.equal(code, 1, stderr)
+    assert.ok(stderr.includes('SIGKILL'), stderr)
+    assert.ok(Date.now() - sigtermAt >= 300, 'stop wait を待ってから SIGKILL した')
+  } finally {
+    await fs.rm(startPath, { force: true })
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('discord-op-runner: bot の stderr は resolved secret を redact して launcher log に写す', async () => {
+  const leakingScript = `process.stderr.write('trace with secret resolved-by-op and plain text\\n')
+process.stdout.write('stdout is ignored\\n')
+process.exit(0)
+`
+  const fixture = await makeFixture(leakingScript)
+
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [fixture.opRunnerPath, '--data-dir', fixture.dataDir, '--op-path', fixture.opPath],
+      { encoding: 'utf8', env: fixture.env },
+    )
+
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stderr, /trace with secret \[redacted\] and plain text\n/u)
+    // launcher log は 1 行 1 record で読めることが必要（改行がリテラル \n になると 1 行に連結する）
+    assert.ok(!result.stderr.includes('\\n'), JSON.stringify(result.stderr))
+    assert.ok(!result.stderr.includes('resolved-by-op'), 'resolved secret をそのまま出さない')
+    assert.ok(!result.stderr.includes('stdout is ignored'), 'bot の stdout は launcher log に流さない')
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }

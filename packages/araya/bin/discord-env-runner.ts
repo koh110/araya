@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 // systemd LoadCredential から .env を読み、検証済み Discord 設定と allowlist 済み runtime environment だけを bot に渡す。
 
-import { spawn } from 'node:child_process'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import process from 'node:process'
@@ -14,6 +13,12 @@ import {
   readDiscordEnvFile,
   validateDiscordSettings,
 } from '../src/discord/config.ts'
+import {
+  launcherStopWaitMs,
+  launchChildAndWait,
+  stderrLineWriter,
+} from '../src/infrastructure/child-launcher.ts'
+
 
 function runnerError(message: string) {
   return new Error(message)
@@ -118,55 +123,17 @@ async function runDiscordBotProcess(
     path.dirname(modulePath),
     `discord-bot${path.extname(modulePath)}`,
   )
-  let child: ReturnType<typeof spawn>
-
-  try {
-    child = spawn(process.execPath, [botEntrypoint, '--data-dir', dataDir], {
-      env: discordBotEnvironment(settings),
-      shell: false,
-      stdio: 'ignore',
-    })
-  } catch {
-    throw runnerError('Discord bot を起動できません')
-  }
-
-  return await new Promise<number>((resolve) => {
-    let settled = false
-
-    function finish(code: number, message?: string) {
-      if (settled) {
-        return
-      }
-
-      settled = true
-      process.off('SIGTERM', forwardSigterm)
-      process.off('SIGINT', forwardSigint)
-
-      if (message !== undefined) {
-        process.stderr.write(`discord-env-runner: ${message}\n`)
-      }
-
-      resolve(code)
-    }
-    function forwardSigterm() {
-      child.kill('SIGTERM')
-    }
-    function forwardSigint() {
-      child.kill('SIGINT')
-    }
-
-    process.once('SIGTERM', forwardSigterm)
-    process.once('SIGINT', forwardSigint)
-    child.once('error', () => {
-      finish(127, 'Discord bot を起動できません')
-    })
-    child.once('exit', (code) => {
-      finish(
-        code ?? 1,
-        code === 0 ? undefined : `Discord bot が終了しました（status=${code ?? 'signal'}）`,
-      )
-    })
+  const outcome = await launchChildAndWait({
+    command: process.execPath,
+    args: [botEntrypoint, '--data-dir', dataDir],
+    env: discordBotEnvironment(settings),
+    stopWaitMs: launcherStopWaitMs(process.env),
+    secretValues: [settings.botToken],
+    label: 'discord-env-runner',
+    writeError: stderrLineWriter(),
   })
+
+  return outcome.exitCode
 }
 
 async function main() {
