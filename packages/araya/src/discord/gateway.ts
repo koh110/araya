@@ -29,6 +29,10 @@ export type DiscordMessageReplyFn = (content: string, nonce: string) => Promise<
 // 許可条件に落ちて session に渡らなかった message の証跡（IDs のみ・本文を含めない）
 export type DiscordIgnoredMessage = DiscordChatMessageMetadata & { messageId: string }
 
+// 起動時に channel から読み戻す history message。live の messageCreate と同じ形にしておくと
+// backfill 側で同じ admission gate を通せる
+export type DiscordHistoryMessage = DiscordChatMessageMetadata & { messageId: string; content: string }
+
 export type DiscordGatewayHandlers = {
   onReady(botUserId?: string): Promise<void> | void
   // slash command を扱う handler。省略されたら interaction は「撤去済み」の ephemeral reply で返す
@@ -42,6 +46,8 @@ export type DiscordGatewayHandlers = {
 export type DiscordGateway = {
   connect(): Promise<void>
   sendText(content: string, nonce: string): Promise<void>
+  // 再起動後の backfill が読む channel の直近 history（新しい順で返る）。test の fake は省略できる
+  fetchRecentMessages?(limit: number): Promise<DiscordHistoryMessage[]>
   // guild への slash command 登録（bulk overwrite。同じ定義を何度流しても置き換えになる）
   registerCommands(commands: readonly SlashCommand[]): Promise<number>
   close(): Promise<void>
@@ -404,6 +410,35 @@ export async function createDiscordGateway(
       }
 
       await channel.send(discordNotificationPayload(content, nonce))
+    },
+    // 再起動後の backfill 用。channel.messages.fetch は新しい順で返すので、live の messageCreate と
+    // 同じ metadata 形に直して渡す（本文はここで取り出すが log には書かない）
+    fetchRecentMessages: async (limit) => {
+      const channel = await client.channels.fetch(config.channelId)
+
+      if (channel === null || !('messages' in channel)) {
+        throw new Error('設定された Discord channel から history を読めません')
+      }
+
+      const fetched = await channel.messages.fetch({ limit })
+      const botId = client.user?.id
+      const history: DiscordHistoryMessage[] = []
+
+      for (const message of fetched.values()) {
+        history.push({
+          guildId: message.guildId,
+          channelId: message.channel.id,
+          userId: message.author.id,
+          isBot: message.author.bot,
+          isWebhook: message.webhookId !== null,
+          isSystem: message.system,
+          mentionsBot: botId !== undefined && message.mentions.users.has(botId),
+          messageId: message.id,
+          content: message.content,
+        })
+      }
+
+      return history
     },
     // guild 配下の command を bulk overwrite で登録する（bot startup から呼ぶ）。同じ定義を何度流しても置き換え。
     // client.application が null（ready 前）なら error。呼び出し側で log して会話機能は続ける

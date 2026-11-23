@@ -12,7 +12,7 @@ import { runDiscordBot, SHUTDOWN_BUDGET_TOTAL_MS } from '../src/discord/bot.ts'
 import { discordUnitSections } from '../src/infrastructure/systemd.ts'
 import { CHAT_SHUTDOWN_UNPROCESSED_REPLY } from '../src/discord/chat.ts'
 import { OBSOLETE_COMMAND_REPLY, routeSlashCommandInteraction } from '../src/discord/gateway.ts'
-import { newState, writeDiscordBotState } from '../src/discord/state.ts'
+import { newState, readDiscordBotState, writeDiscordBotState } from '../src/discord/state.ts'
 import { BOT_STARTED_TEXT, RESTART_STARTED_TEXT } from '../src/discord/restart-notice.ts'
 import { readHootState, enqueueHootInject, setGoal, updateSettings, upsertProposal } from '../src/hoot/store.ts'
 import { controlRequestId, readControlResult, writeControlRequest } from '../src/infrastructure/control-bus.ts'
@@ -1811,6 +1811,136 @@ test('discord bot: CLI の control request（araya reset）を startup 後の po
     assert.equal(cliLog?.command, 'reset')
     // CLI 側の要求 file は claim 後に消える（残った request が後で実行されない）
     assert.deepEqual(await fs.readdir(path.join(dataDir, 'control', 'requests')), [])
+  } finally {
+    stopController.abort()
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+// #36: gateway が閉じていた窓に投稿された message は Discord が再配信しない。ready 後に history を読み、
+// cursor より新しい物だけを会話へ流し込むことを bot の loop 経由で確かめる
+const DISCORD_EPOCH_MS = 1_420_064_800_000
+
+function snowflakeAge(ageMs: number) {
+  return String((BigInt(Date.now() - ageMs - DISCORD_EPOCH_MS) << 22n) + 1n)
+}
+
+test('discord bot: 再起動の窓に投稿された message を ready 後に history から取り直す', async () => {
+  const dataDir = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-backfill-test-')),
+  )
+  const stopController = new AbortController()
+  const logs: Record<string, unknown>[] = []
+  const submits: { content: string; requestId: string }[] = []
+  const cursorId = snowflakeAge(60_000)
+  const windowId = snowflakeAge(20_000)
+  const beforeCursorId = snowflakeAge(90_000)
+
+  writeDiscordBotState(dataDir, {
+    ...newState(),
+    unit: 'araya-discord-seed',
+    readyId: 'ready-seed',
+    lastReadyAt: '2026-11-22T00:00:00.000Z',
+    lastSeenMessageId: cursorId,
+  })
+
+  try {
+    const exitCode = await runDiscordBot({
+      dataDir,
+      env: {
+        ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
+        ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
+        ARAYA_DISCORD_GUILD_ID: GUILD_ID,
+        ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
+        ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
+      },
+      stopSignal: stopController.signal,
+      verifyUnit: false,
+      createChatSession: async () => {
+        return {
+          async submit(content: string, requestId: string) {
+            submits.push({ content, requestId })
+
+            return '取り直しました'
+          },
+          describe: () => {
+            return { conversationId: 1 }
+          },
+          async reset() {},
+          async close() {},
+        }
+      },
+      createGateway: async (_config, handlers) => {
+        return {
+          connect: async () => {
+            handlers.onReady('998877665544332211')
+            // backfill の fetch と queue 処理が走ってから shutdown に入る
+            await new Promise((resolve) => {
+              setTimeout(resolve, 300)
+            })
+            stopController.abort()
+          },
+          sendText: async () => {},
+          async registerCommands() {
+            return 2
+          },
+          async fetchRecentMessages() {
+            return [
+              {
+                guildId: GUILD_ID,
+                channelId: CHANNEL_ID,
+                userId: USER_ID,
+                isBot: false,
+                isWebhook: false,
+                isSystem: false,
+                mentionsBot: false,
+                messageId: windowId,
+                content: '再起動中に出ていた message',
+              },
+              {
+                guildId: GUILD_ID,
+                channelId: CHANNEL_ID,
+                userId: USER_ID,
+                isBot: false,
+                isWebhook: false,
+                isSystem: false,
+                mentionsBot: false,
+                messageId: beforeCursorId,
+                content: 'cursor より古い message',
+              },
+            ]
+          },
+          close: async () => {},
+        }
+      },
+      fetch: noticeStubFetch,
+      log: (entry) => {
+        return logs.push(entry)
+      },
+    })
+
+    assert.equal(exitCode, 0)
+    assert.equal(submits.length, 1, JSON.stringify(logs))
+    assert.equal(submits[0]?.requestId, windowId)
+    assert.match(submits[0]?.content ?? '', /再起動中に出ていた message/)
+
+    const received = logs.find((entry) => {
+      return entry.type === 'discord_backfill_received'
+    })
+
+    assert.ok(received !== undefined, JSON.stringify(logs))
+    assert.equal(received.messageId, windowId)
+    assert.ok(
+      logs.some((entry) => {
+        return entry.type === 'discord_backfill' && entry.handled === 1
+      }),
+    )
+
+    // cursor は取り直した message まで進み、cursor 以下の物は再処理しない
+    const state = readDiscordBotState(dataDir)
+
+    assert.ok(state !== null)
+    assert.equal(state.lastSeenMessageId, windowId)
   } finally {
     stopController.abort()
     await fs.rm(dataDir, { recursive: true, force: true })
