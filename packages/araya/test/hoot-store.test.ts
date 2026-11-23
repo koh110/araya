@@ -1393,6 +1393,74 @@ test('hoot store: recordHootDigest は loop.lastDigestAt を書き UTC 日の ke
   }
 })
 
+test('hoot store: investigate proposal も inject request になる（人間の承認 / autoDispatch gate）', async () => {
+  const fixture = await makeHootFixture()
+  const investigateKey = proposalKeyOf({ goalKeys: ['quality'], decision: 'investigate' })
+  const requestHumanKey = proposalKeyOf({ goalKeys: ['quality'], decision: 'request_human' })
+
+  try {
+    await setGoal(fixture.dataDir, { key: 'quality', objective: 'quality の objective', scope: ['github:koh110/araya'] })
+    for (const [key, decision] of [
+      [investigateKey, 'investigate'],
+      [requestHumanKey, 'request_human']
+    ] as const) {
+      await upsertProposal(fixture.dataDir, {
+        key,
+        decision,
+        goalKeys: ['quality'],
+        reason: `${decision} の理由`,
+        occurrenceKey: 'hoot:2026-11-20T00:00:00.000Z',
+        nowMs: Date.parse('2026-11-20T00:00:00.000Z')
+      })
+    }
+
+    // dry_run では investigate でも request を作らない
+    await assert.rejects(
+      () => {
+        return enqueueHootInject(fixture.dataDir, {
+          proposalKey: investigateKey,
+          authorizedBy: 'human',
+          nowMs: Date.parse('2026-11-20T01:00:00.000Z')
+        })
+      },
+      /hoot_mode_dry_run/
+    )
+
+    await updateSettings(fixture.dataDir, { mode: 'active' })
+
+    // autoDispatch=false の限り mode=active でも自動では作らない
+    const auto = await enqueueHootInject(fixture.dataDir, {
+      proposalKey: investigateKey,
+      authorizedBy: 'mode_active',
+      nowMs: Date.parse('2026-11-20T01:00:00.000Z')
+    })
+    assert.equal(auto.request, null)
+    assert.equal(auto.skipped, 'auto_dispatch_off')
+
+    const enqueued = await enqueueHootInject(fixture.dataDir, {
+      proposalKey: investigateKey,
+      authorizedBy: 'human',
+      nowMs: Date.parse('2026-11-20T01:00:00.000Z')
+    })
+    assert.equal(enqueued.request?.proposalKey, investigateKey)
+    assert.equal(enqueued.request?.status, 'pending')
+    assert.equal(enqueued.request?.authorizedBy, 'human')
+
+    await assert.rejects(
+      () => {
+        return enqueueHootInject(fixture.dataDir, {
+          proposalKey: requestHumanKey,
+          authorizedBy: 'human',
+          nowMs: Date.parse('2026-11-20T02:30:00.000Z')
+        })
+      },
+      /hoot_inject_not_injectable/
+    )
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
 test('hoot store: inject request は mode gate・cooldown・daily limit・pending 重複で作り、take / finish で status を進める', async () => {
   const fixture = await makeHootFixture()
   const proposalKey = proposalKeyOf({ goalKeys: ['quality'], decision: 'dispatch' })
@@ -1476,7 +1544,7 @@ test('hoot store: inject request は mode gate・cooldown・daily limit・pendin
       /hoot_proposal_not_found/
     )
 
-    // inject してよい decision は dispatch だけ（investigate / request_human は提案のまま）
+    // inject してよい decision は dispatch / investigate（request_human は人間への依頼なので提案のまま）
     await assert.rejects(
       () => {
         return enqueueHootInject(fixture.dataDir, {

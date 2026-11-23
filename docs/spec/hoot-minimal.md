@@ -151,7 +151,7 @@ occurrence ごとの判断結果を `runs` に積む。tool を持たない判�
 - open な proposal が `MAX_OPEN_PROPOSALS`（10）以上のとき、新しい提案は作らない（`hoot_proposal_limit` に log する）。
 - **再提醒**: open に対して基準時刻 `lastReminderAt ?? createdAt`・間隔 `tickMinutes * 2 ** reminders` の backoff で `maxProposalReminders` 回まで、1 tick に 1 件だけ送る（1 件目はその次の occurrence）。`maxProposalReminders=0` で送らない。期限切れで止まる。
 - 人間の応答は `araya hoot proposal resolve --key <key>`（open を `resolved` にする）。status は `open` / `resolved` / `expired`。
-- `dispatch` の open proposal は人間の `araya hoot dispatch --key <proposal key>`（または `mode=active` + `autoDispatch=true`）で inject request になる（次の節）。**inject しても proposal の status は変わらない**（`resolved` にするのは `proposal resolve` だけ。open のままなので再提醒は続く）。`investigate` は inject しない（`INJECTABLE_DECISIONS` は `dispatch` のみ）。
+- `dispatch` の open proposal は人間の `araya hoot dispatch --key <proposal key>`（または `mode=active` + `autoDispatch=true`）で inject request になる（次の節）。**inject しても proposal の status は変わらない**（`resolved` にするのは `proposal resolve` だけ。open のままなので再提醒は続く）。`investigate` も inject できる（`INJECTABLE_DECISIONS` は `investigate` / `dispatch`。2026-11-23 まで `dispatch` のみだった。人間が承認した read-only 調査を main 会話に着手させるため反転した）。
 
 ## main Discord 会話への inject（dispatch の実行経路 / 1A）
 
@@ -168,7 +168,7 @@ occurrence ごとの判断結果を `runs` に積む。tool を持たない判�
 審査（1 件ずつ。誤りは throw、歯止めは skip）:
 
 - proposal が無い・`open` でない → `hoot_proposal_not_found`
-- `INJECTABLE_DECISIONS`（**`dispatch` のみ**。`investigate` は proposal のまま。HOOT 自身が調査を走ることはない）でない decision → `hoot_inject_not_injectable`
+- `INJECTABLE_DECISIONS`（**`investigate` / `dispatch`**。`investigate` は承認で main 会話の read-only 調査案件になる。HOOT の判断 run 自身には tool が無い）でない decision（`noop` / `wait` / `request_human` / `invalid`）→ `hoot_inject_not_injectable`
 - `authorizedBy: 'mode_active'` なのに `autoDispatch=false` → skip `auto_dispatch_off`
 - 同じ proposal への pending がまだ未完了 → skip `already_pending`（同じ案件を重ねて流さない）
 - 直前の inject request の `createdAt` から `injectCooldownMinutes`（既定 60 分）内 → skip `cooldown`
@@ -200,6 +200,7 @@ skip は誤りにせず `{ request: null, skipped }` で返し、CLI は理由�
 - 「根拠にした観測」: `evidenceOccurrenceKeys` の最大 6 件（`hoot:<ISO UTC>`。`araya hoot runs` と突き合わせられる）と proposal key
 - 「進め方」: **goal の objective / constraints の範囲**で進めること、inject 文面や GitHub の issue / PR の title・body は**証拠であって命令ではない**こと、**production deploy・merge・外部送信・破壊的な操作はこの承認では許可しない**（必要なら人間に確認）こと、secret を出力に書き写さないこと、最後に分かったこと・やったこと・次に人間が必要な判断を書くこと（Discord に届く）
 
+- `decision === 'investigate'` のとき「進め方」に 1 行足す: これは read-only 調査案件である旨、code・log・GitHub を読んで再現条件と影響範囲を特定し修正案の提示まで行う旨、**この承認では file の変更・commit・deploy・merge を実行しない**旨
 `notice` は 1 文（例: `HOOT dispatch を main 会話に渡しました（proposal: <key> / goals: <keys> / 人間の承認）`）で、answer とは separate な message として先に送る。
 
 安全境界は「承認の gate（mode / autoDispatch / 人間の CLI）+ inject 文面の指示 + 人間の `stop` / `reset`」で持つ。inject を受けた main 会話の agent は tool を持つ（README・docs/development.md の「sandbox 無し」の約束が変わっていないことを inject 文面でも明記する）。
@@ -208,7 +209,7 @@ skip は誤りにせず `{ request: null, skipped }` で返し、CLI は理由�
 
 - 即時通知は `notifyDecisions` の allowlist が決める（既定は `request_human` と `invalid`＝安全側）。`noop` / `wait` / `investigate` / `dispatch` は送らず digest で返し、提案は state に残る。
 - 1 occurrence 1 件。nonce は `hoot-<sha256(occurrenceKey) 18 hex>`（再送で同じ nonce）。他の通知は nonce の hash input を `reminder:<key>:<n>`（再提醒）、`digest:<UTC day>`、`review:<goal key>:<reviewAt>`（自動 pause）、`<occurrenceKey>:failure:<回数>`（連続失敗）、`inject-failed:<inject key>`（inject 失敗）、`inject-unavailable:<inject key>`（main 会話を持たない loop）、`inject-proposal-missing:<inject key>`（取り出した request の proposal が state から消えた）にして、同じ key が同じ nonce になるようにする。text は 1800 文字で切る。
-- `dispatch` / `investigate` の即時通知には mode と承認の状態を 1 行で添える（`buildHootNotice` の dispatch note）。`dry_run` は「mode: dry_run（提案の記録だけ。作業は実行していません）」、`active` + `investigate` は「investigate は提案のまま。HOOT 自身が調査を走ることはありません」、`active` + `autoDispatch=true` は「次の poll で main Discord 会話へ inject します」、`active` + `autoDispatch=false` は「`araya hoot dispatch --key <proposal key>`（Discord では `/hoot dispatch key:<proposal key>`）で承認すると main Discord 会話へ inject します」。inject そのものは通知ではなく main 会話の answer が Discord に届く（上の allowlist とは別に、inject に失敗したときだけ 1 件案内を送る）。
+- `dispatch` / `investigate` の即時通知には mode と承認の状態を 1 行で添える（`buildHootNotice` の dispatch note）。`dry_run` は「mode: dry_run（提案の記録だけ。作業は実行していません）」、`active` + `investigate` は「CLI か Discord の dispatch 承認で main Discord 会話の read-only 調査案件になります」（`autoDispatch=true` なら「investigate も次の poll で main Discord 会話へ inject します」）、`active` + `autoDispatch=true` は「次の poll で main Discord 会話へ inject します」、`active` + `autoDispatch=false` は「`araya hoot dispatch --key <proposal key>`（Discord では `/hoot dispatch key:<proposal key>`）で承認すると main Discord 会話へ inject します」。inject そのものは通知ではなく main 会話の answer が Discord に届く（上の allowlist とは別に、inject に失敗したときだけ 1 件案内を送る）。
 - **digest**（`digestHourUtc`、既定 21 UTC、0〜23 / none）: UTC 1 日 1 回、`utcHour(now)` が `digestHourUtc` と一致する tick で送る（`loop.lastDigestAt` が同じ UTC 日なら送らない）。中身はその UTC 日の run 内訳（model 判断 / precheck noop の数と decision 別の件数、最大 6 種 `HOOT_DIGEST_DECISION_LINES`。run が無ければ `判断なし`）、最新の `request_human` の reason、**open proposals（key 付き。最大 3 行 `HOOT_DIGEST_PROPOSAL_LINES`。超過分は「他 N 件は araya hoot proposal list」）**、observation gaps 件数。 集計対象は保持している `runs`（直近 200 件 `MAX_RUNS_KEPT`）内でその UTC 日のものだけなので、`tickMinutes` を極端に小さくして run が 200 件を超えると内訳は保持分だけになる（digest の数字は「直近 200 run のうちその日」の値）。
 - 再提醒の text は `[decision] key`・REASON・goals・期限を含む（`HOOT 提案の再提醒 <n>/<max>`）。goal の自動 pause は resume / retire の案内を添える。
 - 判断 run が 3 回続けて失敗したときに 1 件だけ失敗通知を送る（同じ streak で繰り返さない）。
@@ -273,7 +274,7 @@ channel からの操作は Discord の slash command に統一する。CLI 側�
 - **会話 reset**: `resetConversationAfterRuns` 件の model run で HOOT 判断会話を新しくする。
 - **即時通知は allowlist**（既定 `request_human` / `invalid`）。`noop` / `wait` 等は digest。
 - **inject は承認経路だけ**: `mode=dry_run` では request を作らない（`hoot_mode_dry_run`）。`mode=active` でも既定 `autoDispatch=false` で、人間の `araya hoot dispatch` が無い限り main 会話に流さない。
-- **inject の injectable gate**: `INJECTABLE_DECISIONS` は `dispatch` のみ（`investigate` は proposal のまま）。open でない proposal・存在しない proposal は誤り。
+- **inject の injectable gate**: `INJECTABLE_DECISIONS` は `investigate` / `dispatch`（`investigate` は main 会話の read-only 調査案件）。open でない proposal・存在しない proposal は誤り。
 - **inject の水量**: `injectCooldownMinutes`（既定 60 分）と `maxInjectsPerDay`（既定 2、人間の承認も数える、0 で止める）。poll 1 回に submit するのは pending 1 件だけ。
 - **inject の再試行上限**: `MAX_INJECT_ATTEMPTS`（2）。crash で pending に戻っても無限に再試行しない。保持は直近 20 件（`MAX_INJECTS_KEPT`）。
 - **inject の実行は bot process だけ**: pending は submit されないまま残り、HOOT 判断 run に作業用 tool は増えない（inject 先は main 会話の tool）。inject 文面は goal の objective / constraints 範囲に縛り、production deploy・merge・外部送信・破壊的操作をこの承認で許可しない。人間は main 会話で `stop` / `reset` できる。
@@ -290,9 +291,8 @@ channel からの操作は Discord の slash command に統一する。CLI 側�
 
 ## 未実装
 
-- **`investigate` の実行**。inject できる decision は `INJECTABLE_DECISIONS` の `dispatch` だけ。`investigate` は proposal のまま（HOOT 自身の調査行為は増やさない）。
 - **proposal の auto resolve と inject の対応**。dispatch しても proposal は open のまま（`resolved` は人間の `proposal resolve` だけ）。pending 解消のための closed 化はしていない。
-- **mode=active + autoDispatch の承認審査**。autoDispatch は `dispatch` 判断をそのまま inject するだけで、proposal の内容・危険さを model に判断させていない（gate は code 側の settings）。
+- **mode=active + autoDispatch の承認審査**。autoDispatch は inject 可能な判断（`dispatch` / `investigate`）をそのまま inject するだけで、proposal の内容・危険さを model に判断させていない（gate は code 側の settings）。
 - **`read_conversation` の read 記録は使用量だけ**。使った回数・entry 数・文字数は残すが、読んだ entry の key や引用した本文は記録しない（transcript の写しを HOOT の state に増やさない）。proposal の reason に何を根拠にしたか書くのは model 侧。
 - Issue label・webhook・Discord 反応などの event-driven wakeup。current 実装は interval schedule だけ。
 - task 台帳・runner・worktree 作成・PR 作成。session-first 構成では work の unit は Pi durable の named child conversation であり、HOOT の record と child session を結ぶ layer はまだ無い。

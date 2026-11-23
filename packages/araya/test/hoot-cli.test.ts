@@ -812,10 +812,87 @@ test('hoot cli: 壊れた state file に対して restore の手順を誤りに�
   }
 })
 
+test('hoot cli: dispatch --key は investigate proposal も inject できる（main 会話の read-only 調査案件）', async () => {
+  const fixture = await makeHootCliFixture()
+  const investigateKey = proposalKeyOf({ goalKeys: ['araya-quality'], decision: 'investigate' })
+
+  try {
+    const added = await fixture.run(['goal', 'add', '--key', 'araya-quality', '--objective', 'open issue の再現条件と影響範囲を特定する'])
+    assert.equal(added.ok, true)
+    const goals = (await readHootState(fixture.dataDir)).goals
+    await writeHootState(fixture.dataDir, {
+      ...defaultState(),
+      goals,
+      proposals: [proposalFixture(investigateKey, { decision: 'investigate', reason: 'open issue の再現条件が観測から確定しない' })]
+    })
+
+    const dryRun = await fixture.run(['dispatch', '--key', investigateKey])
+    assert.equal(dryRun.ok, false)
+    assert.match(dryRun.message, /hoot_mode_dry_run/u)
+
+    const enabled = await fixture.run(['settings', 'set', '--enabled', 'true', '--mode', 'active'])
+    assert.equal(enabled.ok, true)
+
+    const queued = await fixture.run(['dispatch', '--key', investigateKey])
+    assert.equal(queued.ok, true)
+    assert.match(queued.output, /inject request を作りました/u)
+    assert.match(queued.output, new RegExp(`proposal: ${investigateKey} \\[investigate\\]`, 'u'))
+
+    let state = await readHootState(fixture.dataDir)
+    assert.equal(state.injectRequests.length, 1)
+    assert.equal(state.injectRequests[0]?.proposalKey, investigateKey)
+    assert.equal(state.injectRequests[0]?.status, 'pending')
+    assert.equal(state.injectRequests[0]?.authorizedBy, 'human')
+
+    // bot loop が main 会話へ渡す文面に「read-only 調査案件」の旨が出る（実行するのは main 会話）
+    const injectInputs: { content: string; notice: string }[] = []
+    const loop = createHootLoop({
+      dataDir: fixture.dataDir,
+      devRoot: fixture.root,
+      redactor: createRedactor(collectSecretValues({})),
+      decide: async () => {
+        return { text: 'DECISION: noop\nREASON: inject だけ', conversationId: 5 }
+      },
+      deliver: async () => {},
+      dispatchInject: async (input) => {
+        injectInputs.push({ content: input.content, notice: input.notice })
+      },
+      log: () => {},
+      nowMs: () => {
+        return Date.parse(HOOT_NOW_ISO)
+      },
+      env: {},
+      runCommand: async () => ({
+        exitCode: 0,
+        signal: null,
+        stdout: '[]',
+        stderr: '',
+        stdoutBytes: 2,
+        stderrBytes: 0,
+        terminationReason: undefined,
+        terminationConfirmed: true,
+      })
+    })
+
+    const injected = await loop.injectOnce()
+    assert.equal(injected.kind, 'injected')
+    assert.equal(injectInputs.length, 1)
+    assert.match(injectInputs[0]?.content ?? '', /read-only 調査案件/u)
+    assert.match(injectInputs[0]?.content ?? '', /file の変更・commit・deploy・merge を実行しません/u)
+    assert.match(injectInputs[0]?.notice ?? '', /人間の承認/u)
+
+    state = await readHootState(fixture.dataDir)
+    assert.equal(state.injectRequests[0]?.status, 'injected')
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
 test('hoot cli: dispatch --key は inject request を作り、inject list / status に出す（dry_run では拒否）', async () => {
   const fixture = await makeHootCliFixture()
   const dispatchKey = proposalKeyOf({ goalKeys: ['araya-quality'], decision: 'dispatch' })
   const investigateKey = proposalKeyOf({ goalKeys: ['araya-quality'], decision: 'investigate' })
+  const requestHumanKey = proposalKeyOf({ goalKeys: ['araya-quality'], decision: 'request_human' })
 
   try {
     const added = await fixture.run(['goal', 'add', '--key', 'araya-quality', '--objective', 'open issue と draft PR を拾う'])
@@ -828,6 +905,7 @@ test('hoot cli: dispatch --key は inject request を作り、inject list / stat
       proposals: [
         proposalFixture(dispatchKey, { decision: 'dispatch', reason: 'draft PR 1 件を続行すべきか判断したい' }),
         proposalFixture(investigateKey, { decision: 'investigate', reason: 'test workflow の実行を確認する' }),
+        proposalFixture(requestHumanKey, { decision: 'request_human', reason: 'mode を active にしてよいか確認したい' }),
       ],
     })
 
@@ -847,10 +925,11 @@ test('hoot cli: dispatch --key は inject request を作り、inject list / stat
     assert.equal(missing.ok, false)
     assert.match(missing.message, /hoot_proposal_not_found/u)
 
-    // inject してよい decision は dispatch だけ
-    const notInjectable = await fixture.run(['dispatch', '--key', investigateKey])
+    // inject してよい decision は dispatch / investigate。request_human は人間への依頼なので inject しない
+    const notInjectable = await fixture.run(['dispatch', '--key', requestHumanKey])
     assert.equal(notInjectable.ok, false)
     assert.match(notInjectable.message, /hoot_inject_not_injectable/u)
+    assert.match(notInjectable.message, /investigate/u)
 
     const queued = await fixture.run(['dispatch', '--key', dispatchKey])
     assert.equal(queued.ok, true)

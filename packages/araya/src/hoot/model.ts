@@ -85,8 +85,9 @@ export const HOOT_PROPOSAL_STATUSES = ['open', 'resolved', 'expired'] as const
 // 即時に Discord へ送る decision の既定。noop / wait 等は digest で返す
 export const DEFAULT_NOTIFY_DECISIONS: readonly HootDecision[] = ['request_human', 'invalid']
 
-// main 会話への inject を認める decision。investigate は proposal のまま（HOOT 自身の調査行為は増やさない）
-export const INJECTABLE_DECISIONS: readonly HootDecision[] = ['dispatch']
+// main 会話への inject を認める decision。HOOT の判断 run には tool が無いので、調査も dispatch も
+// 実行するのは main 会話。investigate は承認（人間の dispatch か autoDispatch）で read-only 調査案件になる
+export const INJECTABLE_DECISIONS: readonly HootDecision[] = ['investigate', 'dispatch']
 export const HOOT_INJECT_STATUSES = ['pending', 'injected', 'failed'] as const
 export const HOOT_INJECT_AUTHORIZERS = ['human', 'mode_active'] as const
 

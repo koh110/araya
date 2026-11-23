@@ -1087,6 +1087,31 @@ function pendingInjectFixture(overrides: Partial<HootInjectRequest> = {}): HootI
   }
 }
 
+test('hoot tick: mode=active + autoDispatch は investigate 判断も inject request にする（read-only 調査案件）', async () => {
+  const auto = await makeHootLoopFixture({
+    settings: { enabled: true, mode: 'active', autoDispatch: true, notifyDecisions: ['investigate'] },
+    goals: [goalFixture()],
+    decide: async () => {
+      return { text: 'HOOT 判断:\nDECISION: investigate\nREASON: open issue の再現条件が観測から確定しない', conversationId: 7 }
+    }
+  })
+
+  try {
+    const outcome = await auto.loop.tickOnce()
+    assert.equal(outcome.kind, 'ran')
+    const state = await auto.readState()
+    assert.equal(state.proposals[0]?.decision, 'investigate')
+    assert.equal(state.injectRequests.length, 1)
+    assert.equal(state.injectRequests[0]?.status, 'pending')
+    assert.equal(state.injectRequests[0]?.authorizedBy, 'mode_active')
+    assert.ok(auto.notices.some((notice) => {
+      return notice.text.includes('investigate も次の poll で main Discord 会話へ inject')
+    }))
+  } finally {
+    await fs.rm(auto.root, { recursive: true, force: true })
+  }
+})
+
 test('hoot tick: mode=active + autoDispatch の dispatch 判断だけ inject request になる（dry_run・未承認では作らない）', async () => { 
   const auto = await makeHootLoopFixture({
     settings: { enabled: true, mode: 'active', autoDispatch: true, notifyDecisions: ['dispatch'] },

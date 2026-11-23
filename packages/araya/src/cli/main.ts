@@ -89,7 +89,7 @@ function printHelp() {
     inject してよい」という gate で、autoDispatch（既定 false）を true にしたときだけ HOOT 自身の判断で inject します。
   araya hoot dispatch --key <proposal key>
     proposal list の key を人間が承認して、main Discord 会話へ流す inject request を作る（bot process の次の poll で届く）。
-    inject してよい decision は dispatch だけ。dry_run では作りません。mode=active でも autoDispatch=false ならこの command が承認です。
+    inject してよい decision は dispatch / investigate（investigate は main 会話の read-only 調査案件になる）。dry_run では作りません。mode=active でも autoDispatch=false ならこの command が承認です。
   araya hoot inject list
     inject request（pending / injected / failed）を新しい順に表示する。失敗が重なったら proposal list で作り直す。
   araya hoot proposal list | resolve --key <key>

@@ -174,7 +174,10 @@ function dispatchNoteOf(decision: HootDecision, settings: HootSettings) {
   }
 
   if (decision === 'investigate') {
-    return 'mode: active（investigate は提案のまま。HOOT 自身が調査を走ることはありません）'
+    // investigate は「main 会話に read-only 調査をさせる」案件として承認できる
+    return settings.autoDispatch
+      ? 'mode: active + autoDispatch（investigate も次の poll で main Discord 会話へ inject します）'
+      : 'mode: active（araya hoot dispatch --key <proposal key>（CLI）か Discord の `hoot dispatch --key <proposal key>` で承認すると main Discord 会話の read-only 調査案件になります）'
   }
 
   return settings.autoDispatch
@@ -788,7 +791,7 @@ export function createHootLoop(deps: HootTickDeps) {
         }
       }
 
-      // mode=active + autoDispatch のときだけ、dispatch 判断を inject request にする（Issue #31）。
+      // mode=active + autoDispatch のときだけ、inject 可能な判断（dispatch / investigate）を inject request にする（Issue #31）。
       // dry_run・autoDispatch=false では人間の CLI 承認が無い限り main 会話に流さない
       let injectKey: string | null = null
       let injectSkipped: HootInjectSkip | null = null
