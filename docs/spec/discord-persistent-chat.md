@@ -47,6 +47,7 @@
 - 1password mode の runner は `op run` を「bot を起動する process」ではなく「`.env` を 1 回解決して env を返す process」として使う。bot の env は runner が組み立てる（runtime env の allowlist + 解決値）。`CREDENTIALS_DIRECTORY`・`OP_*`・`OP_SERVICE_ACCOUNT_TOKEN` は bot に渡さない。
 - runner は bot の stderr を line 単位で redact（`op://` 由来の解決値を `[redacted]`）して launcher log に書く。stdout は流さない。crash trace を見えるようにしつつ secret を log に残さない。
 - startup の bulk overwrite で guild の command 定義は `/araya` と `/hoot` に置き換わる。古い `/araya task ...` を残している人への interaction には、option を含まない静的な撤去 message（`REMOVED_COMMAND_REPLY`）を ephemeral で返すだけとする。handler を渡さない古い gateway 配線でも同じ案内を返し、throw しない。
+- 再起動で gateway が閉じていた窓に投稿された message は Discord が再配信しない（#36）。bot は `<dataDir>/discord/state.json`（version 2）に `lastSeenMessageId`（見た message の snowflake cursor）を持ち、live の message は受理・無視のどちらでも処理前に cursor を前に進める。ready 後に channel の直近 history を 1 回読み、cursor より新しい物だけを古い順に同じ会話 queue へ流し込む（`discord_backfill` / `discord_backfill_received` / `discord_backfill_ignored` / `discord_backfill_skipped`）。history 読みは live の messageCreate と同じ admission gate を通し、本文は log に残さない。窓の上限は fetch 100 件・处理 20 件・15 分以上古い message は捨て、fetch は 8 s で打ち切る。cursor は 1 件処理ごとに保存するので途中で kill されても同じ message を取り直さない。cursor が有効でない起動（instance 完新・state 消失）では history を処理せず newest を cursor に置くだけにする（落ちて instant の会話を postmortem で掘り返さない）。backfill 失敗は会話機能を止めない。
 
 ## Non-functional Requirements
 

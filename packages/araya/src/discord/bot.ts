@@ -27,7 +27,8 @@ import {
   type DiscordGateway,
   type DiscordGatewayHandlers,
 } from './gateway.ts'
-import { newState, readDiscordBotState, writeDiscordBotState } from './state.ts'
+import { newState, noteDiscordSeenMessageId, readDiscordBotState, writeDiscordBotState, type DiscordBotState } from './state.ts'
+import { runDiscordRestartBackfill } from './backfill.ts'
 import {
   currentDiscordLockOwner,
   discordLockPath,
@@ -452,7 +453,7 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     }
   }
 
-  let state
+  let state: DiscordBotState
 
   try {
     state = readDiscordBotState(dataDir) ?? newState()
@@ -510,6 +511,30 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
   }
 
   const chatHandlerRef: { current: DiscordChatHandler | null } = { current: null }
+  // #36: live で処理・破棄した message id。backfill は cursor とこの Set で重複を飛ばす
+  const liveMessageIds = new Set<string>()
+
+  function saveDiscordState(next: DiscordBotState) {
+    state = next
+
+    try {
+      writeDiscordBotState(dataDir, state)
+    } catch (error) {
+      logError('discord_state_write_failed', error)
+    }
+  }
+
+  // live で見た id を cursor に反映する。backfill が「どこまで見たか」を取り直すための基準になるので
+  // 会話に渡さなかった message も記録する
+  function noteLiveMessageSeen(messageId: string) {
+    liveMessageIds.add(messageId)
+
+    const next = noteDiscordSeenMessageId(state, messageId)
+
+    if (next !== state) {
+      saveDiscordState(next)
+    }
+  }
   const handlers: DiscordGatewayHandlers = {
     onReady: (botUserId) => {
       chatHandlerRef.current = createDiscordChatHandler({
@@ -548,8 +573,44 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
           logError('discord_commands_register_failed', error)
         }
       })()
+
+      // #36: gateway が閉じていた窓に投稿された message は Discord が再配信しないので、cursor より新しい
+      // history だけを古い順に会話 queue へ流し込む。ready 後の 1 回だけ。失敗しても会話機能は止めない
+      void (async () => {
+        const chatHandler = chatHandlerRef.current
+
+        if (chatHandler === null) {
+          logSafe({ type: 'discord_backfill_skipped', reason: 'chat_handler_unavailable' })
+
+          return
+        }
+
+        await runDiscordRestartBackfill({
+          config,
+          botUserId: botUserId ?? '',
+          gateway,
+          chatHandler,
+          log: logSafe,
+          nowMs,
+          state,
+          saveState: (next) => {
+            // backfill は ready 時の state を参照しているので、live 側で cursor が先に進んでいることがある。
+            // 今の state にマージしてから保存し、cursor を後ろへ戻さない
+            saveDiscordState(noteDiscordSeenMessageId(state, next.lastSeenMessageId ?? ''))
+          },
+          isHandled: (messageId) => {
+            return liveMessageIds.has(messageId)
+          },
+          markHandled: (messageId) => {
+            liveMessageIds.add(messageId)
+          },
+        })
+      })().catch((error: unknown) => {
+        logError('discord_backfill_failed', error)
+      })
     },
     onMessage: async (message, reply) => {
+      noteLiveMessageSeen(message.messageId)
       await chatHandlerRef.current?.handle(message, reply)
     },
     // slash command（/araya ... / /hoot ...）。queue を通さないので会話の実行中でも効く
@@ -569,6 +630,7 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     },
     // 取りこぼし診断: messageId・IDs・拒否理由だけを discord.log に残す（本文は渡さない）
     onIgnored: (metadata, failures) => {
+      noteLiveMessageSeen(metadata.messageId)
       logSafe({
         type: 'discord_message_ignored',
         messageId: metadata.messageId,
