@@ -362,3 +362,61 @@ test('hoot CLI: agent session の shell 目印があると承認系 command は 
     }
   }
 })
+
+test('araya status: 稼働中の bot が居ないとき HOOT の状態と unit 案内を返して exit 0', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-cli-control-status-'))
+  const { result, stdout, stderr } = await runArayaCliWithoutPiBinary(
+    ['status', '--wait-seconds', '1'],
+    { ARAYA_DATA_DIR: dir },
+  )
+  assert.equal(result.code, 0, `status: ${stdout}${stderr}`)
+  assert.match(stdout, /enabled: false/)
+  assert.match(stdout, /araya discord status/)
+  // 待ち切れた要求は残さない（bot が後で実行しない）
+  assert.deepEqual(
+    await fs.readdir(path.join(dir, 'control', 'requests')).catch(() => []),
+    [],
+  )
+})
+
+test('araya stop・reset: 稼働中の bot が応答しないとき araya_control_unavailable で失敗する', async () => {
+  for (const command of ['stop', 'reset']) {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-cli-control-down-'))
+    const { result, stdout, stderr } = await runArayaCliWithoutPiBinary(
+      [command, '--wait-seconds', '1'],
+      { ARAYA_DATA_DIR: dir },
+    )
+    assert.notEqual(result.code, 0, `${command}: ${stdout}${stderr}`)
+    assert.match(stderr, /araya_control_unavailable/u)
+    assert.deepEqual(
+      await fs.readdir(path.join(dir, 'control', 'requests')).catch(() => []),
+      [],
+    )
+  }
+})
+
+test('araya stop・reset: agent session の目印入り shell では CLI 入口で拒否し、status は通す', async () => {
+  for (const command of ['stop', 'reset']) {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-cli-control-agent-'))
+    const { result, stderr } = await runArayaCliWithoutPiBinary([command], {
+      ARAYA_DATA_DIR: dir,
+      [ARAYA_AGENT_SESSION_ENV]: '1',
+    })
+    assert.notEqual(result.code, 0)
+    assert.match(stderr, /araya_control_agent_session_blocked/u)
+    // guard は要求を書く前に止めるので control dir を作らない
+    assert.deepEqual(
+      await fs.readdir(path.join(dir, 'control')).catch(() => []),
+      [],
+    )
+  }
+})
+
+test('araya --help・hoot --help・discord --help・status --help は slash command との対応表を出す', async () => {
+  for (const args of [['--help'], ['hoot', '--help'], ['discord', '--help'], ['status', '--help']]) {
+    const { result, stdout, stderr } = await runArayaCliWithoutPiBinary(args)
+    assert.equal(result.code, 0, `${args.join(' ')}: ${stdout}${stderr}`)
+    assert.match(stdout, /Discord slash command と CLI の対応/)
+    assert.match(stdout, /araya status \| stop \| reset/)
+  }
+})

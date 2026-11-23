@@ -1066,3 +1066,97 @@ test('discord chat: 返信失敗の log に messageId を残す', async () => {
   assert.ok(failed, 'reply 失敗の log がある')
   assert.equal(failed?.messageId, '92345678901234606')
 })
+
+test('discord chat: runControl は CLI の control request を slash command と同じ kernel で処理し text で返す', async () => {
+  const logs: Record<string, unknown>[] = []
+  const resetRequestIds: (string | undefined)[] = []
+  let stopCalls = 0
+  const handler = createDiscordChatHandler({
+    config,
+    botUserId: '12345678901234567',
+    dataDir: chatDataDir,
+    redactor: createRedactor(['cli-secret']),
+    session: {
+      submit: async () => 'ok',
+      reset: async (requestId?: string) => {
+        resetRequestIds.push(requestId)
+      },
+      stop: async () => {
+        stopCalls += 1
+      },
+      describe: () => {
+        return { conversationId: 7 }
+      },
+    },
+    log: (entry) => {
+      return logs.push(entry)
+    },
+  })
+
+  // status: 会話 session の状態と HOOT status が同じ kernel から出てくる（/araya status と 1:1）
+  const statusText = await handler.runControl(
+    commandRequest({ subcommand: 'status', userId: 'cli', interactionId: 'cli-status-1' }),
+  )
+  assert.match(statusText, /会話: main conversation #7/)
+  assert.match(statusText, /enabled/)
+  assert.equal(stopCalls, 0)
+
+  const stopText = await handler.runControl(
+    commandRequest({ subcommand: 'stop', userId: 'cli', interactionId: 'cli-stop-1' }),
+  )
+  assert.equal(stopCalls, 1)
+  assert.match(stopText, /中止を要求/)
+
+  // reset の requestId は CLI の request id（同じ request を 2 回実行しないための識別子）
+  const resetText = await handler.runControl(
+    commandRequest({ subcommand: 'reset', userId: 'cli', interactionId: 'cli-reset-1' }),
+  )
+  assert.deepEqual(resetRequestIds, ['cli-reset-1'])
+  assert.match(resetText, /リセットしました/)
+
+  // 未知の subcommand は throw せず応答 text になる（CLI 側は ok:true で受け取る）
+  const unknownText = await handler.runControl(
+    commandRequest({ subcommand: 'dispatch', userId: 'cli', interactionId: 'cli-unknown-1' }),
+  )
+  assert.match(unknownText, /知りません/)
+
+  // log は command 名だけ（option の値・本文を書かない）。unknown subcommand は discord_control_failed
+  const commands = logs
+    .filter((entry) => {
+      return entry.type === 'discord_control_command'
+    })
+    .map((entry) => entry.command)
+  assert.deepEqual(commands, ['araya status', 'araya stop', 'araya reset'])
+  const failed = logs.find((entry) => {
+    return entry.type === 'discord_control_failed'
+  })
+  assert.equal(failed?.command, 'araya dispatch')
+})
+
+test('discord chat: runControl は Discord の allowlist を要求しない（CLI 入口の guard と file 権限が境界）', async () => {
+  const handler = createDiscordChatHandler({
+    config,
+    botUserId: '12345678901234567',
+    dataDir: chatDataDir,
+    redactor: createRedactor([]),
+    session: {
+      submit: async () => 'ok',
+      reset: async () => {},
+      describe: () => {
+        return { conversationId: 3 }
+      },
+    },
+    log: () => {},
+  })
+  const replies: string[] = []
+
+  // 同じ request を handleCommand（Discord の interaction 経路）に渡すと allowlist で拒否される
+  await handler.handleCommand(commandRequest({ subcommand: 'status', userId: 'cli' }), async (text) => {
+    replies.push(text)
+  })
+  assert.match(replies.join(''), /使える channel/)
+
+  // runControl は bot process 内の control 経路なので allowlist を通さない（CLI 側で人間専用 guard を持つ）
+  const text = await handler.runControl(commandRequest({ subcommand: 'status', userId: 'cli' }))
+  assert.match(text, /main conversation #3/)
+})

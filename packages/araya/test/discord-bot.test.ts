@@ -13,6 +13,8 @@ import { OBSOLETE_COMMAND_REPLY, routeSlashCommandInteraction } from '../src/dis
 import { newState, writeDiscordBotState } from '../src/discord/state.ts'
 import { BOT_STARTED_TEXT, RESTART_STARTED_TEXT } from '../src/discord/restart-notice.ts'
 import { readHootState, enqueueHootInject, setGoal, updateSettings, upsertProposal } from '../src/hoot/store.ts'
+import { controlRequestId, readControlResult, writeControlRequest } from '../src/infrastructure/control-bus.ts'
+
 import { defaultState, proposalKeyOf } from '../src/hoot/model.ts'
 
 const BOT_TOKEN = 'synthetic-token'
@@ -1407,6 +1409,107 @@ test('discord bot: 通知投稿に失敗しても bot は継続し、失敗だ�
     })
     assert.ok(noticeLog !== undefined && noticeLog.ok === false, JSON.stringify(logs))
     assert.ok(!JSON.stringify(logs).includes(BOT_TOKEN))
+  } finally {
+    stopController.abort()
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('discord bot: CLI の control request（araya reset）を startup 後の poll で実行して result を書く', async () => {
+  const dataDir = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-cli-control-test-')),
+  )
+  const stopController = new AbortController()
+  const logs: Record<string, unknown>[] = []
+  let resetCount = 0
+  const createdAt = Date.now()
+  const requestId = controlRequestId(createdAt, 'reset:bot-test')
+
+  await writeControlRequest(dataDir, {
+    version: 1,
+    id: requestId,
+    command: 'reset',
+    source: 'cli',
+    createdAt: new Date(createdAt).toISOString(),
+  })
+
+  try {
+    const exitCode = await runDiscordBot({
+      fetch: noticeStubFetch,
+      dataDir,
+      env: {
+        ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
+        ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
+        ARAYA_DISCORD_GUILD_ID: GUILD_ID,
+        ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
+        ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
+      },
+      stopSignal: stopController.signal,
+      verifyUnit: false,
+      cliControlPollMs: 40,
+      createChatSession: async () => {
+        return {
+          describe: () => {
+            return { conversationId: 4 }
+          },
+          async submit() {
+            return '会話を続けています。'
+          },
+          async reset(sessionRequestId?: string) {
+            resetCount += 1
+            logs.push({ type: 'session_reset', requestId: sessionRequestId })
+          },
+          async close() {},
+        }
+      },
+      createGateway: async (_config, handlers) => {
+        return {
+          async connect() {
+            await handlers.onReady('998877665544332211')
+
+            // runControl は queue を通さないので、会話の投稿を待たずに reset が効く
+            for (let index = 0; index < 100; index += 1) {
+              if (await readControlResult(dataDir, requestId) !== null) {
+                break
+              }
+
+              await new Promise((resolve) => {
+                return setTimeout(resolve, 25)
+              })
+            }
+
+            stopController.abort()
+          },
+          async sendText() {},
+          async registerCommands() {
+            return 0
+          },
+          async close() {},
+        }
+      },
+      log: (entry) => {
+        return logs.push(entry)
+      },
+    })
+
+    assert.equal(exitCode, 0)
+    const result = await readControlResult(dataDir, requestId)
+    assert.equal(result?.ok, true)
+    assert.match(result?.output ?? '', /この channel の会話をリセットしました/)
+    assert.equal(resetCount, 1)
+    // reset の requestId は CLI の request id（同じ request を 2 回実行しないための識別子）
+    assert.equal(logs.find((entry) => entry.type === 'session_reset')?.requestId, requestId)
+    assert.ok(
+      logs.some((entry) => {
+        return entry.type === 'discord_cli_control_started'
+      }),
+    )
+    const cliLog = logs.find((entry) => {
+      return entry.type === 'discord_control_cli'
+    })
+    assert.equal(cliLog?.command, 'reset')
+    // CLI 側の要求 file は claim 後に消える（残った request が後で実行されない）
+    assert.deepEqual(await fs.readdir(path.join(dataDir, 'control', 'requests')), [])
   } finally {
     stopController.abort()
     await fs.rm(dataDir, { recursive: true, force: true })
