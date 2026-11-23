@@ -13,11 +13,28 @@ import { readAllProcessEnvironment, readProcessEnvironment } from './config.ts'
 import { ARAYA_AGENT_SESSION_ENV } from '../src/infrastructure/agent-session.ts'
 import { createFakeSystemd } from './support/fake-systemd.ts'
 
+// CLI spawn に host shell の環境をそのまま継承しない。
+// dev unit など host 側が ARAYA_AGENT_SESSION を設定していると「目印が無い shell」を想定した test が
+// environment 依存で失敗するため、目印は既定で消す。目印入りの case は extraEnv で明示的に与える
+function hostEnvironmentWithoutAgentSessionMarker(): Record<string, string> {
+  const env: Record<string, string> = {}
+
+  for (const [name, value] of Object.entries(readAllProcessEnvironment())) {
+    if (name === ARAYA_AGENT_SESSION_ENV || value === undefined) {
+      continue
+    }
+
+    env[name] = value
+  }
+
+  return env
+}
+
 async function runArayaCliWithoutPiBinary(args: string[], extraEnv: Record<string, string> = {}) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-no-pi-cli-test-'))
   const cliPath = fileURLToPath(new URL('../bin/cli.ts', import.meta.url))
   const child = spawn(process.execPath, [cliPath, ...args], {
-    env: { ...readAllProcessEnvironment(), HOME: dir, PATH: dir, ...extraEnv },
+    env: { ...hostEnvironmentWithoutAgentSessionMarker(), HOME: dir, PATH: dir, ...extraEnv },
     stdio: 'pipe',
   })
   const stdout: string[] = []
@@ -314,7 +331,7 @@ test('hoot CLI: agent session の shell 目印があると承認系 command は 
   assert.equal(status.result.code, 0)
   assert.match(status.stdout, /enabled: false/u)
 
-  // 目印が無い（人間の shell）则是同じ command が通る
+  // 目印が無い（人間の shell）では同じ command が通る
   const humanDeniedForMissingProposal = await runArayaCliWithoutPiBinary([
     'hoot',
     'dispatch',
@@ -323,4 +340,25 @@ test('hoot CLI: agent session の shell 目印があると承認系 command は 
   ])
   assert.equal(humanDeniedForMissingProposal.result.code, 1)
   assert.doesNotMatch(humanDeniedForMissingProposal.stderr, /hoot_agent_session_blocked/u)
+
+  // host shell 自体が目印を持つ場合（dev unit など）でも、目印を渡していない CLI 呼び出しは通る
+  const hostMarker = process.env[ARAYA_AGENT_SESSION_ENV]
+  process.env[ARAYA_AGENT_SESSION_ENV] = '1'
+
+  try {
+    const humanWithHostMarker = await runArayaCliWithoutPiBinary([
+      'hoot',
+      'dispatch',
+      '--key',
+      'proposal-key',
+    ])
+    assert.equal(humanWithHostMarker.result.code, 1)
+    assert.doesNotMatch(humanWithHostMarker.stderr, /hoot_agent_session_blocked/u)
+  } finally {
+    if (hostMarker === undefined) {
+      delete process.env[ARAYA_AGENT_SESSION_ENV]
+    } else {
+      process.env[ARAYA_AGENT_SESSION_ENV] = hostMarker
+    }
+  }
 })
