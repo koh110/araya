@@ -128,6 +128,7 @@ test('discord bot: 別 process が同じ dataDir を使用中なら2つ目は起
 
     const stopController = new AbortController()
     let gatewayCreations = 0
+    const lockLog: Record<string, unknown>[] = []
     const secondExitCode = await runDiscordBot({
       fetch: noticeStubFetch,
       dataDir,
@@ -156,11 +157,20 @@ test('discord bot: 別 process が同じ dataDir を使用中なら2つ目は起
           close: async () => {},
         }
       },
-      log: () => {},
+      log: (entry: Record<string, unknown>) => {
+        lockLog.push(entry)
+      },
     })
 
     assert.equal(secondExitCode, 1)
     assert.equal(gatewayCreations, 0, '2つ目は gateway を作らずに終了する')
+    // #37: 拒否した理由（生存 holder の PID と lock age）を log に残す
+    const blocked = lockLog.filter((entry) => {
+      return entry.type === 'discord_already_running'
+    })
+    assert.equal(blocked.length, 1)
+    assert.equal(blocked[0]?.lockReason, 'owner_alive')
+    assert.equal(blocked[0]?.lockOwnerPid, child.pid)
   } finally {
     if (child.exitCode === null && child.signalCode === null) {
       const exited = once(child, 'exit', { signal: AbortSignal.timeout(5_000) })
@@ -226,6 +236,89 @@ test('discord bot: crash 後に残った stale process lock を回収する', as
     await assert.rejects(fs.access(lockPath), { code: 'ENOENT' })
   } finally {
     stopController.abort()
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+// 実測の deploy 事故（#36 / #37）の再現: unit が main process を exit させて cgroup ごと SIGKILL すると
+// lock が残る。stale 30 s を待つと 20〜40 s 起動できないので、owner record で即回収できることを確かめる
+test('discord bot: SIGKILL 後の残留 lock を stale 待ちなく起動直後に回収する', async () => {
+  const dataDir = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-killed-lock-test-')),
+  )
+  const childScript = fileURLToPath(new URL('./support/discord-bot-process.mjs', import.meta.url))
+  const child = spawn(process.execPath, [childScript, dataDir], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  const entries: Record<string, unknown>[] = []
+
+  try {
+    assert.ok(child.stdout)
+    const output = createInterface({ input: child.stdout })
+    await once(output, 'line', { signal: AbortSignal.timeout(5_000) })
+
+    child.kill('SIGKILL')
+    await once(child, 'exit', { signal: AbortSignal.timeout(5_000) })
+
+    // 死んだ holder は lock の refresh を止める。実測に合わせて mtime を 20 s 前に戻す（stale 30 s には届いていない）
+    const lockPath = path.join(dataDir, '.discord-bot.lock')
+    const backdated = new Date(Date.now() - 20_000)
+    await fs.utimes(lockPath, backdated, backdated)
+
+    const stopController = new AbortController()
+    const exitCode = await runDiscordBot({
+      fetch: noticeStubFetch,
+      dataDir,
+      env: {
+        ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
+        ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
+        ARAYA_DISCORD_GUILD_ID: GUILD_ID,
+        ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
+        ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
+      },
+      stopSignal: stopController.signal,
+      verifyUnit: false,
+      createChatSession: createInertChatSession,
+      createGateway: async (_config, handlers) => {
+        return {
+          connect: async () => {
+            handlers.onReady()
+            stopController.abort()
+          },
+          sendText: async () => {},
+          async registerCommands() {
+            return 2
+          },
+          close: async () => {},
+        }
+      },
+      log: (entry: Record<string, unknown>) => {
+        entries.push(entry)
+      },
+    })
+
+    assert.equal(exitCode, 0, '残留 lock を回収して起動できる')
+    const reclaimed = entries.filter((entry) => {
+      return entry.type === 'discord_lock_reclaimed'
+    })
+    assert.equal(reclaimed.length, 1)
+    assert.equal(reclaimed[0]?.ownerPid, child.pid)
+    assert.equal(reclaimed[0]?.ownerStatus, 'dead')
+    assert.equal(
+      entries.some((entry) => {
+        return entry.type === 'discord_already_running'
+      }),
+      false,
+      'stale 待ちの起動失敗を挟まない',
+    )
+    // 回収した側が owner record を引き継ぎ、exit で消している
+    await assert.rejects(fs.access(path.join(dataDir, '.discord-bot.lock-owner.json')), { code: 'ENOENT' })
+    await assert.rejects(fs.access(path.join(dataDir, '.discord-bot.lock')), { code: 'ENOENT' })
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGKILL')
+    }
+
     await fs.rm(dataDir, { recursive: true, force: true })
   }
 })

@@ -29,6 +29,14 @@ import {
 } from './gateway.ts'
 import { newState, readDiscordBotState, writeDiscordBotState } from './state.ts'
 import {
+  currentDiscordLockOwner,
+  discordLockPath,
+  reclaimDeadDiscordProcessLock,
+  removeDiscordLockOwner,
+  writeDiscordLockOwner,
+  type DiscordLockReclaim,
+} from './process-lock.ts'
+import {
   discordRestartStartedText,
   postDiscordRestartNotice,
   type RestartNoticeFetch,
@@ -37,13 +45,22 @@ import {
 type ProperLockfile = {
   lock(
     resourcePath: string,
-    options: { lockfilePath: string; retries: number; stale: number; update: number },
+    options: {
+      lockfilePath: string
+      retries: number
+      stale: number
+      update: number
+      onCompromised?: (error: Error) => void
+    },
   ): Promise<() => Promise<void>>
 }
 
 const properLockfile: ProperLockfile = createRequire(import.meta.url)('proper-lockfile')
 const DISCORD_PROCESS_LOCK_STALE_MS = 30_000
 const DISCORD_PROCESS_LOCK_UPDATE_MS = 10_000
+// 残留 lock を先行回収してよい最小 age。生きている holder は update 周期で mtime を更新するので、
+// その半分より若い lock を削るのは「 refresh が止まっている」証拠が揃うまで待つ
+const DISCORD_PROCESS_LOCK_MIN_RECLAIM_AGE_MS = DISCORD_PROCESS_LOCK_UPDATE_MS / 2
 const DEFAULT_POLL_MS = 5_000
 // 終了時に HOOT 判断 run の完了を待つ上限。越えたら close を進め、durable state 側で resume する
 const HOOT_STOP_WAIT_MS = 20_000
@@ -152,16 +169,103 @@ async function verifyDiscordUnit(
   }
 }
 
-// systemd と foreground の同じ dataDir 起動を排他し、異常終了後は stale lock を回収する。
-async function acquireDiscordProcessLock(dataDir: string) {
+// systemd と foreground の同じ dataDir 起動を排他し、異常終了後は残留 lock を即回収する（#37）。
+// proper-lockfile の stale（30 s）だけを待つと SIGKILL 後に 20〜40 s 起動できない窓ができる。
+// owner record で「 holder が実在しない」と確かめられた分だけ先に回収し、生存 holder の排他は保つ。
+// ELOCKED には判定理由（owner PID・lock age）を載せて、呼び出し側の log で追えるようにする。
+async function acquireDiscordProcessLock(
+  dataDir: string,
+  log: (entry: Record<string, unknown>) => void,
+  onCompromised: (error: Error) => void,
+): Promise<{ release: () => Promise<void>; canonicalDataDir: string }> {
   const canonicalDataDir = await fs.promises.realpath(dataDir)
-
-  return properLockfile.lock(canonicalDataDir, {
-    lockfilePath: path.join(canonicalDataDir, '.discord-bot.lock'),
+  const lockOptions = {
+    lockfilePath: discordLockPath(canonicalDataDir),
     retries: 0,
     stale: DISCORD_PROCESS_LOCK_STALE_MS,
     update: DISCORD_PROCESS_LOCK_UPDATE_MS,
+    onCompromised,
+  }
+  const acquire = async (): Promise<() => Promise<void>> => {
+    const release = await properLockfile.lock(canonicalDataDir, lockOptions)
+    await writeDiscordLockOwner(canonicalDataDir, currentDiscordLockOwner())
+
+    return release
+  }
+
+  try {
+    return { release: await acquire(), canonicalDataDir }
+  } catch (error) {
+    if (!(error instanceof Error) || !('code' in error) || error.code !== 'ELOCKED') {
+      throw error
+    }
+  }
+
+  const reclaim = await reclaimDeadDiscordProcessLock(canonicalDataDir, {
+    nowMs: (): number => Date.now(),
+    minLockAgeMs: DISCORD_PROCESS_LOCK_MIN_RECLAIM_AGE_MS,
   })
+
+  if (!reclaim.reclaimed) {
+    throw lockedError(reclaim)
+  }
+
+  log({
+    type: 'discord_lock_reclaimed',
+    ownerPid: reclaim.ownerPid,
+    ownerStatus: reclaim.ownerStatus,
+    lockAgeMs: Math.round(reclaim.lockAgeMs),
+  })
+
+  try {
+    return { release: await acquire(), canonicalDataDir }
+  } catch {
+    // 回収の隙間に別の起動が lock を取った。排他は保たれているので従来どおり起動失敗で返す
+    throw lockedError({ ...reclaim, reason: 'reclaim_race' })
+  }
+}
+
+function lockedError(reclaim: DiscordLockReclaim): Error {
+  return Object.assign(new Error('discord_already_running'), {
+    code: 'ELOCKED',
+    lockReason: reclaim.reason,
+    lockOwnerPid: reclaim.ownerPid,
+    lockOwnerStatus: reclaim.ownerStatus,
+    lockAgeMs: Math.round(reclaim.lockAgeMs),
+  })
+}
+
+// ELOCKED に載せた診断情報を log entry に落とす（値が無い型は key ごと省略する）
+function lockDiagnosticsOf(error: unknown): Record<string, unknown> {
+  if (!(error instanceof Error)) {
+    return {}
+  }
+
+  const record = error as Error & {
+    lockReason?: unknown
+    lockOwnerPid?: unknown
+    lockOwnerStatus?: unknown
+    lockAgeMs?: unknown
+  }
+  const entry: Record<string, unknown> = {}
+
+  if (typeof record.lockReason === 'string') {
+    entry.lockReason = record.lockReason
+  }
+
+  if (typeof record.lockOwnerPid === 'number') {
+    entry.lockOwnerPid = record.lockOwnerPid
+  }
+
+  if (typeof record.lockOwnerStatus === 'string') {
+    entry.lockOwnerStatus = record.lockOwnerStatus
+  }
+
+  if (typeof record.lockAgeMs === 'number') {
+    entry.lockAgeMs = record.lockAgeMs
+  }
+
+  return entry
 }
 
 export async function runDiscordBot(deps: DiscordBotDependencies) {
@@ -173,13 +277,23 @@ export async function runDiscordBot(deps: DiscordBotDependencies) {
 
   const log = deps.log ?? fileLogger(path.join(deps.dataDir, 'logs', 'discord.log'))
   const redactor = createRedactor(collectSecretValues(deps.env))
-  let releaseLock: () => Promise<void>
+  // lock の維持が壊れた（stale を越えて mtime を更新できなかった）ときは library の既定である timer 内 throw
+  // （未処理例外で process が死んで残留 lock を残すもう一つの入口）にせず、clean shutdown に入る
+  const lockLost = new AbortController()
+  const onLockCompromised = (error: Error): void => {
+    log({
+      type: 'discord_lock_compromised',
+      message: redactor.redact(errorMessage(error)).slice(0, 500),
+    })
+    lockLost.abort()
+  }
+  let acquired: { release: () => Promise<void>; canonicalDataDir: string }
 
   try {
-    releaseLock = await acquireDiscordProcessLock(deps.dataDir)
+    acquired = await acquireDiscordProcessLock(deps.dataDir, log, onLockCompromised)
   } catch (error) {
     if (error instanceof Error && 'code' in error && error.code === 'ELOCKED') {
-      log({ type: 'discord_already_running' })
+      log({ type: 'discord_already_running', ...lockDiagnosticsOf(error) })
 
       return 1
     }
@@ -192,10 +306,33 @@ export async function runDiscordBot(deps: DiscordBotDependencies) {
     return 1
   }
 
+  const shutdown = new AbortController()
+
+  for (const signal of [deps.stopSignal, lockLost.signal]) {
+    if (signal.aborted) {
+      shutdown.abort()
+
+      break
+    }
+
+    signal.addEventListener('abort', () => {
+      shutdown.abort()
+    }, { once: true })
+  }
+
   try {
-    return await runDiscordBotUnlocked(deps)
+    return await runDiscordBotUnlocked({
+      ...deps,
+      stopSignal: shutdown.signal,
+    })
   } finally {
-    await releaseLock()
+    try {
+      await acquired.release()
+    } catch {
+      // 回収済み lock の release 失敗（ENOTACQUIRED 等）で終了処理を止めない
+    }
+
+    await removeDiscordLockOwner(acquired.canonicalDataDir)
   }
 }
 

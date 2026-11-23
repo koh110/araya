@@ -41,6 +41,7 @@
 - stop signal では新しい受付を止め、受理済みの turn（実行中の submit と queue の item）を gateway 接続中に drain して送ってから gateway を閉じる。実行中の submit を打ち切ったり queue を捨てたりしない。stop 後の送信 retry はしない。実行中の submit へ中止を要求し、queue の item を取り消すのは Discord の `/araya stop`（受理済みで未開始の作業を無効化し、`session.stop()` で background child session へ中止を要求する）。`/araya stop` は queue の外で処理するので、queue に積まれた HOOT inject は cancel 対象にしない（承認済みの案件は消さない。実行中の inject submit には中止が伝わり、attempt を 1 消費する。ただし同じ dedupe key の再 submit は durable 側が 1 回に束ねるので、abort した案件を自動でやり直しはしない。やり直すのは人間が `/hoot dispatch key:<proposal key>` を打ち直したとき）。
 - 会話 session の open 失敗は bot の起動を止めない（log と利用不可応答で表面化する）。
 - shutdown は新しい会話入力の受付を止め、受理済み turn と reply を gateway 接続中に drain してから閉じる。
+- process lock（`<dataDir>/.discord-bot.lock`）の所有者を `<dataDir>/.discord-bot.lock-owner.json`（PID と `/proc` の starttime、mode `0600`）に書く。SIGKILL などで holder が死んだ後は proper-lockfile の stale（30 s）を待たずに次の起動試行で回収する（`discord_lock_reclaimed`）。回収は「 owner PID が実在しない」かつ「 lock が update 周期の半分より古く refresh が止まっている」と確かめたときだけなので、生存 holder の排他は壊さない。起動を拒否した理由も `discord_already_running` に `lockReason` / `lockOwnerPid` / `lockAgeMs` として残す。
 - startup の bulk overwrite で guild の command 定義は `/araya` と `/hoot` に置き換わる。古い `/araya task ...` を残している人への interaction には、option を含まない静的な撤去 message（`REMOVED_COMMAND_REPLY`）を ephemeral で返すだけとする。handler を渡さない古い gateway 配線でも同じ案内を返し、throw しない。
 
 ## Non-functional Requirements
