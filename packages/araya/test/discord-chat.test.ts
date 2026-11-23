@@ -1156,7 +1156,7 @@ test('discord chat: runControl は Discord の allowlist を要求しない（CL
   })
   assert.match(replies.join(''), /使える channel/)
 
-  // runControl は bot process 内の control 経路なので allowlist を通さない（CLI 側で人間専用 guard を持つ）
+  // runControl は bot process 内の control 経路なので Discord の allowlist は通さない（境界は control dir を書ける OS user）
   const text = await handler.runControl(commandRequest({ subcommand: 'status', userId: 'cli' }))
   assert.match(text, /main conversation #3/)
 })

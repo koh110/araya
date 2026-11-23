@@ -375,8 +375,10 @@ test('/hoot status・inject list・runs は bot process の dataDir を読む（
   }
 })
 
-test('usage には slash command 形と人間専用の注意を書く', () => {
+test('usage には slash command 形と operation の境界を書く', () => {
   assert.equal(DISCORD_CONTROL_USAGE.includes('/araya help'), true)
   assert.equal(DISCORD_CONTROL_USAGE.includes('/hoot settings'), true)
-  assert.equal(DISCORD_CONTROL_USAGE.includes('人間専用'), true)
+  // 境界は「どの shell から叩いたか」ではなく「承認済みの dispatch を受け取った main 会話だけ」側で説明する
+  assert.equal(DISCORD_CONTROL_USAGE.includes('同じ kernel を通ります'), true)
+  assert.equal(DISCORD_CONTROL_USAGE.includes('agent session の内側から'), false)
 })

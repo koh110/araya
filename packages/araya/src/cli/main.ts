@@ -4,7 +4,6 @@ import { parseCliArguments } from './arguments.ts'
 import { loadConfig, loadPiSdk, withPiEnvironment } from '../config/environment.ts'
 import { runHootCommand } from './hoot-commands.ts'
 import { CLI_CONTROL_SUBCOMMANDS, runControlCommand } from './control-commands.ts'
-import { assertHumanHootInvocation } from '../infrastructure/agent-session.ts'
 import {
   createSystemdOps,
   resolveDiscordEnvRunnerEntrypoint,
@@ -55,7 +54,7 @@ function printHelp() {
     会話 session を操作できるのは稼働中の bot だけなので、要求は <ARAYA_DATA_DIR>/control/requests/ に書き、
     bot が次の poll（既定 1 秒）で実行して <ARAYA_DATA_DIR>/control/results/ に応答を書く。
     [--wait-seconds N]（既定 30、上限 120）。bot が応答しないときは araya discord status で稼働を確かめる。
-    status は読み取りなので agent session からでも打てる。araya stop / reset は agent session の内側では拒否される。
+    境界は <ARAYA_DATA_DIR> の control dir を書ける OS user（bot process と同じ user なら agent の shell からも叩ける）。
 
   Discord slash command と CLI の対応（HOOT は subcommand・option 名まで同じ。slash 側は -- を使わない）:
     /araya status・stop・reset                       = araya status・stop・reset
@@ -263,8 +262,6 @@ export async function runCli(
     }
 
     const config = loadConfig(env)
-    // agent session の bash tool from の実行はここで止める（agent が自分の dispatch を承認できないようにする）
-    assertHumanHootInvocation(hootArgs, env ?? process.env)
     await runHootCommand(hootArgs, {
       dataDir: config.dataDir,
       stdout: (text) => {

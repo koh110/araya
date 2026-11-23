@@ -19,7 +19,6 @@ import {
 } from '../src/infrastructure/control-bus.ts'
 import { createCliControlLoop } from '../src/discord/cli-control.ts'
 import { runControlCommand } from '../src/cli/control-commands.ts'
-import { ARAYA_AGENT_SESSION_ENV, isAgentBlockedControlInvocation } from '../src/infrastructure/agent-session.ts'
 
 function sleep(ms: number) {
   return new Promise<void>((resolve) => {
@@ -270,37 +269,6 @@ test('araya status・stop・reset: 未知の command は拒否する（control b
   }
 })
 
-test('agent session の内側: araya stop / reset は拒否し、araya status は allowed', async () => {
-  const dataDir = await tempDataDir('araya-cli-control-agent-')
-  const env = { [ARAYA_AGENT_SESSION_ENV]: '1' }
-
-  assert.equal(isAgentBlockedControlInvocation('status'), false)
-  assert.equal(isAgentBlockedControlInvocation('stop'), true)
-  assert.equal(isAgentBlockedControlInvocation('reset'), true)
-
-  for (const name of ['stop', 'reset']) {
-    await assert.rejects(
-      async () => {
-        return await runControlCommand([name], {
-          dataDir,
-          stdout: () => {},
-          nowMs: () => Date.now(),
-          env,
-          waitMs: 200,
-          pollMs: 20,
-        })
-      },
-      /araya_control_agent_session_blocked/,
-    )
-  }
-
-  // guard は要求を書く前に止めるので control dir を作らない
-  try {
-    assert.deepEqual(await fs.readdir(controlRequestsDir(dataDir)), [])
-  } catch (error) {
-    assert.equal((error as NodeJS.ErrnoException).code, 'ENOENT')
-  }
-})
 
 test('bot 側の run は slash command と同じ control kernel を通す（runControl の text を result に書く）', async () => {
   const dataDir = await tempDataDir('araya-cli-control-kernel-')

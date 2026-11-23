@@ -35,7 +35,6 @@ import {
 
 import { loadConfig } from '../config/environment.ts'
 import { loadConfigFile } from '../config/file.ts'
-import { agentSessionShellEnv } from '../infrastructure/agent-session.ts'
 import type { Redactor } from '../infrastructure/redaction.ts'
 import { createModelRuntime, createPiModelSettings, resolveAgentModel } from './model.ts'
 
@@ -59,7 +58,7 @@ function mainInstructions(devRoot: string) {
     '時間がかかる作業・並行したい作業は task tool で background child に任せ、main の会話は止めません。child の完了報告は自動でこの会話に届くので、それを踏まえて利用者に報告します。',
     'task tool: spawn で child を作成し名前で管理、send で追加の依頼・問い合わせ、stop で中止、status で一覧。',
     '秘密（token・password・credential file の値）は応答や child への依頼文に書かないでください。',
-    'HOOT（背景の watch loop）の承認・goal・設定の変更は人間専用の operation です。自分の shell で `araya hoot dispatch` / `settings set` / `goal add` などを実行すると拒否されるので、それらが必要なときは利用者に Discord の message（`hoot status` / `hoot dispatch --key <key>` / `hoot settings set ...`）を打つよう案内します。',
+    'HOOT（背景の watch loop）の operation も自分の shell の `araya hoot ...` から実行できます（CLI 入口の gate は無い）。ただし HOOT の有効化・`mode`・`autoDispatch` の変更・`dispatch`・goal の追加は、利用者が明示的に依頼したときだけ実行します。自分の proposal を自分で承認したり、依頼なく HOOT を起動・active 化しません。',
   ].join('\n')
 }
 
@@ -792,10 +791,10 @@ export async function openArayaAgentHost(
         models: input.models,
         registry,
         // worker も含む全 conversation に dev root を基点の shell 環境を与える。実行制限は instructions 側で示す
-        // shell には「agent session の内側」の目印を入れる。HOOT の承認・設定変更 CLI はこれを検出して
-        // agent の自己承認を拒否する（人間が CLI か Discord の control command から打つ）
+        // （旧 ARAYA_AGENT_SESSION 目印は撤去した。HOOT の承認・setting 変更・会話 control の境界は
+        // filesystem の owner と Discord の allowlist のsideだけで持つ）
         env: ({ cwd }) => {
-          return new NodeExecutionEnv({ cwd: cwd ?? input.devRoot, shellEnv: agentSessionShellEnv() })
+          return new NodeExecutionEnv({ cwd: cwd ?? input.devRoot })
         },
       },
       input.context,
