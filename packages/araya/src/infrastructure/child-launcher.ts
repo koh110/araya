@@ -29,6 +29,16 @@ export function launcherStopWaitMs(sourceEnv: Readonly<Record<string, string | u
   return Math.round(parsed)
 }
 
+// runner の log には 1 行単位で書く。newline を決める場所を 1 箇所に寄せる（runner 側で
+// `${line}\\n` のように二重にエスケープすると log が 1 行に連結して読めなくなる）
+export function stderrLineWriter(sink: (chunk: string) => void = (chunk) => {
+  process.stderr.write(chunk)
+}) {
+  return (line: string): void => {
+    sink(`${line}\n`)
+  }
+}
+
 // 秘密値は crash trace に現れうるので、bot の stderr は runner の log に写す前に置換する。
 export function redactSecretValues(text: string, secretValues: readonly string[]) {
   let redacted = text

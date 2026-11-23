@@ -22,6 +22,7 @@ import {
   launcherStopWaitMs,
   launchChildAndWait,
   redactSecretValues,
+  stderrLineWriter,
 } from '../src/infrastructure/child-launcher.ts'
 const MAX_SERVICE_ACCOUNT_TOKEN_BYTES = 16 * 1024
 const OP_AUTH_ENVIRONMENT_NAMES = [
@@ -367,9 +368,7 @@ async function runBot(dataDir: string, env: NodeJS.ProcessEnv, secretValues: rea
     stopWaitMs: launcherStopWaitMs(process.env),
     secretValues,
     label: 'discord-op-runner',
-    writeError: (line) => {
-      process.stderr.write(`${line}\n`)
-    },
+    writeError: stderrLineWriter(),
   })
 }
 

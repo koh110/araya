@@ -520,7 +520,9 @@ process.exit(0)
     )
 
     assert.equal(result.status, 0, result.stderr)
-    assert.match(result.stderr, /trace with secret \[redacted\] and plain text/u)
+    assert.match(result.stderr, /trace with secret \[redacted\] and plain text\n/u)
+    // launcher log は 1 行 1 record で読めることが必要（改行がリテラル \n になると 1 行に連結する）
+    assert.ok(!result.stderr.includes('\\n'), JSON.stringify(result.stderr))
     assert.ok(!result.stderr.includes('resolved-by-op'), 'resolved secret をそのまま出さない')
     assert.ok(!result.stderr.includes('stdout is ignored'), 'bot の stdout は launcher log に流さない')
   } finally {

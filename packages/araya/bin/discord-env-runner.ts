@@ -16,6 +16,7 @@ import {
 import {
   launcherStopWaitMs,
   launchChildAndWait,
+  stderrLineWriter,
 } from '../src/infrastructure/child-launcher.ts'
 
 
@@ -129,9 +130,7 @@ async function runDiscordBotProcess(
     stopWaitMs: launcherStopWaitMs(process.env),
     secretValues: [settings.botToken],
     label: 'discord-env-runner',
-    writeError: (line) => {
-      process.stderr.write(`${line}\\n`)
-    },
+    writeError: stderrLineWriter(),
   })
 
   return outcome.exitCode
