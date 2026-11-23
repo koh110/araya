@@ -959,6 +959,7 @@ test('discord bot: HOOT state が有効なら wakeup loop を走らせて判断�
       },
       stopSignal: stopController.signal,
       verifyUnit: false,
+      cliControlPollMs: 40,
       hootPollMs: 100,
       hootRunCommand: async (_command, args) => {
         observationArgs.push([...args])
@@ -1019,7 +1020,8 @@ test('discord bot: HOOT state が有効なら wakeup loop を走らせて判断�
             )
 
             // HOOT loop は gateway ready 後に 1 件送る。それを待ってから stop する
-            const deadline = Date.now() + 8_000
+            // poll が state を拾うのを待つの実測待ち。8 s は CI load で届いたことがあり、余裕を持たせる
+            const deadline = Date.now() + 20_000
 
             while (notices.length === 0 && Date.now() < deadline) {
               await new Promise((resolve) => {
@@ -1125,6 +1127,7 @@ test('discord bot: CLI で承認した HOOT dispatch を main 会話 session に
       },
       stopSignal: stopController.signal,
       verifyUnit: false,
+      cliControlPollMs: 40,
       hootPollMs: 100,
       hootRunCommand: async () => ({
         exitCode: 0,
@@ -1178,7 +1181,8 @@ test('discord bot: CLI で承認した HOOT dispatch を main 会話 session に
               async () => {}
             )
 
-            const deadline = Date.now() + 8_000
+            // poll が state を拾うのを待つの実測待ち。8 s は CI load で届いたことがあり、余裕を持たせる
+            const deadline = Date.now() + 20_000
 
             while (
               !submissions.some((entry) => {
@@ -1285,6 +1289,7 @@ test('discord bot: Discord の /hoot dispatch 承認を同じ process の poll �
       },
       stopSignal: stopController.signal,
       verifyUnit: false,
+      cliControlPollMs: 40,
       hootPollMs: 100,
       hootRunCommand: async () => ({
         exitCode: 0,
@@ -1338,7 +1343,8 @@ test('discord bot: Discord の /hoot dispatch 承認を同じ process の poll �
               handlers,
             )
 
-            const deadline = Date.now() + 8_000
+            // poll が state を拾うのを待つの実測待ち。8 s は CI load で届いたことがあり、余裕を持たせる
+            const deadline = Date.now() + 20_000
 
             while (
               !notices.some((entry) => {
