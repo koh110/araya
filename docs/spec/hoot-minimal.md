@@ -116,7 +116,7 @@ interval poll（既定 60 秒、`HOOT_TICK_POLL_MS`）で tick するが、run �
 
 HOOT の判断は goal と観測（gh の open issue / PR などの factual snapshot）だけ見て走る。channel で人間が言ったこと・main 会話の agent が何を済ませたかは観測に入らないため、`conversationRead=true` のときだけ判断会話に **読み取り専用の tool 1 本**（`read_conversation`）を入れる。これで HOOT は main 会話の transcript を検索して「もう人間が処理した」「人間が方向を変えた」を確認できる。
 
-- **人間が有効化する permission**。既定 `false`。有効化は人間の `araya hoot settings set --conversation-read true` か Discord の `/hoot settings set conversation-read:true` だけ（agent session 内側からの CLI は `ARAYA_AGENT_SESSION` の guard で拒否される）。tool は extension 経由で harness の registry に登録するが、**main 会話の `tools` / `modelTools` には入れないので main 会話の model は使えない**。判断会話側だけを `configure({ tools, modelTools })` で切り替える（`settings` を false に戻せば次の run から tool は消える）
+- **人間が有効化する permission**。既定 `false`。有効化は人間の `araya hoot settings set --conversation-read true` か Discord の `/hoot settings set conversation-read:true`（agent の shell からも同じ CLI が叩けるが、依頼なしに agent が自分を有効化しない約束は instructions 側で持つ）。tool は extension 経由で harness の registry に登録するが、**main 会話の `tools` / `modelTools` には入れないので main 会話の model は使えない**。判断会話側だけを `configure({ tools, modelTools })` で切り替える（`settings` を false に戻せば次の run から tool は消える）
 - **読めるのは main Discord 会話の transcript だけ**。Pi durable の `Conversation.entries()`（committed raw history、`order: 'descending'`）を読み、`user` / `assistant` の text block だけを出す（tool result・thinking・image は出さない）。HOOT 自身の判断会話・他の conversation・file・gh は読まない
 - **送信はできない**。tool は `main.entries()` を読むだけで、`submit()`・`inject()`・file 編集・child 作成・HOOT state 変更・Discord 送信のどれ持たない。境界は tool の実装側で持し model の判断に任せない
 - **上限（`host.ts` の constants。run ごとに `emptyConversationReadBudget()` でリセット）**:
@@ -258,7 +258,7 @@ channel からの操作は Discord の slash command に統一する。CLI 側�
 - `settings set` は指定した option だけを patch にする（未指定の field は現状維持）。`goal update` も同じ
 - `--data-dir` は Discord 側では受け付けない（`hoot_invalid_argument`。bot process の dataDir だけを正とする）
 - 失敗は `discord_control_failed` に log し、channel には `できませんでした: <error message>` を ephemeral で返す（成功時は `discord_control_command`。command 名は `hoot goal add` のように記録し、option の値は log に残さない）。allowlist 外は `discord_command_denied`
-- **agent の自己承認を止める**: Pi durable の conversation ごとの shell 環境に `ARAYA_AGENT_SESSION=1` を入れる（`src/infrastructure/agent-session.ts`。bot process 自身の env は汚さない）。`araya hoot` の **CLI 入口**（`src/cli/main.ts`）が `assertHumanHootInvocation` で `dispatch` / `settings set` / `goal add・update・pause・resume・retire` / `proposal resolve` / `reset-schedule` を `hoot_agent_session_blocked` で拒否する（`status` / `goal list` / `proposal list` / `settings show` / `inject list` / `runs` は allowed）。guard は CLI 入口だけにかける（`runHootCommand` 内側に入れると in-process の test や bot 自身の control command 経路まで巻き込む）。したがって Discord の slash command は目印の有無に関わらず効き（bot process が `runHootCommand` を直接呼ぶ）、承認は人間の手からだけ出る
+- **agent 側の CLI gate は撤去した**（旧 `src/infrastructure/agent-session.ts` と `ARAYA_AGENT_SESSION` の目印、`hoot_agent_session_blocked`）: main 会話の bash は `araya hoot dispatch` / `settings set` / `goal add` を人間の shell と同じ権限で実行できる。撤去した代わりに残る歯止めは 3 つ。**(1)** instructions で「利用者の明示的な依頼なしに HOOT を有効化・`mode` 変更・`autoDispatch` 変更・dispatch をしない」「自分の proposal を自分で承認しない」を約束させる、**(2)** 承認された dispatch を実行するのは main 会話の inject 経路だけ（`authorizedBy` は `human` / `hoot` を state に記録）、**(3)** 全 operation を log に残す（`discord_control_command` / `discord_control_cli` / `hoot_run` / `hoot_inject_*`）。HOOT の state file を直接書ける OS user に agent は既に成れるので、CLI 入口の目印は本質的な境界ではなかった（境界は filesystem の owner と Discord の allowlist）
 
 ## 実装済みの歯止め
 

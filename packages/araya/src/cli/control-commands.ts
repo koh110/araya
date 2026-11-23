@@ -1,7 +1,7 @@
 // `araya status・stop・reset`（Discord の slash command `/araya status・stop・reset` と同じ operation）。
 // 会話 session を操作できるのは稼働中の Discord bot process だけなので、CLI は file の control request を書き、
 // bot がそれを拾って result を返す（src/infrastructure/control-bus.ts / src/discord/cli-control.ts）。
-// 同じ OS user だけが file を書けるので、それで許可の境界になる。agent session の stop / reset は拒否する
+// 同じ OS user だけが file を書けるので、それで許可の境界になる（agent session の shell も同じ user なので叩ける）
 import { parseArgs } from 'node:util'
 import process from 'node:process'
 import { randomUUID } from 'node:crypto'
@@ -14,7 +14,6 @@ import {
   writeControlRequest,
   type ControlCommandName,
 } from '../infrastructure/control-bus.ts'
-import { assertHumanControlInvocation } from '../infrastructure/agent-session.ts'
 import { runHootCommand } from './hoot-commands.ts'
 
 export const CLI_CONTROL_SUBCOMMANDS = CONTROL_COMMANDS
@@ -81,9 +80,6 @@ export async function runControlCommand(
       `不明な control の command: ${positionals.join(' ') || '（なし）'}。${(CONTROL_COMMANDS as readonly string[]).join(' / ')} のどれかを指定してください（araya --help で一覧）`,
     )
   }
-
-  // 読み取りの status は agent も使える。stop / reset は会話 session を壊すので人間専用
-  assertHumanControlInvocation(name, deps.env)
 
   const dataDir = values['data-dir'] ?? deps.dataDir
   const requestedWait = Number(values['wait-seconds'])

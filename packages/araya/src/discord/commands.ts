@@ -48,7 +48,7 @@ export const DISCORD_CONTROL_USAGE = [
   '  /hoot proposal list / resolve key:<key> … 提案の一覧と解決済み化',
   '  /hoot settings show / set … 設定（enabled・mode・auto-dispatch・conversation-read・max-injects-per-day・inject-cooldown-minutes など）',
   '  /hoot reset-schedule … schedule だけ戻す（run 記録・settings・proposals・inject request は保つ）',
-  '（HOOT の承認・goal・設定の変更は人間専用です。agent session の内側から araya hoot の書き込み command は拒否されます）',
+  '（HOOT の operation は人間の CLI・Discord の slash command・agent の shell のどこからでも同じ kernel を通ります。作業を実行するのは承認済みの dispatch を受け取った main 会話だけ）',
 ].join('\n')
 
 // hoot command の option を CLI の引数配列へ変換する対応表。Discord 側は option 名だけを渡す

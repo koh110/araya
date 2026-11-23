@@ -10,17 +10,14 @@ import { loadConfig } from '../src/config/environment.ts'
 import { parseCliArguments } from '../src/cli/arguments.ts'
 import { runCli } from '../src/cli/main.ts'
 import { readAllProcessEnvironment, readProcessEnvironment } from './config.ts'
-import { ARAYA_AGENT_SESSION_ENV } from '../src/infrastructure/agent-session.ts'
 import { createFakeSystemd } from './support/fake-systemd.ts'
 
-// CLI spawn に host shell の環境をそのまま継承しない。
-// dev unit など host 側が ARAYA_AGENT_SESSION を設定していると「目印が無い shell」を想定した test が
-// environment 依存で失敗するため、目印は既定で消す。目印入りの case は extraEnv で明示的に与える
-function hostEnvironmentWithoutAgentSessionMarker(): Record<string, string> {
+// CLI spawn に host shell の環境をそのまま継承しない（test を host の environment 依存にしない）
+function cliBaseEnvironment(): Record<string, string> {
   const env: Record<string, string> = {}
 
   for (const [name, value] of Object.entries(readAllProcessEnvironment())) {
-    if (name === ARAYA_AGENT_SESSION_ENV || value === undefined) {
+    if (value === undefined) {
       continue
     }
 
@@ -34,7 +31,7 @@ async function runArayaCliWithoutPiBinary(args: string[], extraEnv: Record<strin
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-no-pi-cli-test-'))
   const cliPath = fileURLToPath(new URL('../bin/cli.ts', import.meta.url))
   const child = spawn(process.execPath, [cliPath, ...args], {
-    env: { ...hostEnvironmentWithoutAgentSessionMarker(), HOME: dir, PATH: dir, ...extraEnv },
+    env: { ...cliBaseEnvironment(), HOME: dir, PATH: dir, ...extraEnv },
     stdio: 'pipe',
   })
   const stdout: string[] = []
@@ -311,57 +308,6 @@ test('CLI: Pi SDK はグローバル pi command なしで使える', async () =>
   assert.equal(stderr, '')
 })
 
-test('hoot CLI: agent session の shell 目印があると承認系 command は exit 1 で拒否し、読み取りは通る', async () => {
-  const marker = { [ARAYA_AGENT_SESSION_ENV]: '1' }
-
-  const denied = await runArayaCliWithoutPiBinary(['hoot', 'dispatch', '--key', 'proposal-key'], marker)
-  assert.equal(denied.result.code, 1)
-  assert.match(denied.stderr, /hoot_agent_session_blocked/u)
-  assert.match(denied.stderr, /Discord/u)
-
-  const deniedSettings = await runArayaCliWithoutPiBinary(
-    ['hoot', 'settings', 'set', '--enabled', 'true', '--mode', 'active'],
-    marker,
-  )
-  assert.equal(deniedSettings.result.code, 1)
-  assert.match(deniedSettings.stderr, /hoot_agent_session_blocked/u)
-
-  // 読み取りは agent にも許可する（status で状態を説明できる）
-  const status = await runArayaCliWithoutPiBinary(['hoot', 'status'], marker)
-  assert.equal(status.result.code, 0)
-  assert.match(status.stdout, /enabled: false/u)
-
-  // 目印が無い（人間の shell）では同じ command が通る
-  const humanDeniedForMissingProposal = await runArayaCliWithoutPiBinary([
-    'hoot',
-    'dispatch',
-    '--key',
-    'proposal-key',
-  ])
-  assert.equal(humanDeniedForMissingProposal.result.code, 1)
-  assert.doesNotMatch(humanDeniedForMissingProposal.stderr, /hoot_agent_session_blocked/u)
-
-  // host shell 自体が目印を持つ場合（dev unit など）でも、目印を渡していない CLI 呼び出しは通る
-  const hostMarker = process.env[ARAYA_AGENT_SESSION_ENV]
-  process.env[ARAYA_AGENT_SESSION_ENV] = '1'
-
-  try {
-    const humanWithHostMarker = await runArayaCliWithoutPiBinary([
-      'hoot',
-      'dispatch',
-      '--key',
-      'proposal-key',
-    ])
-    assert.equal(humanWithHostMarker.result.code, 1)
-    assert.doesNotMatch(humanWithHostMarker.stderr, /hoot_agent_session_blocked/u)
-  } finally {
-    if (hostMarker === undefined) {
-      delete process.env[ARAYA_AGENT_SESSION_ENV]
-    } else {
-      process.env[ARAYA_AGENT_SESSION_ENV] = hostMarker
-    }
-  }
-})
 
 test('araya status: 稼働中の bot が居ないとき HOOT の状態と unit 案内を返して exit 0', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-cli-control-status-'))
@@ -395,22 +341,36 @@ test('araya stop・reset: 稼働中の bot が応答しないとき araya_contro
   }
 })
 
-test('araya stop・reset: agent session の目印入り shell では CLI 入口で拒否し、status は通す', async () => {
+test('agent session の目印入り shell でも araya hoot settings set・stop・reset は同じ動作する（gate を撤去）', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-cli-agent-gate-removed-'))
+  const agentEnv = { ARAYA_DATA_DIR: dir, ARAYA_AGENT_SESSION: '1' }
+
+  const enabled = await runArayaCliWithoutPiBinary(
+    ['hoot', 'settings', 'set', '--enabled', 'true', '--mode', 'dry_run'],
+    agentEnv,
+  )
+  assert.equal(enabled.result.code, 0, `settings set: ${enabled.stdout}${enabled.stderr}`)
+  assert.doesNotMatch(enabled.stderr, /hoot_agent_session_blocked/u)
+
+  const shown = await runArayaCliWithoutPiBinary(['hoot', 'settings', 'show'], { ARAYA_DATA_DIR: dir })
+  assert.equal(shown.result.code, 0, `settings show: ${shown.stdout}${shown.stderr}`)
+  assert.match(shown.stdout, /enabled: true/u)
+
+  const goal = await runArayaCliWithoutPiBinary(
+    ['hoot', 'goal', 'add', '--key', 'agent-gate-goal', '--objective', 'agent shell から add できる', '--scope', 'github:koh110/araya'],
+    agentEnv,
+  )
+  assert.equal(goal.result.code, 0, `goal add: ${goal.stdout}${goal.stderr}`)
+
   for (const command of ['stop', 'reset']) {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-cli-control-agent-'))
-    const { result, stderr } = await runArayaCliWithoutPiBinary([command], {
-      ARAYA_DATA_DIR: dir,
-      [ARAYA_AGENT_SESSION_ENV]: '1',
-    })
-    assert.notEqual(result.code, 0)
-    assert.match(stderr, /araya_control_agent_session_blocked/u)
-    // guard は要求を書く前に止めるので control dir を作らない
-    assert.deepEqual(
-      await fs.readdir(path.join(dir, 'control')).catch(() => []),
-      [],
-    )
+    const { result, stderr } = await runArayaCliWithoutPiBinary([command, '--wait-seconds', '1'], agentEnv)
+    assert.notEqual(result.code, 0, `${command}: ${stderr}`)
+    // bot が応答しないので control bus 側で失敗する（agent gate では止まらない）
+    assert.match(stderr, /araya_control_unavailable/u)
+    assert.doesNotMatch(stderr, /araya_control_agent_session_blocked/u)
   }
 })
+
 
 test('araya --help・hoot --help・discord --help・status --help は slash command との対応表を出す', async () => {
   for (const args of [['--help'], ['hoot', '--help'], ['discord', '--help'], ['status', '--help']]) {

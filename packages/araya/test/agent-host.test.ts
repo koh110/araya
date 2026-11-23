@@ -7,7 +7,6 @@ import test from 'node:test'
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
 
 import { openArayaAgentHost } from '../src/agent/host.ts'
-import { ARAYA_AGENT_SESSION_ENV } from '../src/infrastructure/agent-session.ts'
 import { createRedactor } from '../src/infrastructure/redaction.ts'
 import { answer, createFauxModels, toolCall } from './support/faux-shiki.ts'
 
@@ -194,11 +193,12 @@ test('agent host: deliverReport 失敗後は durable state から同じ nonce �
   }
 })
 
-test('agent host: main 会話の shell には agent session の目印が入る（HOOT 承認を agent 自分で実行できないようにする）', async () => {
+test('agent host: tool の shell に agent session の目印を足さない（撤去したことを固定する）', async () => {
   const fixture = await makeAgentFixture()
   const models = await createFauxModels(fixture)
-  // host process の env が目印を持っている environment（dev unit など）でも比較できるよう保存する
-  const hostMarkerBefore = process.env[ARAYA_AGENT_SESSION_ENV]
+  // host process の env に目印が有る environment（dev unit など）でも test が environment 依存にならないよう一時的に消す
+  const hostMarkerBefore = process.env.ARAYA_AGENT_SESSION
+  delete process.env.ARAYA_AGENT_SESSION
 
   try {
     models.script((view) => {
@@ -221,10 +221,8 @@ test('agent host: main 会話の shell には agent session の目印が入る�
 
     try {
       const text = await host.submit('MARKER-CHECK', 'marker-message-1')
-      // 目印は tool の shell 에만 들어간다（bot process 自身の env は汚さない）
-      assert.equal(text, 'marker=1')
-      // host process 自身の env は書き換えない（目印は tool の shell だけに入る）
-      assert.equal(process.env[ARAYA_AGENT_SESSION_ENV], hostMarkerBefore)
+      // agent host 側が tool の shell に目印を足すことは無い（消した値のまま）
+      assert.equal(text, 'marker=')
       // control command の status 表示用の conversation id が取れる
       const described = host.describe()
       assert.equal(typeof described.conversationId, 'number')
@@ -232,6 +230,10 @@ test('agent host: main 会話の shell には agent session の目印が入る�
       await host.close()
     }
   } finally {
+    if (hostMarkerBefore !== undefined) {
+      process.env.ARAYA_AGENT_SESSION = hostMarkerBefore
+    }
+
     await removeAgentFixture(fixture)
   }
 })
