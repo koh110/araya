@@ -123,6 +123,8 @@ Discord bot は systemd の user service です。`araya discord install`（`npm
 
 `araya discord install` の実行は bot の再起動を伴います。再起動が済んだことは state file で確かめます。unit の停止・再起動・起動失敗は `araya discord install` の失敗として終了 code 1 になり、`npm run deploy` の終了 code 1 にもなります。unit file は `~/.config/systemd/user/` に置かれ、起動失敗時は systemd が 5 秒間隔で起動し直します。
 
+再起動が無受信窓を作ることを可視化するため、前回の起動の確かめがある install は restart の前に permission channel へ「再起動します」を投稿し、bot は起動完了後に「再起動しました」（前回の記録が無い初めての起動では「起動しました」）を投稿します。通知の投稿に失敗しても restart と bot の稼働は続け、失敗は warning と `discord_restart_notice` log（成否のみ）で追跡します。窓中に届いたメッセージの再取得は行いません。
+
 Discord bot の起動を確かめたことは、`<dataDir>/discord/state.json` に state key（readyId・lastReadyAt・readyGeneration）として保存されます。state file に credential の値は保存しません。state file が無い・読み取れない・別の unit について記録されている場合は、起動の確かめができません。install は失敗で終わり、service 自体は起動したままになることがあります。
 
 - 止める: `systemctl --user stop araya-discord-<hash>.service`

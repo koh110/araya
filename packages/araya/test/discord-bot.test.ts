@@ -10,6 +10,8 @@ import { fileURLToPath } from 'node:url'
 
 import { runDiscordBot } from '../src/discord/bot.ts'
 import { OBSOLETE_COMMAND_REPLY, routeSlashCommandInteraction } from '../src/discord/gateway.ts'
+import { newState, writeDiscordBotState } from '../src/discord/state.ts'
+import { BOT_STARTED_TEXT, RESTART_STARTED_TEXT } from '../src/discord/restart-notice.ts'
 import { readHootState, enqueueHootInject, setGoal, updateSettings, upsertProposal } from '../src/hoot/store.ts'
 import { defaultState, proposalKeyOf } from '../src/hoot/model.ts'
 
@@ -104,6 +106,9 @@ function makeSlashInteraction(
   }
 }
 
+// 通知投稿の stub。bot テストが実 Discord REST へ行かないように共通で注入する
+const noticeStubFetch = async () => ({ ok: true } as const)
+
 test('discord bot: 別 process が同じ dataDir を使用中なら2つ目は起動しない', async () => {
   const dataDir = await fs.realpath(
     await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-lock-test-')),
@@ -122,6 +127,7 @@ test('discord bot: 別 process が同じ dataDir を使用中なら2つ目は起
     const stopController = new AbortController()
     let gatewayCreations = 0
     const secondExitCode = await runDiscordBot({
+      fetch: noticeStubFetch,
       dataDir,
       env: {
         ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
@@ -186,6 +192,7 @@ test('discord bot: crash 後に残った stale process lock を回収する', as
 
   try {
     const exitCode = await runDiscordBot({
+      fetch: noticeStubFetch,
       dataDir,
       env: {
         ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
@@ -234,6 +241,7 @@ test('discord bot: 指定 channel の mention なし投稿を会話 session に�
 
   try {
     const exitCode = await runDiscordBot({
+      fetch: noticeStubFetch,
       dataDir,
       env: {
         ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
@@ -345,6 +353,7 @@ test('discord bot: 会話 session 初期化に失敗すると会話利用不可�
 
   try {
     const exitCode = await runDiscordBot({
+      fetch: noticeStubFetch,
       dataDir,
       env: {
         ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
@@ -457,6 +466,7 @@ test('discord bot: 撤去済み slash command の返信と log に bot token を
 
   try {
     const exitCode = await runDiscordBot({
+      fetch: noticeStubFetch,
       dataDir,
       env: { ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN },
       stopSignal: stopController.signal,
@@ -539,6 +549,7 @@ test('discord bot: shutdown は進行中の chat reply を送ってから gatewa
 
   try {
     const exitCode = await runDiscordBot({
+      fetch: noticeStubFetch,
       dataDir,
       env: {
         ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
@@ -639,6 +650,7 @@ test('discord bot: HOOT state が有効なら wakeup loop を走らせて判断�
     await updateSettings(dataDir, { enabled: true, tickMinutes: 5 })
 
     const exitCode = await runDiscordBot({
+      fetch: noticeStubFetch,
       dataDir,
       env: {
         ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
@@ -804,6 +816,7 @@ test('discord bot: CLI で承認した HOOT dispatch を main 会話 session に
     assert.notEqual(queued.request, null)
 
     const exitCode = await runDiscordBot({
+      fetch: noticeStubFetch,
       dataDir,
       env: {
         ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
@@ -963,6 +976,7 @@ test('discord bot: Discord の /hoot dispatch 承認を同じ process の poll �
     assert.equal((await readHootState(dataDir)).injectRequests.length, 0)
 
     const exitCode = await runDiscordBot({
+      fetch: noticeStubFetch,
       dataDir,
       env: {
         ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
@@ -1106,6 +1120,7 @@ test('discord bot: gateway の onIgnored は discord_message_ignored を message
 
   try {
     const exitCode = await runDiscordBot({
+      fetch: noticeStubFetch,
       dataDir,
       env: {
         ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
@@ -1174,6 +1189,7 @@ test('discord bot: discord.log の各行は ts timestamp を持つ', async () =>
   try {
     // log を inject しない → production の fileLogger が dataDir/logs/discord.log へ書く
     const exitCode = await runDiscordBot({
+      fetch: noticeStubFetch,
       dataDir,
       env: {
         ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
@@ -1216,6 +1232,181 @@ test('discord bot: discord.log の各行は ts timestamp を持つ', async () =>
       assert.equal(typeof entry.ts, 'string')
       assert.match(entry.ts, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u)
     }
+  } finally {
+    stopController.abort()
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+// #36: 起動完了の通知。前回の ready があれば「再起動しました」、無ければ「起動しました」
+test('discord bot: 前回の ready がある起動では 再起動しました 通知を指定 channel に投稿する', async () => {
+  const dataDir = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-restart-notice-test-')),
+  )
+  const stopController = new AbortController()
+  const notices: { url: string; init: Record<string, unknown> }[] = []
+  const logs: Record<string, unknown>[] = []
+
+  writeDiscordBotState(dataDir, {
+    ...newState(),
+    unit: 'araya-discord-seed',
+    readyId: 'ready-seed',
+    lastReadyAt: '2026-11-22T00:00:00.000Z',
+  })
+
+  try {
+    const exitCode = await runDiscordBot({
+      dataDir,
+      env: {
+        ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
+        ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
+        ARAYA_DISCORD_GUILD_ID: GUILD_ID,
+        ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
+        ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
+      },
+      stopSignal: stopController.signal,
+      verifyUnit: false,
+      createChatSession: createInertChatSession,
+      createGateway: async (_config, handlers) => {
+        return {
+          connect: async () => {
+            handlers.onReady('998877665544332211')
+            stopController.abort()
+          },
+          sendText: async () => {},
+          async registerCommands() {
+            return 2
+          },
+          close: async () => {},
+        }
+      },
+      fetch: async (url, init) => {
+        notices.push({ url, init: init as Record<string, unknown> })
+
+        return { ok: true }
+      },
+      log: (entry) => {
+        logs.push(entry)
+      },
+    })
+
+    assert.equal(exitCode, 0)
+    assert.equal(notices.length, 1)
+    assert.equal(notices[0]?.url, `https://discord.com/api/v10/channels/${CHANNEL_ID}/messages`)
+    assert.equal(JSON.parse(String(notices[0]?.init.body ?? '{}')).content, RESTART_STARTED_TEXT)
+    const noticeLog = logs.find((entry) => {
+      return entry.type === 'discord_restart_notice'
+    })
+    assert.ok(noticeLog !== undefined && noticeLog.ok === true, JSON.stringify(logs))
+    // 通知 log に token を出さない
+    assert.ok(!JSON.stringify(logs).includes(BOT_TOKEN))
+  } finally {
+    stopController.abort()
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('discord bot: 前回の ready が無い最初の起動では 起動しました 通知を送る', async () => {
+  const dataDir = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-first-start-test-')),
+  )
+  const stopController = new AbortController()
+  const notices: { url: string; init: Record<string, unknown> }[] = []
+
+  try {
+    const exitCode = await runDiscordBot({
+      dataDir,
+      env: {
+        ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
+        ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
+        ARAYA_DISCORD_GUILD_ID: GUILD_ID,
+        ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
+        ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
+      },
+      stopSignal: stopController.signal,
+      verifyUnit: false,
+      createChatSession: createInertChatSession,
+      createGateway: async (_config, handlers) => {
+        return {
+          connect: async () => {
+            handlers.onReady('998877665544332211')
+            stopController.abort()
+          },
+          sendText: async () => {},
+          async registerCommands() {
+            return 2
+          },
+          close: async () => {},
+        }
+      },
+      fetch: async (url, init) => {
+        notices.push({ url, init: init as Record<string, unknown> })
+
+        return { ok: true }
+      },
+      log: () => {},
+    })
+
+    assert.equal(exitCode, 0)
+    assert.equal(notices.length, 1)
+    assert.equal(JSON.parse(String(notices[0]?.init.body ?? '{}')).content, BOT_STARTED_TEXT)
+  } finally {
+    stopController.abort()
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('discord bot: 通知投稿に失敗しても bot は継続し、失敗だけ log する', async () => {
+  const dataDir = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-notice-fail-test-')),
+  )
+  const stopController = new AbortController()
+  const notices: unknown[] = []
+  const logs: Record<string, unknown>[] = []
+
+  try {
+    const exitCode = await runDiscordBot({
+      dataDir,
+      env: {
+        ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
+        ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
+        ARAYA_DISCORD_GUILD_ID: GUILD_ID,
+        ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
+        ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
+      },
+      stopSignal: stopController.signal,
+      verifyUnit: false,
+      createChatSession: createInertChatSession,
+      createGateway: async (_config, handlers) => {
+        return {
+          connect: async () => {
+            handlers.onReady('998877665544332211')
+            stopController.abort()
+          },
+          sendText: async () => {},
+          async registerCommands() {
+            return 2
+          },
+          close: async () => {},
+        }
+      },
+      fetch: async (url) => {
+        notices.push(url)
+
+        return { ok: false }
+      },
+      log: (entry) => {
+        logs.push(entry)
+      },
+    })
+
+    assert.equal(exitCode, 0)
+    assert.equal(notices.length, 1)
+    const noticeLog = logs.find((entry) => {
+      return entry.type === 'discord_restart_notice'
+    })
+    assert.ok(noticeLog !== undefined && noticeLog.ok === false, JSON.stringify(logs))
+    assert.ok(!JSON.stringify(logs).includes(BOT_TOKEN))
   } finally {
     stopController.abort()
     await fs.rm(dataDir, { recursive: true, force: true })
