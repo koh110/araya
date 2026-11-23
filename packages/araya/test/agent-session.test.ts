@@ -25,10 +25,21 @@ function allowed(args: readonly string[], env: Record<string, string> = AGENT_EN
 }
 
 test('agent session: 目印は shell env の object として返し、process env は書き換えない', () => {
+  // host process の env 自体が目印を持ちうる（dev unit など）ので、比較は host の値を保存して行う
+  const hostMarker = process.env[ARAYA_AGENT_SESSION_ENV]
+  const shellWithoutMarker: Record<string, string> = {}
+
+  for (const [name, value] of Object.entries(process.env)) {
+    if (name !== ARAYA_AGENT_SESSION_ENV && value !== undefined) {
+      shellWithoutMarker[name] = value
+    }
+  }
+
   const marker = agentSessionShellEnv()
   assert.equal(marker[ARAYA_AGENT_SESSION_ENV], '1')
-  assert.equal(isInAgentSession(process.env), false)
-  assert.equal(isInAgentSession({ ...process.env, ...marker }), true)
+  assert.equal(isInAgentSession(shellWithoutMarker), false)
+  assert.equal(isInAgentSession({ ...shellWithoutMarker, ...marker }), true)
+  assert.equal(process.env[ARAYA_AGENT_SESSION_ENV], hostMarker)
 })
 
 test('agent session: hoot の command 名を positional から読む（--key の値は subcommand にしない）', () => {
