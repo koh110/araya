@@ -36,6 +36,11 @@ import {
   type DiscordAuthMode,
 } from '../discord/config.ts'
 import { discordStateFilePath, readDiscordBotState } from '../discord/state.ts'
+import {
+  RESTART_STOPPING_TEXT,
+  postDiscordRestartNotice,
+  type RestartNoticeFetch,
+} from '../discord/restart-notice.ts'
 import { runDiscordBot, type DiscordBotDependencies } from '../discord/bot.ts'
 import {
   commandError,
@@ -81,6 +86,8 @@ export type DiscordCommandDependencies = CliCommandDependencies & {
   resolveOpCliPath?: (searchPath: string | undefined) => Promise<string>
   // systemd-creds を使う暗号化処理。test では秘密を含まないciphertextに差し替える
   encryptSystemdCredential?: SystemdCredentialEncryptor
+  // 停止通知の REST POST を test で差し替える。既定は global fetch
+  fetch?: RestartNoticeFetch
 }
 
 function notConfiguredMessage(envFilePath: string) {
@@ -685,6 +692,21 @@ async function installDiscord(
     }
   } catch {
     // 古い state が無効なら、起動後に読み直せた state の ready だけを使う
+  }
+
+  // #36: 常駐の再起動前に停止通知を出す（無受信窓が始まることをユーザーへ可視化）。
+  // 前回の ready が無い初めての install では送らない。投稿失敗で restart は止めない
+  if (previousReadyId !== null) {
+    const noticeSent = await postDiscordRestartNotice({
+      botToken: source.config.botToken,
+      channelId: source.config.channelId,
+      text: RESTART_STOPPING_TEXT,
+      fetchImpl: deps.fetch,
+    })
+
+    if (!noticeSent) {
+      deps.stderr('warning: 再起動通知の投稿に失敗しました。service の restart は続行します')
+    }
   }
 
   await runSystemctl(ops, ['--user', 'restart', unit], SYSTEMCTL_RESTART_TIMEOUT_MS, redactor)

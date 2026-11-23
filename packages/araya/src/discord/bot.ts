@@ -27,6 +27,11 @@ import {
   type DiscordGatewayHandlers,
 } from './gateway.ts'
 import { newState, readDiscordBotState, writeDiscordBotState } from './state.ts'
+import {
+  discordRestartStartedText,
+  postDiscordRestartNotice,
+  type RestartNoticeFetch,
+} from './restart-notice.ts'
 
 type ProperLockfile = {
   lock(
@@ -52,6 +57,8 @@ export type DiscordBotDependencies = {
   pollMs?: number
   // 壁時計 ms（backoff の待ち時刻の基準）
   nowMs?: () => number
+  // 通知投稿の REST fetch を test で差し替える。既定は global fetch
+  fetch?: RestartNoticeFetch
   createGateway?: (
     config: DiscordConfig,
     handlers: DiscordGatewayHandlers,
@@ -250,6 +257,9 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
 
     return 1
   }
+
+  // 起動通知を「再起動しました」「起動しました」に分ける基準。onReady が state を更新する前の値を使う
+  const previousLastReadyAt = state.lastReadyAt
 
   let chatSession: ArayaAgentSession | null = null
   // report の deliver は gateway 作成後でないと送れないので、late binding で参照する。
@@ -487,6 +497,16 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     }
 
     logSafe({ type: 'discord_started', unit, pollMs })
+
+    // #36: 起動完了をユーザーへ可視化する。投稿失敗は稼働を止めない（postDiscordRestartNotice は throw しない）
+    void postDiscordRestartNotice({
+      botToken: config.botToken,
+      channelId: config.channelId,
+      text: discordRestartStartedText(previousLastReadyAt),
+      fetchImpl: deps.fetch,
+    }).then((ok) => {
+      logSafe({ type: 'discord_restart_notice', ok })
+    })
 
     // report 配送は agent host の durable task 側で進む。bot loop は stop まで待つ
     while (!deps.stopSignal.aborted) {

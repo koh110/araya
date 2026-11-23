@@ -7,6 +7,7 @@ import test from 'node:test'
 import { runCli } from '../src/cli/main.ts'
 import { dataDirHash, discordUnitName, type CommandResult } from '../src/infrastructure/systemd.ts'
 import type { DiscordCommandDependencies } from '../src/cli/discord-commands.ts'
+import { RESTART_STOPPING_TEXT } from '../src/discord/restart-notice.ts'
 import {
   DISCORD_CONFIG_KEYS,
   OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME,
@@ -237,6 +238,10 @@ async function runDiscord(
       },
       homeDir: installEnv.home,
       uid: UID,
+      // 停止通知の REST POST。test では常に stub（network へ行かない）
+      fetch: async () => {
+        return { ok: true }
+      },
       sleep: async (ms) => {
         sleeps.push(ms)
         clock += ms
@@ -1389,6 +1394,108 @@ test('discord uninstall: unit が無いことの systemctl の失敗だけ無視
       }),
       'disable 失敗の後 stop。not loaded は無視',
     )
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+// #36: 常駐の再起動は約67秒の無受信窓を作る。restart 前に停止通知を送る
+test('discord install: 常駐を再起動する前に停止通知を channel へ投稿する', async () => {
+  const installEnv = await makeInstallEnv()
+
+  await writePlainDiscordEnv(installEnv)
+  const unit = unitOf(await fs.realpath(installEnv.dataDir))
+  writeDiscordBotState(installEnv.dataDir, {
+    ...newState(),
+    unit,
+    readyId: 'ready-before-notice',
+    lastReadyAt: '2026-10-30T23:59:59.000Z',
+  })
+  const sequence: string[] = []
+  const notices: { url: string; init: Record<string, unknown> }[] = []
+  const fake = createFakeSystemd({
+    systemctl: defaultSystemctl(installEnv, {
+      restart: (args) => {
+        sequence.push('restart')
+        writeDiscordBotState(installEnv.dataDir, {
+          ...newState(),
+          unit: args.at(-1) ?? '',
+          readyId: 'ready-after-restart',
+          lastReadyAt: '2026-10-31T00:00:00.000Z',
+        })
+
+        return commandResult()
+      },
+    }),
+  })
+
+  try {
+    const { output } = await runDiscord(installEnv, ['install'], fake, {
+      fetch: async (url, init) => {
+        sequence.push('notice')
+        notices.push({ url, init: init as Record<string, unknown> })
+
+        return { ok: true }
+      },
+    })
+
+    assert.deepEqual(sequence, ['notice', 'restart'])
+    assert.equal(notices.length, 1)
+    assert.equal(notices[0]?.url, `https://discord.com/api/v10/channels/${CHANNEL_ID}/messages`)
+    assert.equal(JSON.parse(String(notices[0]?.init.body ?? '{}')).content, RESTART_STOPPING_TEXT)
+    assert.ok(!String(notices[0]?.init.body).includes(BOT_TOKEN))
+    assert.equal(readField(output, 'ready'), true)
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('discord install: 前回の ready が無い初めての install では停止通知を送らない', async () => {
+  const installEnv = await makeInstallEnv()
+
+  await writePlainDiscordEnv(installEnv)
+  const noticeCount = { value: 0 }
+  const fake = createFakeSystemd({ systemctl: defaultSystemctl(installEnv) })
+
+  try {
+    const { output } = await runDiscord(installEnv, ['install'], fake, {
+      fetch: async () => {
+        noticeCount.value += 1
+
+        return { ok: true }
+      },
+    })
+
+    assert.equal(noticeCount.value, 0)
+    assert.equal(readField(output, 'ready'), true)
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('discord install: 停止通知の投稿に失敗しても restart を続行し warning を出す', async () => {
+  const installEnv = await makeInstallEnv()
+
+  await writePlainDiscordEnv(installEnv)
+  const unit = unitOf(await fs.realpath(installEnv.dataDir))
+  writeDiscordBotState(installEnv.dataDir, {
+    ...newState(),
+    unit,
+    readyId: 'ready-before-notice-fail',
+    lastReadyAt: '2026-10-30T23:59:59.000Z',
+  })
+  const fake = createFakeSystemd({ systemctl: defaultSystemctl(installEnv) })
+
+  try {
+    const { output, stderr } = await runDiscord(installEnv, ['install'], fake, {
+      fetch: async () => {
+        return { ok: false }
+      },
+    })
+
+    assert.ok(stderr.includes('warning: 再起動通知の投稿に失敗しました'), stderr)
+    assert.ok(!stderr.includes(BOT_TOKEN), stderr)
+    assert.equal(readField(output, 'ready'), true)
   } finally {
     await fs.rm(installEnv.root, { recursive: true, force: true })
   }
