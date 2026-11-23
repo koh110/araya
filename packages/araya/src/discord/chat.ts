@@ -188,11 +188,16 @@ export type DiscordChatHandler = {
   inject(injection: DiscordChatInjection, reply: DiscordChatReply): Promise<string>
   stopAccepting(): void
   drain(): Promise<void>
+  // shutdown log 用の pending 内訳（実行待ちの queue 残り と 実行中の turn）
+  pendingCount(): { queued: number; processing: number }
 }
 
 export const CHAT_UNAVAILABLE_REPLY =
   '現在、Araya の会話機能を利用できません。管理者は discord.log を確認してください。'
 const CHAT_ERROR_REPLY = '会話の処理に失敗しました。内容を短くして再度お試しください。'
+// 終了時に打ち切った message。黙って捨てず、受信者に再送を求める（#36 の取りこぼしを可視化する）
+export const CHAT_SHUTDOWN_UNPROCESSED_REPLY =
+  '再起動のためこの message は処理できませんでした。もう 1 回送信してください。'
 
 function errorName(error: unknown) {
   return error instanceof Error ? error.name : 'unknown'
@@ -201,6 +206,8 @@ function errorName(error: unknown) {
 export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
   let accepting = true
   let tail = Promise.resolve()
+  // 終了時に打ち切った message へ送る「未処理」返信。gateway を閉じる前に drain が待つ
+  let shutdownNotices: Promise<void>[] = []
   // 受付済みで未開始の message。stop で実行中の submit とあわせて無効化する
   const queued: { message: DiscordChatMessage; reply: DiscordChatReply; cancelled: boolean }[] = []
   // 実行中の turn 数（status 表示用）
@@ -478,9 +485,29 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
     },
     stopAccepting: () => {
       accepting = false
+
+      for (const item of queued) {
+        if (item.cancelled) {
+          continue
+        }
+
+        item.cancelled = true
+        // 実行待ちを shutdown の終了 budget の外で処理させない。代わりに gateway がまだ生きているうちに
+        // 「処理できなかった」を伝えて、取りこぼさを黙らせない
+        shutdownNotices.push(
+          sendText(item.reply, item.message.messageId, CHAT_SHUTDOWN_UNPROCESSED_REPLY)
+        )
+      }
     },
     drain: async () => {
       await tail
+
+      for (const notice of shutdownNotices) {
+        await notice.catch(() => undefined)
+      }
+    },
+    pendingCount: () => {
+      return { queued: queued.length, processing }
     },
   }
 }
