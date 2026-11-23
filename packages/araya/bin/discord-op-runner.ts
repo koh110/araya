@@ -18,6 +18,11 @@ import {
   readDiscordEnvFile,
 } from '../src/discord/config.ts'
 
+import {
+  launcherStopWaitMs,
+  launchChildAndWait,
+  redactSecretValues,
+} from '../src/infrastructure/child-launcher.ts'
 const MAX_SERVICE_ACCOUNT_TOKEN_BYTES = 16 * 1024
 const OP_AUTH_ENVIRONMENT_NAMES = [
   'CREDENTIALS_DIRECTORY',
@@ -27,6 +32,10 @@ const OP_AUTH_ENVIRONMENT_NAMES = [
   'OP_ACCOUNT',
 ] as const
 const SYSTEM_ENV_EXECUTABLE = '/usr/bin/env'
+const RESOLVER_MARKER = 'ARAYA_RESOLVED_ENV='
+const OP_RESOLVE_TIMEOUT_MS = 30_000
+const MAX_RESOLVER_STDOUT_BYTES = 1024 * 1024
+const MAX_OP_STDERR_CHARS = 2_000
 
 function runnerError(message: string) {
   return new Error(message)
@@ -146,7 +155,16 @@ async function validateDataDir(dataDir: string) {
     throw runnerError(`.env に設定がありません: ${missing.join('・')}`)
   }
 
-  return envFilePath
+  // op:// 参照だった key だけ crash trace から redact する（PATH などの通常値は見せて診断に使う）
+  const secretKeys = Object.entries(settings)
+    .filter(([, value]) => {
+      return typeof value === 'string' && value.startsWith('op://')
+    })
+    .map(([key]) => {
+      return key
+    })
+
+  return { envFilePath, secretKeys }
 }
 
 function parseRunnerArguments(args: string[]) {
@@ -181,86 +199,195 @@ function parseRunnerArguments(args: string[]) {
   return { dataDir, opPath }
 }
 
-async function runOp(opPath: string, envFilePath: string, dataDir: string, token: string) {
-  const opEnvironment = discordRuntimeEnvironment(process.env)
+function strippedEnvironmentNames() {
+  return [...OP_AUTH_ENVIRONMENT_NAMES, OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME]
+}
+
+function envResolverScript(stripped: readonly string[]) {
+  return [
+    'const strip = new Set((process.argv[1] ?? "").split(",").filter(Boolean));',
+    'const snapshot = {};',
+    'for (const [name, value] of Object.entries(process.env)) {',
+    '  if (!strip.has(name) && typeof value === "string") { snapshot[name] = value }',
+    '}',
+    `process.stdout.write(${JSON.stringify(RESOLVER_MARKER)} + JSON.stringify(snapshot) + "\\n");`,
+  ].join(' ')
+}
+
+function opBaseEnvironment(token: string) {
+  const env = discordRuntimeEnvironment(process.env)
 
   for (const name of OP_AUTH_ENVIRONMENT_NAMES) {
-    delete opEnvironment[name]
+    delete env[name]
   }
 
-  opEnvironment[OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME] = token
+  env[OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME] = token
 
-  const botEntrypoint = path.join(
-    path.dirname(fileURLToPath(import.meta.url)),
-    `discord-bot${path.extname(fileURLToPath(import.meta.url))}`,
-  )
+  return env
+}
+
+// op run は「bot を起動する process」ではなく「.env を 1 回解決して env を見せる process」として使う。
+// 解決値を runner の memory に取り込めば、bot は runner の直接 child になる。
+// それが #36 の truncated drain に対する修正: KillMode=control-group では main process（runner）が
+// 先に死んだ時点で残った bot が SIGKILL され、drain が途中で潰れる。
+async function resolveEnvironment(opPath: string, envFilePath: string, token: string) {
+  const stripped = strippedEnvironmentNames()
   const args = ['run', '--env-file', envFilePath, '--', SYSTEM_ENV_EXECUTABLE]
 
-  for (const name of OP_AUTH_ENVIRONMENT_NAMES) {
+  for (const name of stripped) {
     args.push('-u', name)
   }
 
-  args.push(
-    '-u',
-    OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME,
-    process.execPath,
-    botEntrypoint,
-    '--data-dir',
-    dataDir,
-  )
+  args.push(process.execPath, '-e', envResolverScript(stripped), stripped.join(','))
 
-  return await new Promise<number>((resolve) => {
-    const child = spawn(opPath, args, {
-      env: opEnvironment,
-      shell: false,
-      stdio: 'ignore',
-    })
+  const outcome = await new Promise<{
+    code: number | null
+    signal: string | null
+    stdout: string
+    stderr: string
+  }>((resolve) => {
+    let child
+
+    try {
+      child = spawn(opPath, args, {
+        env: opBaseEnvironment(token),
+        shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    } catch {
+      resolve({ code: 127, signal: null, stdout: '', stderr: '' })
+
+      return
+    }
+
+    let stdout = ''
+    let stderr = ''
     let settled = false
-
-    function finish(code: number, message?: string) {
+    const timer = setTimeout(() => {
       if (settled) {
         return
       }
 
       settled = true
-      process.off('SIGTERM', forwardSigterm)
-      process.off('SIGINT', forwardSigint)
+      child.kill('SIGKILL')
+      resolve({ code: null, signal: 'timeout', stdout, stderr })
+    }, OP_RESOLVE_TIMEOUT_MS)
 
-      if (message !== undefined) {
-        process.stderr.write(`discord-op-runner: ${message}\n`)
+    child.stdout?.setEncoding('utf8')
+    child.stderr?.setEncoding('utf8')
+    child.stdout?.on('data', (chunk) => {
+      if (stdout.length < MAX_RESOLVER_STDOUT_BYTES) {
+        stdout += chunk
       }
-
-      resolve(code)
-    }
-    function forwardSigterm() {
-      child.kill('SIGTERM')
-    }
-    function forwardSigint() {
-      child.kill('SIGINT')
-    }
-
-    process.once('SIGTERM', forwardSigterm)
-    process.once('SIGINT', forwardSigint)
+    })
+    child.stderr?.on('data', (chunk) => {
+      if (stderr.length < MAX_OP_STDERR_CHARS) {
+        stderr += chunk
+      }
+    })
     child.once('error', () => {
-      finish(127, '1Password CLIを起動できません')
-    })
-    child.once('exit', (code) => {
-      if (code === 0) {
-        finish(0)
-        return
-      }
+      clearTimeout(timer)
 
-      finish(code ?? 1, `op run が終了しました（status=${code ?? 'signal'}）`)
+      if (!settled) {
+        settled = true
+        resolve({ code: 127, signal: null, stdout, stderr })
+      }
     })
+    child.once('exit', (code, signal) => {
+      clearTimeout(timer)
+
+      if (!settled) {
+        settled = true
+        resolve({ code, signal, stdout, stderr })
+      }
+    })
+  })
+
+  if (outcome.signal === 'timeout') {
+    throw runnerError(`1Password CLI が ${OP_RESOLVE_TIMEOUT_MS}ms 内に .env を解決できませんでした`)
+  }
+
+  if (outcome.code !== 0) {
+    throw runnerError(
+      `1Password CLI で .env を解決できませんでした（status=${outcome.code ?? 'signal'}・${redactSecretValues(outcome.stderr, [token]).slice(0, MAX_OP_STDERR_CHARS)}）`,
+    )
+  }
+
+  const markerLine = outcome.stdout.split('\n').find((line) => {
+    return line.startsWith(RESOLVER_MARKER)
+  })
+
+  if (markerLine === undefined) {
+    throw runnerError('1Password CLI の env 解決結果を取得できません')
+  }
+
+  let parsed
+
+  try {
+    parsed = JSON.parse(markerLine.slice(RESOLVER_MARKER.length))
+  } catch {
+    throw runnerError('1Password CLI の env 解決結果の形式が不正です')
+  }
+
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw runnerError('1Password CLI の env 解決結果の形式が不正です')
+  }
+
+  const snapshot: Record<string, string> = {}
+
+  for (const [name, value] of Object.entries(parsed)) {
+    if (typeof value === 'string' && !stripped.includes(name)) {
+      snapshot[name] = value
+    }
+  }
+
+  return snapshot
+}
+
+function botEnvironmentFromSnapshot(snapshot: Record<string, string>) {
+  const env = discordRuntimeEnvironment(process.env)
+
+  for (const [name, value] of Object.entries(snapshot)) {
+    env[name] = value
+  }
+
+  return env
+}
+
+async function runBot(dataDir: string, env: NodeJS.ProcessEnv, secretValues: readonly string[]) {
+  const botEntrypoint = path.join(
+    path.dirname(fileURLToPath(import.meta.url)),
+    `discord-bot${path.extname(fileURLToPath(import.meta.url))}`,
+  )
+
+  return await launchChildAndWait({
+    command: process.execPath,
+    args: [botEntrypoint, '--data-dir', dataDir],
+    env,
+    stopWaitMs: launcherStopWaitMs(process.env),
+    secretValues,
+    label: 'discord-op-runner',
+    writeError: (line) => {
+      process.stderr.write(`${line}\n`)
+    },
   })
 }
 
 async function main() {
   try {
     const { dataDir, opPath } = parseRunnerArguments(process.argv.slice(2))
-    const envFilePath = await validateDataDir(dataDir)
+    const { envFilePath, secretKeys } = await validateDataDir(dataDir)
     const token = await readServiceAccountToken(process.env.CREDENTIALS_DIRECTORY)
-    process.exitCode = await runOp(opPath, envFilePath, dataDir, token)
+    const snapshot = await resolveEnvironment(opPath, envFilePath, token)
+    const secretValues = secretKeys
+      .map((key) => {
+        return snapshot[key]
+      })
+      .filter((value): value is string => {
+        return typeof value === 'string' && value !== ''
+      })
+    const outcome = await runBot(dataDir, botEnvironmentFromSnapshot(snapshot), secretValues)
+    process.exitCode = outcome.exitCode
   } catch (error) {
     const message = error instanceof Error ? error.message : '初期化に失敗しました'
     process.stderr.write(`discord-op-runner: ${message}\n`)
