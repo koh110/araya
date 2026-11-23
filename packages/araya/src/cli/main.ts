@@ -3,6 +3,7 @@ import os from 'node:os'
 import { parseCliArguments } from './arguments.ts'
 import { loadConfig, loadPiSdk, withPiEnvironment } from '../config/environment.ts'
 import { runHootCommand } from './hoot-commands.ts'
+import { CLI_CONTROL_SUBCOMMANDS, runControlCommand } from './control-commands.ts'
 import { assertHumanHootInvocation } from '../infrastructure/agent-session.ts'
 import {
   createSystemdOps,
@@ -45,6 +46,28 @@ function printHelp() {
   araya discord run
     unit 稼働の確かめをせず、foreground で Discord bot を 1 度動かす（試験起動）。Ctrl+C で止める。
     1Password の op:// 参照を使う場合は op run で設定を解決してから実行する。
+  araya discord status
+    unit の稼働状態を読むだけ（unit file の有無・ActiveState / SubState・restart 回数・last ready・state file の path）。
+    token は読みません。bot が応答しないときの最初の確かめに使う。
+
+  araya status | stop | reset
+    Discord の slash command /araya status・stop・reset と同じ operation（bot process 内の同じ kernel を呼ぶ）。
+    会話 session を操作できるのは稼働中の bot だけなので、要求は <ARAYA_DATA_DIR>/control/requests/ に書き、
+    bot が次の poll（既定 1 秒）で実行して <ARAYA_DATA_DIR>/control/results/ に応答を書く。
+    [--wait-seconds N]（既定 30、上限 120）。bot が応答しないときは araya discord status で稼働を確かめる。
+    status は読み取りなので agent session からでも打てる。araya stop / reset は agent session の内側では拒否される。
+
+  Discord slash command と CLI の対応（HOOT は subcommand・option 名まで同じ。slash 側は -- を使わない）:
+    /araya status・stop・reset                       = araya status・stop・reset
+    /araya help                                       = araya --help（この一覧）
+    /hoot status・runs・reset-schedule               = araya hoot status・runs・reset-schedule
+    /hoot inject list                                = araya hoot inject list
+    /hoot dispatch key:<key>                          = araya hoot dispatch --key <key>
+    /hoot goal list・add・update・pause・resume・retire  = araya hoot goal …（--key --objective --scope --constraint --review-at）
+    /hoot settings show・set                           = araya hoot settings show・set（16 の field 名が同じ）
+    /hoot proposal list・resolve key:<key>            = araya hoot proposal list・resolve --key <key>
+    araya discord init・install・uninstall・run・status は CLI 専用（unit・token を触る操作を Discord からは叩かない）
+    --data-dir は CLI だけ（Discord 側は bot process の dataDir だけを正とする）
 
   会話: 設定 channel に発言すると agent session が応答する。agent が report delivery を依頼した送信依頼は、
   設定 channel へ届くまで再送される。task ledger・runner・/araya task slash command は撤去済み。
@@ -172,6 +195,12 @@ export async function runCli(
 
   // Discord の command は独自の option を持つので、共通の引数の解析より先に振り分ける
   if (args[0] === 'discord') {
+    if (args.slice(1).includes('--help') || args.slice(1).includes('-h')) {
+      printHelp()
+
+      return
+    }
+
     assertSupportedPlatform(commandDependencies.platform ?? process.platform)
     const config = loadConfig(env)
     const deps: DiscordCommandDependencies = {
@@ -195,6 +224,30 @@ export async function runCli(
     }
 
     await runDiscordCommand(args.slice(1), config, deps)
+
+    return
+  }
+
+  // Discord の slash command と同じ operation を CLI にも置く（araya status・stop・reset）。
+  // 会話 session を操作するのは bot process なので、要求は file の control request で渡す
+  if ((CLI_CONTROL_SUBCOMMANDS as readonly string[]).includes(args[0] ?? '')) {
+    if (args.slice(1).includes('--help') || args.slice(1).includes('-h')) {
+      printHelp()
+
+      return
+    }
+
+    const controlConfig = loadConfig(env)
+    await runControlCommand(args, {
+      dataDir: controlConfig.dataDir,
+      stdout: (text) => {
+        return console.log(text)
+      },
+      nowMs: () => {
+        return Date.now()
+      },
+      env: env ?? process.env,
+    })
 
     return
   }

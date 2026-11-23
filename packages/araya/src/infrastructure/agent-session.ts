@@ -82,6 +82,25 @@ export function assertHumanHootInvocation(
   const name = subcommand === undefined ? command : `${command} ${subcommand}`
 
   throw new Error(
-    `hoot_agent_session_blocked: agent session の内側で araya hoot ${name} は実行できません。人間が CLI か Discord の message（hoot ${name}）で実行してください`,
+    `hoot_agent_session_blocked: agent session の内側で araya hoot ${name} は実行できません。人間の shell の CLI か Discord の slash command（/hoot ${name}）で実行してください`,
+  )
+}
+
+// 会話 control（/araya status・stop・reset に対応する CLI 入口）。status は読み取りなので allowed、
+// stop / reset は会話 session を壊すので人間専用（agent が自分の会話を止めたり文脈を切れないようにする）。
+// command 名の一覧そのものは src/infrastructure/control-bus.ts が持つ
+const AGENT_BLOCKED_CONTROL_COMMANDS = ['stop', 'reset'] as const
+
+export function isAgentBlockedControlInvocation(name: string): boolean {
+  return (AGENT_BLOCKED_CONTROL_COMMANDS as readonly string[]).includes(name.toLowerCase())
+}
+
+export function assertHumanControlInvocation(name: string, env: Readonly<Record<string, string | undefined>>): void {
+  if (!isInAgentSession(env) || !isAgentBlockedControlInvocation(name)) {
+    return
+  }
+
+  throw new Error(
+    `araya_control_agent_session_blocked: agent session の内側で araya ${name} は実行できません。人間の shell の CLI か Discord の slash command（/araya ${name}）で実行してください`,
   )
 }

@@ -183,6 +183,8 @@ export type DiscordChatHandler = {
   handle(message: DiscordChatMessage, reply: DiscordChatReply): Promise<void>
   // slash command（/araya ... / /hoot ...）を queue の外で処理する。会話の実行中でも効く
   handleCommand(request: DiscordCommandRequest, reply: DiscordCommandReply): Promise<void>
+  // CLI の control request を slash command と同じ kernel で処理し、reply text を返す（Discord へは送らない）
+  runControl(request: DiscordCommandRequest): Promise<string>
   inject(injection: DiscordChatInjection, reply: DiscordChatReply): Promise<string>
   stopAccepting(): void
   drain(): Promise<void>
@@ -273,21 +275,10 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
     }
   }
 
-  // slash command は queue の外で処理する（会話の実行中・待ちでも常に効く制御系）
-  async function processCommand(request: DiscordCommandRequest, reply: DiscordCommandReply) {
+  // slash command は queue の外で処理する（会話の実行中・待ちでも常に効く制御系）。
+  // send だけ差し替え可能にして、Discord の ephemeral reply と CLI の control request で同じ kernel を通す
+  async function runCommand(request: DiscordCommandRequest, send: (text: string) => Promise<void>) {
     const cancelledCount = { value: 0 }
-    // 応答は ephemeral（command を打った人だけに見える）。長い output は 2000 字で切って followUp する
-    const send = async (text: string) => {
-      for (const chunk of splitDiscordChatReply(deps.redactor.redact(text))) {
-        try {
-          await reply(chunk)
-        } catch (error) {
-          deps.log({ type: 'discord_command_reply_failed', errorName: errorName(error) })
-
-          return
-        }
-      }
-    }
 
     await control.handle(request, {
       conversationId: conversationIdOf(),
@@ -358,7 +349,18 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
         return
       }
 
-      const operation = processCommand(request, reply).catch((error: unknown) => {
+      // 応答は ephemeral（command を打った人だけに見える）。長い output は 2000 字で切って followUp する
+      const operation = runCommand(request, async (text) => {
+        for (const chunk of splitDiscordChatReply(deps.redactor.redact(text))) {
+          try {
+            await reply(chunk)
+          } catch (error) {
+            deps.log({ type: 'discord_command_reply_failed', errorName: errorName(error) })
+
+            return
+          }
+        }
+      }).catch((error: unknown) => {
         deps.log({ type: 'discord_control_failed', message: errorName(error) })
 
         return reply('command を処理できませんでした。/araya help で一覧を見られます。').catch(() => undefined)
@@ -369,6 +371,24 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
       })
 
       await operation
+    },
+    // CLI の `araya status・stop・reset`（src/infrastructure/control-bus.ts の request）を slash command と
+    // 同じ operation で走らせる。Discord へは送らず、ephemeral reply と同じ規則で redact した text を返す
+    runControl: async (request: DiscordCommandRequest) => {
+      const chunks: string[] = []
+      // slash command と同じで queue を通さない（会話の実行中でも止める／リセットできる）
+      const operation = runCommand(request, async (text) => {
+        chunks.push(deps.redactor.redact(text))
+      })
+        .catch((error: unknown) => {
+          deps.log({ type: 'discord_control_failed', message: errorName(error) })
+
+          return chunks.push('command を処理できませんでした。araya --help か /araya help で一覧を見られます。')
+        })
+
+      await operation
+
+      return chunks.join('\n')
     },
     handle: (message: DiscordChatMessage, reply: DiscordChatReply) => {
       if (!accepting) {

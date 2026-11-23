@@ -16,7 +16,8 @@ import {
   splitDiscordChatReply,
   type DiscordChatHandler,
 } from './chat.ts'
-import { ARAYA_SLASH_COMMANDS, validateArayaSlashCommands } from './slash.ts'
+import { ARAYA_SLASH_COMMANDS, SESSION_COMMAND_NAME, validateArayaSlashCommands } from './slash.ts'
+import { CLI_CONTROL_POLL_MS, createCliControlLoop } from './cli-control.ts'
 import { createDefaultArayaAgentSession, type ArayaAgentSession } from '../agent/host.ts'
 import { createHootLoop } from '../hoot/tick.ts'
 import type { ObservationDependencies } from '../hoot/observe.ts'
@@ -46,6 +47,8 @@ const DISCORD_PROCESS_LOCK_UPDATE_MS = 10_000
 const DEFAULT_POLL_MS = 5_000
 // 終了時に HOOT 判断 run の完了を待つ上限。越えたら close を進め、durable state 側で resume する
 const HOOT_STOP_WAIT_MS = 20_000
+// CLI の control request を bot 内部で処理するときの user 識別子（Discord の user ではない。log と session に残す name）
+const CLI_CONTROL_USER = 'cli'
 
 export type DiscordBotDependencies = {
   dataDir: string
@@ -67,6 +70,8 @@ export type DiscordBotDependencies = {
   log?: (entry: Record<string, unknown>) => void
   // HOOT loop の poll 間隔（test で短くする）。既定 60000
   hootPollMs?: number
+  // CLI の control request を拾う poll 間隔（test で短くする）。既定 1000
+  cliControlPollMs?: number
   // HOOT 観測の command 実行（test で fake を入れる）。既定は runBoundedCommand での gh 実行
   hootRunCommand?: ObservationDependencies['runCommand']
   hootObservationTimeoutMs?: number
@@ -487,6 +492,49 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     logError('hoot_state_failed', error)
   }
 
+  // CLI からの control request（`araya status・stop・reset`）。slash command と同じ chat handler の runControl を
+  // 呼ぶので operation は Discord 側と 1:1。local file を書ける OS user が許可の境界（Discord の allowlist は通さない）
+  let cliControl: ReturnType<typeof createCliControlLoop> | undefined
+
+  try {
+    cliControl = createCliControlLoop({
+      dataDir,
+      nowMs,
+      log: logSafe,
+      pollMs: deps.cliControlPollMs,
+      redact: (text) => {
+        return redactor.redact(text)
+      },
+      run: async (command, requestId) => {
+        const chatHandler = chatHandlerRef.current
+
+        if (chatHandler === null) {
+          if (command === 'status') {
+            // 読み取りの status だけは startup 中でも答える（session が無いので会話の状態は出せない）
+            return '会話 session はまだ ready ではありません（bot の startup 中）。unit の稼働は araya discord status で確かめてください'
+          }
+
+          throw new Error('chat_session_unavailable: 会話 session がまだ ready ではありません')
+        }
+
+        return await chatHandler.runControl({
+          interactionId: requestId,
+          commandName: SESSION_COMMAND_NAME,
+          userId: CLI_CONTROL_USER,
+          guildId: config.guildId,
+          channelId: config.channelId,
+          subcommandGroup: null,
+          subcommand: command,
+          options: {},
+        })
+      },
+    })
+    cliControl.start()
+    logSafe({ type: 'discord_cli_control_started', pollMs: deps.cliControlPollMs ?? CLI_CONTROL_POLL_MS })
+  } catch (error) {
+    logError('discord_cli_control_failed', error)
+  }
+
   try {
     try {
       await gateway.connect()
@@ -513,6 +561,9 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
       await sleep(pollMs, deps.stopSignal)
     }
   } finally {
+    // CLI の control を最初に止める（shutdown の途中で新しい stop / reset を受け取らない）
+    cliControl?.stop()
+
     // gateway を閉じる前に HOOT loop を止める（送信先の gateway が無くなった後の deliver を避ける）
     hoot?.stop()
 

@@ -1,8 +1,9 @@
-// araya discord <init|install|uninstall|run>。
+// araya discord <init|install|uninstall|run|status>。
 // init: 標準の設定 file（<dataDir>/.env）を作る（既存 file は上書きしない）。
 // install: 平文 .env を既定にし、明示 option で1Password launcherを選ぶ。
 // uninstall: unit を止めて file を消す。state.json・agent session の SQLite は残す。
 // run: foreground で 1 度動かす（unit 稼働の確かめなし）。
+// status: unit の稼働状態を読むだけ（ActiveState・SubState・restart 回数・last ready）。token は読まない。
 // unit の file 作成・enable・restart は人間の実行（discord install が restart まで行う）
 
 import { randomBytes } from 'node:crypto'
@@ -36,6 +37,7 @@ import {
   type DiscordAuthMode,
 } from '../discord/config.ts'
 import { discordStateFilePath, readDiscordBotState } from '../discord/state.ts'
+import { formatDiscordStatusReport, readDiscordUnitStatus } from './discord-status.ts'
 import {
   RESTART_STOPPING_TEXT,
   postDiscordRestartNotice,
@@ -76,7 +78,7 @@ const UNIT_NOT_LOADED_PATTERN = /not loaded/iu
 const LEGACY_RUNNER_UNIT_NAME_PATTERN = /^araya-runner-[0-9a-f]{12}\.service$/
 const LEGACY_RUNNER_UNIT_LIST_ARG = 'araya-runner-*.service'
 
-export const DISCORD_SUBCOMMANDS = ['init', 'install', 'uninstall', 'run'] as const
+export const DISCORD_SUBCOMMANDS = ['init', 'install', 'uninstall', 'run', 'status'] as const
 
 export type DiscordCommandDependencies = CliCommandDependencies & {
   // test 用に差し替える。既定は実際の bot 実行
@@ -1007,6 +1009,14 @@ export async function runDiscordCommand(
     case 'run':
       body = await runForeground(config, deps)
       break
+    case 'status': {
+      // 読-only なので unit が無くても失敗しない（install 前でも状態がわかる）
+      const ops = await deps.createSystemdOps(deps.env)
+      const report = await readDiscordUnitStatus(ops, config.dataDir, deps.homeDir, deps.env)
+      deps.stdout(formatDiscordStatusReport(report))
+
+      return
+    }
     default:
       throw commandError('invalid_arguments', '上記の command を指定してください')
   }

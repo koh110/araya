@@ -251,7 +251,7 @@ araya hoot <command> ... [--data-dir <path>]
 
 ### Discord から打つ HOOT 操作（slash command / Issue #33）
 
-channel からの操作は Discord の slash command に統一する。command 定義は `src/discord/slash.ts`（`/araya` と `/hoot`）、処理は `src/discord/commands.ts`。Discord の option を **CLI と同じ引数列**へ変換して `runHootCommand` を bot process 内で呼ぶ（`src/cli/hoot-commands.ts` を chat 側から呼ぶ。model には渡さない）。text message の `hoot ...` / `status` / `stop` / `reset` は予約をやめ、会話として model に渡る。
+channel からの操作は Discord の slash command に統一する。CLI 側にも同じ operation 名を置いている（`araya hoot ...`、`araya status`・`araya stop`・`araya reset`。後者は file の control bus 経由で bot process の同じ kernel を呼ぶ。境界と file の扱いは `docs/spec/discord-persistent-chat.md`）。command 定義は `src/discord/slash.ts`（`/araya` と `/hoot`）、処理は `src/discord/commands.ts`。Discord の option を **CLI と同じ引数列**へ変換して `runHootCommand` を bot process 内で呼ぶ（`src/cli/hoot-commands.ts` を chat 側から呼ぶ。model には渡さない）。text message の `hoot ...` / `status` / `stop` / `reset` は予約をやめ、会話として model に渡る。
 
 - 会話側の command は `/araya status`（main conversation の durable id・実行中・待ち + HOOT の `status` 出力） / `/araya stop` / `/araya reset` / `/araya help`。HOOT 側は `/hoot status` / `/hoot dispatch key:<proposal key>` / `/hoot runs` / `/hoot reset-schedule` / `/hoot inject list` / `/hoot goal list・add・update・pause・resume・retire` / `/hoot settings show・set` / `/hoot proposal list・resolve`。queue の外で処理するので実行中でも効き、応答は ephemeral（`docs/spec/discord-persistent-chat.md`）
 - option から CLI 引数列への変換は `hootArgumentsOf`。boolean は `true` / `false`、integer は文字列にして CLI の parser と option 名（`goal` / `settings` の alias 解決ではなく正式名）をそのまま通す。`key` のような必須 option が無ければ `hoot_invalid_argument`、未知の subcommand も `hoot_invalid_argument`
