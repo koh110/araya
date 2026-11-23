@@ -434,7 +434,7 @@ test('discord gateway: 許可された message は onMessage に渡り onIgnored
   assert.equal(capture.messages[0]?.mentionsBot, false)
 })
 
-test('discord gateway: bot 自身の message echo は onIgnored / onMessage を呼ばず黙って捨てる', () => {
+test('discord gateway: bot 自身の message echo は onMessage に渡さず is_bot 理由で onIgnored に記録する（M1）', () => {
   const capture = makeGatewayHandlerCapture()
   const message = makeFakeMessageCreate({
     id: '92345678901234613',
@@ -445,18 +445,22 @@ test('discord gateway: bot 自身の message echo は onIgnored / onMessage を�
 
   handleDiscordMessageCreate(message, gatewayConfig, capture.handlers, fakeTypingIndicator, '12345678901234567')
 
-  assert.deepEqual(capture.ignored, [])
   assert.deepEqual(capture.messages, [])
+  assert.equal(capture.ignored.length, 1)
+  assert.equal(capture.ignored[0]?.metadata.messageId, '92345678901234613')
+  assert.deepEqual(capture.ignored[0]?.failures, ['is_bot'])
+  assert.equal(JSON.stringify(capture.ignored).includes('Araya の返信 echo'), false)
 })
 
-test('discord gateway: Araya 自身の user id の message は onIgnored に failures を積まない', () => {
+test('discord gateway: Araya 自身の user id の message（bot flag なし）は self_message 理由で onIgnored に記録する（M1）', () => {
   const capture = makeGatewayHandlerCapture()
   const message = makeFakeMessageCreate({ id: '92345678901234614', userId: '42345678901234567' })
 
   handleDiscordMessageCreate(message, gatewayConfig, capture.handlers, fakeTypingIndicator, '42345678901234567')
 
-  assert.deepEqual(capture.ignored, [])
   assert.deepEqual(capture.messages, [])
+  assert.equal(capture.ignored.length, 1)
+  assert.deepEqual(capture.ignored[0]?.failures, ['self_message'])
 })
 
 test('discord gateway: onIgnored を持たない handlers でも許可外 message で throw しない', () => {

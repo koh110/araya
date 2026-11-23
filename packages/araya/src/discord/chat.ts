@@ -99,6 +99,8 @@ export type DiscordChatAdmissionFailure =
   | 'is_bot'
   | 'is_webhook'
   | 'is_system'
+  // gateway 層のみ: Araya 自身の messageCreate echo を会話入力から除外した理由
+  | 'self_message'
 
 export function discordChatAdmissionFailures(
   message: DiscordChatMessageMetadata,

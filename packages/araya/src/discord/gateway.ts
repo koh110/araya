@@ -299,14 +299,18 @@ export function handleDiscordMessageCreate(
     mentionsBot: botUserId !== undefined && message.mentions.users.has(botUserId),
   }
 
-  // Araya 自身の echo は会話でも取りこぼしでもないので log を汚さない
-  if (botUserId !== undefined && message.author.id === botUserId) {
-    return
-  }
-
   // Message Content intent は有効だが、本文を取り出す前に guild/channel/user を絞る。
   // 破棄は handlers.onIgnored に IDs + 理由だけ残す（本文は渡さない）
   const failures = discordChatAdmissionFailures(metadata, config)
+
+  // Araya 自身の echo は会話入力にしない。ただし取りこぼし追跡のため
+  // messageId と破棄理由（is_bot / self_message）だけは必ず記録する。
+  if (botUserId !== undefined && message.author.id === botUserId) {
+    const selfFailures: DiscordChatAdmissionFailure[] = failures.includes('is_bot') ? ['is_bot'] : ['self_message']
+    handlers.onIgnored?.({ ...metadata, messageId: message.id }, selfFailures)
+
+    return
+  }
 
   if (failures.length > 0) {
     handlers.onIgnored?.({ ...metadata, messageId: message.id }, failures)
