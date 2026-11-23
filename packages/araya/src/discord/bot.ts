@@ -62,8 +62,21 @@ const DISCORD_PROCESS_LOCK_UPDATE_MS = 10_000
 // その半分より若い lock を削るのは「 refresh が止まっている」証拠が揃うまで待つ
 const DISCORD_PROCESS_LOCK_MIN_RECLAIM_AGE_MS = DISCORD_PROCESS_LOCK_UPDATE_MS / 2
 const DEFAULT_POLL_MS = 5_000
-// 終了時に HOOT 判断 run の完了を待つ上限。越えたら close を進め、durable state 側で resume する
-const HOOT_STOP_WAIT_MS = 20_000
+// #36: shutdown は budget 付きで進める。unit の TimeoutStopSec=30 に収まる合計にする（越えた分は SIGKILL になり、
+// 残留 lock（#37）と無受信窓を増やす）。drain を無制限に待つことが 67 s 窓の一方の要因だった
+export const SHUTDOWN_WAIT_MS = {
+  // HOOT 判断 run。判断 state は durable なので、待てなくても次の tick で resume する
+  hootMs: 5_000,
+  // 受理済みの conversation turn と reply 送信
+  drainMs: 10_000,
+  // gateway close
+  gatewayMs: 5_000,
+  // agent session close
+  sessionMs: 5_000,
+} as const
+export const SHUTDOWN_BUDGET_TOTAL_MS =
+  SHUTDOWN_WAIT_MS.hootMs + SHUTDOWN_WAIT_MS.drainMs + SHUTDOWN_WAIT_MS.gatewayMs + SHUTDOWN_WAIT_MS.sessionMs
+export type DiscordShutdownWaits = { [key in keyof typeof SHUTDOWN_WAIT_MS]: number }
 // CLI の control request を bot 内部で処理するときの user 識別子（Discord の user ではない。log と session に残す name）
 const CLI_CONTROL_USER = 'cli'
 
@@ -85,6 +98,8 @@ export type DiscordBotDependencies = {
   ) => Promise<DiscordGateway>
   createChatSession?: typeof createDefaultArayaAgentSession
   log?: (entry: Record<string, unknown>) => void
+  // test で shutdown budget を短くする。既定は SHUTDOWN_WAIT_MS（production 値）
+  shutdownWaits?: Partial<DiscordShutdownWaits>
   // HOOT loop の poll 間隔（test で短くする）。既定 60000
   hootPollMs?: number
   // CLI の control request を拾う poll 間隔（test で短くする）。既定 1000
@@ -133,6 +148,53 @@ function fileLogger(filePath: string) {
 }
 
 // systemd unit process であることを INVOCATION_ID と cgroup で確かめる
+type WaitOutcome = { outcome: 'done' } | { outcome: 'failed'; error: unknown } | { outcome: 'timeout' }
+
+// budget 内に task を収める。越えたら timeout を返して置きに行く（実行中の reply 送信を途中で潰すより、
+// 次の SIGKILL に任せる方が被害が小さい。task の throw は here で握らず failed として返す）
+async function waitWithBudget(task: Promise<unknown>, budgetMs: number): Promise<WaitOutcome> {
+  let timer: NodeJS.Timeout | undefined
+
+  const outcome = await new Promise<WaitOutcome>((resolve) => {
+    let settled = false
+
+    timer = setTimeout(() => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      resolve({ outcome: 'timeout' })
+    }, budgetMs)
+    timer.unref?.()
+
+    void task.then(
+      () => {
+        if (settled) {
+          return
+        }
+
+        settled = true
+        resolve({ outcome: 'done' })
+      },
+      (error: unknown) => {
+        if (settled) {
+          return
+        }
+
+        settled = true
+        resolve({ outcome: 'failed', error })
+      }
+    )
+  })
+
+  if (timer !== undefined) {
+    clearTimeout(timer)
+  }
+
+  return outcome
+}
+
 async function verifyDiscordUnit(
   expectedUnit: string,
   env: Readonly<Record<string, string | undefined>>,
@@ -699,35 +761,69 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     }
   } finally {
     // CLI の control を最初に止める（shutdown の途中で新しい stop / reset を受け取らない）
+    const shutdownStartedAtMs = nowMs()
+    const waits: DiscordShutdownWaits = { ...SHUTDOWN_WAIT_MS, ...deps.shutdownWaits }
+
     cliControl?.stop()
 
     // gateway を閉じる前に HOOT loop を止める（送信先の gateway が無くなった後の deliver を避ける）
     hoot?.stop()
 
     if (hootTask !== undefined) {
-      await Promise.race([
-        hootTask,
-        new Promise<void>((resolve) => {
-          const timer = setTimeout(() => {
-            clearTimeout(timer)
-            resolve()
-          }, HOOT_STOP_WAIT_MS)
-          timer.unref?.()
-        }),
-      ])
+      const waited = await waitWithBudget(hootTask, waits.hootMs)
+
+      if (waited.outcome === 'timeout') {
+        logSafe({ type: 'discord_shutdown_timeout', step: 'hoot_run', budgetMs: waits.hootMs })
+      }
     }
 
-    chatHandlerRef.current?.stopAccepting()
-    await chatHandlerRef.current?.drain()
+    const chatHandler = chatHandlerRef.current
+    chatHandler?.stopAccepting()
+    const pending = chatHandler?.pendingCount() ?? { queued: 0, processing: 0 }
+    // drain がどこまで進んだかの実測できる証跡（#36: graceful drain が動いているかを log で確かめる）
+    logSafe({
+      type: 'discord_stopping',
+      queued: pending.queued,
+      processing: pending.processing,
+      elapsedMs: Math.max(0, nowMs() - shutdownStartedAtMs),
+    })
 
-    try {
-      await gateway.close()
-    } catch {
-      // close の失敗は終了処理の邪魔をしない
+    if (chatHandler !== null && chatHandler !== undefined) {
+      const waited = await waitWithBudget(chatHandler.drain(), waits.drainMs)
+
+      if (waited.outcome === 'timeout') {
+        logSafe({
+          type: 'discord_shutdown_timeout',
+          step: 'chat_drain',
+          budgetMs: waits.drainMs,
+          queued: pending.queued,
+          processing: pending.processing,
+        })
+      } else if (waited.outcome === 'failed') {
+        logError('discord_drain_failed', waited.error)
+      }
     }
 
-    await closeChatSession()
-    logSafe({ type: 'discord_stopped' })
+    const gatewayWaited = await waitWithBudget(gateway.close(), waits.gatewayMs)
+
+    if (gatewayWaited.outcome === 'timeout') {
+      logSafe({ type: 'discord_shutdown_timeout', step: 'gateway_close', budgetMs: waits.gatewayMs })
+    } else if (gatewayWaited.outcome === 'failed') {
+      logError('discord_gateway_close_failed', gatewayWaited.error)
+    }
+
+    const sessionWaited = await waitWithBudget(closeChatSession(), waits.sessionMs)
+
+    if (sessionWaited.outcome === 'timeout') {
+      logSafe({ type: 'discord_shutdown_timeout', step: 'agent_session_close', budgetMs: waits.sessionMs })
+    } else if (sessionWaited.outcome === 'failed') {
+      logError('discord_session_close_failed', sessionWaited.error)
+    }
+
+    logSafe({
+      type: 'discord_stopped',
+      elapsedMs: Math.max(0, nowMs() - shutdownStartedAtMs),
+    })
   }
 
   return 0

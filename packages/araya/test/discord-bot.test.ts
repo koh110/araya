@@ -8,7 +8,9 @@ import test from 'node:test'
 import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
 
-import { runDiscordBot } from '../src/discord/bot.ts'
+import { runDiscordBot, SHUTDOWN_BUDGET_TOTAL_MS } from '../src/discord/bot.ts'
+import { discordUnitSections } from '../src/infrastructure/systemd.ts'
+import { CHAT_SHUTDOWN_UNPROCESSED_REPLY } from '../src/discord/chat.ts'
 import { OBSOLETE_COMMAND_REPLY, routeSlashCommandInteraction } from '../src/discord/gateway.ts'
 import { newState, writeDiscordBotState } from '../src/discord/state.ts'
 import { BOT_STARTED_TEXT, RESTART_STARTED_TEXT } from '../src/discord/restart-notice.ts'
@@ -641,6 +643,7 @@ test('discord bot: shutdown は進行中の chat reply を送ってから gatewa
   let gatewayClosed = false
   let replyAfterGatewayClose = false
   const replies: string[] = []
+  const drainLogs: Record<string, unknown>[] = []
 
   try {
     const exitCode = await runDiscordBot({
@@ -708,7 +711,9 @@ test('discord bot: shutdown は進行中の chat reply を送ってから gatewa
           },
         }
       },
-      log: () => {},
+      log: (entry: Record<string, unknown>) => {
+        drainLogs.push(entry)
+      },
     })
 
     await messageDone
@@ -716,11 +721,208 @@ test('discord bot: shutdown は進行中の chat reply を送ってから gatewa
     assert.deepEqual(replies, ['reply while connected'])
     assert.equal(replyAfterGatewayClose, false)
     assert.equal(gatewayClosed, true)
+    // #36: drain が動いたことを log で確かめる（discord_stopped は clean 完了の時にだけ出る）
+    const stopping = drainLogs.find((entry) => {
+      return entry.type === 'discord_stopping'
+    })
+    assert.ok(stopping !== undefined, 'discord_stopping が残らない')
+    // shutdown の瞬間に turn が完了した直後でもよいので、値の内訳より「記録されていること」を見る
+    assert.equal(typeof stopping?.processing, 'number')
+    assert.equal(typeof stopping?.queued, 'number')
+    assert.equal(
+      drainLogs.some((entry) => {
+        return entry.type === 'discord_shutdown_timeout'
+      }),
+      false,
+      'drain が budget 内に収まったのに timeout を出さない',
+    )
+    const stopped = drainLogs.find((entry) => {
+      return entry.type === 'discord_stopped'
+    })
+    assert.ok(stopped !== undefined, 'discord_stopped が残らない')
+    assert.equal(typeof stopped?.elapsedMs, 'number')
   } finally {
     releaseSubmit?.('cleanup')
     stopController.abort()
     await fs.rm(dataDir, { recursive: true, force: true })
   }
+})
+
+// #36: drain に上限が無いと unit の TimeoutStopSec（30 s）を越えて SIGKILL され、残留 lock（#37）と
+// 無受信窓を増やす。budget で打ち切って gateway / session を閉じ、取りこぼしを reply と log で示す
+// ことを実際の hang で確かめる
+test('discord bot: shutdown は drain budget で打ち切って gateway と session を閉じる', async () => {
+  const dataDir = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-drain-budget-test-')),
+  )
+  const stopController = new AbortController()
+  const drainMs = 300
+  const logs: Record<string, unknown>[] = []
+  const replies: { content: string; gatewayClosed: boolean }[] = []
+  let gatewayClosed = false
+  let sessionCloseCount = 0
+  let firstSubmitStarted: (() => void) | undefined
+  const submitStarted = new Promise<void>((resolve) => {
+    firstSubmitStarted = resolve
+  })
+
+  try {
+    const exitCode = await runDiscordBot({
+      fetch: noticeStubFetch,
+      dataDir,
+      env: {
+        ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
+        ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
+        ARAYA_DISCORD_GUILD_ID: GUILD_ID,
+        ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
+        ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
+      },
+      stopSignal: stopController.signal,
+      verifyUnit: false,
+      shutdownWaits: { hootMs: 50, drainMs, gatewayMs: 300, sessionMs: 300 },
+      createChatSession: async function createChatSession() {
+        return {
+          describe: () => {
+            return { conversationId: 3 }
+          },
+          // 永遠に終わらない turn（実測の「実行中の turn を置き去りにする」状況）
+          async submit() {
+            firstSubmitStarted?.()
+
+            return await new Promise<string>(() => {})
+          },
+          async reset() {},
+          async close() {
+            sessionCloseCount += 1
+          },
+        }
+      },
+      createGateway: async function createGateway(_config, handlers) {
+        return {
+          async connect() {
+            await handlers.onReady('998877665544332211')
+            void handlers.onMessage(
+              {
+                messageId: 'stuck-turn-message',
+                guildId: GUILD_ID,
+                channelId: CHANNEL_ID,
+                userId: USER_ID,
+                isBot: false,
+                isWebhook: false,
+                isSystem: false,
+                mentionsBot: false,
+                content: 'this turn never finishes',
+              },
+              async (content) => {
+                replies.push({ content, gatewayClosed })
+              },
+            )
+            await submitStarted
+            // 実行中の turn の後ろで待っている message（shutdown で打ち切る側）
+            void handlers.onMessage(
+              {
+                messageId: 'queued-message',
+                guildId: GUILD_ID,
+                channelId: CHANNEL_ID,
+                userId: USER_ID,
+                isBot: false,
+                isWebhook: false,
+                isSystem: false,
+                mentionsBot: false,
+                content: 'queued behind the stuck turn',
+              },
+              async (content) => {
+                replies.push({ content, gatewayClosed })
+              },
+            )
+            await new Promise<void>((resolve) => {
+              setTimeout(resolve, 40)
+            })
+            stopController.abort()
+          },
+          async sendText() {},
+          async registerCommands() {
+            return 2
+          },
+          async close() {
+            gatewayClosed = true
+          },
+        }
+      },
+      log: (entry: Record<string, unknown>) => {
+        logs.push(entry)
+      },
+    })
+
+    assert.equal(exitCode, 0, 'hang する turn を置き去りにしても shutdown は完了する')
+    const stopping = logs.find((entry) => {
+      return entry.type === 'discord_stopping'
+    })
+    assert.ok(stopping !== undefined)
+    assert.equal(stopping?.processing, 1, '実行中の turn 数')
+    assert.equal(stopping?.queued, 1, '実行待ちの message 数')
+
+    const timeouts = logs.filter((entry) => {
+      return entry.type === 'discord_shutdown_timeout'
+    })
+    assert.deepEqual(
+      timeouts.map((entry) => {
+        return entry.step
+      }),
+      ['chat_drain'],
+      'drain だけを budget で打ち切る',
+    )
+    assert.equal(timeouts[0]?.budgetMs, drainMs)
+    assert.equal(timeouts[0]?.queued, 1)
+
+    const stopped = logs.find((entry) => {
+      return entry.type === 'discord_stopped'
+    })
+    assert.ok(stopped !== undefined, 'budget 内なので discord_stopped は残る')
+    assert.ok(Number(stopped?.elapsedMs) >= drainMs, 'drain budget だけは実際に待った')
+    // 打ち切った message には gateway を閉じる前に「未処理」を返す（黙って捨てない）
+    assert.deepEqual(
+      replies.map((entry) => {
+        return entry.content
+      }),
+      [CHAT_SHUTDOWN_UNPROCESSED_REPLY],
+    )
+    assert.deepEqual(
+      replies.map((entry) => {
+        return entry.gatewayClosed
+      }),
+      [false],
+      'reply は gateway が生きている間に送った',
+    )
+    assert.equal(gatewayClosed, true)
+    assert.equal(sessionCloseCount, 1)
+  } finally {
+    stopController.abort()
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+// shutdown budget は unit の TimeoutStopSec に収まっていなければならない（#36 と #37 の跨 file 不変条件）
+test('discord bot: shutdown budget は unit の TimeoutStopSec 以内に収まる', () => {
+  const sections = discordUnitSections({
+    authMode: 'env-file',
+    dataDir: '/tmp/araya-shutdown-budget-invariant',
+    nodePath: '/usr/bin/node',
+    botEntrypoint: '/usr/bin/node',
+    envFilePath: '/tmp/araya-shutdown-budget-invariant/.env',
+    environment: [],
+  })
+  const timeoutStopSec = Number(
+    sections.service.find(([name]) => {
+      return name === 'TimeoutStopSec'
+    })?.[1] ?? '0',
+  )
+
+  assert.ok(timeoutStopSec > 0, 'unit に TimeoutStopSec がない')
+  assert.ok(
+    SHUTDOWN_BUDGET_TOTAL_MS < timeoutStopSec * 1_000,
+    `shutdown budget ${SHUTDOWN_BUDGET_TOTAL_MS} ms が TimeoutStopSec ${timeoutStopSec} s を越えている`,
+  )
 })
 
 test('discord bot: HOOT state が有効なら wakeup loop を走らせて判断を 1 件送り、会話 session は汚さない', async () => {
@@ -757,6 +959,7 @@ test('discord bot: HOOT state が有効なら wakeup loop を走らせて判断�
       },
       stopSignal: stopController.signal,
       verifyUnit: false,
+      cliControlPollMs: 40,
       hootPollMs: 100,
       hootRunCommand: async (_command, args) => {
         observationArgs.push([...args])
@@ -817,7 +1020,8 @@ test('discord bot: HOOT state が有効なら wakeup loop を走らせて判断�
             )
 
             // HOOT loop は gateway ready 後に 1 件送る。それを待ってから stop する
-            const deadline = Date.now() + 8_000
+            // poll が state を拾うのを待つの実測待ち。8 s は CI load で届いたことがあり、余裕を持たせる
+            const deadline = Date.now() + 20_000
 
             while (notices.length === 0 && Date.now() < deadline) {
               await new Promise((resolve) => {
@@ -923,6 +1127,7 @@ test('discord bot: CLI で承認した HOOT dispatch を main 会話 session に
       },
       stopSignal: stopController.signal,
       verifyUnit: false,
+      cliControlPollMs: 40,
       hootPollMs: 100,
       hootRunCommand: async () => ({
         exitCode: 0,
@@ -976,7 +1181,8 @@ test('discord bot: CLI で承認した HOOT dispatch を main 会話 session に
               async () => {}
             )
 
-            const deadline = Date.now() + 8_000
+            // poll が state を拾うのを待つの実測待ち。8 s は CI load で届いたことがあり、余裕を持たせる
+            const deadline = Date.now() + 20_000
 
             while (
               !submissions.some((entry) => {
@@ -1083,6 +1289,7 @@ test('discord bot: Discord の /hoot dispatch 承認を同じ process の poll �
       },
       stopSignal: stopController.signal,
       verifyUnit: false,
+      cliControlPollMs: 40,
       hootPollMs: 100,
       hootRunCommand: async () => ({
         exitCode: 0,
@@ -1136,7 +1343,8 @@ test('discord bot: Discord の /hoot dispatch 承認を同じ process の poll �
               handlers,
             )
 
-            const deadline = Date.now() + 8_000
+            // poll が state を拾うのを待つの実測待ち。8 s は CI load で届いたことがあり、余裕を持たせる
+            const deadline = Date.now() + 20_000
 
             while (
               !notices.some((entry) => {
