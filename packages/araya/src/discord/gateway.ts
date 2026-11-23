@@ -8,7 +8,7 @@ import type {
   Interaction,
 } from 'discord.js'
 import { type DiscordConfig } from './config.ts'
-import { isDiscordChatMessageAllowed, type DiscordChatMessage } from './chat.ts'
+import { discordChatAdmissionFailures, type DiscordChatAdmissionFailure, type DiscordChatMessage, type DiscordChatMessageMetadata } from './chat.ts'
 import { isArayaCommandName, REMOVED_COMMAND_REPLY, type SlashCommand } from './slash.ts'
 
 // slash command の interaction を handler に渡すための形（command 名は slash.ts の ARAYA_COMMAND_NAMES）
@@ -26,12 +26,17 @@ export type DiscordCommandRequest = {
 export type DiscordCommandReplyFn = (content: string) => Promise<void>
 export type DiscordMessageReplyFn = (content: string, nonce: string) => Promise<void>
 
+// 許可条件に落ちて session に渡らなかった message の証跡（IDs のみ・本文を含めない）
+export type DiscordIgnoredMessage = DiscordChatMessageMetadata & { messageId: string }
+
 export type DiscordGatewayHandlers = {
   onReady(botUserId?: string): Promise<void> | void
   // slash command を扱う handler。省略されたら interaction は「撤去済み」の ephemeral reply で返す
   onInteraction?(request: DiscordCommandRequest, reply: DiscordCommandReplyFn): Promise<void> | void
   onMessage(message: DiscordChatMessage, reply: DiscordMessageReplyFn): Promise<void> | void
   onError(message: string): void
+  // 取りこぼし診断。許可条件の失敗理由を IDs 付きで受け取る（本文は渡さない）
+  onIgnored?(metadata: DiscordIgnoredMessage, failures: DiscordChatAdmissionFailure[]): void
 }
 
 export type DiscordGateway = {
@@ -49,7 +54,7 @@ function errorMessage(error: unknown) {
 // Discord typing event は10秒で失効するため、少し余裕を持って更新する。
 const DISCORD_TYPING_REFRESH_INTERVAL_MS = 8_000
 
-type DiscordTypingChannel = Pick<GuildTextBasedChannel, 'sendTyping'>
+export type DiscordTypingChannel = Pick<GuildTextBasedChannel, 'sendTyping'>
 
 export function createDiscordTypingIndicator(onError: (message: string) => void) {
   const activeRequests = new Set<symbol>()
@@ -257,6 +262,90 @@ export function wireSlashCommandInteractions(
   })
 }
 
+// messageCreate の event から handler が使う最小の形。discord.js の Message 全体を test に渡さない
+export type DiscordMessageCreateEvent = {
+  id: string
+  guildId: string | null
+  channelId: string
+  author: { id: string; bot: boolean }
+  webhookId: string | null
+  system: boolean
+  mentions: { users: { has(id: string): boolean } }
+  content: string
+  inGuild(): boolean
+  // typing 表示と返信に使う channel 能力（discord.js の TextBasedChannel と同じ形）
+  channel: {
+    isTextBased(): boolean
+    sendTyping(): Promise<void>
+  }
+  reply(payload: ReturnType<typeof discordNotificationPayload>): Promise<unknown>
+}
+
+// 受信 message を session に渡すか破棄するか決める。本文を取り出す前に guild/channel/user を絞る
+export function handleDiscordMessageCreate(
+  message: DiscordMessageCreateEvent,
+  config: DiscordConfig,
+  handlers: DiscordGatewayHandlers,
+  typingIndicator: ReturnType<typeof createDiscordTypingIndicator>,
+  botUserId: string | undefined,
+) {
+  const metadata = {
+    guildId: message.guildId,
+    channelId: message.channelId,
+    userId: message.author.id,
+    isBot: message.author.bot,
+    isWebhook: message.webhookId !== null,
+    isSystem: message.system,
+    mentionsBot: botUserId !== undefined && message.mentions.users.has(botUserId),
+  }
+
+  // Message Content intent は有効だが、本文を取り出す前に guild/channel/user を絞る。
+  // 破棄は handlers.onIgnored に IDs + 理由だけ残す（本文は渡さない）
+  const failures = discordChatAdmissionFailures(metadata, config)
+
+  // Araya 自身の echo は会話入力にしない。ただし取りこぼし追跡のため
+  // messageId と破棄理由（is_bot / self_message）だけは必ず記録する。
+  if (botUserId !== undefined && message.author.id === botUserId) {
+    const selfFailures: DiscordChatAdmissionFailure[] = failures.includes('is_bot') ? ['is_bot'] : ['self_message']
+    handlers.onIgnored?.({ ...metadata, messageId: message.id }, selfFailures)
+
+    return
+  }
+
+  if (failures.length > 0) {
+    handlers.onIgnored?.({ ...metadata, messageId: message.id }, failures)
+
+    return
+  }
+
+  async function reply(content: string, nonce: string) {
+    if (!message.channel.isTextBased()) {
+      throw new Error('Discord message の返信先が text channel ではありません')
+    }
+
+    await message.reply(discordNotificationPayload(content, nonce))
+  }
+
+  function onMessage() {
+    return handlers.onMessage(
+      {
+        ...metadata,
+        messageId: message.id,
+        content: message.content,
+      },
+      reply,
+    )
+  }
+
+  void (
+    message.inGuild() && message.channel.isTextBased()
+      ? typingIndicator.run(message.channel, onMessage)
+      : Promise.resolve().then(onMessage)
+  ).catch((error: unknown) => {
+    handlers.onError(errorMessage(error))
+  })
+}
+
 export async function createDiscordGateway(
   config: DiscordConfig,
   handlers: DiscordGatewayHandlers,
@@ -298,48 +387,7 @@ export async function createDiscordGateway(
   wireSlashCommandInteractions(client, handlers)
 
   client.on('messageCreate', (message) => {
-    const botUserId = client.user?.id
-    const metadata = {
-      guildId: message.guildId,
-      channelId: message.channelId,
-      userId: message.author.id,
-      isBot: message.author.bot,
-      isWebhook: message.webhookId !== null,
-      isSystem: message.system,
-      mentionsBot: botUserId !== undefined && message.mentions.users.has(botUserId),
-    }
-
-    // Message Content intent は有効だが、本文を取り出す前に guild/channel/user を絞る。
-    if (!isDiscordChatMessageAllowed(metadata, config)) {
-      return
-    }
-
-    async function reply(content: string, nonce: string) {
-      if (!message.channel.isTextBased()) {
-        throw new Error('Discord message の返信先が text channel ではありません')
-      }
-
-      await message.reply(discordNotificationPayload(content, nonce))
-    }
-
-    function onMessage() {
-      return handlers.onMessage(
-        {
-          ...metadata,
-          messageId: message.id,
-          content: message.content,
-        },
-        reply,
-      )
-    }
-
-    void (
-      message.inGuild() && message.channel.isTextBased()
-        ? typingIndicator.run(message.channel, onMessage)
-        : Promise.resolve().then(onMessage)
-    ).catch((error: unknown) => {
-      handlers.onError(errorMessage(error))
-    })
+    handleDiscordMessageCreate(message, config, handlers, typingIndicator, client.user?.id)
   })
 
   return {

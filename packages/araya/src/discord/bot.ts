@@ -95,7 +95,8 @@ function defaultSleep(ms: number, signal: AbortSignal) {
 function fileLogger(filePath: string) {
   return (entry: Record<string, unknown>) => {
     try {
-      fs.appendFileSync(filePath, `${JSON.stringify(entry)}\n`, 'utf8')
+      // ts を先頭に: 「いつ」起きたかを log から直接追えるようにする
+      fs.appendFileSync(filePath, `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`, 'utf8')
     } catch {
       // log が書けないことは診断の失敗で、処理は続けないよりマシに扱う（次 tick でまた試みる）
     }
@@ -351,6 +352,17 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     },
     onError: (message) => {
       logSafe({ type: 'discord_error', message: redactor.redact(message).slice(0, 500) })
+    },
+    // 取りこぼし診断: messageId・IDs・拒否理由だけを discord.log に残す（本文は渡さない）
+    onIgnored: (metadata, failures) => {
+      logSafe({
+        type: 'discord_message_ignored',
+        messageId: metadata.messageId,
+        guildId: metadata.guildId,
+        channelId: metadata.channelId,
+        userId: metadata.userId,
+        failures,
+      })
     },
   }
 

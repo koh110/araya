@@ -91,18 +91,55 @@ export function discordChatReplyNonce(messageId: string, chunkIndex: number) {
   return `araya-${createHash('sha256').update(`${messageId}:${chunkIndex}`).digest('hex').slice(0, 18)}`
 }
 
+// 取りこぼし診断用の拒否理由。message 1 件ごとに、どの許可条件を落としたか列挙する
+export type DiscordChatAdmissionFailure =
+  | 'guild_mismatch'
+  | 'channel_mismatch'
+  | 'user_not_allowed'
+  | 'is_bot'
+  | 'is_webhook'
+  | 'is_system'
+  // gateway 層のみ: Araya 自身の messageCreate echo を会話入力から除外した理由
+  | 'self_message'
+
+export function discordChatAdmissionFailures(
+  message: DiscordChatMessageMetadata,
+  config: DiscordConfig,
+): DiscordChatAdmissionFailure[] {
+  const failures: DiscordChatAdmissionFailure[] = []
+
+  if (message.guildId !== config.guildId) {
+    failures.push('guild_mismatch')
+  }
+
+  if (message.channelId !== config.channelId) {
+    failures.push('channel_mismatch')
+  }
+
+  if (!config.allowedUserIds.includes(message.userId)) {
+    failures.push('user_not_allowed')
+  }
+
+  if (message.isBot) {
+    failures.push('is_bot')
+  }
+
+  if (message.isWebhook) {
+    failures.push('is_webhook')
+  }
+
+  if (message.isSystem) {
+    failures.push('is_system')
+  }
+
+  return failures
+}
+
 export function isDiscordChatMessageAllowed(
   message: DiscordChatMessageMetadata,
   config: DiscordConfig,
 ) {
-  return (
-    message.guildId === config.guildId &&
-    message.channelId === config.channelId &&
-    config.allowedUserIds.includes(message.userId) &&
-    !message.isBot &&
-    !message.isWebhook &&
-    !message.isSystem
-  )
+  return discordChatAdmissionFailures(message, config).length === 0
 }
 
 export type DiscordChatSession = {
@@ -189,7 +226,7 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
       try {
         await reply(chunks[index] ?? '', discordChatReplyNonce(messageId, index))
       } catch (error) {
-        deps.log({ type: 'discord_chat_reply_failed', errorName: errorName(error) })
+        deps.log({ type: 'discord_chat_reply_failed', messageId, errorName: errorName(error) })
 
         return
       }
@@ -206,6 +243,9 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
     if (content === '') {
       if (message.mentionsBot) {
         await send(message, reply, 'メッセージを入力してください。')
+      } else {
+        // mention なし空本文は会話にしない。取りこぼしと区別できるよう理由を残す
+        deps.log({ type: 'discord_chat_ignored', messageId: message.messageId, reason: 'empty_content' })
       }
 
       return
@@ -226,7 +266,7 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
       )
       await send(message, reply, answer === '' ? '応答を生成できませんでした。' : answer)
     } catch (error) {
-      deps.log({ type: 'discord_chat_turn_failed', errorName: errorName(error) })
+      deps.log({ type: 'discord_chat_turn_failed', messageId: message.messageId, errorName: errorName(error) })
       await send(message, reply, CHAT_ERROR_REPLY)
     } finally {
       processing -= 1
@@ -331,9 +371,23 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
       await operation
     },
     handle: (message: DiscordChatMessage, reply: DiscordChatReply) => {
-      if (!accepting || !isDiscordChatMessageAllowed(message, deps.config)) {
+      if (!accepting) {
+        // 停止中に到着した message。IDs だけ記録して本文は残さない
+        deps.log({ type: 'discord_chat_ignored', messageId: message.messageId, reason: 'not_accepting' })
+
         return Promise.resolve()
       }
+
+      const failures = discordChatAdmissionFailures(message, deps.config)
+
+      if (failures.length > 0) {
+        deps.log({ type: 'discord_chat_ignored', messageId: message.messageId, failures })
+
+        return Promise.resolve()
+      }
+
+      // handler に到達した証跡。Discord 側の受信欠落と handler 後の破棄を切り分ける
+      deps.log({ type: 'discord_chat_received', messageId: message.messageId, mentionsBot: message.mentionsBot })
 
       const content = stripDiscordBotMention(message.content, deps.botUserId)
 

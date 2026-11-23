@@ -859,3 +859,210 @@ test('discord chat: /hoot dispatch は inject request を pending にし、sessi
 
   await fs.rm(dataDir, { recursive: true, force: true })
 })
+
+test('discord chat: 受理した message は messageId 付きの received log を残し本文を書かない', async () => {
+  const logs: Record<string, unknown>[] = []
+  const handler = createDiscordChatHandler({
+    config,
+    botUserId: '12345678901234567',
+    dataDir: chatDataDir,
+    redactor: createRedactor([]),
+    session: {
+      submit: async () => 'ok',
+      reset: async () => {},
+    },
+    log: (entry) => {
+      logs.push(entry)
+    },
+  })
+
+  await handler.handle(
+    { ...message, mentionsBot: false, messageId: '92345678901234601', content: '受信証跡の本文' },
+    async () => {},
+  )
+
+  const received = logs.find((entry) => {
+    return entry.type === 'discord_chat_received'
+  })
+  assert.ok(received, '受理した message の received log がある')
+  assert.equal(received?.messageId, '92345678901234601')
+  assert.equal(received?.mentionsBot, false)
+  assert.ok(
+    !logs.some((entry) => {
+      return JSON.stringify(entry).includes('受信証跡の本文')
+    }),
+    'log に本文を残さない',
+  )
+})
+
+test('discord chat: mention なし空本文の message は ignored log に messageId と理由を残す', async () => {
+  const logs: Record<string, unknown>[] = []
+  const submitted: string[] = []
+  const handler = createDiscordChatHandler({
+    config,
+    botUserId: '12345678901234567',
+    dataDir: chatDataDir,
+    redactor: createRedactor([]),
+    session: {
+      submit: async (content) => {
+        submitted.push(content)
+
+        return 'unexpected'
+      },
+      reset: async () => {},
+    },
+    log: (entry) => {
+      logs.push(entry)
+    },
+  })
+
+  await handler.handle(
+    { ...message, mentionsBot: false, messageId: '92345678901234602', content: '   ' },
+    async () => {},
+  )
+
+  const ignored = logs.find((entry) => {
+    return entry.type === 'discord_chat_ignored'
+  })
+  assert.ok(ignored, '空本文 message の ignored log がある')
+  assert.equal(ignored?.messageId, '92345678901234602')
+  assert.equal(ignored?.reason, 'empty_content')
+  assert.deepEqual(submitted, [])
+})
+
+test('discord chat: stopAccepting 後の message は ignored log に not_accepting を残す', async () => {
+  const logs: Record<string, unknown>[] = []
+  let submitCount = 0
+  const handler = createDiscordChatHandler({
+    config,
+    botUserId: '12345678901234567',
+    dataDir: chatDataDir,
+    redactor: createRedactor([]),
+    session: {
+      submit: async () => {
+        submitCount += 1
+
+        return 'unexpected'
+      },
+      reset: async () => {},
+    },
+    log: (entry) => {
+      logs.push(entry)
+    },
+  })
+  handler.stopAccepting()
+
+  await handler.handle(
+    { ...message, messageId: '92345678901234603', content: '停止後に到着' },
+    async () => {},
+  )
+
+  const ignored = logs.find((entry) => {
+    return entry.type === 'discord_chat_ignored'
+  })
+  assert.ok(ignored, '停止後 message の ignored log がある')
+  assert.equal(ignored?.messageId, '92345678901234603')
+  assert.equal(ignored?.reason, 'not_accepting')
+  assert.equal(submitCount, 0)
+})
+
+test('discord chat: 許可外 message は handle でも ignored log に failures を残す', async () => {
+  const logs: Record<string, unknown>[] = []
+  let submitCount = 0
+  const handler = createDiscordChatHandler({
+    config,
+    botUserId: '12345678901234567',
+    dataDir: chatDataDir,
+    redactor: createRedactor([]),
+    session: {
+      submit: async () => {
+        submitCount += 1
+
+        return 'unexpected'
+      },
+      reset: async () => {},
+    },
+    log: (entry) => {
+      logs.push(entry)
+    },
+  })
+
+  await handler.handle(
+    { ...message, messageId: '92345678901234604', userId: '72345678901234567', content: '許可外 user' },
+    async () => {},
+  )
+
+  const ignored = logs.find((entry) => {
+    return entry.type === 'discord_chat_ignored'
+  })
+  assert.ok(ignored, '許可外 message の ignored log がある')
+  assert.equal(ignored?.messageId, '92345678901234604')
+  const failures = ignored?.failures
+  assert.ok(Array.isArray(failures), 'failures が配列')
+  assert.ok((failures as string[]).includes('user_not_allowed'))
+  assert.equal(submitCount, 0)
+})
+
+test('discord chat: 会話 turn 失敗の log に messageId を残す', async () => {
+  const logs: Record<string, unknown>[] = []
+  const replies: string[] = []
+  const handler = createDiscordChatHandler({
+    config,
+    botUserId: '12345678901234567',
+    dataDir: chatDataDir,
+    redactor: createRedactor([]),
+    session: {
+      submit: async () => {
+        throw new Error('model submit failed')
+      },
+      reset: async () => {},
+    },
+    log: (entry) => {
+      logs.push(entry)
+    },
+  })
+
+  await handler.handle(
+    { ...message, messageId: '92345678901234605', content: '失敗する会話' },
+    async (content) => {
+      replies.push(content)
+    },
+  )
+
+  const failed = logs.find((entry) => {
+    return entry.type === 'discord_chat_turn_failed'
+  })
+  assert.ok(failed, 'turn 失敗の log がある')
+  assert.equal(failed?.messageId, '92345678901234605')
+  assert.match(replies.join('\n'), /会話の処理に失敗しました/u)
+})
+
+test('discord chat: 返信失敗の log に messageId を残す', async () => {
+  const logs: Record<string, unknown>[] = []
+  const handler = createDiscordChatHandler({
+    config,
+    botUserId: '12345678901234567',
+    dataDir: chatDataDir,
+    redactor: createRedactor([]),
+    session: {
+      submit: async () => '回答本文',
+      reset: async () => {},
+    },
+    log: (entry) => {
+      logs.push(entry)
+    },
+  })
+
+  await handler.handle(
+    { ...message, messageId: '92345678901234606', content: '返信が失敗する' },
+    async () => {
+      throw new Error('discord send failed')
+    },
+  )
+
+  const failed = logs.find((entry) => {
+    return entry.type === 'discord_chat_reply_failed'
+  })
+  assert.ok(failed, 'reply 失敗の log がある')
+  assert.equal(failed?.messageId, '92345678901234606')
+})
