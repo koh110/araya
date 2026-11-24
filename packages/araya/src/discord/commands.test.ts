@@ -311,6 +311,140 @@ test('Discord control command: /araya の help・status・stop・reset', async (
   }
 })
 
+test('Discord control command: /araya status は実行中詳細が未取得なら idle と誤表示しない', async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-progress-unknown-'))
+
+  try {
+    const context = {
+      ...fakeContext({ dataDir }),
+      progress: null,
+    }
+
+    await createDiscordControlCommands({
+      dataDir,
+      nowMs: () => {
+        return Date.parse('2026-06-30T09:00:00.000Z')
+      },
+      log: () => {},
+    }).handle(
+      {
+        interactionId: 'progress-unknown',
+        commandName: 'araya',
+        userId: 'u',
+        guildId: 'g',
+        channelId: 'c',
+        subcommandGroup: null,
+        subcommand: 'status',
+        options: {},
+      },
+      context,
+    )
+
+    assert.match(context.sends[0] ?? '', /進捗: 実行中の作業詳細を取得できません/u)
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('Discord control command: /araya status は現在の処理と background task の経過を表示する', async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-progress-control-'))
+
+  try {
+    const nowMs = Date.parse('2026-06-30T09:00:00.000Z')
+    const context = {
+      ...fakeContext({ dataDir }),
+      progress: {
+        main: {
+          operation: 'bash' as const,
+          phaseStartedAtMs: nowMs - 12_000,
+          phaseStartedAtIsEstimated: true,
+        },
+        children: [
+          {
+            name: 'worker-1',
+            operation: 'edit' as const,
+            phaseStartedAtMs: nowMs - 7_000,
+            phaseStartedAtIsEstimated: true,
+            requestStartedAtMs: nowMs - 45_000,
+          },
+        ],
+      },
+    }
+
+    await createDiscordControlCommands({
+      dataDir,
+      nowMs: () => {
+        return nowMs
+      },
+      log: () => {},
+    }).handle(
+      {
+        interactionId: 'progress-status',
+        commandName: 'araya',
+        userId: 'u',
+        guildId: 'g',
+        channelId: 'c',
+        subcommandGroup: null,
+        subcommand: 'status',
+        options: {},
+      },
+      context,
+    )
+
+    assert.match(context.sends[0] ?? '', /現在の処理: コマンドを実行中/u)
+    assert.match(context.sends[0] ?? '', /この工程 少なくとも12秒（観測時点から）/u)
+    assert.match(context.sends[0] ?? '', /task\[worker-1\].*ファイルを編集中/u)
+    assert.match(context.sends[0] ?? '', /この工程 少なくとも7秒（観測時点から）/u)
+    assert.match(context.sends[0] ?? '', /依頼から 45秒/u)
+    assert.doesNotMatch(context.sends[0] ?? '', /private-command|secret-output/u)
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('Discord control command: /araya status は汎用準備待ちを background task 待ちと誤表示しない', async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-progress-preparing-'))
+  const nowMs = Date.parse('2026-06-30T09:00:00.000Z')
+  const context = {
+    ...fakeContext({ dataDir }),
+    progress: {
+      main: {
+        operation: 'preparing' as const,
+        phaseStartedAtMs: nowMs - 2_000,
+        phaseStartedAtIsEstimated: true,
+      },
+      children: [],
+    },
+  }
+
+  try {
+    await createDiscordControlCommands({
+      dataDir,
+      nowMs: () => {
+        return nowMs
+      },
+      log: () => {},
+    }).handle(
+      {
+        interactionId: 'progress-preparing',
+        commandName: 'araya',
+        userId: 'u',
+        guildId: 'g',
+        channelId: 'c',
+        subcommandGroup: null,
+        subcommand: 'status',
+        options: {},
+      },
+      context,
+    )
+
+    assert.match(context.sends[0] ?? '', /現在の処理: 次の処理を準備中/u)
+    assert.doesNotMatch(context.sends[0] ?? '', /background task の完了待ち/u)
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
 test('Discord control command: 知らない subcommand はエラー応答と discord_control_failed', async () => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-control-'))
 

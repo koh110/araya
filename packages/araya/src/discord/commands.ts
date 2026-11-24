@@ -3,7 +3,13 @@
 // interaction は queue の外で処理するので、会話の実行中・待ち状態でも常に効く。
 // 人間の interaction だけがこの function 群に到達するので、HOOT の承認は agent 経由ではない
 import { runHootCommand } from '../cli/hoot-commands.ts'
-import { HOOT_COMMAND_NAME, REMOVED_COMMAND_REPLY, REMOVED_TASK_SUBCOMMANDS, SESSION_COMMAND_NAME } from './slash.ts'
+import { PROGRESS_OPERATION_LABELS, type ProgressSnapshot } from '../agent/progress.ts'
+import {
+  HOOT_COMMAND_NAME,
+  REMOVED_COMMAND_REPLY,
+  REMOVED_TASK_SUBCOMMANDS,
+  SESSION_COMMAND_NAME,
+} from './slash.ts'
 import type { DiscordCommandRequest } from './gateway.ts'
 
 export type DiscordControlSend = (content: string) => Promise<void>
@@ -14,6 +20,7 @@ export type DiscordControlContext = {
   runningCount: number
   queuedCount: number
   sessionAvailable: boolean
+  progress?: ProgressSnapshot | null
   // 応答は chat handler 側で redaction・分割して ephemeral に送る
   send: DiscordControlSend
   // 受付済みで未開始の message を無効化し、件数を返す
@@ -82,6 +89,69 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
 
+function elapsedLabel(nowMs: number, startedAtMs: number | null, isEstimated: boolean) {
+  if (startedAtMs === null || !Number.isFinite(startedAtMs)) {
+    return '開始時刻不明'
+  }
+
+  const totalSeconds = Math.max(0, Math.floor((nowMs - startedAtMs) / 1_000))
+  let label: string
+
+  if (totalSeconds < 60) {
+    label = `${totalSeconds.toString()}秒`
+  } else {
+    const minutes = Math.floor(totalSeconds / 60)
+    const seconds = totalSeconds % 60
+
+    if (minutes < 60) {
+      label =
+        seconds === 0 ? `${minutes.toString()}分` : `${minutes.toString()}分${seconds.toString()}秒`
+    } else {
+      const hours = Math.floor(minutes / 60)
+      const remainingMinutes = minutes % 60
+
+      label =
+        remainingMinutes === 0
+          ? `${hours.toString()}時間`
+          : `${hours.toString()}時間${remainingMinutes.toString()}分`
+    }
+  }
+
+  return isEstimated ? `少なくとも${label}（観測時点から）` : label
+}
+
+function progressLines(progress: ProgressSnapshot, nowMs: number, runningCount: number) {
+  const lines: string[] = []
+
+  if (progress.main !== null) {
+    lines.push(
+      `現在の処理: ${PROGRESS_OPERATION_LABELS[progress.main.operation]}（この工程 ${elapsedLabel(nowMs, progress.main.phaseStartedAtMs, progress.main.phaseStartedAtIsEstimated)}）`,
+    )
+  }
+
+  for (const child of progress.children) {
+    const elapsed = [
+      `この工程 ${elapsedLabel(nowMs, child.phaseStartedAtMs, child.phaseStartedAtIsEstimated)}`,
+    ]
+
+    if (child.requestStartedAtMs !== undefined) {
+      elapsed.push(`依頼から ${elapsedLabel(nowMs, child.requestStartedAtMs, false)}`)
+    }
+
+    lines.push(
+      `task[${child.name.replace(/[^A-Za-z0-9-]/gu, '?').slice(0, 64) || 'child'}]: ${PROGRESS_OPERATION_LABELS[child.operation]}（${elapsed.join(' / ')}）`,
+    )
+  }
+
+  return lines.length === 0
+    ? [
+        runningCount > 0
+          ? '進捗: 実行中の作業詳細を取得できません'
+          : '進捗: 実行中の作業はありません',
+      ]
+    : lines
+}
+
 function invalid(message: string) {
   return new Error(`hoot_invalid_argument: ${message}`)
 }
@@ -100,7 +170,11 @@ function optionValue(options: DiscordCommandRequest['options'], name: string) {
   return String(value)
 }
 
-function requiredOptionValue(options: DiscordCommandRequest['options'], name: string, where: string) {
+function requiredOptionValue(
+  options: DiscordCommandRequest['options'],
+  name: string,
+  where: string,
+) {
   const value = optionValue(options, name)
 
   if (value === undefined || value.trim() === '') {
@@ -146,7 +220,9 @@ export function hootArgumentsOf(request: DiscordCommandRequest): string[] {
 
   if (group === 'goal') {
     if (!HOOT_GOAL_SUBCOMMANDS.has(subcommand)) {
-      throw invalid(`/hoot goal ${subcommand} は知りません（list / add / update / pause / resume / retire）`)
+      throw invalid(
+        `/hoot goal ${subcommand} は知りません（list / add / update / pause / resume / retire）`,
+      )
     }
 
     const args = ['goal', subcommand]
@@ -219,7 +295,9 @@ export function hootArgumentsOf(request: DiscordCommandRequest): string[] {
   throw invalid(`/hoot ${group} は知りません（/araya help で一覧）`)
 }
 
-export function createDiscordControlCommands(deps: DiscordControlDependencies): DiscordControlCommands {
+export function createDiscordControlCommands(
+  deps: DiscordControlDependencies,
+): DiscordControlCommands {
   async function runHoot(args: readonly string[]) {
     const lines: string[] = []
 
@@ -272,11 +350,25 @@ export function createDiscordControlCommands(deps: DiscordControlDependencies): 
         try {
           hootText = await runHoot(['status'])
         } catch (error) {
-          deps.log({ type: 'discord_control_failed', command: 'araya status', message: errorMessage(error).slice(0, 500) })
+          deps.log({
+            type: 'discord_control_failed',
+            command: 'araya status',
+            message: errorMessage(error).slice(0, 500),
+          })
           hootText = `HOOT の状態を読めませんでした: ${errorMessage(error)}`
         }
 
-        await context.send(`${session}\n\n${hootText}`)
+        await context.send(
+          [
+            session,
+            ...(context.progress === undefined || context.progress === null
+              ? context.runningCount > 0
+                ? ['進捗: 実行中の作業詳細を取得できません']
+                : []
+              : progressLines(context.progress, deps.nowMs(), context.runningCount)),
+            hootText,
+          ].join('\n\n'),
+        )
 
         return
       }
@@ -285,7 +377,9 @@ export function createDiscordControlCommands(deps: DiscordControlDependencies): 
         const cancelled = context.cancelQueued()
         const text = await context.stopSession()
         deps.log({ type: 'discord_control_command', command: 'araya stop', cancelled })
-        await context.send(cancelled > 0 ? `${text}（実行待ち ${cancelled.toString()} 件を取り消しました）` : text)
+        await context.send(
+          cancelled > 0 ? `${text}（実行待ち ${cancelled.toString()} 件を取り消しました）` : text,
+        )
 
         return
       }
@@ -300,7 +394,9 @@ export function createDiscordControlCommands(deps: DiscordControlDependencies): 
       }
 
       deps.log({ type: 'discord_control_failed', command: `araya ${subcommand}` })
-      await context.send(`できませんでした: /araya ${subcommand} は知りません（/araya help で一覧）`)
+      await context.send(
+        `できませんでした: /araya ${subcommand} は知りません（/araya help で一覧）`,
+      )
 
       return
     }
@@ -318,7 +414,11 @@ export function createDiscordControlCommands(deps: DiscordControlDependencies): 
     try {
       args = hootArgumentsOf(request)
     } catch (error) {
-      deps.log({ type: 'discord_control_failed', command: label, message: errorMessage(error).slice(0, 500) })
+      deps.log({
+        type: 'discord_control_failed',
+        command: label,
+        message: errorMessage(error).slice(0, 500),
+      })
       await context.send(`できませんでした: ${errorMessage(error)}`)
 
       return
@@ -346,7 +446,11 @@ export function createDiscordControlCommands(deps: DiscordControlDependencies): 
       return
     }
 
-    deps.log({ type: 'discord_control_command', command: label, args: args.join(' ').slice(0, 200) })
+    deps.log({
+      type: 'discord_control_command',
+      command: label,
+      args: args.join(' ').slice(0, 200),
+    })
     await context.send(output === '' ? '出力はありません' : output)
   }
 
