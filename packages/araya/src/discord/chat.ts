@@ -195,9 +195,10 @@ export type DiscordChatHandler = {
 export const CHAT_UNAVAILABLE_REPLY =
   '現在、Araya の会話機能を利用できません。管理者は discord.log を確認してください。'
 const CHAT_ERROR_REPLY = '会話の処理に失敗しました。内容を短くして再度お試しください。'
-// 終了時に打ち切った message。黙って捨てず、受信者に再送を求める（#36 の取りこぼしを可視化する）
+// 終了時に打ち切った message。黙って捨てず、再起動後に読み直すことを伝える（#36 の取りこぼしを可視化する）
+// cursor を進めていないので、restart 後の backfill が同じ message を取り直します（at-least-once）
 export const CHAT_SHUTDOWN_UNPROCESSED_REPLY =
-  '再起動のためこの message は処理できませんでした。もう 1 回送信してください。'
+  '再起動のためこの message は今処理できませんでした。再起動後に自動的に読み直します。'
 
 function errorName(error: unknown) {
   return error instanceof Error ? error.name : 'unknown'

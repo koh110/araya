@@ -5,7 +5,9 @@ import path from 'node:path'
 import test from 'node:test'
 
 import {
+  BACKFILL_MAX_AGE_MS,
   BACKFILL_MAX_MESSAGES,
+  discordBackfillReferenceMs,
   discordMessageTimestampMs,
   runDiscordRestartBackfill,
   selectBackfillMessages,
@@ -450,4 +452,90 @@ test('backfill: history が読めなくても bot の起動を止めない（理
 
   assert.equal(outcomeNoApi.seeded, false)
   assert.ok(noApi.logs.some((entry) => entry.reason === 'history_api_unavailable'))
+})
+
+test('backfill: host clock が Discord の id 時刻より進んでいても stale で捨てない（#36 の実測ずれ）', () => {
+  // 実測: discord.log の ts と messageId の復元時刻の差は 2 日間 136 件で 5600.1〜5600.5 s の一定だった。
+  // wall clock 基準の age 判定では、このずれだけで窓内の message が全て stale になる
+  const skewedNowMs = (): number => {
+    return NOW_MS + 5_600_000
+  }
+  const history = [
+    historyMessage(messageIdAtAge(10_000)),
+    historyMessage(messageIdAtAge(150_000)),
+    historyMessage(messageIdAtAge(1_500_000)),
+  ]
+  const cursor = messageIdAtAge(2_000_000)
+
+  // 基準は history の最新 id（Discord 側の時間軸）。nowMs() は history に valid id が無いときだけ使う
+  assert.equal(discordBackfillReferenceMs(history, skewedNowMs()), NOW_MS - 10_000)
+  assert.equal(discordBackfillReferenceMs([], skewedNowMs()), skewedNowMs())
+
+  const selection = selectBackfillMessages({
+    history,
+    cursor,
+    config,
+    botUserId: BOT_USER_ID,
+    nowMs: skewedNowMs,
+  })
+
+  // wall clock 基準の age なら、このずれだけで window 内の message まで捨てていた
+  const wallClockAgeMs = skewedNowMs() - (discordMessageTimestampMs(messageIdAtAge(150_000)) ?? 0)
+
+  assert.ok(wallClockAgeMs > BACKFILL_MAX_AGE_MS, `wall clock age=${wallClockAgeMs}`)
+
+  assert.deepEqual(
+    selection.candidates.map((message) => message.messageId),
+    [messageIdAtAge(150_000), messageIdAtAge(10_000)],
+    'history の最新 id から 15 分以内は clock のずれに関係なく取り直す',
+  )
+  assert.deepEqual(
+    selection.skipped.map((skip) => skip.reason),
+    ['stale'],
+    '最新 id から 15 分以上古い message だけが stale',
+  )
+})
+
+test('backfill: 取り直した窓の長さと age を Discord 側の時間軸で log に残す', async () => {
+  const cursor = messageIdAtAge(200_000)
+  const windowId = messageIdAtAge(20_000)
+  const harness = createBackfillHarness([historyMessage(windowId), historyMessage(cursor)])
+  const state = noteDiscordSeenMessageId(newState(), cursor)
+
+  const outcome = await runDiscordRestartBackfill({
+    config,
+    botUserId: BOT_USER_ID,
+    gateway: harness.gateway,
+    chatHandler: harness.chatHandler,
+    log: (entry) => {
+      harness.logs.push(entry)
+    },
+    // host clock が 5600 s 進んでいる状況を想定
+    nowMs: () => NOW_MS + 5_600_000,
+    state,
+    saveState: (next) => {
+      harness.saved.push(next.lastSeenMessageId ?? '')
+    },
+    isHandled: () => {
+      return false
+    },
+    markHandled: () => {},
+  })
+
+  assert.deepEqual(outcome.handled, [windowId])
+
+  const received = harness.logs.find((entry) => {
+    return entry.type === 'discord_backfill_received'
+  })
+
+  assert.ok(received !== undefined)
+  assert.equal(received.ageMs, 0, 'history の最新 id からの age')
+
+  const summary = harness.logs.find((entry) => {
+    return entry.type === 'discord_backfill'
+  })
+
+  assert.ok(summary !== undefined)
+  assert.equal(summary.windowMs, 180_000, 'cursor から history の最新 id までの Discord 側の窓')
+  assert.equal(summary.cursor, cursor)
 })
