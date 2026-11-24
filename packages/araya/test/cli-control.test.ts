@@ -235,11 +235,14 @@ test('bot が応答しないとき: stop / reset は araya_control_unavailable�
     /araya_control_unavailable/,
   )
 
-  // status は読み取りなので、bot が居なくても HOOT の状態と案内を返す（exit code を壊さない）
+  // status は読み取りなので、bot が応答しなくても HOOT の状態と案内を返す（exit code を壊さない）
   await runControlCommand(['status'], deps)
   const text = outputs.join('\n')
   assert.match(text, /enabled/u)
-  assert.match(text, /araya discord status/)
+  assert.match(
+    text,
+    /bot から会話 session の状態応答がありませんでした。bot unit の稼働状態は araya discord status で確認できます/u,
+  )
   // 待ち切れにした要求は bot が後で実行しないよう消えている（status 分も消す）
   assert.equal((await readPendingControlRequests(dataDir)).length, 0)
 })
