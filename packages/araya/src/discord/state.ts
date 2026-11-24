@@ -17,8 +17,9 @@ export type DiscordBotState = {
   // ready になった process の識別子。旧 state には無いので読み込み時は optional
   readyId?: string | null
   lastReadyAt: string | null
-  // gateway から見た (受理・破棄どちらでも) message id の最大値。Discord の snowflake は単調増加なので
-  // id だけで「どこまで見たか」を比較できる。旧 state には無いので読み込み時は optional
+  // 処理を終えたか、明示的に破棄した message id の最大値（「この id より古い message は処理済み」の位置）。
+  // 受理しただけで turn が終わっていない id は進めない。Discord の snowflake は単調増加なので id だけで比較できる。
+  // 旧 state には無いので読み込み時は optional
   lastSeenMessageId?: string | null
 }
 

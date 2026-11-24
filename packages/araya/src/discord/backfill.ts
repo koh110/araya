@@ -1,8 +1,10 @@
 // 再起動の間に投稿された message を channel の history から取り直す（Issue #36）。
 // Discord gateway は切断中に生成された messageCreate を再接続後に再配信しないため、unit を stop して
-// ready になるまでの窓に投稿された message は黙って消える。bot は live で見た message id を
+// ready になるまでの窓に投稿された message は黙って消える。bot は live で処理を終えた message id を
 // state.json の cursor に記録しているので、ready 後に「cursor より新しい history」だけを
 // 古い順に会話 queue へ流し込む。
+// cursor は turn が終わってから進む（at-least-once）。実行中に kill された message は cursor より
+// 古い側に残るので、次の restart でここに取り直される
 
 import { discordChatAdmissionFailures, type DiscordChatHandler } from './chat.ts'
 import type { DiscordConfig } from './config.ts'
@@ -33,6 +35,27 @@ export function discordMessageTimestampMs(messageId: string): number | null {
   }
 }
 
+// stale 判定の基準時刻。bot の wall clock は Discord の id 時刻とずれ続ける実測がある
+// （discord.log の messageId と ts を突き合わせた実測 5600.1〜5600.5 s、2 日間 136 件で一定）。
+// wall clock 基準だと取り直すべき message が全部 stale で捨れるので、id 単調増加を使って
+// 「history の中で最新の id から見て何秒前か」で窓を測る
+export function discordBackfillReferenceMs(
+  history: readonly DiscordHistoryMessage[],
+  fallbackMs: number,
+): number {
+  let newest: number | null = null
+
+  for (const message of history) {
+    const createdMs = discordMessageTimestampMs(message.messageId)
+
+    if (createdMs !== null && (newest === null || createdMs > newest)) {
+      newest = createdMs
+    }
+  }
+
+  return newest ?? fallbackMs
+}
+
 // cursor より新しい message だけを対象に、live と同じ admission gate を通して古い順に並べ直す。
 // cursor が無い instance は live で何も拾えていないので history を処理しない（seed 側で埋める）
 export function selectBackfillMessages(
@@ -53,6 +76,8 @@ export function selectBackfillMessages(
   if (input.cursor === null) {
     return { candidates: [], skipped }
   }
+
+  const referenceMs = discordBackfillReferenceMs(input.history, input.nowMs())
 
   const candidates: DiscordHistoryMessage[] = []
 
@@ -83,7 +108,7 @@ export function selectBackfillMessages(
 
     const createdMs = discordMessageTimestampMs(message.messageId)
 
-    if (createdMs === null || input.nowMs() - createdMs > maxAgeMs) {
+    if (createdMs === null || referenceMs - createdMs > maxAgeMs) {
       skipped.push({ messageId: message.messageId, reason: 'stale' })
 
       continue
@@ -213,6 +238,8 @@ export async function runDiscordRestartBackfill(
     return { handled: [], skipped: [], seeded: true }
   }
 
+  // ageMs の基準も selection と同じ Discord 側の時間軸（history の最新 id）
+  const referenceMs = discordBackfillReferenceMs(history, nowMs())
   const selection = selectBackfillMessages({
     history,
     cursor,
@@ -238,18 +265,10 @@ export async function runDiscordRestartBackfill(
 
     deps.markHandled(message.messageId)
 
-    // cursor を 1 件ずつ前に進める。途中で kill されても同じ message を取り直さないため
-    const advanced = noteDiscordSeenMessageId(current, message.messageId)
-
-    if (advanced !== current) {
-      current = advanced
-      deps.saveState(advanced)
-    }
-
     const ageMs = (() => {
       const createdMs = discordMessageTimestampMs(message.messageId)
 
-      return createdMs === null ? null : Math.max(0, nowMs() - createdMs)
+      return createdMs === null ? null : Math.max(0, referenceMs - createdMs)
     })()
 
     deps.log({
@@ -269,6 +288,15 @@ export async function runDiscordRestartBackfill(
 
     await deps.chatHandler.handle(message, reply)
     handled.push(message.messageId)
+
+    // cursor を 1 件ずつ前に進める。live と同じ規則で turn が終わってから進めるので、
+    // 処理中に kill された message は次の restart の backfill が取り直します（at-least-once）
+    const advanced = noteDiscordSeenMessageId(current, message.messageId)
+
+    if (advanced !== current) {
+      current = advanced
+      deps.saveState(advanced)
+    }
   }
 
   if (handled.length > 0 || selection.skipped.length > 0) {
@@ -277,6 +305,12 @@ export async function runDiscordRestartBackfill(
       handled: handled.length,
       skipped: selection.skipped.length,
       cursor,
+      // cursor から history の最新 id までの Discord 側の窓の長さ（取りこぼし窓の実測用）
+      windowMs: (() => {
+        const cursorMs = discordMessageTimestampMs(cursor)
+
+        return cursorMs === null ? null : Math.max(0, referenceMs - cursorMs)
+      })(),
     })
   }
 

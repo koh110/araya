@@ -27,7 +27,14 @@ import {
   type DiscordGateway,
   type DiscordGatewayHandlers,
 } from './gateway.ts'
-import { newState, noteDiscordSeenMessageId, readDiscordBotState, writeDiscordBotState, type DiscordBotState } from './state.ts'
+import {
+  isDiscordMessageIdNewer,
+  newState,
+  noteDiscordSeenMessageId,
+  readDiscordBotState,
+  writeDiscordBotState,
+  type DiscordBotState,
+} from './state.ts'
 import { runDiscordRestartBackfill } from './backfill.ts'
 import {
   currentDiscordLockOwner,
@@ -513,6 +520,12 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
   const chatHandlerRef: { current: DiscordChatHandler | null } = { current: null }
   // #36: live で処理・破棄した message id。backfill は cursor とこの Set で重複を飛ばす
   const liveMessageIds = new Set<string>()
+  // #36: 受理したが turn が終わっていない id。cursor をこの Set より新しい所へ進めると、
+  // 実行中に kill された message が backfill の対象から消えて二度と処理されない（at-least-once の gate）
+  const unfinishedMessageIds = new Set<string>()
+  // shutdown に入ったら cursor を進めない。drain budget で置き去りにした turn の promise が後で
+  // 解決して cursor が動くと、その message が backfill の対象から消える
+  let shuttingDown = false
 
   function saveDiscordState(next: DiscordBotState) {
     state = next
@@ -524,10 +537,53 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     }
   }
 
-  // live で見た id を cursor に反映する。backfill が「どこまで見たか」を取り直すための基準になるので
-  // 会話に渡さなかった message も記録する
-  function noteLiveMessageSeen(messageId: string) {
+  // 受理した ids を cursor より古い unfinished に加える。backfill は live で取り直さないために
+  // 受理の事実をすぐ liveMessageIds へ書く（同じ message を live と backfill で二重に走らせない）
+  function noteLiveMessageReceived(messageId: string) {
     liveMessageIds.add(messageId)
+    unfinishedMessageIds.add(messageId)
+  }
+
+  // cursor は「この id より古い message を全て処理し終えた」位置なので、turn 中の message より先へ
+  // 進めると、そこで kill された message は restart 後の backfill で取り直せません。
+  // 古い unfinished が無くなってから cursor を進める
+  function canAdvanceCursorPast(messageId: string) {
+    for (const pending of unfinishedMessageIds) {
+      if (isDiscordMessageIdNewer(messageId, pending)) {
+        return false
+      }
+    }
+
+    return true
+  }
+
+  function commitLiveMessageSeen(messageId: string) {
+    if (shuttingDown) {
+      // 置き去りにした turn の id は unfinished に残す（discord_shutdown_unfinished に載る）
+      return
+    }
+
+    unfinishedMessageIds.delete(messageId)
+
+    if (!canAdvanceCursorPast(messageId)) {
+      return
+    }
+
+    const next = noteDiscordSeenMessageId(state, messageId)
+
+    if (next !== state) {
+      saveDiscordState(next)
+    }
+  }
+
+  // 会話にしない message（admission 失敗など）。turn を走らせないので受理した時点で完了扱い
+  function noteLiveMessageDiscarded(messageId: string) {
+    liveMessageIds.add(messageId)
+    unfinishedMessageIds.delete(messageId)
+
+    if (!canAdvanceCursorPast(messageId)) {
+      return
+    }
 
     const next = noteDiscordSeenMessageId(state, messageId)
 
@@ -610,8 +666,15 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
       })
     },
     onMessage: async (message, reply) => {
-      noteLiveMessageSeen(message.messageId)
-      await chatHandlerRef.current?.handle(message, reply)
+      // #36: cursor は turn が終わった後に進める。drain budget で置き去りにされた message は cursor が
+      // 動いていないので、restart 後の backfill が同じ id から取り直します（at-least-once）
+      noteLiveMessageReceived(message.messageId)
+
+      try {
+        await chatHandlerRef.current?.handle(message, reply)
+      } finally {
+        commitLiveMessageSeen(message.messageId)
+      }
     },
     // slash command（/araya ... / /hoot ...）。queue を通さないので会話の実行中でも効く
     onInteraction: async (request, reply) => {
@@ -630,7 +693,7 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     },
     // 取りこぼし診断: messageId・IDs・拒否理由だけを discord.log に残す（本文は渡さない）
     onIgnored: (metadata, failures) => {
-      noteLiveMessageSeen(metadata.messageId)
+      noteLiveMessageDiscarded(metadata.messageId)
       logSafe({
         type: 'discord_message_ignored',
         messageId: metadata.messageId,
@@ -824,6 +887,7 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
   } finally {
     // CLI の control を最初に止める（shutdown の途中で新しい stop / reset を受け取らない）
     const shutdownStartedAtMs = nowMs()
+    shuttingDown = true
     const waits: DiscordShutdownWaits = { ...SHUTDOWN_WAIT_MS, ...deps.shutdownWaits }
 
     cliControl?.stop()
@@ -863,6 +927,21 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
         })
       } else if (waited.outcome === 'failed') {
         logError('discord_drain_failed', waited.error)
+      }
+
+      // #36: 実行中に置き去りにした ids。cursor が動いていないので restart 後の backfill が同じ id から
+      // 取り直します。黙って捨てていないことを log に残す
+      if (unfinishedMessageIds.size > 0) {
+        const ids = [...unfinishedMessageIds].sort((a, b) => {
+          return isDiscordMessageIdNewer(a, b) ? 1 : -1
+        })
+
+        logSafe({
+          type: 'discord_shutdown_unfinished',
+          count: ids.length,
+          messageIds: ids.slice(0, 20),
+          cursor: state.lastSeenMessageId ?? null,
+        })
       }
     }
 
