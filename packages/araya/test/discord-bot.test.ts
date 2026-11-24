@@ -1098,18 +1098,22 @@ test('discord bot: CLI で承認した HOOT dispatch を main 会話 session に
     await updateSettings(dataDir, { enabled: true, tickMinutes: 5, mode: 'active' })
 
     const proposalKey = proposalKeyOf({ goalKeys: ['github-scan'], decision: 'dispatch' })
+    // fixture の now は実行時刻にする。過去の日付だと settings.proposalTTLHours（72 h）で bot の tick が
+    // 先に open を closed（expired）へ変えて、dispatch が race に負ける（#36 の test 追加で CI load が上がって露見）
+    const fixtureNowMs = Date.now()
+    const fixtureOccurrenceKey = `hoot:${new Date(fixtureNowMs).toISOString()}`
     await upsertProposal(dataDir, {
       key: proposalKey,
       decision: 'dispatch',
       goalKeys: ['github-scan'],
       reason: 'draft PR 1 件を続行すべきか判断したい',
-      occurrenceKey: 'hoot:2026-11-19T08:00:00.000Z',
-      nowMs: Date.parse('2026-11-19T08:00:00.000Z'),
+      occurrenceKey: fixtureOccurrenceKey,
+      nowMs: fixtureNowMs,
     })
     const queued = await enqueueHootInject(dataDir, {
       proposalKey,
       authorizedBy: 'human',
-      nowMs: Date.parse('2026-11-19T08:00:00.000Z'),
+      nowMs: fixtureNowMs,
     })
     assert.equal(queued.skipped, null)
     assert.notEqual(queued.request, null)
@@ -1266,13 +1270,15 @@ test('discord bot: Discord の /hoot dispatch 承認を同じ process の poll �
     await updateSettings(dataDir, { enabled: true, tickMinutes: 5, mode: 'active' })
 
     const proposalKey = proposalKeyOf({ goalKeys: ['github-scan'], decision: 'dispatch' })
+    // 上の test と同じ理由で fixture の now は実行時刻（proposalTTLHours 切れで expired にならないため）
+    const fixtureNowMs = Date.now()
     await upsertProposal(dataDir, {
       key: proposalKey,
       decision: 'dispatch',
       goalKeys: ['github-scan'],
       reason: 'draft PR 1 件を続行すべきか判断したい',
-      occurrenceKey: 'hoot:2026-11-20T08:00:00.000Z',
-      nowMs: Date.parse('2026-11-20T08:00:00.000Z'),
+      occurrenceKey: `hoot:${new Date(fixtureNowMs).toISOString()}`,
+      nowMs: fixtureNowMs,
     })
     assert.equal((await readHootState(dataDir)).injectRequests.length, 0)
 

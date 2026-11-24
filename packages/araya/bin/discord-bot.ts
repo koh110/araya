@@ -23,8 +23,9 @@ if (typeof dataDir !== 'string' || dataDir === '') {
 }
 
 const controller = new AbortController()
-// systemd（control group 全体）と runner（child へ forward）の両方が SIGTERM を送る。once にすると
-// 2 回目で drain が打ち切られる（#36 の実測: discord_stopping まで書いて 22 ms 後に終了していた）
+// systemd（control group 全体）と runner（child へ forward）の両方が SIGTERM を送るので、同じ signal が外から 2 届く。
+// process.once だと 2 本目で node の default 動作 kill になり drain が途中で切れる（#36 の実測:
+// `discord_stopping` まで書いて 22 ms 後に signal kill、runner は exit 1 で `status=1/FAILURE`）
 installShutdownSignals(process, () => {
   controller.abort()
 })
