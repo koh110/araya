@@ -7,7 +7,6 @@ import test from 'node:test'
 import {
   BACKFILL_MAX_AGE_MS,
   BACKFILL_MAX_MESSAGES,
-  discordBackfillReferenceMs,
   discordMessageTimestampMs,
   runDiscordRestartBackfill,
   selectBackfillMessages,
@@ -33,7 +32,7 @@ const USER_ID = '42345678901234567'
 const BOT_USER_ID = '998877665544332211'
 
 const NOW_MS = Date.UTC(2026, 10, 23, 12, 0, 0)
-const DISCORD_EPOCH_MS = 1_420_064_800_000
+const DISCORD_EPOCH_MS = 1_420_070_400_000
 
 // Discord snowflake を作る。ageMs 前に投稿された id にする（同順を保つため increment を増やす）
 function messageIdAtAge(ageMs: number): string {
@@ -454,49 +453,26 @@ test('backfill: history が読めなくても bot の起動を止めない（理
   assert.ok(noApi.logs.some((entry) => entry.reason === 'history_api_unavailable'))
 })
 
-test('backfill: host clock が Discord の id 時刻より進んでいても stale で捨てない（#36 の実測ずれ）', () => {
-  // 実測: discord.log の ts と messageId の復元時刻の差は 2 日間 136 件で 5600.1〜5600.5 s の一定だった。
-  // wall clock 基準の age 判定では、このずれだけで窓内の message が全て stale になる
-  const skewedNowMs = (): number => {
-    return NOW_MS + 5_600_000
-  }
-  const history = [
-    historyMessage(messageIdAtAge(10_000)),
-    historyMessage(messageIdAtAge(150_000)),
-    historyMessage(messageIdAtAge(1_500_000)),
+test('backfill: snowflake からの復元時刻が Discord REST の timestamp と一致する（#36 の epoch 実測）', () => {
+  // 2026-11-24 に channel の history を REST で読んだ実測（Discord が自分で返した timestamp）。
+  // 以前使っていた epoch 1_420_064_800_000 ではここが 5600.000 s ずれ、age 上限 15 分を常に越えて
+  // 窓内の message が全部 stale で捨れた（human backfill が 1 件も処理されなかった実因）
+  const observed: [string, string][] = [
+    ['1574678984665337868', '2026-11-24T06:52:06.065Z'],
+    ['1574678607257669644', '2026-11-24T06:50:36.084Z'],
+    ['1574678605714432045', '2026-11-24T06:50:35.716Z'],
+    ['1574668611015155743', '2026-11-24T06:10:52.794Z'],
+    ['1574667688813400115', '2026-11-24T06:07:12.924Z'],
   ]
-  const cursor = messageIdAtAge(2_000_000)
 
-  // 基準は history の最新 id（Discord 側の時間軸）。nowMs() は history に valid id が無いときだけ使う
-  assert.equal(discordBackfillReferenceMs(history, skewedNowMs()), NOW_MS - 10_000)
-  assert.equal(discordBackfillReferenceMs([], skewedNowMs()), skewedNowMs())
+  for (const [messageId, timestamp] of observed) {
+    const createdMs = discordMessageTimestampMs(messageId)
 
-  const selection = selectBackfillMessages({
-    history,
-    cursor,
-    config,
-    botUserId: BOT_USER_ID,
-    nowMs: skewedNowMs,
-  })
-
-  // wall clock 基準の age なら、このずれだけで window 内の message まで捨てていた
-  const wallClockAgeMs = skewedNowMs() - (discordMessageTimestampMs(messageIdAtAge(150_000)) ?? 0)
-
-  assert.ok(wallClockAgeMs > BACKFILL_MAX_AGE_MS, `wall clock age=${wallClockAgeMs}`)
-
-  assert.deepEqual(
-    selection.candidates.map((message) => message.messageId),
-    [messageIdAtAge(150_000), messageIdAtAge(10_000)],
-    'history の最新 id から 15 分以内は clock のずれに関係なく取り直す',
-  )
-  assert.deepEqual(
-    selection.skipped.map((skip) => skip.reason),
-    ['stale'],
-    '最新 id から 15 分以上古い message だけが stale',
-  )
+    assert.equal(createdMs, Date.parse(timestamp), `id=${messageId} createdMs=${createdMs}`)
+  }
 })
 
-test('backfill: 取り直した窓の長さと age を Discord 側の時間軸で log に残す', async () => {
+test('backfill: 無受信窓の message は age 上限で捨てられず、窓の長さを log に残す', async () => {
   const cursor = messageIdAtAge(200_000)
   const windowId = messageIdAtAge(20_000)
   const harness = createBackfillHarness([historyMessage(windowId), historyMessage(cursor)])
@@ -510,8 +486,7 @@ test('backfill: 取り直した窓の長さと age を Discord 側の時間軸�
     log: (entry) => {
       harness.logs.push(entry)
     },
-    // host clock が 5600 s 進んでいる状況を想定
-    nowMs: () => NOW_MS + 5_600_000,
+    nowMs: () => NOW_MS,
     state,
     saveState: (next) => {
       harness.saved.push(next.lastSeenMessageId ?? '')
@@ -529,7 +504,7 @@ test('backfill: 取り直した窓の長さと age を Discord 側の時間軸�
   })
 
   assert.ok(received !== undefined)
-  assert.equal(received.ageMs, 0, 'history の最新 id からの age')
+  assert.equal(received.ageMs, 20_000, '投稿から backfill 処理までの wall clock age')
 
   const summary = harness.logs.find((entry) => {
     return entry.type === 'discord_backfill'
@@ -539,3 +514,5 @@ test('backfill: 取り直した窓の長さと age を Discord 側の時間軸�
   assert.equal(summary.windowMs, 180_000, 'cursor から history の最新 id までの Discord 側の窓')
   assert.equal(summary.cursor, cursor)
 })
+
+
