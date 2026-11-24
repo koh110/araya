@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import test from 'node:test'
+import { test } from 'vite-plus/test'
 
 import {
   DISCORD_CONFIG_KEYS,
@@ -13,7 +13,7 @@ import {
   parseDiscordEnvFile,
   readDiscordEnvFile,
   validateDiscordSettings,
-} from '../src/discord/config.ts'
+} from './config.ts'
 
 const BOT_TOKEN = 'discord-b…alue'
 const APPLICATION_ID = '123456789012345678'

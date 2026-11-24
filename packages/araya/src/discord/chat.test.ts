@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
-import test from 'node:test'
+import { test } from 'vite-plus/test'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -11,10 +11,10 @@ import {
   splitDiscordChatReply,
   stripDiscordBotMention,
   type DiscordChatMessageMetadata,
-} from '../src/discord/chat.ts'
-import { createRedactor } from '../src/infrastructure/redaction.ts'
-import { readHootState, upsertProposal } from '../src/hoot/store.ts'
-import type { DiscordConfig } from '../src/discord/config.ts'
+} from './chat.ts'
+import { createRedactor } from '../infrastructure/redaction.ts'
+import { readHootState, upsertProposal } from '../hoot/store.ts'
+import type { DiscordConfig } from './config.ts'
 
 // control command は state file を読むので deps に dataDir が必要（この test の既存ケースは
 // HOOT を触らないので、存在しなくて readHootState は default state を返すだけ）
@@ -377,7 +377,9 @@ test('discord chat: HOOT inject は人間の message と同じ session・queue �
           await humanGate
         }
 
-        return requestId === '82345678901234567' ? 'human answer' : 'HOOT 案件を進めました hoot-secret'
+        return requestId === '82345678901234567'
+          ? 'human answer'
+          : 'HOOT 案件を進めました hoot-secret'
       },
       reset: async () => {},
     },
@@ -390,7 +392,7 @@ test('discord chat: HOOT inject は人間の message と同じ session・queue �
 
   const human = handler.handle(
     { ...message, messageId: '82345678901234567', content: 'human message' },
-    noopReply
+    noopReply,
   )
   // 人間の message が実行中に HOOT inject を積んでも、同じ queue で直列化する
   const injected = handler.inject(
@@ -399,7 +401,7 @@ test('discord chat: HOOT inject は人間の message と同じ session・queue �
       notice: 'HOOT dispatch を main 会話に渡しました（proposal: abc / 人間の承認）',
       requestId: 'hoot-inject:abc:1',
     },
-    replyLog
+    replyLog,
   )
 
   releaseHuman()
@@ -410,7 +412,7 @@ test('discord chat: HOOT inject は人間の message と同じ session・queue �
     submitted.map((entry) => {
       return entry.requestId
     }),
-    ['82345678901234567', 'hoot-inject:abc:1']
+    ['82345678901234567', 'hoot-inject:abc:1'],
   )
   // main 会話に渡す content は secret を置き換えてある
   assert.equal(submitted[1]?.content, 'HOOT dispatch の承認済み案件 [REDACTED]')
@@ -422,7 +424,7 @@ test('discord chat: HOOT inject は人間の message と同じ session・queue �
     [
       'HOOT dispatch を main 会話に渡しました（proposal: abc / 人間の承認）',
       'HOOT 案件を進めました [REDACTED]',
-    ]
+    ],
   )
   // notice と answer の nonce は違う（同じだと gateway の dedupe で answer が落ちる）
   assert.notEqual(replies[0]?.nonce, replies[1]?.nonce)
@@ -440,12 +442,12 @@ test('discord chat: session が無い / stop 後の HOOT inject は hoot_inject_
     log: () => {},
   })
 
-  await assert.rejects(
-    () => {
-      return noSession.inject({ content: 'HOOT dispatch', notice: 'notice', requestId: 'hoot-inject:abc:1' }, replyLog)
-    },
-    /hoot_inject_unavailable/u
-  )
+  await assert.rejects(() => {
+    return noSession.inject(
+      { content: 'HOOT dispatch', notice: 'notice', requestId: 'hoot-inject:abc:1' },
+      replyLog,
+    )
+  }, /hoot_inject_unavailable/u)
 
   let submitted = 0
   const stopped = createDiscordChatHandler({
@@ -465,12 +467,12 @@ test('discord chat: session が無い / stop 後の HOOT inject は hoot_inject_
   })
   stopped.stopAccepting()
 
-  await assert.rejects(
-    () => {
-      return stopped.inject({ content: 'HOOT dispatch', notice: 'notice', requestId: 'hoot-inject:abc:2' }, replyLog)
-    },
-    /hoot_inject_unavailable/u
-  )
+  await assert.rejects(() => {
+    return stopped.inject(
+      { content: 'HOOT dispatch', notice: 'notice', requestId: 'hoot-inject:abc:2' },
+      replyLog,
+    )
+  }, /hoot_inject_unavailable/u)
   assert.equal(submitted, 0)
 })
 
@@ -497,17 +499,14 @@ test('discord chat: HOOT inject の submit が失敗しても queue は止まら
     log: () => {},
   })
 
-  await assert.rejects(
-    () => {
-      return handler.inject(
-        { content: 'HOOT dispatch の案件', notice: 'notice', requestId: 'hoot-inject:abc:3' },
-        async (content) => {
-          replies.push(content)
-        }
-      )
-    },
-    /429/u
-  )
+  await assert.rejects(() => {
+    return handler.inject(
+      { content: 'HOOT dispatch の案件', notice: 'notice', requestId: 'hoot-inject:abc:3' },
+      async (content) => {
+        replies.push(content)
+      },
+    )
+  }, /429/u)
   // 失敗で送っていない
   assert.equal(replies.length, 0)
 
@@ -515,7 +514,7 @@ test('discord chat: HOOT inject の submit が失敗しても queue は止まら
     { ...message, messageId: '92345678901234570', content: 'after inject' },
     async (content) => {
       replies.push(content)
-    }
+    },
   )
   assert.equal(submitted.length, 2)
   assert.match(replies[0] ?? '', /answer after inject failure/u)
@@ -619,22 +618,28 @@ test('discord chat: status や hoot ... という text message は会話とし�
     log: () => {},
   })
 
-  for (const content of ['status', 'stop', 'session reset', 'hoot dispatch --key abc', 'hoot の状態を教えて']) {
-    await handler.handle({ ...message, messageId: `923456789012346${submitted.length}`, content }, async (replyContent) => {
-      replies.push(replyContent)
-    })
+  for (const content of [
+    'status',
+    'stop',
+    'session reset',
+    'hoot dispatch --key abc',
+    'hoot の状態を教えて',
+  ]) {
+    await handler.handle(
+      { ...message, messageId: `923456789012346${submitted.length}`, content },
+      async (replyContent) => {
+        replies.push(replyContent)
+      },
+    )
   }
 
-  assert.deepEqual(
-    submitted,
-    [
-      'Discord user 42345678901234567 said:\nstatus',
-      'Discord user 42345678901234567 said:\nstop',
-      'Discord user 42345678901234567 said:\nsession reset',
-      'Discord user 42345678901234567 said:\nhoot dispatch --key abc',
-      'Discord user 42345678901234567 said:\nhoot の状態を教えて',
-    ],
-  )
+  assert.deepEqual(submitted, [
+    'Discord user 42345678901234567 said:\nstatus',
+    'Discord user 42345678901234567 said:\nstop',
+    'Discord user 42345678901234567 said:\nsession reset',
+    'Discord user 42345678901234567 said:\nhoot dispatch --key abc',
+    'Discord user 42345678901234567 said:\nhoot の状態を教えて',
+  ])
   assert.equal(resetRequestIds.length, 0, 'text message の session reset は reset を走らせない')
   assert.deepEqual(replies, ['会話の応答', '会話の応答', '会話の応答', '会話の応答', '会話の応答'])
 })
@@ -721,12 +726,18 @@ test('discord chat: /araya stop は queue 内の message を取り消して sess
     log: () => {},
   })
 
-  const first = handler.handle({ ...message, messageId: '92345678901234581', content: '1 件目' }, async () => {})
+  const first = handler.handle(
+    { ...message, messageId: '92345678901234581', content: '1 件目' },
+    async () => {},
+  )
   // 1 件目が実行中になってから 2 件目を queue に積む
   await new Promise((resolve) => {
     setTimeout(resolve, 20)
   })
-  const second = handler.handle({ ...message, messageId: '92345678901234582', content: '2 件目' }, async () => {})
+  const second = handler.handle(
+    { ...message, messageId: '92345678901234582', content: '2 件目' },
+    async () => {},
+  )
 
   await handler.handleCommand(commandRequest({ subcommand: 'stop' }), async (content) => {
     commandReplies.push(content)
@@ -737,7 +748,11 @@ test('discord chat: /araya stop は queue 内の message を取り消して sess
   assert.equal(stopCount, 1)
   assert.match(commandReplies.join('\n'), /中止を要求/u)
   assert.match(commandReplies.join('\n'), /実行待ち 1 件を取り消しました/u)
-  assert.deepEqual(submitted, ['Discord user 42345678901234567 said:\n1 件目'], '実行待ちの 2 件目は走らない')
+  assert.deepEqual(
+    submitted,
+    ['Discord user 42345678901234567 said:\n1 件目'],
+    '実行待ちの 2 件目は走らない',
+  )
 })
 
 test('discord chat: 許可外の user / channel の slash command は拒否して log に残す', async () => {
@@ -757,12 +772,18 @@ test('discord chat: 許可外の user / channel の slash command は拒否し�
     },
   })
 
-  await handler.handleCommand(commandRequest({ subcommand: 'status', userId: '99999999999999999' }), async (content) => {
-    replies.push(content)
-  })
-  await handler.handleCommand(commandRequest({ subcommand: 'status', channelId: '62345678901234567' }), async (content) => {
-    replies.push(content)
-  })
+  await handler.handleCommand(
+    commandRequest({ subcommand: 'status', userId: '99999999999999999' }),
+    async (content) => {
+      replies.push(content)
+    },
+  )
+  await handler.handleCommand(
+    commandRequest({ subcommand: 'status', channelId: '62345678901234567' }),
+    async (content) => {
+      replies.push(content)
+    },
+  )
 
   assert.equal(replies.length, 2)
   assert.match(replies[0] ?? '', /使える channel/u)
@@ -852,9 +873,12 @@ test('discord chat: /hoot dispatch は inject request を pending にし、sessi
     log: () => {},
   })
   const offlineReplies: string[] = []
-  await offline.handleCommand(commandRequest({ name: 'hoot', group: 'inject', subcommand: 'list' }), async (content) => {
-    offlineReplies.push(content)
-  })
+  await offline.handleCommand(
+    commandRequest({ name: 'hoot', group: 'inject', subcommand: 'list' }),
+    async (content) => {
+      offlineReplies.push(content)
+    },
+  )
   assert.match(offlineReplies.join('\n'), /\[pending\] dispatch proposal=dispatch-proposal/u)
 
   await fs.rm(dataDir, { recursive: true, force: true })
@@ -988,7 +1012,12 @@ test('discord chat: 許可外 message は handle でも ignored log に failures
   })
 
   await handler.handle(
-    { ...message, messageId: '92345678901234604', userId: '72345678901234567', content: '許可外 user' },
+    {
+      ...message,
+      messageId: '92345678901234604',
+      userId: '72345678901234567',
+      content: '許可外 user',
+    },
     async () => {},
   )
 
@@ -1151,9 +1180,12 @@ test('discord chat: runControl は Discord の allowlist を要求しない（CL
   const replies: string[] = []
 
   // 同じ request を handleCommand（Discord の interaction 経路）に渡すと allowlist で拒否される
-  await handler.handleCommand(commandRequest({ subcommand: 'status', userId: 'cli' }), async (text) => {
-    replies.push(text)
-  })
+  await handler.handleCommand(
+    commandRequest({ subcommand: 'status', userId: 'cli' }),
+    async (text) => {
+      replies.push(text)
+    },
+  )
   assert.match(replies.join(''), /使える channel/)
 
   // runControl は bot process 内の control 経路なので Discord の allowlist は通さない（境界は control dir を書ける OS user）

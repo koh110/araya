@@ -2,13 +2,16 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import test from 'node:test'
+import { test } from 'vite-plus/test'
 
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
 
 import { openArayaAgentHost, type ArayaAgentSession } from '../src/agent/host.ts'
 import { createRedactor } from '../src/infrastructure/redaction.ts'
-import { HOOT_CONVERSATION_INSTRUCTIONS, HOOT_CONVERSATION_READ_INSTRUCTIONS } from '../src/hoot/prompt.ts'
+import {
+  HOOT_CONVERSATION_INSTRUCTIONS,
+  HOOT_CONVERSATION_READ_INSTRUCTIONS,
+} from '../src/hoot/prompt.ts'
 import { answer, createFauxModels, toolCall } from './support/faux-shiki.ts'
 
 async function makeHootAgentFixture() {
@@ -64,7 +67,9 @@ test('hoot agent host: hootDecide は専用 conversation で走り、main 会話
   try {
     models.script((view) => {
       if (view.prompt.includes('HOOT 判断 tick')) {
-        return answer('観測: open issue 1 件。\nDECISION: investigate\nREASON: open issue 1 件を調べたい')
+        return answer(
+          '観測: open issue 1 件。\nDECISION: investigate\nREASON: open issue 1 件を調べたい',
+        )
       }
 
       return answer('main の answer secret-value')
@@ -360,7 +365,10 @@ test('hoot agent host: settings.conversationRead=true の run は read_conversat
       assert.match(readText, /user: channel の発言: PR #34/u)
       assert.match(readText, /assistant: main の answer/u)
       // durable transcript に残る秘密は tool の出力でも伏せる
-      assert.ok(!readText.includes('secret-value-123'), `read_conversation output must be redacted: ${readText}`)
+      assert.ok(
+        !readText.includes('secret-value-123'),
+        `read_conversation output must be redacted: ${readText}`,
+      )
       assert.equal(decided.conversationReads.calls, 1)
       assert.ok(decided.conversationReads.entries >= 2)
       assert.ok(decided.conversationReads.chars > 0)
@@ -394,7 +402,7 @@ test('hoot agent host: settings.conversationRead=false なら read_conversation 
           .map((result) => {
             return `${result.toolName}:${result.isError}`
           })
-          .join(',')
+          .join(','),
       )
 
       return answer('DECISION: noop\nREASON: main 会話を読めない')
@@ -425,8 +433,10 @@ test('hoot agent host: settings.conversationRead=false なら read_conversation 
       assert.equal(decided.conversationReads.chars, 0)
       // tool を要求されても判断会話に read_conversation は無い（結果の誤りか unknown tool で終わる）
       assert.ok(
-        refusals.length === 0 || refusals[0] === undefined || refusals[0].includes('read_conversation:true'),
-        JSON.stringify(refusals)
+        refusals.length === 0 ||
+          refusals[0] === undefined ||
+          refusals[0].includes('read_conversation:true'),
+        JSON.stringify(refusals),
       )
     } finally {
       await session.close()
@@ -533,7 +543,10 @@ test('hoot agent host: read_conversation は registry に登録しても main �
     })
 
     try {
-      const answered = await session.submit('channel の発言: main から tool を試す', 'main-request-tool-denied')
+      const answered = await session.submit(
+        'channel の発言: main から tool を試す',
+        'main-request-tool-denied',
+      )
       assert.match(answered, /main は read_conversation を使えない/u)
       // main 会話の tools / modelTools は coding tool と task tool だけ。registry にある tool でも選べない
       assert.match(mainToolResults[0] ?? '', /read_conversation:true/u)

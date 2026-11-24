@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import test from 'node:test'
+import { test } from 'vite-plus/test'
 
 import {
   CONTROL_REQUEST_TTL_MS,
@@ -92,7 +92,13 @@ test('control bus: 未知の command の request は読まない（注入され�
   await fs.mkdir(requestsDir, { recursive: true })
   await fs.writeFile(
     path.join(requestsDir, 'evil.json'),
-    JSON.stringify({ version: 1, id: 'evil', command: 'dispatch', source: 'cli', createdAt: new Date().toISOString() }),
+    JSON.stringify({
+      version: 1,
+      id: 'evil',
+      command: 'dispatch',
+      source: 'cli',
+      createdAt: new Date().toISOString(),
+    }),
     'utf8',
   )
   assert.equal((await readPendingControlRequests(dataDir)).length, 0)
@@ -158,7 +164,11 @@ test('cli control loop: run が失敗したら result を ok:false で閉じ、d
 })
 
 // bot の poll 役：溜まっている request を拾って応答を書く
-async function fakeBot(dataDir: string, respond: (command: string, id: string) => string, attempts = 60) {
+async function fakeBot(
+  dataDir: string,
+  respond: (command: string, id: string) => string,
+  attempts = 60,
+) {
   for (let index = 0; index < attempts; index += 1) {
     const pending = await readPendingControlRequests(dataDir)
 
@@ -191,19 +201,16 @@ test('araya status・stop・reset: 稼働中の bot の応答を stdout に出�
     return command === 'stop' ? '実行中・実行待ちの作業があれば中止を要求しました' : 'bot の応答'
   })
 
-  await runControlCommand(
-    ['stop'],
-    {
-      dataDir,
-      stdout: (text) => {
-        return outputs.push(text)
-      },
-      nowMs: () => Date.now(),
-      env: {},
-      waitMs: 5_000,
-      pollMs: 20,
+  await runControlCommand(['stop'], {
+    dataDir,
+    stdout: (text) => {
+      return outputs.push(text)
     },
-  )
+    nowMs: () => Date.now(),
+    env: {},
+    waitMs: 5_000,
+    pollMs: 20,
+  })
   await bot
   assert.match(outputs.join('\n'), /中止を要求しました/)
 })
@@ -222,18 +229,12 @@ test('bot が応答しないとき: stop / reset は araya_control_unavailable�
     pollMs: 30,
   }
 
-  await assert.rejects(
-    async () => {
-      return await runControlCommand(['reset'], deps)
-    },
-    /araya_control_unavailable/,
-  )
-  await assert.rejects(
-    async () => {
-      return await runControlCommand(['stop'], deps)
-    },
-    /araya_control_unavailable/,
-  )
+  await assert.rejects(async () => {
+    return await runControlCommand(['reset'], deps)
+  }, /araya_control_unavailable/)
+  await assert.rejects(async () => {
+    return await runControlCommand(['stop'], deps)
+  }, /araya_control_unavailable/)
 
   // status は読み取りなので、bot が応答しなくても HOOT の状態と案内を返す（exit code を壊さない）
   await runControlCommand(['status'], deps)
@@ -250,19 +251,16 @@ test('bot が応答しないとき: stop / reset は araya_control_unavailable�
 test('araya status・stop・reset: 未知の command は拒否する（control bus に file を書かない）', async () => {
   const dataDir = await tempDataDir('araya-cli-control-invalid-')
 
-  await assert.rejects(
-    async () => {
-      return await runControlCommand(['dispatch'], {
-        dataDir,
-        stdout: () => {},
-        nowMs: () => Date.now(),
-        env: {},
-        waitMs: 200,
-        pollMs: 20,
-      })
-    },
-    /不明な control の command/,
-  )
+  await assert.rejects(async () => {
+    return await runControlCommand(['dispatch'], {
+      dataDir,
+      stdout: () => {},
+      nowMs: () => Date.now(),
+      env: {},
+      waitMs: 200,
+      pollMs: 20,
+    })
+  }, /不明な control の command/)
 
   try {
     assert.deepEqual(await fs.readdir(controlResultsDir(dataDir)), [])
@@ -271,7 +269,6 @@ test('araya status・stop・reset: 未知の command は拒否する（control b
     assert.equal((error as NodeJS.ErrnoException).code, 'ENOENT')
   }
 })
-
 
 test('bot 側の run は slash command と同じ control kernel を通す（runControl の text を result に書く）', async () => {
   const dataDir = await tempDataDir('araya-cli-control-kernel-')
@@ -286,7 +283,9 @@ test('bot 側の run は slash command と同じ control kernel を通す（runC
     run: async (command, requestId) => {
       calls.push(`${command}:${requestId}`)
 
-      return command === 'status' ? '会話: main conversation #9 / 実行中 0 / 待ち 0' : 'できませんでした'
+      return command === 'status'
+        ? '会話: main conversation #9 / 実行中 0 / 待ち 0'
+        : 'できませんでした'
     },
   })
   loop.start()

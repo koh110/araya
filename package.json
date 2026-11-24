@@ -24,7 +24,7 @@
     "postbuild": "node scripts/copy-package-metadata.mjs",
     "deploy": "sh scripts/deploy.sh",
     "prepack": "npm run build",
-    "test": "npm run build && node --test packages/araya/test",
+    "test": "npm run build && vp test run --config=./vite.config.ts",
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
@@ -38,6 +38,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "vite-plus": "^0.2.9"
   }
 }

@@ -2,10 +2,10 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import test from 'node:test'
+import { test } from 'vite-plus/test'
 
-import { createHootLoop, type HootInjectInput, type HootTickOutcome } from '../src/hoot/tick.ts'
-import { readHootState, setGoalStatus, writeHootState } from '../src/hoot/store.ts'
+import { createHootLoop, type HootInjectInput, type HootTickOutcome } from './tick.ts'
+import { readHootState, setGoalStatus, writeHootState } from './store.ts'
 import {
   MAX_INJECT_ATTEMPTS,
   defaultState,
@@ -15,17 +15,16 @@ import {
   type HootProposal,
   type HootSettings,
   type HootState,
-} from '../src/hoot/model.ts'
-import { collectSecretValues, createRedactor } from '../src/infrastructure/redaction.ts'
-import type { BoundedProcessResult } from '../src/infrastructure/process.ts'
+} from './model.ts'
+import { collectSecretValues, createRedactor } from '../infrastructure/redaction.ts'
+import type { BoundedProcessResult } from '../infrastructure/process.ts'
 
 function ghResult(payload: unknown): BoundedProcessResult {
   const stdout = JSON.stringify(payload)
 
   return {
     exitCode: 0,
-    signal:
-      null,
+    signal: null,
     stdout,
     stderr: '',
     stdoutBytes: Buffer.byteLength(stdout),
@@ -69,28 +68,30 @@ function proposalFixture(overrides: Partial<HootProposal> = {}): HootProposal {
   }
 }
 
-async function makeHootLoopFixture(input: {
-  settings?: Partial<HootSettings>
-  goals?: HootGoal[]
-  runs?: HootState['runs']
-  proposals?: HootProposal[]
-  injectRequests?: HootInjectRequest[]
-  loop?: Partial<HootState['loop']>
-  decide?: (request: {
-    prompt: string
-    conversationId: number | null
-    conversationRead: boolean
-    instructions: string
-  }) => Promise<{
-    text: string
-    conversationId: number
-    conversationReads?: { calls: number; entries: number; chars: number }
-  }>
-  command?: (args: readonly string[]) => BoundedProcessResult
-  inject?: (input: HootInjectInput) => Promise<void>
-  env?: Record<string, string | undefined>
-  nowIso?: string
-} = {}) {
+async function makeHootLoopFixture(
+  input: {
+    settings?: Partial<HootSettings>
+    goals?: HootGoal[]
+    runs?: HootState['runs']
+    proposals?: HootProposal[]
+    injectRequests?: HootInjectRequest[]
+    loop?: Partial<HootState['loop']>
+    decide?: (request: {
+      prompt: string
+      conversationId: number | null
+      conversationRead: boolean
+      instructions: string
+    }) => Promise<{
+      text: string
+      conversationId: number
+      conversationReads?: { calls: number; entries: number; chars: number }
+    }>
+    command?: (args: readonly string[]) => BoundedProcessResult
+    inject?: (input: HootInjectInput) => Promise<void>
+    env?: Record<string, string | undefined>
+    nowIso?: string
+  } = {},
+) {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'araya-hoot-tick-test-')))
   const dataDir = path.join(root, 'data')
   let currentMs = new Date(input.nowIso ?? '2026-11-19T09:00:00.000Z').getTime()
@@ -179,10 +180,24 @@ async function makeHootLoopFixture(input: {
       }
 
       if (args.includes('issue')) {
-        return ghResult([{ number: 10, title: 'HOOT discovery loop', updatedAt: '2026-11-18T00:00:00Z', isPullRequest: false }])
+        return ghResult([
+          {
+            number: 10,
+            title: 'HOOT discovery loop',
+            updatedAt: '2026-11-18T00:00:00Z',
+            isPullRequest: false,
+          },
+        ])
       }
 
-      return ghResult([{ number: 29, title: 'session-first agent', updatedAt: '2026-11-19T00:00:00Z', isDraft: true }])
+      return ghResult([
+        {
+          number: 29,
+          title: 'session-first agent',
+          updatedAt: '2026-11-19T00:00:00Z',
+          isDraft: true,
+        },
+      ])
     },
   })
 
@@ -206,7 +221,10 @@ async function makeHootLoopFixture(input: {
 }
 
 test('hoot tick: 無効なら model も gh も呼ばない', async () => {
-  const fixture = await makeHootLoopFixture({ settings: { enabled: false }, goals: [goalFixture()] })
+  const fixture = await makeHootLoopFixture({
+    settings: { enabled: false },
+    goals: [goalFixture()],
+  })
 
   try {
     const outcome: HootTickOutcome = await fixture.loop.tickOnce()
@@ -305,7 +323,10 @@ test('hoot tick: occurrence ごとに 1 回だけ走り、判断と観測を sta
     assert.match(fixture.notices[0]?.nonce ?? '', /^hoot-[0-9a-z]{18}$/u)
     assert.match(fixture.notices[0]?.text ?? '', /HOOT 判断 \[investigate\]/u)
     assert.match(fixture.notices[0]?.text ?? '', /mode: dry_run/u)
-    assert.match(fixture.logs.map((entry) => JSON.stringify(entry)).join('\n'), /"type":"hoot_run"/u)
+    assert.match(
+      fixture.logs.map((entry) => JSON.stringify(entry)).join('\n'),
+      /"type":"hoot_run"/u,
+    )
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
@@ -339,7 +360,10 @@ test('hoot tick: request_human は dry_run でも即時通知し、open proposal
     settings: { enabled: true, tickMinutes: 5 },
     goals: [goalFixture()],
     decide: async () => {
-      return { text: 'DECISION: request_human\nREASON: 要人の判断: 優先順位を決めてください', conversationId: 12 }
+      return {
+        text: 'DECISION: request_human\nREASON: 要人の判断: 優先順位を決めてください',
+        conversationId: 12,
+      }
     },
   })
 
@@ -568,7 +592,9 @@ test('hoot tick: 観測に gap がある occurrence は fingerprint が同じで
       }
 
       if (args.includes('issue')) {
-        return ghResult([{ number: 30, title: 'HOOT wakeup dry run', updatedAt: '2026-11-19T00:00:00Z' }])
+        return ghResult([
+          { number: 30, title: 'HOOT wakeup dry run', updatedAt: '2026-11-19T00:00:00Z' },
+        ])
       }
 
       return ghResult([])
@@ -651,14 +677,26 @@ test('hoot tick: 観測が変われば model を呼び、open proposal は同じ
     settings: { enabled: true, tickMinutes: 5 },
     goals: [goalFixture()],
     decide: async () => {
-      return { text: 'DECISION: request_human\nREASON: 優先順位を決めてください', conversationId: 14 }
+      return {
+        text: 'DECISION: request_human\nREASON: 優先順位を決めてください',
+        conversationId: 14,
+      }
     },
     command: (args) => {
       if (args.includes('issue')) {
-        return ghResult([{ number: issueNumber, title: 'HOOT discovery loop', updatedAt: '2026-11-18T00:00:00Z' }])
+        return ghResult([
+          { number: issueNumber, title: 'HOOT discovery loop', updatedAt: '2026-11-18T00:00:00Z' },
+        ])
       }
 
-      return ghResult([{ number: 29, title: 'session-first agent', updatedAt: '2026-11-19T00:00:00Z', isDraft: true }])
+      return ghResult([
+        {
+          number: 29,
+          title: 'session-first agent',
+          updatedAt: '2026-11-19T00:00:00Z',
+          isDraft: true,
+        },
+      ])
     },
   })
 
@@ -710,7 +748,10 @@ test('hoot tick: watchdogHours が過ぎている occurrence では観測が変�
     assert.equal(second.kind, 'ran')
     assert.equal(fixture.decideInputs.length, 2)
     const state2 = await fixture.readState()
-    assert.equal(state2.loop.goalFingerprints['araya-quality'], state1.loop.goalFingerprints['araya-quality'])
+    assert.equal(
+      state2.loop.goalFingerprints['araya-quality'],
+      state1.loop.goalFingerprints['araya-quality'],
+    )
     assert.equal(state2.loop.lastModelRunAt, state2.runs.at(-1)?.decidedAt)
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
@@ -758,7 +799,9 @@ test('hoot tick: 自動 paused になった goal は resume 後の occurrence �
     await setGoalStatus(fixture.dataDir, 'araya-quality', 'active')
     const afterResume = await fixture.readState()
     assert.equal(afterResume.goals[0]?.status, 'active')
-    assert.ok(Date.parse(afterResume.goals[0]?.reviewAt ?? '') > Date.parse('2026-11-19T09:00:00.000Z'))
+    assert.ok(
+      Date.parse(afterResume.goals[0]?.reviewAt ?? '') > Date.parse('2026-11-19T09:00:00.000Z'),
+    )
 
     fixture.setNow('2026-11-19T09:05:00.000Z')
     const next = await fixture.loop.tickOnce()
@@ -767,9 +810,12 @@ test('hoot tick: 自動 paused になった goal は resume 後の occurrence �
 
     const state = await fixture.readState()
     assert.equal(state.goals[0]?.status, 'active')
-    assert.equal(fixture.notices.filter((notice) => {
-      return /自動 paused/u.test(notice.text)
-    }).length, 1)
+    assert.equal(
+      fixture.notices.filter((notice) => {
+        return /自動 paused/u.test(notice.text)
+      }).length,
+      1,
+    )
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
@@ -957,7 +1003,12 @@ test('hoot tick: digest の open proposal 行は上限 3 件で、超過分は a
 
 test('hoot tick: resetConversationAfterRuns で HOOT 判断会話を新しくする', async () => {
   const fixture = await makeHootLoopFixture({
-    settings: { enabled: true, tickMinutes: 5, precheckObservation: false, resetConversationAfterRuns: 2 },
+    settings: {
+      enabled: true,
+      tickMinutes: 5,
+      precheckObservation: false,
+      resetConversationAfterRuns: 2,
+    },
     goals: [goalFixture()],
     loop: { conversationId: 7, conversationRuns: 1 },
     decide: async (request) => {
@@ -1003,7 +1054,9 @@ test('hoot tick: 複数 goal ではどれか 1 つでも変われば model を�
     },
     command: (args) => {
       if (args.includes('issue')) {
-        return ghResult([{ number: 10, title: 'HOOT discovery loop', updatedAt: '2026-11-18T00:00:00Z' }])
+        return ghResult([
+          { number: 10, title: 'HOOT discovery loop', updatedAt: '2026-11-18T00:00:00Z' },
+        ])
       }
 
       return ghResult([])
@@ -1014,10 +1067,7 @@ test('hoot tick: 複数 goal ではどれか 1 つでも変われば model を�
     const first = await fixture.loop.tickOnce()
     assert.equal(first.kind, 'ran')
     const afterFirst = await fixture.readState()
-    assert.deepEqual(
-      Object.keys(afterFirst.loop.goalFingerprints).sort(),
-      ['goal-a', 'goal-b']
-    )
+    assert.deepEqual(Object.keys(afterFirst.loop.goalFingerprints).sort(), ['goal-a', 'goal-b'])
 
     // 2 件目: どちらも変わっていないので precheck で飛ばす
     fixture.setNow('2026-11-19T09:05:00.000Z')
@@ -1089,11 +1139,19 @@ function pendingInjectFixture(overrides: Partial<HootInjectRequest> = {}): HootI
 
 test('hoot tick: mode=active + autoDispatch は investigate 判断も inject request にする（read-only 調査案件）', async () => {
   const auto = await makeHootLoopFixture({
-    settings: { enabled: true, mode: 'active', autoDispatch: true, notifyDecisions: ['investigate'] },
+    settings: {
+      enabled: true,
+      mode: 'active',
+      autoDispatch: true,
+      notifyDecisions: ['investigate'],
+    },
     goals: [goalFixture()],
     decide: async () => {
-      return { text: 'HOOT 判断:\nDECISION: investigate\nREASON: open issue の再現条件が観測から確定しない', conversationId: 7 }
-    }
+      return {
+        text: 'HOOT 判断:\nDECISION: investigate\nREASON: open issue の再現条件が観測から確定しない',
+        conversationId: 7,
+      }
+    },
   })
 
   try {
@@ -1104,20 +1162,25 @@ test('hoot tick: mode=active + autoDispatch は investigate 判断も inject req
     assert.equal(state.injectRequests.length, 1)
     assert.equal(state.injectRequests[0]?.status, 'pending')
     assert.equal(state.injectRequests[0]?.authorizedBy, 'mode_active')
-    assert.ok(auto.notices.some((notice) => {
-      return notice.text.includes('investigate も次の poll で main Discord 会話へ inject')
-    }))
+    assert.ok(
+      auto.notices.some((notice) => {
+        return notice.text.includes('investigate も次の poll で main Discord 会話へ inject')
+      }),
+    )
   } finally {
     await fs.rm(auto.root, { recursive: true, force: true })
   }
 })
 
-test('hoot tick: mode=active + autoDispatch の dispatch 判断だけ inject request になる（dry_run・未承認では作らない）', async () => { 
+test('hoot tick: mode=active + autoDispatch の dispatch 判断だけ inject request になる（dry_run・未承認では作らない）', async () => {
   const auto = await makeHootLoopFixture({
     settings: { enabled: true, mode: 'active', autoDispatch: true, notifyDecisions: ['dispatch'] },
     goals: [goalFixture()],
     decide: async () => {
-      return { text: 'HOOT 判断:\nDECISION: dispatch\nREASON: open PR 1 件を main 会話で進めるべき', conversationId: 7 }
+      return {
+        text: 'HOOT 判断:\nDECISION: dispatch\nREASON: open PR 1 件を main 会話で進めるべき',
+        conversationId: 7,
+      }
     },
   })
 
@@ -1132,9 +1195,13 @@ test('hoot tick: mode=active + autoDispatch の dispatch 判断だけ inject req
     assert.equal((outcome as { injectKey?: string | null }).injectKey, state.injectRequests[0]?.key)
     // tick 自体は main 会話に submit しない（inject は次の poll の injectOnce が流す）
     assert.equal(auto.injectInputs.length, 0)
-    assert.ok(auto.notices.some((notice) => {
-      return notice.text.includes('autoDispatch') && notice.text.includes('main Discord 会話へ inject')
-    }))
+    assert.ok(
+      auto.notices.some((notice) => {
+        return (
+          notice.text.includes('autoDispatch') && notice.text.includes('main Discord 会話へ inject')
+        )
+      }),
+    )
   } finally {
     await fs.rm(auto.root, { recursive: true, force: true })
   }
@@ -1155,9 +1222,11 @@ test('hoot tick: mode=active + autoDispatch の dispatch 判断だけ inject req
     assert.deepEqual(state.injectRequests, [])
     assert.equal(state.proposals[0]?.status, 'open')
     assert.equal((outcome as { injectKey?: string | null }).injectKey, null)
-    assert.ok(manual.notices.some((notice) => {
-      return notice.text.includes('araya hoot dispatch --key')
-    }))
+    assert.ok(
+      manual.notices.some((notice) => {
+        return notice.text.includes('araya hoot dispatch --key')
+      }),
+    )
   } finally {
     await fs.rm(manual.root, { recursive: true, force: true })
   }
@@ -1245,9 +1314,14 @@ test('hoot tick: dispatchInject が無い process は attempts を数えて fail
     assert.equal(state.injectRequests[0]?.attempts, MAX_INJECT_ATTEMPTS)
     // 同じ request を 3 回目は選ばれない
     assert.equal((await fixture.loop.injectOnce()).kind, 'nothing')
-    assert.ok(fixture.notices.some((notice) => {
-      return notice.text.includes('inject に失敗しました') || notice.text.includes('inject をできませんでした')
-    }))
+    assert.ok(
+      fixture.notices.some((notice) => {
+        return (
+          notice.text.includes('inject に失敗しました') ||
+          notice.text.includes('inject をできませんでした')
+        )
+      }),
+    )
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
@@ -1301,16 +1375,22 @@ test('hoot tick: inject の失敗は retry して next poll で status を戻せ
       assert.equal(retryState.injectRequests[0]?.attempts, 2)
       assert.match(retryState.injectRequests[0]?.lastError ?? '', /429/u)
       // 失敗の知らせは 1 件（digest ではなく即時 notice）
-      assert.ok(retry.notices.some((notice) => {
-        return notice.text.includes('inject に失敗しました')
-      }))
-      assert.ok(retry.notices.some((notice) => {
-        return notice.text.includes('hoot dispatch --key ' + DISPATCH_PROPOSAL_KEY)
-      }))
+      assert.ok(
+        retry.notices.some((notice) => {
+          return notice.text.includes('inject に失敗しました')
+        }),
+      )
+      assert.ok(
+        retry.notices.some((notice) => {
+          return notice.text.includes('hoot dispatch --key ' + DISPATCH_PROPOSAL_KEY)
+        }),
+      )
       // 同じ dedupe key の再試行なので、人間が打ち直すまで同じ案件は自動で再実行しない旨を出す
-      assert.ok(retry.notices.some((notice) => {
-        return notice.text.includes('同じ案件は自動で再実行しません')
-      }))
+      assert.ok(
+        retry.notices.some((notice) => {
+          return notice.text.includes('同じ案件は自動で再実行しません')
+        }),
+      )
       retryState = await retry.readState()
       assert.equal(retryState.injectRequests[0]?.status, 'failed')
     } finally {

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import test from 'node:test'
+import { test } from 'vite-plus/test'
 
 import {
   currentDiscordLockOwner,
@@ -11,7 +11,7 @@ import {
   discordLockPath,
   reclaimDeadDiscordProcessLock,
   writeDiscordLockOwner,
-} from '../src/discord/process-lock.ts'
+} from './process-lock.ts'
 
 // Linux の pid_max より大きいので process.kill(pid, 0) は ESRCH（= 実在しない）になる
 const DEAD_PID = 2_147_483_647

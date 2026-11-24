@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import { afterEach, test, vi } from 'vite-plus/test'
 
 import { MessageFlags } from 'discord.js'
 
@@ -14,9 +14,13 @@ import {
   type DiscordGatewayHandlers,
   type DiscordMessageCreateEvent,
   type DiscordTypingChannel,
-} from '../src/discord/gateway.ts'
-import type { DiscordChatMessage, DiscordChatMessageMetadata } from '../src/discord/chat.ts'
-import type { DiscordConfig } from '../src/discord/config.ts'
+} from './gateway.ts'
+import type { DiscordChatMessage, DiscordChatMessageMetadata } from './chat.ts'
+import type { DiscordConfig } from './config.ts'
+
+afterEach(() => {
+  vi.useRealTimers()
+})
 
 test('discord gateway: nonce payload は enforce_nonce を有効にする', () => {
   assert.deepEqual(discordNotificationPayload('Task update', 'nonce-1'), {
@@ -61,8 +65,8 @@ test('discord gateway: nested task group options reach the retry handler as leaf
   )
 })
 
-test('discord gateway: typing indicator is refreshed while any accepted response is pending', async (context) => {
-  context.mock.timers.enable({ apis: ['setInterval'] })
+test('discord gateway: typing indicator is refreshed while any accepted response is pending', async () => {
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
   let refreshes = 0
   const errors: string[] = []
   const channel = {
@@ -93,26 +97,26 @@ test('discord gateway: typing indicator is refreshed while any accepted response
   await Promise.resolve()
   assert.equal(refreshes, 1)
 
-  context.mock.timers.tick(8_000)
+  await vi.advanceTimersByTimeAsync(8_000)
   await Promise.resolve()
   assert.equal(refreshes, 2)
 
   releaseFirst?.()
   await pending[0]
-  context.mock.timers.tick(8_000)
+  await vi.advanceTimersByTimeAsync(8_000)
   await Promise.resolve()
   assert.equal(refreshes, 3)
 
   releaseSecond?.()
   await pending[1]
-  context.mock.timers.tick(16_000)
+  await vi.advanceTimersByTimeAsync(16_000)
   assert.equal(refreshes, 3)
   indicator.close()
   assert.deepEqual(errors, [])
 })
 
-test('discord gateway: a missed refresh is sent when the current typing request settles', async (context) => {
-  context.mock.timers.enable({ apis: ['setInterval'] })
+test('discord gateway: a missed refresh is sent when the current typing request settles', async () => {
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
   let refreshes = 0
   let releaseFirstSend: (() => void) | undefined
   const firstSend = new Promise<void>((resolve) => {
@@ -141,28 +145,28 @@ test('discord gateway: a missed refresh is sent when the current typing request 
   await Promise.resolve()
   assert.equal(refreshes, 1)
 
-  context.mock.timers.tick(8_000)
+  await vi.advanceTimersByTimeAsync(8_000)
   assert.equal(refreshes, 1)
-  context.mock.timers.tick(1_000)
+  await vi.advanceTimersByTimeAsync(1_000)
   releaseFirstSend?.()
   await Promise.resolve()
   await Promise.resolve()
   assert.equal(refreshes, 2)
 
-  context.mock.timers.tick(7_000)
+  await vi.advanceTimersByTimeAsync(7_000)
   await Promise.resolve()
   await Promise.resolve()
   assert.equal(refreshes, 3)
 
   releaseOperation?.()
   await pending
-  context.mock.timers.tick(16_000)
+  await vi.advanceTimersByTimeAsync(16_000)
   assert.equal(refreshes, 3)
   indicator.close()
 })
 
-test('discord gateway: typing failure does not fail the chat response', async (context) => {
-  context.mock.timers.enable({ apis: ['setInterval'] })
+test('discord gateway: typing failure does not fail the chat response', async () => {
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
   const errors: string[] = []
   const indicator = createDiscordTypingIndicator((message) => {
     errors.push(message)
@@ -186,8 +190,8 @@ test('discord gateway: typing failure does not fail the chat response', async (c
   indicator.close()
 })
 
-test('discord gateway: typing heartbeat stops when a response rejects', async (context) => {
-  context.mock.timers.enable({ apis: ['setInterval'] })
+test('discord gateway: typing heartbeat stops when a response rejects', async () => {
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
   let refreshes = 0
   const indicator = createDiscordTypingIndicator(() => {})
   await assert.rejects(
@@ -204,13 +208,13 @@ test('discord gateway: typing heartbeat stops when a response rejects', async (c
     /chat response failed/u,
   )
 
-  context.mock.timers.tick(16_000)
+  await vi.advanceTimersByTimeAsync(16_000)
   assert.equal(refreshes, 1)
   indicator.close()
 })
 
-test('discord gateway: closing the typing indicator stops an active heartbeat', async (context) => {
-  context.mock.timers.enable({ apis: ['setInterval'] })
+test('discord gateway: closing the typing indicator stops an active heartbeat', async () => {
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
   let refreshes = 0
   let release: (() => void) | undefined
   const gate = new Promise<void>((resolve) => {
@@ -234,7 +238,7 @@ test('discord gateway: closing the typing indicator stops an active heartbeat', 
   assert.equal(refreshes, 1)
 
   indicator.close()
-  context.mock.timers.tick(16_000)
+  await vi.advanceTimersByTimeAsync(16_000)
   assert.equal(refreshes, 1)
 
   release?.()
@@ -385,7 +389,10 @@ const fakeTypingIndicator = {
 
 function makeGatewayHandlerCapture() {
   const messages: DiscordChatMessage[] = []
-  const ignored: { metadata: DiscordChatMessageMetadata & { messageId: string }; failures: string[] }[] = []
+  const ignored: {
+    metadata: DiscordChatMessageMetadata & { messageId: string }
+    failures: string[]
+  }[] = []
   const errors: string[] = []
   const handlers: DiscordGatewayHandlers = {
     onReady: () => {},
@@ -411,7 +418,13 @@ test('discord gateway: 許可条件に落ちる message は onIgnored に messag
     content: '別 channel の投稿',
   })
 
-  handleDiscordMessageCreate(message, gatewayConfig, capture.handlers, fakeTypingIndicator, '12345678901234567')
+  handleDiscordMessageCreate(
+    message,
+    gatewayConfig,
+    capture.handlers,
+    fakeTypingIndicator,
+    '12345678901234567',
+  )
 
   assert.equal(capture.ignored.length, 1)
   assert.equal(capture.ignored[0]?.metadata.messageId, '92345678901234611')
@@ -425,7 +438,13 @@ test('discord gateway: 許可された message は onMessage に渡り onIgnored
   const capture = makeGatewayHandlerCapture()
   const message = makeFakeMessageCreate({ id: '92345678901234612', content: 'hello' })
 
-  handleDiscordMessageCreate(message, gatewayConfig, capture.handlers, fakeTypingIndicator, '12345678901234567')
+  handleDiscordMessageCreate(
+    message,
+    gatewayConfig,
+    capture.handlers,
+    fakeTypingIndicator,
+    '12345678901234567',
+  )
 
   assert.deepEqual(capture.ignored, [])
   assert.equal(capture.messages.length, 1)
@@ -443,7 +462,13 @@ test('discord gateway: bot 自身の message echo は onMessage に渡さず is_
     content: 'Araya の返信 echo',
   })
 
-  handleDiscordMessageCreate(message, gatewayConfig, capture.handlers, fakeTypingIndicator, '12345678901234567')
+  handleDiscordMessageCreate(
+    message,
+    gatewayConfig,
+    capture.handlers,
+    fakeTypingIndicator,
+    '12345678901234567',
+  )
 
   assert.deepEqual(capture.messages, [])
   assert.equal(capture.ignored.length, 1)
@@ -456,7 +481,13 @@ test('discord gateway: Araya 自身の user id の message（bot flag なし）�
   const capture = makeGatewayHandlerCapture()
   const message = makeFakeMessageCreate({ id: '92345678901234614', userId: '42345678901234567' })
 
-  handleDiscordMessageCreate(message, gatewayConfig, capture.handlers, fakeTypingIndicator, '42345678901234567')
+  handleDiscordMessageCreate(
+    message,
+    gatewayConfig,
+    capture.handlers,
+    fakeTypingIndicator,
+    '42345678901234567',
+  )
 
   assert.deepEqual(capture.messages, [])
   assert.equal(capture.ignored.length, 1)

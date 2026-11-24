@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import { test } from 'vite-plus/test'
 
 import {
   BOT_STARTED_TEXT,
@@ -7,13 +7,16 @@ import {
   RESTART_STOPPING_TEXT,
   discordRestartStartedText,
   postDiscordRestartNotice,
-} from '../src/discord/restart-notice.ts'
+} from './restart-notice.ts'
 
 const BOT_TOKEN = 'synthetic-token'
 const CHANNEL_ID = '32345678901234567'
 
 test('restart notice: 停止通知を permission channel 宛に Bot token 付き POST する', async () => {
-  const calls: { url: string; init: { method: string; headers: Record<string, string>; body: string } }[] = []
+  const calls: {
+    url: string
+    init: { method: string; headers: Record<string, string>; body: string }
+  }[] = []
 
   const ok = await postDiscordRestartNotice({
     botToken: BOT_TOKEN,

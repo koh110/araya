@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import test from 'node:test'
+import { test } from 'vite-plus/test'
 
 import {
   enqueueHootInject,
@@ -24,7 +24,7 @@ import {
   updateSettings,
   upsertProposal,
   writeHootState,
-} from '../src/hoot/store.ts'
+} from './store.ts'
 import {
   DEFAULT_GOAL_REVIEW_DAYS,
   DEFAULT_INJECT_COOLDOWN_MINUTES,
@@ -53,7 +53,7 @@ import {
   type HootRun,
   type HootSettings,
   type HootState,
-} from '../src/hoot/model.ts'
+} from './model.ts'
 
 const DAY_MS = 86_400_000
 const HOUR_MS = 3_600_000
@@ -64,7 +64,11 @@ async function makeHootFixture() {
   return { root, dataDir: path.join(root, 'data') }
 }
 
-function runFixture(occurrenceKey: string, decidedAt: string, overrides: Partial<HootRun> = {}): HootRun {
+function runFixture(
+  occurrenceKey: string,
+  decidedAt: string,
+  overrides: Partial<HootRun> = {},
+): HootRun {
   return {
     occurrenceKey,
     // occurrenceKey は plannedAt そのもの（hoot:<ISO>）。schedule の advance は plannedAt を使う
@@ -80,8 +84,8 @@ function runFixture(occurrenceKey: string, decidedAt: string, overrides: Partial
     dispatched: false,
     observedRepos: [],
     observationGaps: [],
-        conversationReads: { calls: 0, entries: 0, chars: 0 },
-...overrides,
+    conversationReads: { calls: 0, entries: 0, chars: 0 },
+    ...overrides,
   }
 }
 
@@ -117,12 +121,14 @@ function proposalFixture(key: string, overrides: Partial<HootProposal> = {}): Ho
 }
 
 // version 1（goal review・precheck・proposal のない state file）の形。settings に notifyNoop がある
-function v1StateFixture(overrides: {
-  settings?: Record<string, unknown>
-  goals?: Record<string, unknown>[]
-  loop?: Record<string, unknown>
-  runs?: Record<string, unknown>[]
-} = {}) {
+function v1StateFixture(
+  overrides: {
+    settings?: Record<string, unknown>
+    goals?: Record<string, unknown>[]
+    loop?: Record<string, unknown>
+    runs?: Record<string, unknown>[]
+  } = {},
+) {
   return {
     version: 1,
     settings: {
@@ -175,7 +181,10 @@ async function writeV1File(dataDir: string, value: unknown) {
 }
 
 async function readStateFile(dataDir: string) {
-  return JSON.parse(await fs.readFile(hootStateFilePath(dataDir), 'utf8')) as Record<string, unknown>
+  return JSON.parse(await fs.readFile(hootStateFilePath(dataDir), 'utf8')) as Record<
+    string,
+    unknown
+  >
 }
 
 // 形が壊れていることを test したい state は型を通さず渡す（writeHootState / readHootState の検査を通す）
@@ -213,25 +222,29 @@ test('hoot store: 初期 state は version 2 で enabled=false・mode=dry_run・
         scope: ['github:koh110/araya'],
         constraints: ['merge は人間の承認後だけ'],
       },
-      { replace: false }
+      { replace: false },
     )
     assert.equal(added.created, true)
     assert.equal(added.goal.key, 'araya-quality')
     // goal add は review 期限を自動で入れる（tick の test 時刻より後ろになって自動 paused しない）
     assert.notEqual(added.goal.reviewAt, null)
-    assert.ok(Date.parse(added.goal.reviewAt ?? '') >= beforeAddMs + (DEFAULT_GOAL_REVIEW_DAYS - 1) * DAY_MS)
-
-    await assert.rejects(
-      () => {
-        return setGoal(fixture.dataDir, { key: 'araya-quality', objective: 'duplicate' }, { replace: false })
-      },
-      /hoot_goal_exists/
+    assert.ok(
+      Date.parse(added.goal.reviewAt ?? '') >=
+        beforeAddMs + (DEFAULT_GOAL_REVIEW_DAYS - 1) * DAY_MS,
     )
+
+    await assert.rejects(() => {
+      return setGoal(
+        fixture.dataDir,
+        { key: 'araya-quality', objective: 'duplicate' },
+        { replace: false },
+      )
+    }, /hoot_goal_exists/)
 
     const updated = await setGoal(
       fixture.dataDir,
       { key: 'araya-quality', objective: '更新後の objective', scope: ['github:koh110/araya'] },
-      { replace: true }
+      { replace: true },
     )
     assert.equal(updated.created, false)
     const state = await readHootState(fixture.dataDir)
@@ -243,12 +256,9 @@ test('hoot store: 初期 state は version 2 で enabled=false・mode=dry_run・
 
     const paused = await setGoalStatus(fixture.dataDir, 'araya-quality', 'paused')
     assert.equal(paused.status, 'paused')
-    await assert.rejects(
-      () => {
-        return setGoalStatus(fixture.dataDir, 'missing-key', 'active')
-      },
-      /hoot_goal_not_found/
-    )
+    await assert.rejects(() => {
+      return setGoalStatus(fixture.dataDir, 'missing-key', 'active')
+    }, /hoot_goal_not_found/)
 
     const settings = await updateSettings(fixture.dataDir, {
       enabled: true,
@@ -286,19 +296,13 @@ test('hoot store: settings の検証（mode=active は inject gate として受�
     assert.equal(active.injectCooldownMinutes, DEFAULT_INJECT_COOLDOWN_MINUTES)
     assert.equal((await readHootState(fixture.dataDir)).settings.mode, 'active')
 
-    await assert.rejects(
-      () => {
-        return updateSettings(fixture.dataDir, { tickMinutes: 1 })
-      },
-      /hoot_settings_invalid/
-    )
+    await assert.rejects(() => {
+      return updateSettings(fixture.dataDir, { tickMinutes: 1 })
+    }, /hoot_settings_invalid/)
 
-    await assert.rejects(
-      () => {
-        return updateSettings(fixture.dataDir, { maxRunsPerDay: 0 })
-      },
-      /hoot_settings_invalid/
-    )
+    await assert.rejects(() => {
+      return updateSettings(fixture.dataDir, { maxRunsPerDay: 0 })
+    }, /hoot_settings_invalid/)
 
     // 新しい settings の範囲チェック（mergeSettings 直接でも同じ誤り）
     const current = defaultSettings()
@@ -326,19 +330,13 @@ test('hoot store: settings の検証（mode=active は inject gate として受�
     for (const patch of invalidPatches) {
       const settingsPatch = patch as unknown as Partial<HootSettings>
 
-      assert.throws(
-        () => {
-          return mergeSettings(current, settingsPatch)
-        },
-        /hoot_settings_invalid/u
-      )
+      assert.throws(() => {
+        return mergeSettings(current, settingsPatch)
+      }, /hoot_settings_invalid/u)
 
-      await assert.rejects(
-        () => {
-          return updateSettings(fixture.dataDir, settingsPatch)
-        },
-        /hoot_settings_invalid/
-      )
+      await assert.rejects(() => {
+        return updateSettings(fixture.dataDir, settingsPatch)
+      }, /hoot_settings_invalid/)
     }
 
     // 境界値は通る。notifyDecisions は重複を取り除いて保持
@@ -396,10 +394,12 @@ test('hoot store: 同時更新は lock で直列化され、両方の goal が�
     const state = await readHootState(fixture.dataDir)
     // lock で直列化されるので 3 件とも残る。lock 取得順は process 側で決まるため goal の並びは fix しない
     assert.deepEqual(
-      state.goals.map((goal) => {
-        return goal.key
-      }).sort(),
-      ['goal-one', 'goal-three', 'goal-two']
+      state.goals
+        .map((goal) => {
+          return goal.key
+        })
+        .sort(),
+      ['goal-one', 'goal-three', 'goal-two'],
     )
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
@@ -410,11 +410,17 @@ test('hoot store: 同じ occurrenceKey の run は書き込まず、記録は直
   const fixture = await makeHootFixture()
 
   try {
-    const first = await recordHootRun(fixture.dataDir, runFixture('hoot:2026-11-19T00:00:00.000Z', '2026-11-19T00:00:01.000Z'))
+    const first = await recordHootRun(
+      fixture.dataDir,
+      runFixture('hoot:2026-11-19T00:00:00.000Z', '2026-11-19T00:00:01.000Z'),
+    )
     assert.equal(first.recorded, true)
     assert.equal(first.run.source, 'model')
 
-    const replay = await recordHootRun(fixture.dataDir, runFixture('hoot:2026-11-19T00:00:00.000Z', '2026-11-19T00:09:00.000Z'))
+    const replay = await recordHootRun(
+      fixture.dataDir,
+      runFixture('hoot:2026-11-19T00:00:00.000Z', '2026-11-19T00:09:00.000Z'),
+    )
     assert.equal(replay.recorded, false)
     assert.equal(replay.run.decidedAt, '2026-11-19T00:00:01.000Z')
 
@@ -424,7 +430,7 @@ test('hoot store: 同じ occurrenceKey の run は書き込まず、記録は直
       runFixture('hoot:2026-11-19T01:00:00.000Z', '2026-11-19T01:00:01.000Z', {
         source: 'precheck',
         reason: '観測 fingerprint が前回と同じため model を呼ばない',
-      })
+      }),
     )
     assert.equal(prechecked.recorded, true)
 
@@ -443,14 +449,20 @@ test('hoot store: 同じ occurrenceKey の run は書き込まず、記録は直
     for (let index = 0; index < MAX_RUNS_KEPT + 5; index += 1) {
       await recordHootRun(
         fixture.dataDir,
-        runFixture(`hoot:2026-11-20T00:${padded(index)}:00.000Z`, `2026-11-20T00:${padded(index)}:01.000Z`)
+        runFixture(
+          `hoot:2026-11-20T00:${padded(index)}:00.000Z`,
+          `2026-11-20T00:${padded(index)}:01.000Z`,
+        ),
       )
     }
 
     state = await readHootState(fixture.dataDir)
     assert.equal(state.runs.length, MAX_RUNS_KEPT)
     assert.equal(state.runs[0]?.occurrenceKey, `hoot:2026-11-20T00:${padded(5)}:00.000Z`)
-    assert.equal(state.runs.at(-1)?.occurrenceKey, `hoot:2026-11-20T00:${padded(MAX_RUNS_KEPT + 4)}:00.000Z`)
+    assert.equal(
+      state.runs.at(-1)?.occurrenceKey,
+      `hoot:2026-11-20T00:${padded(MAX_RUNS_KEPT + 4)}:00.000Z`,
+    )
 
     await setHootConversationId(fixture.dataDir, 42)
     await resetSchedule(fixture.dataDir)
@@ -471,21 +483,15 @@ test('hoot store: 壊れた state は復旧せず誤り、書き込みは atomic
     await writeHootState(fixture.dataDir, defaultState())
     await fs.writeFile(hootStateFilePath(fixture.dataDir), '{ not json', 'utf8')
 
-    await assert.rejects(
-      () => {
-        return readHootState(fixture.dataDir)
-      },
-      /hoot_state_invalid/
-    )
+    await assert.rejects(() => {
+      return readHootState(fixture.dataDir)
+    }, /hoot_state_invalid/)
 
-    await assert.rejects(
-      () => {
-        return updateHootState(fixture.dataDir, (state) => {
-          state.settings.enabled = true
-        })
-      },
-      /hoot_state_invalid/
-    )
+    await assert.rejects(() => {
+      return updateHootState(fixture.dataDir, (state) => {
+        state.settings.enabled = true
+      })
+    }, /hoot_state_invalid/)
 
     const directory = path.dirname(hootStateFilePath(fixture.dataDir))
     const leftovers = (await fs.readdir(directory)).filter((entry) => {
@@ -494,71 +500,69 @@ test('hoot store: 壊れた state は復旧せず誤り、書き込みは atomic
     assert.deepEqual(leftovers, [])
 
     await fs.writeFile(hootStateFilePath(fixture.dataDir), JSON.stringify({ version: 99 }), 'utf8')
-    await assert.rejects(
-      () => {
-        return readHootState(fixture.dataDir)
-      },
-      /hoot_state_invalid/
-    )
+    await assert.rejects(() => {
+      return readHootState(fixture.dataDir)
+    }, /hoot_state_invalid/)
 
     // version 2 でも field が欠けていれば hoot_state_invalid（黙って既定値で作り直さない）
     await writeHootState(fixture.dataDir, defaultState())
 
     // settings の range 外
-    await assert.rejects(
-      () => {
-        return writeHootState(fixture.dataDir, brokenState({ settings: { ...defaultSettings(), watchdogHours: 10_000 } }))
-      },
-      /hoot_state_invalid/
-    )
+    await assert.rejects(() => {
+      return writeHootState(
+        fixture.dataDir,
+        brokenState({ settings: { ...defaultSettings(), watchdogHours: 10_000 } }),
+      )
+    }, /hoot_state_invalid/)
 
     // 旧 notifyNoop だけの settings（notifyDecisions が無い）は v2 の形ではない
     const legacySettings = { ...defaultSettings(), notifyNoop: true } as Partial<HootSettings>
     delete legacySettings.notifyDecisions
-    await assert.rejects(
-      () => {
-        return writeHootState(fixture.dataDir, brokenState({ settings: legacySettings }))
-      },
-      /hoot_state_invalid/
-    )
+    await assert.rejects(() => {
+      return writeHootState(fixture.dataDir, brokenState({ settings: legacySettings }))
+    }, /hoot_state_invalid/)
 
     // run の source 欠落
-    await assert.rejects(
-      () => {
-        return writeHootState(
-          fixture.dataDir,
-          brokenState({ runs: [{ ...runFixture('hoot:2026-11-19T00:00:00.000Z', '2026-11-19T00:00:01.000Z'), source: undefined }] })
-        )
-      },
-      /hoot_state_invalid/
-    )
+    await assert.rejects(() => {
+      return writeHootState(
+        fixture.dataDir,
+        brokenState({
+          runs: [
+            {
+              ...runFixture('hoot:2026-11-19T00:00:00.000Z', '2026-11-19T00:00:01.000Z'),
+              source: undefined,
+            },
+          ],
+        }),
+      )
+    }, /hoot_state_invalid/)
 
     // goal の reviewAt 欠落（v2 は null を含む reviewAt を要求する）
-    await assert.rejects(
-      () => {
-        return writeHootState(fixture.dataDir, brokenState({ goals: [{ ...goalFixture('no-review'), reviewAt: undefined }] }))
-      },
-      /hoot_state_invalid/
-    )
+    await assert.rejects(() => {
+      return writeHootState(
+        fixture.dataDir,
+        brokenState({ goals: [{ ...goalFixture('no-review'), reviewAt: undefined }] }),
+      )
+    }, /hoot_state_invalid/)
 
     // loop の新しい field 欠落
-    await assert.rejects(
-      () => {
-        return writeHootState(
-          fixture.dataDir,
-          brokenState({ loop: { ...defaultState().loop, goalFingerprints: undefined, conversationRuns: undefined } })
-        )
-      },
-      /hoot_state_invalid/
-    )
+    await assert.rejects(() => {
+      return writeHootState(
+        fixture.dataDir,
+        brokenState({
+          loop: {
+            ...defaultState().loop,
+            goalFingerprints: undefined,
+            conversationRuns: undefined,
+          },
+        }),
+      )
+    }, /hoot_state_invalid/)
 
     // proposals が配列でない（migration で埋める前提が崩れている）
-    await assert.rejects(
-      () => {
-        return writeHootState(fixture.dataDir, brokenState({ proposals: undefined }))
-      },
-      /hoot_state_invalid/
-    )
+    await assert.rejects(() => {
+      return writeHootState(fixture.dataDir, brokenState({ proposals: undefined }))
+    }, /hoot_state_invalid/)
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
@@ -585,7 +589,10 @@ test('hoot store: version 1 の state.json は読み取り時に v2 へ migratio
     assert.equal(migrated.settings.precheckObservation, defaultSettings().precheckObservation)
     assert.equal(migrated.settings.watchdogHours, defaultSettings().watchdogHours)
     assert.equal(migrated.settings.digestHourUtc, defaultSettings().digestHourUtc)
-    assert.equal(migrated.settings.resetConversationAfterRuns, defaultSettings().resetConversationAfterRuns)
+    assert.equal(
+      migrated.settings.resetConversationAfterRuns,
+      defaultSettings().resetConversationAfterRuns,
+    )
     assert.equal(migrated.settings.goalReviewDays, DEFAULT_GOAL_REVIEW_DAYS)
     assert.equal(migrated.settings.proposalTtlHours, defaultSettings().proposalTtlHours)
     assert.equal(migrated.settings.maxProposalReminders, defaultSettings().maxProposalReminders)
@@ -665,33 +672,34 @@ test('hoot store: version 1 migration の notifyNoop=false / 壊れた version 1
 
     // 型が違う notifyNoop は v1 の形として受け付けない
     await writeV1File(fixture.dataDir, v1StateFixture({ settings: { notifyNoop: 'yes' } }))
-    await assert.rejects(
-      () => {
-        return readHootState(fixture.dataDir)
-      },
-      /hoot_state_invalid/
-    )
+    await assert.rejects(() => {
+      return readHootState(fixture.dataDir)
+    }, /hoot_state_invalid/)
 
     // loop の durable field が壊れた version 1 も誤り
-    await writeV1File(fixture.dataDir, v1StateFixture({ loop: { lastRunAt: null, conversationId: 0, consecutiveFailures: 0, failureCooldownUntil: null } }))
-    await assert.rejects(
-      () => {
-        return readHootState(fixture.dataDir)
-      },
-      /hoot_state_invalid/
+    await writeV1File(
+      fixture.dataDir,
+      v1StateFixture({
+        loop: {
+          lastRunAt: null,
+          conversationId: 0,
+          consecutiveFailures: 0,
+          failureCooldownUntil: null,
+        },
+      }),
     )
+    await assert.rejects(() => {
+      return readHootState(fixture.dataDir)
+    }, /hoot_state_invalid/)
 
     // proposal の形が壊れた version 2 も誤り（migration で救わない）。file に直接書いて read だけの状態で見る
     await writeV1File(fixture.dataDir, {
       ...defaultState(),
       proposals: [{ ...proposalFixture('broken-proposal'), reminders: -1 }],
     })
-    await assert.rejects(
-      () => {
-        return readHootState(fixture.dataDir)
-      },
-      /hoot_state_invalid/
-    )
+    await assert.rejects(() => {
+      return readHootState(fixture.dataDir)
+    }, /hoot_state_invalid/)
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
@@ -717,7 +725,7 @@ test('hoot store: setGoalStatus active は review 期限を過ぎた goal の期
       paused.map((goal) => {
         return goal.key
       }),
-      ['expired-goal']
+      ['expired-goal'],
     )
 
     const resumed = await setGoalStatus(fixture.dataDir, 'expired-goal', 'active')
@@ -757,26 +765,29 @@ test('hoot store: 最近使った version 1 の migration は goal を即 pause 
   try {
     const recentRunAt = isoUtc(Date.now() - 60_000)
 
-    await writeV1File(fixture.dataDir, v1StateFixture({
-      loop: {
-        lastOccurrenceAt: recentRunAt,
-        lastRunAt: recentRunAt,
-        conversationId: null,
-        consecutiveFailures: 0,
-        failureCooldownUntil: null,
-      },
-      goals: [
-        {
-          key: 'legacy-goal',
-          objective: 'legacy objective',
-          scope: [],
-          constraints: [],
-          status: 'active',
-          createdAt: recentRunAt,
-          updatedAt: recentRunAt,
+    await writeV1File(
+      fixture.dataDir,
+      v1StateFixture({
+        loop: {
+          lastOccurrenceAt: recentRunAt,
+          lastRunAt: recentRunAt,
+          conversationId: null,
+          consecutiveFailures: 0,
+          failureCooldownUntil: null,
         },
-      ],
-    }))
+        goals: [
+          {
+            key: 'legacy-goal',
+            objective: 'legacy objective',
+            scope: [],
+            constraints: [],
+            status: 'active',
+            createdAt: recentRunAt,
+            updatedAt: recentRunAt,
+          },
+        ],
+      }),
+    )
 
     const migrated = await readHootState(fixture.dataDir)
     const reviewAtMs = Date.parse(migrated.goals[0]?.reviewAt ?? '')
@@ -817,19 +828,20 @@ test('hoot store: goal key / objective / scope / constraint の検証', async ()
       { key: '', objective: 'o' },
       { key: 'ok-key', objective: '   ' },
       { key: 'ok-key', objective: 'x'.repeat(1501) },
-      { key: 'ok-key', objective: 'o', scope: Array.from({ length: 13 }, (unused, index) => `github:a${index}/b`) },
+      {
+        key: 'ok-key',
+        objective: 'o',
+        scope: Array.from({ length: 13 }, (unused, index) => `github:a${index}/b`),
+      },
       { key: 'ok-key', objective: 'o', scope: ['x'.repeat(201)] },
       { key: 'ok-key', objective: 'o', constraints: Array.from({ length: 13 }, () => 'c') },
       { key: 'ok-key', objective: 'o', constraints: ['c'.repeat(301)] },
     ]
 
     for (const input of invalidGoals) {
-      await assert.rejects(
-        () => {
-          return setGoal(fixture.dataDir, input, { replace: true })
-        },
-        /hoot_goal_invalid/
-      )
+      await assert.rejects(() => {
+        return setGoal(fixture.dataDir, input, { replace: true })
+      }, /hoot_goal_invalid/)
     }
 
     // 誤り之后も state は変わらない（書き込み前に止まる）
@@ -838,7 +850,7 @@ test('hoot store: goal key / objective / scope / constraint の検証', async ()
       state.goals.map((goal) => {
         return goal.key
       }),
-      ['araya-quality']
+      ['araya-quality'],
     )
 
     // goal は最大 MAX_GOALS 件
@@ -846,12 +858,9 @@ test('hoot store: goal key / objective / scope / constraint の検証', async ()
       await setGoal(fixture.dataDir, { key: `goal-${index}`, objective: 'o' })
     }
 
-    await assert.rejects(
-      () => {
-        return setGoal(fixture.dataDir, { key: 'goal-over-limit', objective: 'o' })
-      },
-      /hoot_goal_limit/
-    )
+    await assert.rejects(() => {
+      return setGoal(fixture.dataDir, { key: 'goal-over-limit', objective: 'o' })
+    }, /hoot_goal_limit/)
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
@@ -869,44 +878,64 @@ test('hoot store: setGoal は settings.goalReviewDays で reviewAt を入れ、�
     assert.ok(reviewAtMs >= beforeMs + 7 * DAY_MS)
     assert.ok(reviewAtMs <= afterMs + 7 * DAY_MS)
 
-    const kept = await setGoal(fixture.dataDir, { key: 'review-default', objective: '更新' }, { replace: true })
+    const kept = await setGoal(
+      fixture.dataDir,
+      { key: 'review-default', objective: '更新' },
+      { replace: true },
+    )
     assert.equal(kept.goal.reviewAt, added.goal.reviewAt)
 
-    const dated = await setGoal(fixture.dataDir, { key: 'review-date', objective: 'o', reviewAt: '2026-12-01' })
+    const dated = await setGoal(fixture.dataDir, {
+      key: 'review-date',
+      objective: 'o',
+      reviewAt: '2026-12-01',
+    })
     assert.equal(dated.goal.reviewAt, '2026-12-01T00:00:00.000Z')
 
-    const iso = await setGoal(fixture.dataDir, { key: 'review-iso', objective: 'o', reviewAt: '2026-12-02T09:30:00.000Z' })
+    const iso = await setGoal(fixture.dataDir, {
+      key: 'review-iso',
+      objective: 'o',
+      reviewAt: '2026-12-02T09:30:00.000Z',
+    })
     assert.equal(iso.goal.reviewAt, '2026-12-02T09:30:00.000Z')
 
-    const none = await setGoal(fixture.dataDir, { key: 'review-none', objective: 'o', reviewAt: 'none' })
+    const none = await setGoal(fixture.dataDir, {
+      key: 'review-none',
+      objective: 'o',
+      reviewAt: 'none',
+    })
     assert.equal(none.goal.reviewAt, null)
 
-    const explicitNull = await setGoal(fixture.dataDir, { key: 'review-null', objective: 'o', reviewAt: null })
+    const explicitNull = await setGoal(fixture.dataDir, {
+      key: 'review-null',
+      objective: 'o',
+      reviewAt: null,
+    })
     assert.equal(explicitNull.goal.reviewAt, null)
 
     // 更新で 'none' を渡すと無期限に戻す
     const cleared = await setGoal(
       fixture.dataDir,
       { key: 'review-date', objective: '更新', reviewAt: 'none' },
-      { replace: true }
+      { replace: true },
     )
     assert.equal(cleared.goal.reviewAt, null)
 
-    await assert.rejects(
-      () => {
-        return setGoal(fixture.dataDir, { key: 'review-bad', objective: 'o', reviewAt: 'not-a-date' })
-      },
-      /hoot_goal_invalid/
-    )
+    await assert.rejects(() => {
+      return setGoal(fixture.dataDir, { key: 'review-bad', objective: 'o', reviewAt: 'not-a-date' })
+    }, /hoot_goal_invalid/)
 
     // 不正な reviewAt の更新では既存 goal の期限がそのまま残る
     const state = await readHootState(fixture.dataDir)
-    assert.equal(state.goals.find((goal) => goal.key === 'review-default')?.reviewAt, added.goal.reviewAt)
+    assert.equal(
+      state.goals.find((goal) => goal.key === 'review-default')?.reviewAt,
+      added.goal.reviewAt,
+    )
     assert.equal(
       state.goals.some((goal) => {
         return goal.key === 'review-bad'
       }),
-      false
+      false,
     )
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
@@ -928,7 +957,7 @@ test('hoot store: settings.goalReviewDays=0 は 新しい goal を無期限に�
       state.goals.find((goal) => {
         return goal.key === 'review-zero'
       })?.reviewAt,
-      null
+      null,
     )
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
@@ -959,13 +988,13 @@ test('hoot store: pauseExpiredGoals は reviewAt を過ぎた active goal だけ
       paused.map((goal) => {
         return goal.key
       }),
-      ['expired-goal', 'boundary-goal']
+      ['expired-goal', 'boundary-goal'],
     )
     assert.deepEqual(
       paused.map((goal) => {
         return goal.updatedAt
       }),
-      ['2026-11-19T09:00:00.000Z', '2026-11-19T09:00:00.000Z']
+      ['2026-11-19T09:00:00.000Z', '2026-11-19T09:00:00.000Z'],
     )
     assert.equal(paused[0]?.reviewAt, '2026-11-19T08:00:00.000Z')
 
@@ -981,7 +1010,7 @@ test('hoot store: pauseExpiredGoals は reviewAt を過ぎた active goal だけ
         'none-goal=active',
         'already-paused=paused',
         'retired-goal=retired',
-      ]
+      ],
     )
 
     // 2 回目以降は変更がない（毎回 paused を返さない）
@@ -1011,7 +1040,10 @@ test('hoot store: upsertProposal は同じ key の open を更新し、open 上�
     assert.equal(created.proposal?.status, 'open')
     assert.equal(created.proposal?.reminders, 0)
     assert.equal(created.proposal?.lastReminderAt, null)
-    assert.equal(created.proposal?.expiresAt, isoUtc(Date.parse('2026-11-19T08:00:00.000Z') + 72 * HOUR_MS))
+    assert.equal(
+      created.proposal?.expiresAt,
+      isoUtc(Date.parse('2026-11-19T08:00:00.000Z') + 72 * HOUR_MS),
+    )
 
     // 同じ key（同じ goal keys + decision）の open は 1 件に寄せる。期限・提醒回数・作成時刻は据え置く
     const merged = await upsertProposal(fixture.dataDir, {
@@ -1129,7 +1161,7 @@ test('hoot store: upsertProposal は同じ key の open を更新し、open 上�
         .map((proposal) => {
           return `${proposal.status}:${proposal.reason}`
         }),
-      ['resolved:old', 'open:new']
+      ['resolved:old', 'open:new'],
     )
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
@@ -1141,8 +1173,14 @@ test('hoot store: proposal key は decision と goal keys だけから決まる�
 
   try {
     const keyAb = proposalKeyOf({ goalKeys: ['goal-b', 'goal-a'], decision: 'request_human' })
-    const keyShuffled = proposalKeyOf({ goalKeys: ['goal-a', 'goal-b', 'goal-a'], decision: 'request_human' })
-    const keyOtherDecision = proposalKeyOf({ goalKeys: ['goal-b', 'goal-a'], decision: 'investigate' })
+    const keyShuffled = proposalKeyOf({
+      goalKeys: ['goal-a', 'goal-b', 'goal-a'],
+      decision: 'request_human',
+    })
+    const keyOtherDecision = proposalKeyOf({
+      goalKeys: ['goal-b', 'goal-a'],
+      decision: 'investigate',
+    })
     const keyOtherGoals = proposalKeyOf({ goalKeys: ['goal-a'], decision: 'request_human' })
 
     assert.equal(keyAb, keyShuffled)
@@ -1191,7 +1229,11 @@ test('hoot store: upsertProposal は保持上限で closed を古い順に落と
         status: index < MAX_PROPOSALS_KEPT - 3 ? 'resolved' : 'open',
       })
     })
-    await writeHootState(fixture.dataDir, { ...defaultState(), goals: [goalFixture('araya-quality')], proposals })
+    await writeHootState(fixture.dataDir, {
+      ...defaultState(),
+      goals: [goalFixture('araya-quality')],
+      proposals,
+    })
 
     const added = await upsertProposal(fixture.dataDir, {
       key: 'brand-new',
@@ -1210,7 +1252,7 @@ test('hoot store: upsertProposal は保持上限で closed を古い順に落と
       state.proposals.some((proposal) => {
         return proposal.key === 'k000'
       }),
-      false
+      false,
     )
     const expectedOpen = [
       ...Array.from({ length: 3 }, (unused, index) => {
@@ -1219,12 +1261,14 @@ test('hoot store: upsertProposal は保持上限で closed を古い順に落と
       'brand-new',
     ]
     assert.deepEqual(
-      state.proposals.filter((proposal) => {
-        return proposal.status === 'open'
-      }).map((proposal) => {
-        return proposal.key
-      }),
-      expectedOpen
+      state.proposals
+        .filter((proposal) => {
+          return proposal.status === 'open'
+        })
+        .map((proposal) => {
+          return proposal.key
+        }),
+      expectedOpen,
     )
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
@@ -1251,9 +1295,18 @@ test('hoot store: takeProposalReminder は期限切れを closed にし、backof
     const everyMs = HOUR_MS
 
     // 期限前（createdAt + everyMs > now）は送らない
-    assert.equal(await takeProposalReminder(fixture.dataDir, { nowMs: Date.parse('2026-11-19T08:59:59.000Z'), everyMs }), null)
+    assert.equal(
+      await takeProposalReminder(fixture.dataDir, {
+        nowMs: Date.parse('2026-11-19T08:59:59.000Z'),
+        everyMs,
+      }),
+      null,
+    )
 
-    const first = await takeProposalReminder(fixture.dataDir, { nowMs: Date.parse('2026-11-19T09:00:00.000Z'), everyMs })
+    const first = await takeProposalReminder(fixture.dataDir, {
+      nowMs: Date.parse('2026-11-19T09:00:00.000Z'),
+      everyMs,
+    })
     assert.equal(first?.proposal.key, 'p-backoff')
     assert.equal(first?.reminderIndex, 1)
     assert.equal(first?.proposal.reminders, 1)
@@ -1261,30 +1314,57 @@ test('hoot store: takeProposalReminder は期限切れを closed にし、backof
     assert.equal(first?.proposal.status, 'open')
 
     // 同じ now では 2 件目を送らない。期限切れの closed は file に書き込まれる
-    assert.equal(await takeProposalReminder(fixture.dataDir, { nowMs: Date.parse('2026-11-19T09:00:00.000Z'), everyMs }), null)
+    assert.equal(
+      await takeProposalReminder(fixture.dataDir, {
+        nowMs: Date.parse('2026-11-19T09:00:00.000Z'),
+        everyMs,
+      }),
+      null,
+    )
     let state = await readHootState(fixture.dataDir)
-    assert.equal(state.proposals.find((proposal) => proposal.key === 'p-expired')?.status, 'expired')
+    assert.equal(
+      state.proposals.find((proposal) => proposal.key === 'p-expired')?.status,
+      'expired',
+    )
 
     // backoff は everyMs * 2 ** reminders（60 分 → 120 分 → 240 分）
-    assert.equal(await takeProposalReminder(fixture.dataDir, { nowMs: Date.parse('2026-11-19T10:59:00.000Z'), everyMs }), null)
+    assert.equal(
+      await takeProposalReminder(fixture.dataDir, {
+        nowMs: Date.parse('2026-11-19T10:59:00.000Z'),
+        everyMs,
+      }),
+      null,
+    )
 
-    const second = await takeProposalReminder(fixture.dataDir, { nowMs: Date.parse('2026-11-19T11:00:00.000Z'), everyMs })
+    const second = await takeProposalReminder(fixture.dataDir, {
+      nowMs: Date.parse('2026-11-19T11:00:00.000Z'),
+      everyMs,
+    })
     assert.equal(second?.reminderIndex, 2)
     assert.equal(second?.proposal.reminders, 2)
 
-    const third = await takeProposalReminder(fixture.dataDir, { nowMs: Date.parse('2026-11-19T15:00:00.000Z'), everyMs })
+    const third = await takeProposalReminder(fixture.dataDir, {
+      nowMs: Date.parse('2026-11-19T15:00:00.000Z'),
+      everyMs,
+    })
     assert.equal(third?.reminderIndex, 3)
     assert.equal(third?.proposal.reminders, 3)
 
     // maxProposalReminders（既定 3）を超えたら送らない
-    assert.equal(await takeProposalReminder(fixture.dataDir, { nowMs: Date.parse('2026-11-19T23:00:00.000Z'), everyMs }), null)
+    assert.equal(
+      await takeProposalReminder(fixture.dataDir, {
+        nowMs: Date.parse('2026-11-19T23:00:00.000Z'),
+        everyMs,
+      }),
+      null,
+    )
 
     state = await readHootState(fixture.dataDir)
     assert.deepEqual(
       state.proposals.map((proposal) => {
         return `${proposal.key}=${proposal.status}/${proposal.reminders}`
       }),
-      ['p-backoff=open/3', 'p-expired=expired/0']
+      ['p-backoff=open/3', 'p-expired=expired/0'],
     )
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
@@ -1298,7 +1378,9 @@ test('hoot store: takeProposalReminder は maxProposalReminders=0 で送らな�
     await writeHootState(fixture.dataDir, {
       ...defaultState(),
       settings: { ...defaultSettings(), maxProposalReminders: 0 },
-      proposals: [proposalFixture('p-zero', { decision: 'dispatch', expiresAt: '2026-11-19T08:30:00.000Z' })],
+      proposals: [
+        proposalFixture('p-zero', { decision: 'dispatch', expiresAt: '2026-11-19T08:30:00.000Z' }),
+      ],
     })
 
     const taken = await takeProposalReminder(fixture.dataDir, {
@@ -1327,7 +1409,11 @@ test('hoot store: resolveProposal は open を resolved にし、open が無い 
       ],
     })
 
-    const resolved = await resolveProposal(fixture.dataDir, 'p-open', Date.parse('2026-11-19T09:00:00.000Z'))
+    const resolved = await resolveProposal(
+      fixture.dataDir,
+      'p-open',
+      Date.parse('2026-11-19T09:00:00.000Z'),
+    )
     assert.equal(resolved.status, 'resolved')
     assert.equal(resolved.updatedAt, '2026-11-19T09:00:00.000Z')
     assert.equal(resolved.reason, '優先順位を決めてください')
@@ -1336,28 +1422,22 @@ test('hoot store: resolveProposal は open を resolved にし、open が無い 
     assert.equal(state.proposals.find((proposal) => proposal.key === 'p-open')?.status, 'resolved')
 
     // 同じ key をもう resolve できない（open だけでは探す）
-    await assert.rejects(
-      () => {
-        return resolveProposal(fixture.dataDir, 'p-open')
-      },
-      /hoot_proposal_not_found/
-    )
+    await assert.rejects(() => {
+      return resolveProposal(fixture.dataDir, 'p-open')
+    }, /hoot_proposal_not_found/)
 
-    await assert.rejects(
-      () => {
-        return resolveProposal(fixture.dataDir, 'missing-key')
-      },
-      /hoot_proposal_not_found/
-    )
+    await assert.rejects(() => {
+      return resolveProposal(fixture.dataDir, 'missing-key')
+    }, /hoot_proposal_not_found/)
 
     // 期限切れの open も resolve 対象にならない（takeProposalReminder で closed になる）
-    await takeProposalReminder(fixture.dataDir, { nowMs: Date.parse('2026-11-19T09:00:00.000Z'), everyMs: HOUR_MS })
-    await assert.rejects(
-      () => {
-        return resolveProposal(fixture.dataDir, 'p-expiring')
-      },
-      /hoot_proposal_not_found/
-    )
+    await takeProposalReminder(fixture.dataDir, {
+      nowMs: Date.parse('2026-11-19T09:00:00.000Z'),
+      everyMs: HOUR_MS,
+    })
+    await assert.rejects(() => {
+      return resolveProposal(fixture.dataDir, 'p-expiring')
+    }, /hoot_proposal_not_found/)
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
@@ -1399,10 +1479,14 @@ test('hoot store: investigate proposal も inject request になる（人間の�
   const requestHumanKey = proposalKeyOf({ goalKeys: ['quality'], decision: 'request_human' })
 
   try {
-    await setGoal(fixture.dataDir, { key: 'quality', objective: 'quality の objective', scope: ['github:koh110/araya'] })
+    await setGoal(fixture.dataDir, {
+      key: 'quality',
+      objective: 'quality の objective',
+      scope: ['github:koh110/araya'],
+    })
     for (const [key, decision] of [
       [investigateKey, 'investigate'],
-      [requestHumanKey, 'request_human']
+      [requestHumanKey, 'request_human'],
     ] as const) {
       await upsertProposal(fixture.dataDir, {
         key,
@@ -1410,21 +1494,18 @@ test('hoot store: investigate proposal も inject request になる（人間の�
         goalKeys: ['quality'],
         reason: `${decision} の理由`,
         occurrenceKey: 'hoot:2026-11-20T00:00:00.000Z',
-        nowMs: Date.parse('2026-11-20T00:00:00.000Z')
+        nowMs: Date.parse('2026-11-20T00:00:00.000Z'),
       })
     }
 
     // dry_run では investigate でも request を作らない
-    await assert.rejects(
-      () => {
-        return enqueueHootInject(fixture.dataDir, {
-          proposalKey: investigateKey,
-          authorizedBy: 'human',
-          nowMs: Date.parse('2026-11-20T01:00:00.000Z')
-        })
-      },
-      /hoot_mode_dry_run/
-    )
+    await assert.rejects(() => {
+      return enqueueHootInject(fixture.dataDir, {
+        proposalKey: investigateKey,
+        authorizedBy: 'human',
+        nowMs: Date.parse('2026-11-20T01:00:00.000Z'),
+      })
+    }, /hoot_mode_dry_run/)
 
     await updateSettings(fixture.dataDir, { mode: 'active' })
 
@@ -1432,7 +1513,7 @@ test('hoot store: investigate proposal も inject request になる（人間の�
     const auto = await enqueueHootInject(fixture.dataDir, {
       proposalKey: investigateKey,
       authorizedBy: 'mode_active',
-      nowMs: Date.parse('2026-11-20T01:00:00.000Z')
+      nowMs: Date.parse('2026-11-20T01:00:00.000Z'),
     })
     assert.equal(auto.request, null)
     assert.equal(auto.skipped, 'auto_dispatch_off')
@@ -1440,22 +1521,19 @@ test('hoot store: investigate proposal も inject request になる（人間の�
     const enqueued = await enqueueHootInject(fixture.dataDir, {
       proposalKey: investigateKey,
       authorizedBy: 'human',
-      nowMs: Date.parse('2026-11-20T01:00:00.000Z')
+      nowMs: Date.parse('2026-11-20T01:00:00.000Z'),
     })
     assert.equal(enqueued.request?.proposalKey, investigateKey)
     assert.equal(enqueued.request?.status, 'pending')
     assert.equal(enqueued.request?.authorizedBy, 'human')
 
-    await assert.rejects(
-      () => {
-        return enqueueHootInject(fixture.dataDir, {
-          proposalKey: requestHumanKey,
-          authorizedBy: 'human',
-          nowMs: Date.parse('2026-11-20T02:30:00.000Z')
-        })
-      },
-      /hoot_inject_not_injectable/
-    )
+    await assert.rejects(() => {
+      return enqueueHootInject(fixture.dataDir, {
+        proposalKey: requestHumanKey,
+        authorizedBy: 'human',
+        nowMs: Date.parse('2026-11-20T02:30:00.000Z'),
+      })
+    }, /hoot_inject_not_injectable/)
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
@@ -1468,8 +1546,16 @@ test('hoot store: inject request は mode gate・cooldown・daily limit・pendin
   const requestHumanKey = proposalKeyOf({ goalKeys: ['quality'], decision: 'request_human' })
 
   try {
-    await setGoal(fixture.dataDir, { key: 'quality', objective: 'quality の objective', scope: ['github:koh110/araya'] })
-    await setGoal(fixture.dataDir, { key: 'docs', objective: 'docs の objective', scope: ['github:koh110/araya'] })
+    await setGoal(fixture.dataDir, {
+      key: 'quality',
+      objective: 'quality の objective',
+      scope: ['github:koh110/araya'],
+    })
+    await setGoal(fixture.dataDir, {
+      key: 'docs',
+      objective: 'docs の objective',
+      scope: ['github:koh110/araya'],
+    })
 
     for (const [key, decision] of [
       [proposalKey, 'dispatch'],
@@ -1487,16 +1573,13 @@ test('hoot store: inject request は mode gate・cooldown・daily limit・pendin
     }
 
     // dry_run では request さえ作らない（mode=active のときだけ inject を考える）
-    await assert.rejects(
-      () => {
-        return enqueueHootInject(fixture.dataDir, {
-          proposalKey,
-          authorizedBy: 'human',
-          nowMs: Date.parse('2026-11-20T01:00:00.000Z'),
-        })
-      },
-      /hoot_mode_dry_run/
-    )
+    await assert.rejects(() => {
+      return enqueueHootInject(fixture.dataDir, {
+        proposalKey,
+        authorizedBy: 'human',
+        nowMs: Date.parse('2026-11-20T01:00:00.000Z'),
+      })
+    }, /hoot_mode_dry_run/)
 
     await updateSettings(fixture.dataDir, { mode: 'active' })
 
@@ -1533,28 +1616,22 @@ test('hoot store: inject request は mode gate・cooldown・daily limit・pendin
     assert.equal(again.request, null)
     assert.equal(again.skipped, 'already_pending')
 
-    await assert.rejects(
-      () => {
-        return enqueueHootInject(fixture.dataDir, {
-          proposalKey: 'hoot-prop-missing',
-          authorizedBy: 'human',
-          nowMs: Date.parse('2026-11-20T01:20:00.000Z'),
-        })
-      },
-      /hoot_proposal_not_found/
-    )
+    await assert.rejects(() => {
+      return enqueueHootInject(fixture.dataDir, {
+        proposalKey: 'hoot-prop-missing',
+        authorizedBy: 'human',
+        nowMs: Date.parse('2026-11-20T01:20:00.000Z'),
+      })
+    }, /hoot_proposal_not_found/)
 
     // inject してよい decision は dispatch / investigate（request_human は人間への依頼なので提案のまま）
-    await assert.rejects(
-      () => {
-        return enqueueHootInject(fixture.dataDir, {
-          proposalKey: requestHumanKey,
-          authorizedBy: 'human',
-          nowMs: Date.parse('2026-11-20T01:20:00.000Z'),
-        })
-      },
-      /hoot_inject_not_injectable/
-    )
+    await assert.rejects(() => {
+      return enqueueHootInject(fixture.dataDir, {
+        proposalKey: requestHumanKey,
+        authorizedBy: 'human',
+        nowMs: Date.parse('2026-11-20T01:20:00.000Z'),
+      })
+    }, /hoot_inject_not_injectable/)
 
     // take は attempts を 1 増やす。requestId は attempt を含まないので、再試行でも同じ dedupe key
     // （Pi durable が同じ dispatch を 2 度走らせない）
@@ -1574,7 +1651,10 @@ test('hoot store: inject request は mode gate・cooldown・daily limit・pendin
     assert.equal(failedOnce.attempts, 1)
     assert.equal(failedOnce.lastError, 'gateway closed')
 
-    const takenAgain = await takePendingInject(fixture.dataDir, Date.parse('2026-11-20T02:12:00.000Z'))
+    const takenAgain = await takePendingInject(
+      fixture.dataDir,
+      Date.parse('2026-11-20T02:12:00.000Z'),
+    )
     assert.equal(takenAgain?.attempts, 2)
     assert.equal(takenAgain?.requestId, request?.key)
 
@@ -1586,7 +1666,10 @@ test('hoot store: inject request は mode gate・cooldown・daily limit・pendin
     })
     assert.equal(failedTwice.status, 'failed')
     assert.equal(failedTwice.attempts, MAX_INJECT_ATTEMPTS)
-    assert.equal(await takePendingInject(fixture.dataDir, Date.parse('2026-11-20T02:14:00.000Z')), null)
+    assert.equal(
+      await takePendingInject(fixture.dataDir, Date.parse('2026-11-20T02:14:00.000Z')),
+      null,
+    )
 
     // cooldown（120 分に伸ばした）は同じ proposal への新しい request も抑える
     await updateSettings(fixture.dataDir, { injectCooldownMinutes: 120 })
@@ -1609,7 +1692,10 @@ test('hoot store: inject request は mode gate・cooldown・daily limit・pendin
     assert.match(later.request?.key ?? '', /:2$/u)
 
     // 注入成功: injected になり lastError を消す
-    const injectedTaken = await takePendingInject(fixture.dataDir, Date.parse('2026-11-20T05:01:00.000Z'))
+    const injectedTaken = await takePendingInject(
+      fixture.dataDir,
+      Date.parse('2026-11-20T05:01:00.000Z'),
+    )
     assert.equal(injectedTaken?.key, later.request?.key)
     const injected = await finishHootInject(fixture.dataDir, later.request?.key ?? '', {
       ok: true,
@@ -1635,7 +1721,7 @@ test('hoot store: inject request は mode gate・cooldown・daily limit・pendin
       state.injectRequests.map((entry) => {
         return entry.status
       }),
-      ['failed', 'injected']
+      ['failed', 'injected'],
     )
     // inject の記録は schedule・proposal・run を壊さない
     assert.equal(state.proposals.length, 3)
@@ -1649,7 +1735,11 @@ test('hoot store: inject request は直近保持で prune しても pending を�
   const fixture = await makeHootFixture()
 
   try {
-    await updateSettings(fixture.dataDir, { mode: 'active', injectCooldownMinutes: 0, maxInjectsPerDay: 10 })
+    await updateSettings(fixture.dataDir, {
+      mode: 'active',
+      injectCooldownMinutes: 0,
+      maxInjectsPerDay: 10,
+    })
 
     // 満杯の injected 記録を直接書いてから新しい pending を足す
     const old: HootInjectRequest[] = []
@@ -1764,7 +1854,9 @@ test('hoot store: version 2 の state file は読み取り時に v3 へ寄す（
     assert.equal(first.loop.conversationRuns, 3)
 
     // 読み取りでは file を書き換えない（version を上げた file を作り直さない）
-    const raw = JSON.parse(await fs.readFile(hootStateFilePath(fixture.dataDir), 'utf8')) as { version: number }
+    const raw = JSON.parse(await fs.readFile(hootStateFilePath(fixture.dataDir), 'utf8')) as {
+      version: number
+    }
     assert.equal(raw.version, HOOT_STATE_VERSION_INJECT)
 
     // 再読込みでも値が動かない（read ごとに deadline を作り直さない）
@@ -1852,7 +1944,9 @@ test('hoot store: version 3 の state file は migration で conversationRead �
     assert.equal(state.loop.conversationId, 9)
 
     // 読み取りだけでは file を書き換えない（古い process と混ぜても壊さない）
-    const before = JSON.parse(await fs.readFile(hootStateFilePath(fixture.dataDir), 'utf8')) as { version: number }
+    const before = JSON.parse(await fs.readFile(hootStateFilePath(fixture.dataDir), 'utf8')) as {
+      version: number
+    }
     assert.equal(before.version, 3)
 
     // 人間が tool を有効化する update で version 4 として保存される
@@ -1881,12 +1975,11 @@ test('hoot store: conversationRead settings の validation と per-run の read 
     const state = await readHootState(fixture.dataDir)
     assert.equal(state.settings.conversationRead, false)
 
-    await assert.rejects(
-      async () => {
-        return await updateSettings(fixture.dataDir, { conversationRead: 'yes' as unknown as boolean })
-      },
-      /hoot_settings_invalid: conversationRead/u
-    )
+    await assert.rejects(async () => {
+      return await updateSettings(fixture.dataDir, {
+        conversationRead: 'yes' as unknown as boolean,
+      })
+    }, /hoot_settings_invalid: conversationRead/u)
 
     // 判断 run の tool 使用実績は run ごとに記録し、次の run に引き継がない
     await recordHootRun(fixture.dataDir, {

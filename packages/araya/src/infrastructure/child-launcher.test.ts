@@ -1,14 +1,14 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import { test } from 'vite-plus/test'
 
 import {
   DEFAULT_LAUNCHER_STOP_WAIT_MS,
   launchChildAndWait,
   launcherStopWaitMs,
   stderrLineWriter,
-} from '../src/infrastructure/child-launcher.ts'
-import { discordUnitSections } from '../src/infrastructure/systemd.ts'
-import { SHUTDOWN_BUDGET_TOTAL_MS } from '../src/discord/bot.ts'
+} from './child-launcher.ts'
+import { discordUnitSections } from './systemd.ts'
+import { SHUTDOWN_BUDGET_TOTAL_MS } from '../discord/bot.ts'
 
 test('child launcher: stderrLineWriter は 1 件を 1 行として書き、改行を二重エスケープしない', () => {
   const chunks: string[] = []
@@ -28,10 +28,7 @@ test('child launcher: bot の stderr は行ごとに redact して writeError �
   const lines: string[] = []
   const outcome = await launchChildAndWait({
     command: process.execPath,
-    args: [
-      '-e',
-      'process.stderr.write("trace with bot-secret-value line\\nsecond line\\n")',
-    ],
+    args: ['-e', 'process.stderr.write("trace with bot-secret-value line\\nsecond line\\n")'],
     env: { ...process.env },
     stopWaitMs: 5_000,
     secretValues: ['bot-secret-value'],
@@ -55,8 +52,14 @@ test('child launcher: stop wait の default は bot の shutdown budget と unit
   assert.equal(launcherStopWaitMs({}), DEFAULT_LAUNCHER_STOP_WAIT_MS)
   assert.equal(launcherStopWaitMs({ ARAYA_LAUNCHER_STOP_WAIT_MS: '21000' }), 21_000)
   // 数字でない物と bounds 外は default に戻す
-  assert.equal(launcherStopWaitMs({ ARAYA_LAUNCHER_STOP_WAIT_MS: 'abc' }), DEFAULT_LAUNCHER_STOP_WAIT_MS)
-  assert.equal(launcherStopWaitMs({ ARAYA_LAUNCHER_STOP_WAIT_MS: '50' }), DEFAULT_LAUNCHER_STOP_WAIT_MS)
+  assert.equal(
+    launcherStopWaitMs({ ARAYA_LAUNCHER_STOP_WAIT_MS: 'abc' }),
+    DEFAULT_LAUNCHER_STOP_WAIT_MS,
+  )
+  assert.equal(
+    launcherStopWaitMs({ ARAYA_LAUNCHER_STOP_WAIT_MS: '50' }),
+    DEFAULT_LAUNCHER_STOP_WAIT_MS,
+  )
 
   // #36 の跨 file 不変条件: runner は bot の drain より先に死なず、unit の SIGKILL より先に諦める
   const sections = discordUnitSections({

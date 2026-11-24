@@ -9,5 +9,8 @@
   "include": [
     "packages/araya/bin/**/*.ts",
     "packages/araya/src/**/*.ts"
+  ],
+  "exclude": [
+    "packages/araya/src/**/*.test.ts"
   ]
 }

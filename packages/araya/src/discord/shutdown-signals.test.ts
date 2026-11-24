@@ -4,12 +4,12 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
-import test from 'node:test'
+import { test } from 'vite-plus/test'
 import { fileURLToPath } from 'node:url'
 
-import { installShutdownSignals } from '../src/discord/shutdown-signals.ts'
+import { installShutdownSignals } from './shutdown-signals.ts'
 
-const SRC_DIR = path.resolve(fileURLToPath(import.meta.url), '../../src')
+const SRC_DIR = path.resolve(fileURLToPath(import.meta.url), '../../')
 const SIGNAL_HELPER_PATH = path.join(SRC_DIR, 'discord/shutdown-signals.ts')
 const CHILD_LAUNCHER_PATH = path.join(SRC_DIR, 'infrastructure/child-launcher.ts')
 
@@ -100,9 +100,7 @@ process.exit(0)
 // systemd の stop は main（runner）と control group 内の bot の両方へ SIGTERM を送る。
 // runner は自分の child にも SIGTERM を forward するので、bot には外から 2 本届く。その順番を再現する
 async function runWithTwoExternalSignals(signalMode: 'persistent' | 'once') {
-  const root = await fs.realpath(
-    await fs.mkdtemp(path.join(os.tmpdir(), 'araya-shutdown-signal-')),
-  )
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'araya-shutdown-signal-')))
   const botPath = path.join(root, 'fake-bot.mts')
   const runnerPath = path.join(root, 'fake-runner.mts')
 

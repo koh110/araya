@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
-import fs from 'node:fs/promises'
-import os from 'node:os'
-import path from 'node:path'
-import test from 'node:test'
+import { test } from 'vite-plus/test'
+
+import {
+  DISCORD_TEST_NOW_MS as NOW_MS,
+  messageIdAtAge,
+} from '../../test/support/discord-snowflake.ts'
 
 import {
   BACKFILL_MAX_AGE_MS,
@@ -10,36 +12,18 @@ import {
   discordMessageTimestampMs,
   runDiscordRestartBackfill,
   selectBackfillMessages,
-} from '../src/discord/backfill.ts'
-import {
-  DISCORD_STATE_VERSION,
-  isDiscordMessageIdNewer,
-  newState,
-  noteDiscordSeenMessageId,
-  readDiscordBotState,
-  writeDiscordBotState,
-} from '../src/discord/state.ts'
-import { discordStateFilePath } from '../src/discord/state.ts'
-import type { DiscordConfig } from '../src/discord/config.ts'
-import type { DiscordGateway, DiscordHistoryMessage } from '../src/discord/gateway.ts'
-import type { DiscordChatHandler, DiscordChatMessage } from '../src/discord/chat.ts'
-import type { DiscordBotState } from '../src/discord/state.ts'
+} from './backfill.ts'
+import { newState, noteDiscordSeenMessageId } from './state.ts'
+import type { DiscordConfig } from './config.ts'
+import type { DiscordGateway, DiscordHistoryMessage } from './gateway.ts'
+import type { DiscordChatHandler, DiscordChatMessage } from './chat.ts'
+import type { DiscordBotState } from './state.ts'
 
 const BOT_TOKEN = 'synthetic-token'
 const GUILD_ID = '22345678901234567'
 const CHANNEL_ID = '32345678901234567'
 const USER_ID = '42345678901234567'
 const BOT_USER_ID = '998877665544332211'
-
-const NOW_MS = Date.UTC(2026, 10, 23, 12, 0, 0)
-const DISCORD_EPOCH_MS = 1_420_070_400_000
-
-// Discord snowflake を作る。ageMs 前に投稿された id にする（同順を保つため increment を増やす）
-function messageIdAtAge(ageMs: number): string {
-  const timestampMs = NOW_MS - ageMs - DISCORD_EPOCH_MS
-
-  return String((BigInt(timestampMs) << 22n) + 1n)
-}
 
 const config: DiscordConfig = {
   botToken: BOT_TOKEN,
@@ -73,9 +57,10 @@ test('backfill: snowflake id から投稿時刻を復元できる', () => {
 
   assert.ok(createdMs !== null)
   assert.ok(Math.abs(NOW_MS - 5_000 - createdMs) < 2, `createdMs=${createdMs}`)
-  assert.ok(isDiscordMessageIdNewer(messageIdAtAge(1_000), messageIdAtAge(9_000)))
+})
+
+test('backfill: invalid な snowflake id から投稿時刻を復元しない', () => {
   assert.equal(discordMessageTimestampMs('not-a-snowflake'), null)
-  assert.equal(isDiscordMessageIdNewer('abc', messageIdAtAge(1_000)), false)
 })
 
 test('backfill: cursor より新しい message だけ、古い順に選ぶ（bot・拒否用户・空・古い物は飛ばす）', () => {
@@ -128,7 +113,10 @@ test('backfill: cursor が無い instance は history を処理しない', () =>
 
 test('backfill: 上限より多い history では新しい側を残し、古い側を over_limit で落とす', () => {
   const cursor = messageIdAtAge(300_000)
-  const ages = Array.from({ length: BACKFILL_MAX_MESSAGES + 3 }, (_unused, index) => 5_000 + index * 100)
+  const ages = Array.from(
+    { length: BACKFILL_MAX_MESSAGES + 3 },
+    (_unused, index) => 5_000 + index * 100,
+  )
 
   const selection = selectBackfillMessages({
     history: ages.map((age) => historyMessage(messageIdAtAge(age))).reverse(),
@@ -151,69 +139,6 @@ test('backfill: 上限より多い history では新しい側を残し、古い�
       messageIdAtAge(5_000 + (BACKFILL_MAX_MESSAGES + 2) * 100),
     ].sort(),
   )
-})
-
-test('discord state: v1 の state.json を読んで cursor を null で埋める', async () => {
-  const dataDir = await fs.realpath(
-    await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-state-migration-test-')),
-  )
-
-  try {
-    await fs.mkdir(path.dirname(discordStateFilePath(dataDir)), { recursive: true, mode: 0o700 })
-    await fs.writeFile(
-      discordStateFilePath(dataDir),
-      `${JSON.stringify({ version: 1, unit: 'araya-discord-old', readyId: 'ready-old', lastReadyAt: '2026-11-22T00:00:00.000Z' }, null, 2)}\n`,
-      { mode: 0o600 },
-    )
-
-    const state = readDiscordBotState(dataDir)
-
-    assert.ok(state !== null)
-    assert.equal(state.version, DISCORD_STATE_VERSION)
-    assert.equal(state.unit, 'araya-discord-old')
-    assert.equal(state.lastSeenMessageId, null)
-    // read だけでは file を書き換えない
-    assert.equal(JSON.parse(await fs.readFile(discordStateFilePath(dataDir), 'utf8')).version, 1)
-
-    // 次の保存で v2 になる
-    writeDiscordBotState(dataDir, state)
-    assert.equal(JSON.parse(await fs.readFile(discordStateFilePath(dataDir), 'utf8')).version, DISCORD_STATE_VERSION)
-
-    // 未来の version と不正な cursor は reject（壊れた state を黙って上書きしない）
-    await fs.writeFile(
-      discordStateFilePath(dataDir),
-      `${JSON.stringify({ version: DISCORD_STATE_VERSION + 1, unit: null, lastReadyAt: null }, null, 2)}\n`,
-      { mode: 0o600 },
-    )
-    assert.throws(() => readDiscordBotState(dataDir), { code: 'discord_state_invalid' })
-
-    await fs.writeFile(
-      discordStateFilePath(dataDir),
-      `${JSON.stringify({ version: DISCORD_STATE_VERSION, unit: null, lastReadyAt: null, lastSeenMessageId: 'not-an-id' }, null, 2)}\n`,
-      { mode: 0o600 },
-    )
-    assert.throws(() => readDiscordBotState(dataDir), { code: 'discord_state_invalid' })
-  } finally {
-    await fs.rm(dataDir, { recursive: true, force: true })
-  }
-})
-
-test('discord state: cursor は新しい id だけ前に進める', () => {
-  const base = newState()
-  const older = messageIdAtAge(30_000)
-  const newer = messageIdAtAge(1_000)
-
-  const first = noteDiscordSeenMessageId(base, older)
-
-  assert.equal(first.lastSeenMessageId, older)
-  // 同じ object を返すときは caller が保存を飛ばせる
-  assert.equal(noteDiscordSeenMessageId(first, messageIdAtAge(40_000)), first)
-  assert.equal(noteDiscordSeenMessageId(first, ''), first)
-
-  const second = noteDiscordSeenMessageId(first, newer)
-
-  assert.equal(second.lastSeenMessageId, newer)
-  assert.equal(first.lastSeenMessageId, older, '元の state は変わらない')
 })
 
 type BackfillHarness = {
@@ -280,7 +205,10 @@ function createBackfillHarness(
 
 test('backfill: cursor が無い起動では history の newest を cursor に置いて今回は処理しない', async () => {
   const newest = messageIdAtAge(1_000)
-  const harness = createBackfillHarness([historyMessage(newest), historyMessage(messageIdAtAge(9_000))])
+  const harness = createBackfillHarness([
+    historyMessage(newest),
+    historyMessage(messageIdAtAge(9_000)),
+  ])
   let state: DiscordBotState = newState()
 
   const outcome = await runDiscordRestartBackfill({
@@ -306,7 +234,11 @@ test('backfill: cursor が無い起動では history の newest を cursor に�
   assert.equal(state.lastSeenMessageId, newest)
   assert.deepEqual(harness.saved, [newest])
   assert.deepEqual(harness.handled, [])
-  assert.ok(harness.logs.some((entry) => entry.type === 'discord_backfill_seeded' && entry.messageId === newest))
+  assert.ok(
+    harness.logs.some(
+      (entry) => entry.type === 'discord_backfill_seeded' && entry.messageId === newest,
+    ),
+  )
 })
 
 test('backfill: 停止中に届いた message を古い順に会話へ流し、1 件ごとに cursor を保存する', async () => {
@@ -402,7 +334,9 @@ test('backfill: live で既に処理した message は取り直さない', async
   assert.deepEqual(harness.handled, [])
   assert.equal(state.lastSeenMessageId, cursor, 'live で処理済みの id で cursor を動かし直さない')
   assert.ok(
-    harness.logs.some((entry) => entry.type === 'discord_backfill_ignored' && entry.reason === 'already_handled'),
+    harness.logs.some(
+      (entry) => entry.type === 'discord_backfill_ignored' && entry.reason === 'already_handled',
+    ),
   )
 })
 
@@ -430,7 +364,12 @@ test('backfill: history が読めなくても bot の起動を止めない（理
 
   assert.deepEqual(outcome.handled, [])
   assert.equal(state.lastSeenMessageId, cursor)
-  assert.ok(harness.logs.some((entry) => entry.type === 'discord_backfill_skipped' && entry.reason === 'history_fetch_failed'))
+  assert.ok(
+    harness.logs.some(
+      (entry) =>
+        entry.type === 'discord_backfill_skipped' && entry.reason === 'history_fetch_failed',
+    ),
+  )
 
   // gateway が history API を持たない（古い fake など）場合も飛ばす
   const noApi = createBackfillHarness([])
@@ -511,8 +450,10 @@ test('backfill: 停止中に届いた message は age 上限で捨てられず�
   })
 
   assert.ok(summary !== undefined)
-  assert.equal(summary.unreceivedMs, 180_000, 'cursor から history の最新 id までの Discord 側の時間差')
+  assert.equal(
+    summary.unreceivedMs,
+    180_000,
+    'cursor から history の最新 id までの Discord 側の時間差',
+  )
   assert.equal(summary.cursor, cursor)
 })
-
-

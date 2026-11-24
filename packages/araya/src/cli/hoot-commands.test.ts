@@ -2,10 +2,10 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import test from 'node:test'
+import { test } from 'vite-plus/test'
 
-import { parseHootArguments, runHootCommand } from '../src/cli/hoot-commands.ts'
-import { readHootState, upsertProposal, writeHootState } from '../src/hoot/store.ts'
+import { parseHootArguments, runHootCommand } from './hoot-commands.ts'
+import { readHootState, upsertProposal, writeHootState } from '../hoot/store.ts'
 import {
   DEFAULT_NOTIFY_DECISIONS,
   defaultState,
@@ -13,9 +13,9 @@ import {
   type HootProposal,
   type HootRun,
   type HootState,
-} from '../src/hoot/model.ts'
-import { createHootLoop } from '../src/hoot/tick.ts'
-import { collectSecretValues, createRedactor } from '../src/infrastructure/redaction.ts'
+} from '../hoot/model.ts'
+import { createHootLoop } from '../hoot/tick.ts'
+import { collectSecretValues, createRedactor } from '../infrastructure/redaction.ts'
 
 const HOOT_NOW_ISO = '2026-11-19T09:00:00.000Z'
 
@@ -84,17 +84,39 @@ function runFixture(occurrenceKey: string, overrides: Partial<HootRun> = {}): Ho
     dispatched: false,
     observedRepos: ['koh110/araya'],
     observationGaps: [],
-        conversationReads: { calls: 0, entries: 0, chars: 0 },
-...overrides,
+    conversationReads: { calls: 0, entries: 0, chars: 0 },
+    ...overrides,
   }
 }
 
 test('hoot cli: 引数の解析（positional と --key value、新しい flag）', () => {
-  const parsed = parseHootArguments(['goal', 'add', '--key', 'araya-quality', '--objective', 'a b c', '--scope', 'github:a/b'])
+  const parsed = parseHootArguments([
+    'goal',
+    'add',
+    '--key',
+    'araya-quality',
+    '--objective',
+    'a b c',
+    '--scope',
+    'github:a/b',
+  ])
   assert.deepEqual(parsed.positionals, ['goal', 'add'])
-  assert.deepEqual(parsed.options, { key: 'araya-quality', objective: 'a b c', scope: 'github:a/b' })
+  assert.deepEqual(parsed.options, {
+    key: 'araya-quality',
+    objective: 'a b c',
+    scope: 'github:a/b',
+  })
 
-  const reviewAt = parseHootArguments(['goal', 'update', '--key', 'araya-quality', '--objective', 'o', '--review-at', 'none'])
+  const reviewAt = parseHootArguments([
+    'goal',
+    'update',
+    '--key',
+    'araya-quality',
+    '--objective',
+    'o',
+    '--review-at',
+    'none',
+  ])
   assert.deepEqual(reviewAt.positionals, ['goal', 'update'])
   assert.deepEqual(reviewAt.options, { key: 'araya-quality', objective: 'o', 'review-at': 'none' })
 
@@ -139,19 +161,13 @@ test('hoot cli: 引数の解析（positional と --key value、新しい flag）
     'inject-cooldown-minutes': '15',
   })
 
-  assert.throws(
-    () => {
-      return parseHootArguments(['settings', 'set', '--enabled'])
-    },
-    /hoot_invalid_argument/
-  )
+  assert.throws(() => {
+    return parseHootArguments(['settings', 'set', '--enabled'])
+  }, /hoot_invalid_argument/)
 
-  assert.throws(
-    () => {
-      return parseHootArguments(['goal', 'add', '--objective', '--key', 'araya-quality'])
-    },
-    /hoot_invalid_argument/
-  )
+  assert.throws(() => {
+    return parseHootArguments(['goal', 'add', '--objective', '--key', 'araya-quality'])
+  }, /hoot_invalid_argument/)
 })
 
 test('hoot cli: status / goal add / update / pause / settings set / runs が state file に効く', async () => {
@@ -163,9 +179,18 @@ test('hoot cli: status / goal add / update / pause / settings set / runs が sta
     assert.match(status.output, /enabled: false/u)
     assert.match(status.output, /mode: dry_run/u)
     assert.match(status.output, /active goals: 0\/0/u)
-    assert.match(status.output, /hoot conversationId: （まだ作っていません） \/ conversationRuns: 0/u)
-    assert.match(status.output, /notifyDecisions: request_human, invalid \/ precheck: true \/ watchdogHours: 24/u)
-    assert.match(status.output, /digestHourUtc: 21 \/ resetConversationAfterRuns: 24 \/ goalReviewDays: 30/u)
+    assert.match(
+      status.output,
+      /hoot conversationId: （まだ作っていません） \/ conversationRuns: 0/u,
+    )
+    assert.match(
+      status.output,
+      /notifyDecisions: request_human, invalid \/ precheck: true \/ watchdogHours: 24/u,
+    )
+    assert.match(
+      status.output,
+      /digestHourUtc: 21 \/ resetConversationAfterRuns: 24 \/ goalReviewDays: 30/u,
+    )
     assert.match(status.output, /lastModelRunAt: （なし） \/ lastDigestAt: （なし）/u)
 
     const added = await fixture.run([
@@ -187,11 +212,25 @@ test('hoot cli: status / goal add / update / pause / settings set / runs が sta
     assert.match(added.output, /constraints: merge は人間の承認後だけ \/ secret を commit しない/u)
     assert.match(added.output, /reviewAt: 2026-12-01T00:00:00\.000Z（過ぎていれば自動 paused）/u)
 
-    const duplicate = await fixture.run(['goal', 'add', '--key', 'araya-quality', '--objective', 'duplicate'])
+    const duplicate = await fixture.run([
+      'goal',
+      'add',
+      '--key',
+      'araya-quality',
+      '--objective',
+      'duplicate',
+    ])
     assert.equal(duplicate.ok, false)
     assert.match(duplicate.message, /hoot_goal_exists/u)
 
-    const updated = await fixture.run(['goal', 'update', '--key', 'araya-quality', '--objective', '更新後の objective'])
+    const updated = await fixture.run([
+      'goal',
+      'update',
+      '--key',
+      'araya-quality',
+      '--objective',
+      '更新後の objective',
+    ])
     assert.equal(updated.ok, true)
     assert.match(updated.output, /更新後の objective/u)
     // --review-at を渡さない更新は前の期限を保つ
@@ -236,7 +275,14 @@ test('hoot cli: status / goal add / update / pause / settings set / runs が sta
     assert.match(settings.output, /tickMinutes: 10/u)
 
     // Issue #31: mode=active は「承認された dispatch を main 会話へ inject してよい」 gate。autoDispatch の既定は false
-    const modeActive = await fixture.run(['settings', 'set', '--mode', 'active', '--max-injects-per-day', '1'])
+    const modeActive = await fixture.run([
+      'settings',
+      'set',
+      '--mode',
+      'active',
+      '--max-injects-per-day',
+      '1',
+    ])
     assert.equal(modeActive.ok, true)
     assert.match(modeActive.output, /mode: active/u)
     assert.match(modeActive.output, /autoDispatch: false/u)
@@ -277,8 +323,14 @@ test('hoot cli: status / goal add / update / pause / settings set / runs が sta
     assert.match(statusAfter.output, /active goals: 0\/1/u)
     assert.match(statusAfter.output, /araya-quality \[paused\]/u)
     assert.match(statusAfter.output, /reviewAt: 2026-12-01T00:00:00\.000Z/u)
-    assert.match(statusAfter.output, /notifyDecisions: noop, wait, request_human \/ precheck: false \/ watchdogHours: 12/u)
-    assert.match(statusAfter.output, /digestHourUtc: 7 \/ resetConversationAfterRuns: 5 \/ goalReviewDays: 14/u)
+    assert.match(
+      statusAfter.output,
+      /notifyDecisions: noop, wait, request_human \/ precheck: false \/ watchdogHours: 12/u,
+    )
+    assert.match(
+      statusAfter.output,
+      /digestHourUtc: 7 \/ resetConversationAfterRuns: 5 \/ goalReviewDays: 14/u,
+    )
 
     const unknown = await fixture.run(['nope'])
     assert.equal(unknown.ok, false)
@@ -292,7 +344,16 @@ test('hoot cli: goal の review 期限（--review-at の YYYY-MM-DD / ISO / none
   const fixture = await makeHootCliFixture()
 
   try {
-    const dated = await fixture.run(['goal', 'add', '--key', 'review-date', '--objective', '期限つき goal', '--review-at', '2026-12-01'])
+    const dated = await fixture.run([
+      'goal',
+      'add',
+      '--key',
+      'review-date',
+      '--objective',
+      '期限つき goal',
+      '--review-at',
+      '2026-12-01',
+    ])
     assert.equal(dated.ok, true)
     assert.match(dated.output, /reviewAt: 2026-12-01T00:00:00\.000Z/u)
 
@@ -310,11 +371,29 @@ test('hoot cli: goal の review 期限（--review-at の YYYY-MM-DD / ISO / none
     assert.match(iso.output, /reviewAt: 2026-12-02T09:30:00\.000Z/u)
 
     // --review-at を明示した form だけここで確認する（既定の review 期限は別の test で pin する）
-    const none = await fixture.run(['goal', 'update', '--key', 'review-iso', '--objective', '無期限に戻す', '--review-at', 'none'])
+    const none = await fixture.run([
+      'goal',
+      'update',
+      '--key',
+      'review-iso',
+      '--objective',
+      '無期限に戻す',
+      '--review-at',
+      'none',
+    ])
     assert.equal(none.ok, true)
     assert.match(none.output, /reviewAt: none（過ぎていれば自動 paused）/u)
 
-    const invalid = await fixture.run(['goal', 'add', '--key', 'review-bad', '--objective', 'o', '--review-at', 'not-a-date'])
+    const invalid = await fixture.run([
+      'goal',
+      'add',
+      '--key',
+      'review-bad',
+      '--objective',
+      'o',
+      '--review-at',
+      'not-a-date',
+    ])
     assert.equal(invalid.ok, false)
     assert.match(invalid.message, /hoot_goal_invalid/u)
     assert.match(invalid.message, /YYYY-MM-DD/u)
@@ -331,12 +410,15 @@ test('hoot cli: goal の review 期限（--review-at の YYYY-MM-DD / ISO / none
     assert.match(status.output, /reviewAt: 2026-12-01T00:00:00\.000Z/u)
 
     const state = await readHootState(fixture.dataDir)
-    assert.equal(state.goals.find((goal) => goal.key === 'review-date')?.reviewAt, '2026-12-01T00:00:00.000Z')
+    assert.equal(
+      state.goals.find((goal) => goal.key === 'review-date')?.reviewAt,
+      '2026-12-01T00:00:00.000Z',
+    )
     assert.equal(
       state.goals.some((goal) => {
         return goal.key === 'review-bad'
       }),
-      false
+      false,
     )
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
@@ -348,7 +430,14 @@ test('hoot cli: goal add は --review-at を省くと settings.goalReviewDays �
 
   try {
     assert.equal((await fixture.run(['settings', 'set', '--goal-review-days', '14'])).ok, true)
-    const added = await fixture.run(['goal', 'add', '--key', 'review-default', '--objective', '既定期限の goal'])
+    const added = await fixture.run([
+      'goal',
+      'add',
+      '--key',
+      'review-default',
+      '--objective',
+      '既定期限の goal',
+    ])
     assert.equal(added.ok, true)
     assert.match(added.output, /reviewAt: 2\d{3}-\d{2}-\d{2}T/u)
 
@@ -360,20 +449,44 @@ test('hoot cli: goal add は --review-at を省くと settings.goalReviewDays �
 
     // store が now 起点で settings.goalReviewDays 日先を入れる（CLI fixture の now とは独立なので秒程度の揺れを見る）
     const daysFromNow = (Date.parse(String(reviewAt)) - Date.now()) / (24 * 60 * 60 * 1000)
-    assert.ok(daysFromNow > 13.99 && daysFromNow < 14.01, `reviewAt=${String(reviewAt)} / days=${String(daysFromNow)}`)
+    assert.ok(
+      daysFromNow > 13.99 && daysFromNow < 14.01,
+      `reviewAt=${String(reviewAt)} / days=${String(daysFromNow)}`,
+    )
 
     // 同じ settings で追加した別の goal も同じ日数
-    const second = await fixture.run(['goal', 'add', '--key', 'review-default-2', '--objective', '二つ目の goal'])
+    const second = await fixture.run([
+      'goal',
+      'add',
+      '--key',
+      'review-default-2',
+      '--objective',
+      '二つ目の goal',
+    ])
     assert.equal(second.ok, true)
     assert.match(second.output, /reviewAt: 2\d{3}-\d{2}-\d{2}T/u)
 
     // goalReviewDays: 0 は無期限（reviewAt none）。既存 goal の更新で 0 が足し直されないことも確認する
     assert.equal((await fixture.run(['settings', 'set', '--goal-review-days', '0'])).ok, true)
-    const unlimited = await fixture.run(['goal', 'add', '--key', 'review-unlimited', '--objective', '無期限の goal'])
+    const unlimited = await fixture.run([
+      'goal',
+      'add',
+      '--key',
+      'review-unlimited',
+      '--objective',
+      '無期限の goal',
+    ])
     assert.equal(unlimited.ok, true)
     assert.match(unlimited.output, /reviewAt: none（過ぎていれば自動 paused）/u)
 
-    const keptUnlimited = await fixture.run(['goal', 'update', '--key', 'review-unlimited', '--objective', '更新'])
+    const keptUnlimited = await fixture.run([
+      'goal',
+      'update',
+      '--key',
+      'review-unlimited',
+      '--objective',
+      '更新',
+    ])
     assert.equal(keptUnlimited.ok, true)
     assert.match(keptUnlimited.output, /reviewAt: none（過ぎていれば自動 paused）/u)
 
@@ -382,7 +495,7 @@ test('hoot cli: goal add は --review-at を省くと settings.goalReviewDays �
       stateAfter.goals.find((goal) => {
         return goal.key === 'review-unlimited'
       })?.reviewAt,
-      null
+      null,
     )
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
@@ -395,11 +508,23 @@ test('hoot cli: settings show / set の新しい flag（notifyDecisions・preche
   try {
     const shown = await fixture.run(['settings'])
     assert.equal(shown.ok, true)
-    assert.match(shown.output, /notifyDecisions: request_human, invalid（即時 Discord に送る decision。他は digest）/u)
-    assert.match(shown.output, /precheckObservation: true（観測 fingerprint が同じなら model を呼ばない）/u)
-    assert.match(shown.output, /watchdogHours: 24（precheck で飛ばしていてもこの時間以内に 1 回は model で見る）/u)
+    assert.match(
+      shown.output,
+      /notifyDecisions: request_human, invalid（即時 Discord に送る decision。他は digest）/u,
+    )
+    assert.match(
+      shown.output,
+      /precheckObservation: true（観測 fingerprint が同じなら model を呼ばない）/u,
+    )
+    assert.match(
+      shown.output,
+      /watchdogHours: 24（precheck で飛ばしていてもこの時間以内に 1 回は model で見る）/u,
+    )
     assert.match(shown.output, /digestHourUtc: 21（UTC 1 日 1 回の digest。none で無効）/u)
-    assert.match(shown.output, /resetConversationAfterRuns: 24（この model run 数で HOOT 会話を新しくする）/u)
+    assert.match(
+      shown.output,
+      /resetConversationAfterRuns: 24（この model run 数で HOOT 会話を新しくする）/u,
+    )
     assert.match(shown.output, /goalReviewDays: 30（新しい goal の review 期限。0 で無期限）/u)
     assert.match(shown.output, /proposalTtlHours: 72 \/ maxProposalReminders: 3/u)
     assert.match(shown.output, /maxRunsPerDay: 8（既定 8。model を呼んだ run だけを数える）/u)
@@ -462,7 +587,10 @@ test('hoot cli: settings show / set の新しい flag（notifyDecisions・preche
     assert.equal(badDecisions.ok, false)
     assert.match(badDecisions.message, /hoot_invalid_argument/u)
     assert.match(badDecisions.message, /--notify-decisions/u)
-    assert.deepEqual((await readHootState(fixture.dataDir)).settings.notifyDecisions, ['wait', 'investigate'])
+    assert.deepEqual((await readHootState(fixture.dataDir)).settings.notifyDecisions, [
+      'wait',
+      'investigate',
+    ])
 
     const badSubcommand = await fixture.run(['settings', 'nope'])
     assert.equal(badSubcommand.ok, false)
@@ -479,7 +607,14 @@ test('hoot cli: --notify-noop はもう効かない（notifyDecisions を変え�
     const before = await readHootState(fixture.dataDir)
     assert.deepEqual(before.settings.notifyDecisions, [...DEFAULT_NOTIFY_DECISIONS])
 
-    const result = await fixture.run(['settings', 'set', '--notify-noop', 'true', '--tick-minutes', '15'])
+    const result = await fixture.run([
+      'settings',
+      'set',
+      '--notify-noop',
+      'true',
+      '--tick-minutes',
+      '15',
+    ])
     assert.equal(result.ok, true)
     assert.match(result.output, /tickMinutes: 15/u)
     // 撤去された flag なので silent に無視される（notifyDecisions は既定のまま）
@@ -498,22 +633,31 @@ test('hoot cli: key は --key でだけ受け取る（subcommand 名を key に�
   const fixture = await makeHootCliFixture()
 
   try {
-    assert.equal((await fixture.run(['goal', 'add', '--key', 'keep-key', '--objective', 'objective'])).ok, true)
+    assert.equal(
+      (await fixture.run(['goal', 'add', '--key', 'keep-key', '--objective', 'objective'])).ok,
+      true,
+    )
 
     for (const subcommand of ['pause', 'resume', 'retire']) {
       const missing = await fixture.run(['goal', subcommand])
       assert.equal(missing.ok, false)
-      assert.match(missing.message, new RegExp(`hoot_invalid_argument: --key が必要です（araya hoot goal ${subcommand} --key <key>）`, 'u'))
+      assert.match(
+        missing.message,
+        new RegExp(
+          `hoot_invalid_argument: --key が必要です（araya hoot goal ${subcommand} --key <key>）`,
+          'u',
+        ),
+      )
     }
 
     // positional で goal key を渡しても key として扱わない（黙って goal を変更しない）
     const positionalKey = await fixture.run(['goal', 'pause', 'keep-key'])
     assert.equal(positionalKey.ok, false)
-    assert.match(positionalKey.message, /hoot_invalid_argument: --key が必要です（araya hoot goal pause --key <key>）/u)
-    assert.equal(
-      (await readHootState(fixture.dataDir)).goals[0]?.status,
-      'active'
+    assert.match(
+      positionalKey.message,
+      /hoot_invalid_argument: --key が必要です（araya hoot goal pause --key <key>）/u,
     )
+    assert.equal((await readHootState(fixture.dataDir)).goals[0]?.status, 'active')
 
     const addWithoutKey = await fixture.run(['goal', 'add', 'positional-objective'])
     assert.equal(addWithoutKey.ok, false)
@@ -526,7 +670,10 @@ test('hoot cli: key は --key でだけ受け取る（subcommand 名を key に�
 
     const resolveWithoutKey = await fixture.run(['proposal', 'resolve'])
     assert.equal(resolveWithoutKey.ok, false)
-    assert.match(resolveWithoutKey.message, /hoot_invalid_argument: araya hoot proposal resolve --key <key>/u)
+    assert.match(
+      resolveWithoutKey.message,
+      /hoot_invalid_argument: araya hoot proposal resolve --key <key>/u,
+    )
 
     // --key 自体に値が無い場合は parser 側で弾く
     const resolveEmptyFlag = await fixture.run(['proposal', 'resolve', '--key'])
@@ -546,7 +693,16 @@ test('hoot cli: --data-dir を渡したときだけ別の state file を指す�
   const otherDir = path.join(fixture.root, 'other-data')
 
   try {
-    const added = await fixture.run(['goal', 'add', '--key', 'external', '--objective', '外部 file の goal', '--data-dir', otherDir])
+    const added = await fixture.run([
+      'goal',
+      'add',
+      '--key',
+      'external',
+      '--objective',
+      '外部 file の goal',
+      '--data-dir',
+      otherDir,
+    ])
     assert.equal(added.ok, true)
 
     const otherState = await readHootState(otherDir)
@@ -557,14 +713,20 @@ test('hoot cli: --data-dir を渡したときだけ別の state file を指す�
 
     const statusOther = await fixture.run(['status', '--data-dir', otherDir])
     assert.match(statusOther.output, /external \[active\]/u)
-    assert.match(statusOther.output, new RegExp(`state file: ${path.join(otherDir, 'hoot', 'state.json')}`, 'u'))
+    assert.match(
+      statusOther.output,
+      new RegExp(`state file: ${path.join(otherDir, 'hoot', 'state.json')}`, 'u'),
+    )
 
     const statusDefault = await fixture.run(['status'])
     assert.match(statusDefault.output, /active goals: 0\/0/u)
     assert.equal(statusDefault.output.includes('external'), false)
 
     // settings も --data-dir 側の file だけ変わる
-    assert.equal((await fixture.run(['settings', 'set', '--tick-minutes', '15', '--data-dir', otherDir])).ok, true)
+    assert.equal(
+      (await fixture.run(['settings', 'set', '--tick-minutes', '15', '--data-dir', otherDir])).ok,
+      true,
+    )
     assert.equal((await readHootState(otherDir)).settings.tickMinutes, 15)
     assert.equal((await readHootState(fixture.dataDir)).settings.tickMinutes, 60)
   } finally {
@@ -601,7 +763,10 @@ test('hoot cli: proposal list / proposal resolve --key（open と closed を分�
     const listed = await fixture.run(['proposal', 'list'])
     assert.equal(listed.ok, true)
     assert.match(listed.output, /open 2 \/ closed 0/u)
-    assert.match(listed.output, new RegExp(`${openKey} \\[open\\] request_human goals=araya-quality`, 'u'))
+    assert.match(
+      listed.output,
+      new RegExp(`${openKey} \\[open\\] request_human goals=araya-quality`, 'u'),
+    )
     assert.match(listed.output, /reason: 優先順位を決めてください/u)
     assert.match(listed.output, /expires: 2026-11-22T09:00:00\.000Z \/ reminders: 0/u)
 
@@ -616,14 +781,17 @@ test('hoot cli: proposal list / proposal resolve --key（open と closed を分�
     const resolved = await fixture.run(['proposal', 'resolve', '--key', openKey])
     assert.equal(resolved.ok, true)
     assert.match(resolved.output, /resolved/u)
-    assert.match(resolved.output, new RegExp(`proposal ${openKey} を resolved にしました（\\[request_human\\]）`, 'u'))
+    assert.match(
+      resolved.output,
+      new RegExp(`proposal ${openKey} を resolved にしました（\\[request_human\\]）`, 'u'),
+    )
 
     const state = await readHootState(fixture.dataDir)
     assert.equal(
       state.proposals.find((proposal) => {
         return proposal.key === openKey
       })?.status,
-      'resolved'
+      'resolved',
     )
 
     // resolved をもう resolve できない（open だけが高い対象）
@@ -687,7 +855,11 @@ test('hoot cli: status に open proposals・conversationRuns・lastModelRunAt・
       ],
       proposals: [
         proposalFixture('open-proposal'),
-        proposalFixture('open-proposal-2', { decision: 'dispatch', goalKeys: ['araya-quality'], reminders: 0 }),
+        proposalFixture('open-proposal-2', {
+          decision: 'dispatch',
+          goalKeys: ['araya-quality'],
+          reminders: 0,
+        }),
         proposalFixture('closed-proposal', { status: 'resolved', reason: 'すでに回答済み' }),
       ],
     }
@@ -696,7 +868,10 @@ test('hoot cli: status に open proposals・conversationRuns・lastModelRunAt・
     const status = await fixture.run(['status'])
     assert.equal(status.ok, true)
     assert.match(status.output, /conversationRuns: 3/u)
-    assert.match(status.output, /lastModelRunAt: 2026-11-19T08:00:02\.000Z \/ lastDigestAt: 2026-11-18T21:00:00\.000Z/u)
+    assert.match(
+      status.output,
+      /lastModelRunAt: 2026-11-19T08:00:02\.000Z \/ lastDigestAt: 2026-11-18T21:00:00\.000Z/u,
+    )
     assert.match(status.output, /open proposals: 2/u)
     assert.match(status.output, /open-proposal \[open\] request_human goals=araya-quality/u)
     assert.match(status.output, /open-proposal-2 \[open\] dispatch goals=araya-quality/u)
@@ -704,7 +879,10 @@ test('hoot cli: status に open proposals・conversationRuns・lastModelRunAt・
     assert.equal(status.output.includes('closed-proposal'), false)
     assert.match(status.output, /reviewAt: 2026-12-19T00:00:00\.000Z/u)
     assert.match(status.output, /next occurrence: 2026-11-19T09:00:00\.000Z/u)
-    assert.match(status.output, /last run: 2026-11-19T09:00:01\.000Z noop — 観測 fingerprint が前回と同じため model を呼ばない/u)
+    assert.match(
+      status.output,
+      /last run: 2026-11-19T09:00:01\.000Z noop — 観測 fingerprint が前回と同じため model を呼ばない/u,
+    )
 
     const runs = await fixture.run(['runs', '--limit', '1'])
     assert.equal(runs.ok, true)
@@ -798,7 +976,14 @@ test('hoot cli: 壊れた state file に対して restore の手順を誤りに�
   const fixture = await makeHootCliFixture()
 
   try {
-    const written = await fixture.run(['goal', 'add', '--key', 'keep-me', '--objective', 'objective'])
+    const written = await fixture.run([
+      'goal',
+      'add',
+      '--key',
+      'keep-me',
+      '--objective',
+      'objective',
+    ])
     assert.equal(written.ok, true)
     const statePath = path.join(fixture.dataDir, 'hoot', 'state.json')
     await fs.writeFile(statePath, '{ broken', 'utf8')
@@ -817,13 +1002,25 @@ test('hoot cli: dispatch --key は investigate proposal も inject できる（m
   const investigateKey = proposalKeyOf({ goalKeys: ['araya-quality'], decision: 'investigate' })
 
   try {
-    const added = await fixture.run(['goal', 'add', '--key', 'araya-quality', '--objective', 'open issue の再現条件と影響範囲を特定する'])
+    const added = await fixture.run([
+      'goal',
+      'add',
+      '--key',
+      'araya-quality',
+      '--objective',
+      'open issue の再現条件と影響範囲を特定する',
+    ])
     assert.equal(added.ok, true)
     const goals = (await readHootState(fixture.dataDir)).goals
     await writeHootState(fixture.dataDir, {
       ...defaultState(),
       goals,
-      proposals: [proposalFixture(investigateKey, { decision: 'investigate', reason: 'open issue の再現条件が観測から確定しない' })]
+      proposals: [
+        proposalFixture(investigateKey, {
+          decision: 'investigate',
+          reason: 'open issue の再現条件が観測から確定しない',
+        }),
+      ],
     })
 
     const dryRun = await fixture.run(['dispatch', '--key', investigateKey])
@@ -871,14 +1068,17 @@ test('hoot cli: dispatch --key は investigate proposal も inject できる（m
         stderrBytes: 0,
         terminationReason: undefined,
         terminationConfirmed: true,
-      })
+      }),
     })
 
     const injected = await loop.injectOnce()
     assert.equal(injected.kind, 'injected')
     assert.equal(injectInputs.length, 1)
     assert.match(injectInputs[0]?.content ?? '', /read-only 調査案件/u)
-    assert.match(injectInputs[0]?.content ?? '', /file の変更・commit・deploy・merge を実行しません/u)
+    assert.match(
+      injectInputs[0]?.content ?? '',
+      /file の変更・commit・deploy・merge を実行しません/u,
+    )
     assert.match(injectInputs[0]?.notice ?? '', /人間の承認/u)
 
     state = await readHootState(fixture.dataDir)
@@ -895,7 +1095,14 @@ test('hoot cli: dispatch --key は inject request を作り、inject list / stat
   const requestHumanKey = proposalKeyOf({ goalKeys: ['araya-quality'], decision: 'request_human' })
 
   try {
-    const added = await fixture.run(['goal', 'add', '--key', 'araya-quality', '--objective', 'open issue と draft PR を拾う'])
+    const added = await fixture.run([
+      'goal',
+      'add',
+      '--key',
+      'araya-quality',
+      '--objective',
+      'open issue と draft PR を拾う',
+    ])
     assert.equal(added.ok, true)
     const goals = (await readHootState(fixture.dataDir)).goals
 
@@ -903,9 +1110,18 @@ test('hoot cli: dispatch --key は inject request を作り、inject list / stat
       ...defaultState(),
       goals,
       proposals: [
-        proposalFixture(dispatchKey, { decision: 'dispatch', reason: 'draft PR 1 件を続行すべきか判断したい' }),
-        proposalFixture(investigateKey, { decision: 'investigate', reason: 'test workflow の実行を確認する' }),
-        proposalFixture(requestHumanKey, { decision: 'request_human', reason: 'mode を active にしてよいか確認したい' }),
+        proposalFixture(dispatchKey, {
+          decision: 'dispatch',
+          reason: 'draft PR 1 件を続行すべきか判断したい',
+        }),
+        proposalFixture(investigateKey, {
+          decision: 'investigate',
+          reason: 'test workflow の実行を確認する',
+        }),
+        proposalFixture(requestHumanKey, {
+          decision: 'request_human',
+          reason: 'mode を active にしてよいか確認したい',
+        }),
       ],
     })
 
@@ -973,7 +1189,11 @@ test('hoot cli: dispatch --key は inject request を作り、inject list / stat
       },
       deliver: async () => {},
       dispatchInject: async (input) => {
-        injectInputs.push({ content: input.content, notice: input.notice, requestId: input.requestId })
+        injectInputs.push({
+          content: input.content,
+          notice: input.notice,
+          requestId: input.requestId,
+        })
       },
       log: () => {},
       nowMs: () => {
@@ -996,7 +1216,10 @@ test('hoot cli: dispatch --key は inject request を作り、inject list / stat
     assert.equal(injected.kind, 'injected')
     assert.equal(injectInputs.length, 1)
     assert.match(injectInputs[0]?.content ?? '', /open issue と draft PR を拾う/u)
-    assert.match(injectInputs[0]?.content ?? '', new RegExp(`araya hoot dispatch --key ${dispatchKey}`, 'u'))
+    assert.match(
+      injectInputs[0]?.content ?? '',
+      new RegExp(`araya hoot dispatch --key ${dispatchKey}`, 'u'),
+    )
     assert.match(injectInputs[0]?.notice ?? '', /人間の承認/u)
 
     state = await readHootState(fixture.dataDir)
