@@ -5,6 +5,7 @@
 import process from 'node:process'
 import { parseArgs } from 'node:util'
 import { runDiscordBot } from '../src/discord/bot.ts'
+import { installShutdownSignals } from '../src/discord/shutdown-signals.ts'
 
 const parsed = parseArgs({
   args: process.argv.slice(2),
@@ -22,12 +23,11 @@ if (typeof dataDir !== 'string' || dataDir === '') {
 }
 
 const controller = new AbortController()
-function onSignal() {
+// systemd（control group 全体）と runner（child へ forward）の両方が SIGTERM を送る。once にすると
+// 2 回目で drain が打ち切られる（#36 の実測: discord_stopping まで書いて 22 ms 後に終了していた）
+installShutdownSignals(process, () => {
   controller.abort()
-}
-
-process.once('SIGTERM', onSignal)
-process.once('SIGINT', onSignal)
+})
 
 const exitCode = await runDiscordBot({
   dataDir,

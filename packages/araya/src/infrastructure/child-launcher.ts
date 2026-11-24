@@ -6,6 +6,8 @@ import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 
 export const DEFAULT_LAUNCHER_STOP_WAIT_MS = 28_000
+// child の exit 後に stderr が閉じるのを待つ上限（launcher log に最後の trace を残すため）
+export const MAX_CHILD_STDIO_DRAIN_MS = 1_000
 
 export type ChildStopOutcome = {
   exitCode: number
@@ -137,7 +139,12 @@ export async function launchChildAndWait(options: {
     let settled = false
     let forwarded = false
     let killedByLauncher = false
+    let exited = false
+    let closed = false
+    let exitCode: number | null = null
+    let exitSignal: string | null = null
     let killTimer: NodeJS.Timeout | undefined
+    let stdioDrainTimer: NodeJS.Timeout | undefined
 
     function finish(outcome: ChildStopOutcome) {
       if (settled) {
@@ -150,9 +157,36 @@ export async function launchChildAndWait(options: {
         clearTimeout(killTimer)
       }
 
-      process.off('SIGTERM', forwardSignal)
-      process.off('SIGINT', forwardSignal)
+      if (stdioDrainTimer !== undefined) {
+        clearTimeout(stdioDrainTimer)
+      }
+
+      process.off('SIGTERM', onTerminate)
+      process.off('SIGINT', onInterrupt)
       resolve(outcome)
+    }
+    function outcomeFromExit(): ChildStopOutcome {
+      const code = exitCode
+
+      if (killedByLauncher) {
+        return { exitCode: 1, signal: exitSignal, killedByLauncher }
+      }
+
+      if (code !== null) {
+        return { exitCode: code, signal: exitSignal, killedByLauncher }
+      }
+
+      // signal で死んだ（SIGKILL 等）のは異常。systemd に失敗として伝える
+      return { exitCode: 1, signal: exitSignal, killedByLauncher }
+    }
+    // child の stderr 最後の 1 行（crash trace など）が launcher log から落ちないよう、stdio が閉じるまで待つ。
+    // 閉じないまま待ち続けると unit の stop job を延ばすので上限を置く
+    function tryFinishAfterExit() {
+      if (!exited || !closed) {
+        return
+      }
+
+      finish(outcomeFromExit())
     }
     function forwardSignal(signal: 'SIGTERM' | 'SIGINT') {
       // 2 回目以降の signal は無視する（SIGKILL 前に bot 自身の budget を見守る）
@@ -172,30 +206,49 @@ export async function launchChildAndWait(options: {
       killTimer.unref?.()
     }
 
-    process.once('SIGTERM', () => {
+    function onTerminate() {
       forwardSignal('SIGTERM')
-    })
-    process.once('SIGINT', () => {
+    }
+    function onInterrupt() {
       forwardSignal('SIGINT')
-    })
+    }
+
+    // runner 自身が 2 回目以降の signal を default 動作で殺されないよう on() で張り続ける
+    process.on('SIGTERM', onTerminate)
+    process.on('SIGINT', onInterrupt)
     child.once('error', () => {
+      exited = true
+      closed = true
+      exitCode = 127
+      exitSignal = null
       finish({ exitCode: 127, signal: null, killedByLauncher })
     })
     child.once('exit', (code, signal) => {
-      if (killedByLauncher) {
-        finish({ exitCode: 1, signal: signal ?? null, killedByLauncher })
+      exited = true
+      exitCode = code ?? null
+      exitSignal = signal ?? null
+      // #36 の実測で runner の exit code だけ見て bot の死因が分からなかった。終了理由を log に残す
+      options.writeError(
+        `${options.label}: child 終了（code=${String(exitCode)}, signal=${exitSignal ?? 'none'}${killedByLauncher ? ', launcher が SIGKILL' : ''}）`,
+      )
+      stdioDrainTimer = setTimeout(() => {
+        closed = true
+        tryFinishAfterExit()
+      }, MAX_CHILD_STDIO_DRAIN_MS)
+      stdioDrainTimer.unref?.()
+      tryFinishAfterExit()
+    })
+    child.once('close', (code, signal) => {
+      closed = true
 
-        return
+      if (exitCode === null) {
+        exitCode = code ?? null
+        exitSignal = signal ?? null
       }
 
-      if (signal !== null) {
-        // bot が signal で死んだ（SIGKILL 等）のは異常。systemd に失敗として伝える。
-        finish({ exitCode: code ?? 1, signal, killedByLauncher })
-
-        return
+      if (exited) {
+        tryFinishAfterExit()
       }
-
-      finish({ exitCode: code ?? 1, signal: null, killedByLauncher })
     })
   })
 }

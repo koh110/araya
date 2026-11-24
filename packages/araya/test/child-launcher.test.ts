@@ -43,7 +43,12 @@ test('child launcher: bot の stderr は行ごとに redact して writeError �
 
   assert.equal(outcome.exitCode, 0, JSON.stringify(outcome))
   assert.equal(outcome.killedByLauncher, false)
-  assert.deepEqual(lines, ['fake-runner: trace with [redacted] line\n', 'fake-runner: second line\n'])
+  // child の終了理由（code / signal）が stderr 本文の後ろに残り、launch log から trace が落ちない（#36 の死因切り分け）
+  assert.deepEqual(lines, [
+    'fake-runner: trace with [redacted] line\n',
+    'fake-runner: second line\n',
+    'fake-runner: child 終了（code=0, signal=none）\n',
+  ])
 })
 
 test('child launcher: stop wait の default は bot の shutdown budget と unit TimeoutStopSec の間に入る', () => {
