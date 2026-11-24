@@ -696,7 +696,7 @@ async function installDiscord(
     // 古い state が無効なら、起動後に読み直せた state の ready だけを使う
   }
 
-  // #36: 常駐の再起動前に停止通知を出す（無受信窓が始まることをユーザーへ可視化）。
+  // #36: 常駐の再起動前に停止通知を出す（再起動の間 message を受信できないことをユーザーへ可視化）。
   // 前回の ready が無い初めての install では送らない。投稿失敗で restart は止めない
   if (previousReadyId !== null) {
     const noticeSent = await postDiscordRestartNotice({
