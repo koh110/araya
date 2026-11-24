@@ -2,8 +2,11 @@
 // systemd LoadCredential から1Passwordを認証し、Discord botへ解決済み環境変数だけを渡す。
 
 import { spawn } from 'node:child_process'
+import type { ChildProcess } from 'node:child_process'
 import { constants as fsConstants } from 'node:fs'
 import fs from 'node:fs/promises'
+import net from 'node:net'
+import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import { parseArgs } from 'node:util'
@@ -33,9 +36,8 @@ const OP_AUTH_ENVIRONMENT_NAMES = [
   'OP_ACCOUNT',
 ] as const
 const SYSTEM_ENV_EXECUTABLE = '/usr/bin/env'
-const RESOLVER_MARKER = 'ARAYA_RESOLVED_ENV='
 const OP_RESOLVE_TIMEOUT_MS = 30_000
-const MAX_RESOLVER_STDOUT_BYTES = 1024 * 1024
+const MAX_RESOLVER_SOCKET_BYTES = 1024 * 1024
 const MAX_OP_STDERR_CHARS = 2_000
 
 function runnerError(message: string) {
@@ -204,15 +206,176 @@ function strippedEnvironmentNames() {
   return [...OP_AUTH_ENVIRONMENT_NAMES, OP_SERVICE_ACCOUNT_TOKEN_ENV_NAME]
 }
 
-function envResolverScript(stripped: readonly string[]) {
+// op run は stdout/stderr に出た参照値を redact するため、解決済み値は private socket で返す。
+function envResolverScript() {
   return [
-    'const strip = new Set((process.argv[1] ?? "").split(",").filter(Boolean));',
+    `const keys = ${JSON.stringify(DISCORD_CONFIG_KEYS)};`,
     'const snapshot = {};',
-    'for (const [name, value] of Object.entries(process.env)) {',
-    '  if (!strip.has(name) && typeof value === "string") { snapshot[name] = value }',
+    'for (const name of keys) {',
+    '  const value = process.env[name];',
+    '  if (typeof value === "string") { snapshot[name] = value }',
     '}',
-    `process.stdout.write(${JSON.stringify(RESOLVER_MARKER)} + JSON.stringify(snapshot) + "\\n");`,
+    'import("node:net").then(({ createConnection }) => {',
+    '  const socket = createConnection(process.argv[1] ?? "");',
+    '  socket.once("connect", () => socket.end(JSON.stringify(snapshot)));',
+    '  socket.once("error", () => { process.exitCode = 1 });',
+    '}).catch(() => { process.exitCode = 1 });',
   ].join(' ')
+}
+
+type ResolverRelayResult = { payload: string } | { error: string }
+
+async function createResolverRelay() {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-op-env-'))
+  const socketPath = path.join(directory, 's')
+  const sockets = new Set<net.Socket>()
+  let acceptedConnection = false
+  let settled = false
+  let timer: NodeJS.Timeout | undefined
+  let resolveResult!: (result: ResolverRelayResult) => void
+  const result = new Promise<ResolverRelayResult>((resolve) => {
+    resolveResult = resolve
+  })
+
+  function settle(value: ResolverRelayResult) {
+    if (settled) {
+      return
+    }
+
+    settled = true
+
+    if (timer !== undefined) {
+      clearTimeout(timer)
+      timer = undefined
+    }
+
+    resolveResult(value)
+  }
+
+  const server = net.createServer((socket) => {
+    if (acceptedConnection || settled) {
+      socket.destroy()
+
+      return
+    }
+
+    acceptedConnection = true
+    sockets.add(socket)
+    socket.once('close', () => {
+      sockets.delete(socket)
+    })
+
+    const chunks: Buffer[] = []
+    let totalBytes = 0
+
+    socket.on('data', (chunk: Buffer) => {
+      totalBytes += chunk.byteLength
+
+      if (totalBytes > MAX_RESOLVER_SOCKET_BYTES) {
+        settle({ error: 'payload_too_large' })
+        socket.destroy()
+
+        return
+      }
+
+      chunks.push(chunk)
+    })
+    socket.once('end', () => {
+      try {
+        settle({
+          payload: new TextDecoder('utf-8', { fatal: true }).decode(
+            Buffer.concat(chunks, totalBytes),
+          ),
+        })
+        socket.end()
+      } catch {
+        settle({ error: 'invalid_utf8' })
+        socket.destroy()
+      }
+    })
+    socket.once('error', () => {
+      settle({ error: 'socket_error' })
+    })
+  })
+
+  async function close() {
+    if (timer !== undefined) {
+      clearTimeout(timer)
+      timer = undefined
+    }
+
+    settle({ error: 'closed' })
+
+    for (const socket of sockets) {
+      socket.destroy()
+    }
+
+    if (server.listening) {
+      await new Promise<void>((resolve) => {
+        server.close(() => {
+          resolve()
+        })
+      })
+    }
+
+    await fs.rm(directory, { recursive: true, force: true })
+  }
+
+  try {
+    await fs.chmod(directory, 0o700)
+    const directoryStat = await fs.lstat(directory)
+    const uid = typeof process.getuid === 'function' ? process.getuid() : null
+
+    if (
+      !directoryStat.isDirectory() ||
+      uid === null ||
+      directoryStat.uid !== uid ||
+      (directoryStat.mode & 0o077) !== 0
+    ) {
+      throw runnerError('1Password env relay directory の形式または権限が不正です')
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      function onListening() {
+        server.off('error', onListenError)
+        resolve()
+      }
+
+      function onListenError(error: Error) {
+        server.off('listening', onListening)
+        reject(error)
+      }
+
+      server.once('listening', onListening)
+      server.once('error', onListenError)
+      server.listen(socketPath)
+    })
+
+    server.on('error', () => {
+      settle({ error: 'server_error' })
+    })
+
+    if (!(await fs.lstat(socketPath)).isSocket()) {
+      throw runnerError('1Password env relay socket の形式が不正です')
+    }
+
+    await fs.chmod(socketPath, 0o600)
+    timer = setTimeout(() => {
+      settle({ error: 'timeout' })
+    }, OP_RESOLVE_TIMEOUT_MS)
+  } catch {
+    await close()
+    throw runnerError('1Password env 解決用の private socket を作成できません')
+  }
+
+  return {
+    socketPath,
+    result,
+    close,
+    cancel() {
+      settle({ error: 'interrupted' })
+    },
+  }
 }
 
 function opBaseEnvironment(token: string) {
@@ -232,117 +395,212 @@ function opBaseEnvironment(token: string) {
 // それが #36 の truncated drain に対する修正: KillMode=control-group では main process（runner）が
 // 先に死んだ時点で残った bot が SIGKILL され、drain が途中で潰れる。
 async function resolveEnvironment(opPath: string, envFilePath: string, token: string) {
-  const stripped = strippedEnvironmentNames()
-  const args = ['run', '--env-file', envFilePath, '--', SYSTEM_ENV_EXECUTABLE]
+  let relay: Awaited<ReturnType<typeof createResolverRelay>> | undefined
+  let activeChild: ChildProcess | undefined
+  let interruptedSignal: 'SIGINT' | 'SIGTERM' | null = null
+  let signalKillTimer: NodeJS.Timeout | undefined
+  let resolvedSnapshot: Record<string, string> | undefined
 
-  for (const name of stripped) {
-    args.push('-u', name)
+  function clearSignalKillTimer() {
+    if (signalKillTimer !== undefined) {
+      clearTimeout(signalKillTimer)
+      signalKillTimer = undefined
+    }
   }
 
-  args.push(process.execPath, '-e', envResolverScript(stripped), stripped.join(','))
-
-  const outcome = await new Promise<{
-    code: number | null
-    signal: string | null
-    stdout: string
-    stderr: string
-  }>((resolve) => {
-    let child
-
-    try {
-      child = spawn(opPath, args, {
-        env: opBaseEnvironment(token),
-        shell: false,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
-    } catch {
-      resolve({ code: 127, signal: null, stdout: '', stderr: '' })
-
+  function handleSignal(signal: 'SIGINT' | 'SIGTERM') {
+    if (interruptedSignal !== null) {
       return
     }
 
-    let stdout = ''
-    let stderr = ''
-    let settled = false
-    const timer = setTimeout(() => {
-      if (settled) {
-        return
-      }
+    interruptedSignal = signal
+    relay?.cancel()
 
-      settled = true
-      child.kill('SIGKILL')
-      resolve({ code: null, signal: 'timeout', stdout, stderr })
-    }, OP_RESOLVE_TIMEOUT_MS)
-
-    child.stdout?.setEncoding('utf8')
-    child.stderr?.setEncoding('utf8')
-    child.stdout?.on('data', (chunk) => {
-      if (stdout.length < MAX_RESOLVER_STDOUT_BYTES) {
-        stdout += chunk
-      }
-    })
-    child.stderr?.on('data', (chunk) => {
-      if (stderr.length < MAX_OP_STDERR_CHARS) {
-        stderr += chunk
-      }
-    })
-    child.once('error', () => {
-      clearTimeout(timer)
-
-      if (!settled) {
-        settled = true
-        resolve({ code: 127, signal: null, stdout, stderr })
-      }
-    })
-    child.once('exit', (code, signal) => {
-      clearTimeout(timer)
-
-      if (!settled) {
-        settled = true
-        resolve({ code, signal, stdout, stderr })
-      }
-    })
-  })
-
-  if (outcome.signal === 'timeout') {
-    throw runnerError(`1Password CLI が ${OP_RESOLVE_TIMEOUT_MS}ms 内に .env を解決できませんでした`)
-  }
-
-  if (outcome.code !== 0) {
-    throw runnerError(
-      `1Password CLI で .env を解決できませんでした（status=${outcome.code ?? 'signal'}・${redactSecretValues(outcome.stderr, [token]).slice(0, MAX_OP_STDERR_CHARS)}）`,
-    )
-  }
-
-  const markerLine = outcome.stdout.split('\n').find((line) => {
-    return line.startsWith(RESOLVER_MARKER)
-  })
-
-  if (markerLine === undefined) {
-    throw runnerError('1Password CLI の env 解決結果を取得できません')
-  }
-
-  let parsed
-
-  try {
-    parsed = JSON.parse(markerLine.slice(RESOLVER_MARKER.length))
-  } catch {
-    throw runnerError('1Password CLI の env 解決結果の形式が不正です')
-  }
-
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw runnerError('1Password CLI の env 解決結果の形式が不正です')
-  }
-
-  const snapshot: Record<string, string> = {}
-
-  for (const [name, value] of Object.entries(parsed)) {
-    if (typeof value === 'string' && !stripped.includes(name)) {
-      snapshot[name] = value
+    if (activeChild !== undefined) {
+      activeChild.kill(signal)
+      signalKillTimer = setTimeout(() => {
+        activeChild?.kill('SIGKILL')
+      }, 1_000)
+      signalKillTimer.unref?.()
     }
   }
 
-  return snapshot
+  function onSigterm() {
+    handleSignal('SIGTERM')
+  }
+
+  function onSigint() {
+    handleSignal('SIGINT')
+  }
+
+  process.on('SIGTERM', onSigterm)
+  process.on('SIGINT', onSigint)
+
+  try {
+    relay = await createResolverRelay()
+    const resolverRelay = relay
+
+    if (interruptedSignal !== null) {
+      throw runnerError(`1Password CLI の env 解決は ${interruptedSignal} で中断されました`)
+    }
+
+    const stripped = strippedEnvironmentNames()
+    const args = ['run', '--env-file', envFilePath, '--', SYSTEM_ENV_EXECUTABLE]
+
+    for (const name of stripped) {
+      args.push('-u', name)
+    }
+
+    args.push(process.execPath, '-e', envResolverScript(), resolverRelay.socketPath)
+
+    const outcome = await new Promise<{
+      code: number | null
+      signal: string | null
+      stderr: string
+    }>((resolve) => {
+      let child: ChildProcess
+
+      try {
+        child = spawn(opPath, args, {
+          env: opBaseEnvironment(token),
+          shell: false,
+          stdio: ['ignore', 'ignore', 'pipe'],
+        })
+      } catch {
+        resolve({ code: 127, signal: null, stderr: '' })
+
+        return
+      }
+
+      activeChild = child
+
+      if (interruptedSignal !== null) {
+        child.kill(interruptedSignal)
+      }
+
+      let stderr = ''
+      let settled = false
+      const timer = setTimeout(() => {
+        if (settled) {
+          return
+        }
+
+        settled = true
+        child.kill('SIGKILL')
+        resolve({ code: null, signal: 'timeout', stderr })
+      }, OP_RESOLVE_TIMEOUT_MS)
+
+      child.stderr?.setEncoding('utf8')
+      child.stderr?.on('data', (chunk) => {
+        if (stderr.length < MAX_OP_STDERR_CHARS) {
+          stderr += chunk
+        }
+      })
+      child.once('error', () => {
+        clearTimeout(timer)
+        clearSignalKillTimer()
+
+        if (activeChild === child) {
+          activeChild = undefined
+        }
+
+        if (!settled) {
+          settled = true
+          resolve({ code: 127, signal: null, stderr })
+        }
+      })
+      child.once('exit', (code, signal) => {
+        clearTimeout(timer)
+        clearSignalKillTimer()
+
+        if (activeChild === child) {
+          activeChild = undefined
+        }
+
+        if (!settled) {
+          settled = true
+          resolve({ code, signal, stderr })
+        }
+      })
+    })
+
+    if (interruptedSignal !== null) {
+      throw runnerError(`1Password CLI の env 解決は ${interruptedSignal} で中断されました`)
+    }
+
+    if (outcome.signal === 'timeout') {
+      throw runnerError(
+        `1Password CLI が ${OP_RESOLVE_TIMEOUT_MS}ms 内に .env を解決できませんでした`,
+      )
+    }
+
+    if (outcome.code !== 0) {
+      throw runnerError(
+        `1Password CLI で .env を解決できませんでした（status=${outcome.code ?? 'signal'}・${redactSecretValues(outcome.stderr, [token]).slice(0, MAX_OP_STDERR_CHARS)}）`,
+      )
+    }
+
+    const relayOutcome = await resolverRelay.result
+
+    if (interruptedSignal !== null) {
+      throw runnerError(`1Password CLI の env 解決は ${interruptedSignal} で中断されました`)
+    }
+
+    if ('error' in relayOutcome) {
+      throw runnerError('1Password CLI の env 解決結果を private socket から取得できません')
+    }
+
+    let parsed
+
+    try {
+      parsed = JSON.parse(relayOutcome.payload)
+    } catch {
+      throw runnerError('1Password CLI の env 解決結果の形式が不正です')
+    }
+
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw runnerError('1Password CLI の env 解決結果の形式が不正です')
+    }
+
+    const snapshot: Record<string, string> = {}
+    const resolvedValues: Record<string, unknown> = parsed
+
+    for (const name of DISCORD_CONFIG_KEYS) {
+      const value = resolvedValues[name]
+
+      if (typeof value !== 'string' || value === '') {
+        throw runnerError(`1Password CLI の env 解決結果に ${name} がありません`)
+      }
+
+      snapshot[name] = value
+    }
+
+    if (interruptedSignal !== null) {
+      throw runnerError(`1Password CLI の env 解決は ${interruptedSignal} で中断されました`)
+    }
+
+    resolvedSnapshot = snapshot
+  } finally {
+    try {
+      if (relay !== undefined) {
+        await relay.close()
+      }
+    } finally {
+      clearSignalKillTimer()
+      process.off('SIGTERM', onSigterm)
+      process.off('SIGINT', onSigint)
+    }
+  }
+
+  if (interruptedSignal !== null) {
+    throw runnerError(`1Password CLI の env 解決は ${interruptedSignal} で中断されました`)
+  }
+
+  if (resolvedSnapshot === undefined) {
+    throw runnerError('1Password CLI の env 解決結果がありません')
+  }
+
+  return resolvedSnapshot
 }
 
 function botEnvironmentFromSnapshot(snapshot: Record<string, string>) {

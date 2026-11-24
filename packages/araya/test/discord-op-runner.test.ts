@@ -12,10 +12,11 @@ const discordConfigSource = path.join(packageRoot, 'src', 'discord', 'config.ts'
 const childLauncherSource = path.join(packageRoot, 'src', 'infrastructure', 'child-launcher.ts')
 const TEST_SERVICE_TOKEN = 'synthetic-service-account-token'
 
-function fakeOpScript(opRecordPath: string) {
+function fakeOpScript(opRecordPath: string, delayMs = 0) {
   return `#!/usr/bin/env node
 import { spawn } from 'node:child_process'
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile, writeFile, lstat } from 'node:fs/promises'
+import path from 'node:path'
 
 const args = process.argv.slice(2)
 const separator = args.indexOf('--')
@@ -43,8 +44,20 @@ for (const [name, value] of Object.entries(fileEnvironment)) {
   childEnvironment[name] = value.startsWith('op://') ? resolvedByOp[name] : value
 }
 
+const secretValues = Object.entries(fileEnvironment)
+  .filter(([, value]) => value.startsWith('op://'))
+  .map(([name]) => resolvedByOp[name])
+  .filter((value) => typeof value === 'string' && value !== '')
+const resolverSocketPath = commandArgs.at(-1) ?? ''
+const relayDirectoryStat = await lstat(path.dirname(resolverSocketPath))
+const relaySocketStat = await lstat(resolverSocketPath)
+
 await writeFile(${JSON.stringify(opRecordPath)}, JSON.stringify({
   args,
+  resolverSocketPath,
+  relayDirectoryMode: relayDirectoryStat.mode & 0o777,
+  relaySocketMode: relaySocketStat.mode & 0o777,
+  relayIsSocket: relaySocketStat.isSocket(),
   tokenPresent: token !== undefined,
   tokenMatchesCredential: token === ${JSON.stringify(TEST_SERVICE_TOKEN)},
   tokenInArgs: token !== undefined && args.includes(token),
@@ -57,14 +70,27 @@ await writeFile(${JSON.stringify(opRecordPath)}, JSON.stringify({
   githubTokenPresent: process.env.GITHUB_TOKEN !== undefined,
 }), 'utf8')
 
+if (${JSON.stringify(delayMs)} > 0) {
+  await new Promise((resolve) => setTimeout(resolve, ${JSON.stringify(delayMs)}))
+}
+
 const child = spawn(command, commandArgs, {
   env: childEnvironment,
-  stdio: 'inherit',
+  stdio: ['ignore', 'pipe', 'pipe'],
 })
+let stdout = ''
+let stderr = ''
+child.stdout?.setEncoding('utf8')
+child.stderr?.setEncoding('utf8')
+child.stdout?.on('data', (chunk) => { stdout += chunk })
+child.stderr?.on('data', (chunk) => { stderr += chunk })
 child.once('error', () => {
   process.exitCode = 127
 })
-child.once('exit', (code) => {
+child.once('close', (code) => {
+  const redact = (text) => secretValues.reduce((result, secret) => result.split(secret).join('[REDACTED BY OP CLI]'), text)
+  process.stdout.write(redact(stdout))
+  process.stderr.write(redact(stderr))
   process.exitCode = code ?? 1
 })
 `
@@ -77,6 +103,9 @@ await writeFile(${JSON.stringify(botRecordPath)}, JSON.stringify({
   args: process.argv.slice(2),
   botToken: process.env.ARAYA_DISCORD_BOT_TOKEN,
   applicationId: process.env.ARAYA_DISCORD_APPLICATION_ID,
+  guildId: process.env.ARAYA_DISCORD_GUILD_ID,
+  channelId: process.env.ARAYA_DISCORD_CHANNEL_ID,
+  allowedUserIds: process.env.ARAYA_DISCORD_ALLOWED_USER_IDS,
   serviceTokenPresent: process.env.OP_SERVICE_ACCOUNT_TOKEN !== undefined,
   credentialsDirectoryPresent: process.env.CREDENTIALS_DIRECTORY !== undefined,
   connectHostPresent: process.env.OP_CONNECT_HOST !== undefined,
@@ -90,7 +119,7 @@ await writeFile(${JSON.stringify(botRecordPath)}, JSON.stringify({
 `
 }
 
-async function makeFixture(botScript?: string) {
+async function makeFixture(botScript?: string, opDelayMs = 0) {
   const root = await fs.realpath(
     await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-op-runner-test-')),
   )
@@ -118,7 +147,7 @@ async function makeFixture(botScript?: string) {
   await fs.copyFile(discordConfigSource, path.join(packageConfigDir, 'config.ts'))
   await fs.copyFile(childLauncherSource, path.join(packageInfrastructureDir, 'child-launcher.ts'))
   await fs.writeFile(botPath, botScript ?? fakeBotScript(botRecordPath), 'utf8')
-  await fs.writeFile(opPath, fakeOpScript(opRecordPath), { mode: 0o700 })
+  await fs.writeFile(opPath, fakeOpScript(opRecordPath, opDelayMs), { mode: 0o700 })
   await fs.writeFile(credentialPath, `${TEST_SERVICE_TOKEN}\n`, { mode: 0o400 })
   await fs.writeFile(
     path.join(dataDir, '.env'),
@@ -174,6 +203,10 @@ test('discord-op-runner: LoadCredential token を op run にだけ渡し、Araya
 
     const opRecord: {
       args: string[]
+      resolverSocketPath: string
+      relayDirectoryMode: number
+      relaySocketMode: number
+      relayIsSocket: boolean
       tokenPresent: boolean
       tokenMatchesCredential: boolean
       tokenInArgs: boolean
@@ -189,6 +222,9 @@ test('discord-op-runner: LoadCredential token を op run にだけ渡し、Araya
       args: string[]
       botToken: string
       applicationId: string
+      guildId: string
+      channelId: string
+      allowedUserIds: string
       serviceTokenPresent: boolean
       credentialsDirectoryPresent: boolean
       connectHostPresent: boolean
@@ -200,7 +236,14 @@ test('discord-op-runner: LoadCredential token を op run にだけ渡し、Araya
       invocationId: string
     } = JSON.parse(await fs.readFile(fixture.botRecordPath, 'utf8'))
 
-    const { args: opArgs, ...opSecurity } = opRecord
+    const {
+      args: opArgs,
+      resolverSocketPath,
+      relayDirectoryMode,
+      relaySocketMode,
+      relayIsSocket,
+      ...opSecurity
+    } = opRecord
     const strippedNames = [
       'CREDENTIALS_DIRECTORY',
       'OP_CONNECT_HOST',
@@ -222,7 +265,7 @@ test('discord-op-runner: LoadCredential token を op run にだけ渡し、Araya
       awsSecretPresent: false,
       githubTokenPresent: false,
     })
-    // op run は bot を起動せず「.env を解決して env を printed する」だけの process になった（#36）
+    // op run は .env の値だけを解決し、runner が private Unix socket から受け取る。stdout には載せない。
     assert.deepEqual(opArgs.slice(0, 19), [
       'run',
       '--env-file',
@@ -245,14 +288,31 @@ test('discord-op-runner: LoadCredential token を op run にだけ渡し、Araya
       '-e',
     ])
     const resolverScript = opArgs[19] ?? ''
-    const strippedArg = opArgs[20] ?? ''
-    assert.match(resolverScript, /ARAYA_RESOLVED_ENV/u)
-    assert.equal(strippedArg, strippedNames.join(','))
+    assert.match(resolverScript, /createConnection/u)
+    assert.match(resolverScript, /JSON\.stringify\(snapshot\)/u)
+    assert.doesNotMatch(resolverScript, /process\.stdout/u)
+    assert.deepEqual(
+      opArgs.slice(5, 17),
+      strippedNames.flatMap((name) => {
+        return ['-u', name]
+      }),
+    )
+    assert.equal(opArgs[17], process.execPath)
+    assert.equal(opArgs[18], '-e')
+    assert.equal(resolverSocketPath, opArgs[20])
+    assert.equal(path.basename(resolverSocketPath), 's')
+    assert.ok(path.basename(path.dirname(resolverSocketPath)).startsWith('araya-op-env-'))
+    assert.equal(relayDirectoryMode, 0o700)
+    assert.equal(relaySocketMode, 0o600)
+    assert.equal(relayIsSocket, true)
     assert.ok(!opArgs.includes(fixture.botPath), 'op run の args に bot を含まない')
     assert.deepEqual(botRecord, {
       args: ['--data-dir', fixture.dataDir],
       botToken: 'resolved-by-op',
       applicationId: '12345678901234567',
+      guildId: '23456789012345678',
+      channelId: '34567890123456789',
+      allowedUserIds: '45678901234567890',
       serviceTokenPresent: false,
       credentialsDirectoryPresent: false,
       connectHostPresent: false,
@@ -283,6 +343,18 @@ test('discord-op-runner: Bot Token 以外の Discord 設定も op:// から解�
         .replace(
           'ARAYA_DISCORD_APPLICATION_ID=12345678901234567',
           'ARAYA_DISCORD_APPLICATION_ID=op://vault/item/application-id',
+        )
+        .replace(
+          'ARAYA_DISCORD_GUILD_ID=23456789012345678',
+          'ARAYA_DISCORD_GUILD_ID=op://vault/item/guild-id',
+        )
+        .replace(
+          'ARAYA_DISCORD_CHANNEL_ID=34567890123456789',
+          'ARAYA_DISCORD_CHANNEL_ID=op://vault/item/channel-id',
+        )
+        .replace(
+          'ARAYA_DISCORD_ALLOWED_USER_IDS=45678901234567890',
+          'ARAYA_DISCORD_ALLOWED_USER_IDS=op://vault/item/allowed-user-ids',
         ),
       { mode: 0o600 },
     )
@@ -294,10 +366,15 @@ test('discord-op-runner: Bot Token 以外の Discord 設定も op:// から解�
     )
 
     assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.stdout, '', 'resolved secret values are not serialized to op run stdout')
+    assert.ok(!result.stderr.includes('[REDACTED BY OP CLI]'))
     assert.deepEqual(JSON.parse(await fs.readFile(fixture.botRecordPath, 'utf8')), {
       args: ['--data-dir', fixture.dataDir],
       botToken: 'synthetic-plain-bot-token',
       applicationId: '12345678901234567',
+      guildId: '23456789012345678',
+      channelId: '34567890123456789',
+      allowedUserIds: '45678901234567890',
       serviceTokenPresent: false,
       credentialsDirectoryPresent: false,
       connectHostPresent: false,
@@ -380,6 +457,94 @@ test('discord-op-runner: credential file が他ユーザーに読める場合は
   }
 })
 
+function sigtermDuringRelayCloseHook() {
+  return `import net from 'node:net'
+import path from 'node:path'
+
+const originalClose = net.Server.prototype.close
+function closeWithSignal(callback) {
+  const address = this.address()
+  const socketPath = typeof address === 'string'
+    ? address
+    : typeof address === 'object' && address !== null && 'path' in address && typeof address.path === 'string'
+      ? address.path
+      : null
+  const isResolverSocket = socketPath !== null &&
+    path.basename(path.dirname(socketPath)).startsWith('araya-op-env-')
+
+  if (isResolverSocket) {
+    process.kill(process.pid, 'SIGTERM')
+    setTimeout(() => originalClose.call(this, callback), 50)
+    return this
+  }
+
+  return originalClose.call(this, callback)
+}
+
+net.Server.prototype.close = closeWithSignal
+`
+}
+
+test('discord-op-runner: relay cleanup 中の SIGTERM は bot startup を止める', async () => {
+  const fixture = await makeFixture()
+  const hookPath = path.join(fixture.root, 'sigterm-during-relay-close.mjs')
+  await fs.writeFile(hookPath, sigtermDuringRelayCloseHook(), 'utf8')
+  let child: ReturnType<typeof spawn> | undefined
+  let relayDirectory: string | undefined
+
+  try {
+    child = spawn(
+      process.execPath,
+      [
+        '--import',
+        hookPath,
+        fixture.opRunnerPath,
+        '--data-dir',
+        fixture.dataDir,
+        '--op-path',
+        fixture.opPath,
+      ],
+      { env: fixture.env },
+    )
+    let stderr = ''
+    child.stderr?.setEncoding('utf8')
+    child.stderr?.on('data', (chunk) => {
+      stderr += chunk
+    })
+
+    assert.deepEqual(
+      await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+        const timer = setTimeout(() => {
+          child?.kill('SIGKILL')
+          resolve({ code: null, signal: 'SIGKILL' })
+        }, 5_000)
+        child?.once('exit', (code, signal) => {
+          clearTimeout(timer)
+          resolve({ code, signal })
+        })
+      }),
+      { code: 1, signal: null },
+      stderr,
+    )
+
+    const { resolverSocketPath: socketPath }: { resolverSocketPath: string } = JSON.parse(
+      await fs.readFile(fixture.opRecordPath, 'utf8'),
+    )
+    relayDirectory = path.dirname(socketPath)
+    await assert.rejects(fs.access(fixture.botRecordPath), { code: 'ENOENT' })
+    await assert.rejects(fs.lstat(socketPath), { code: 'ENOENT' })
+    await assert.rejects(fs.lstat(relayDirectory), { code: 'ENOENT' })
+  } finally {
+    child?.kill('SIGKILL')
+
+    if (relayDirectory !== undefined) {
+      await fs.rm(relayDirectory, { recursive: true, force: true })
+    }
+
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
 // #36: runner（unit の main process）が bot より先に死ぬと、KillMode=control-group の systemd は
 // 残った bot を SIGKILL して drain を途中で潰す。runner が bot の終了を待つことを実証する。
 function drainingBotScript(startPath: string, stopPath: string) {
@@ -425,6 +590,55 @@ async function waitForFile(filePath: string, timeoutMs: number) {
 
   return false
 }
+
+test('discord-op-runner: env 解決中の SIGTERM で private relay を片付ける', async () => {
+  const fixture = await makeFixture(undefined, 10_000)
+  let relayDirectory: string | undefined
+
+  try {
+    const child = spawn(
+      process.execPath,
+      [fixture.opRunnerPath, '--data-dir', fixture.dataDir, '--op-path', fixture.opPath],
+      { env: fixture.env },
+    )
+    let stderr = ''
+    child.stderr?.setEncoding('utf8')
+    child.stderr?.on('data', (chunk) => {
+      stderr += chunk
+    })
+
+    assert.ok(await waitForFile(fixture.opRecordPath, 15_000), 'op run が起動し relay を確認した')
+    const { resolverSocketPath: socketPath }: { resolverSocketPath: string } = JSON.parse(
+      await fs.readFile(fixture.opRecordPath, 'utf8'),
+    )
+    relayDirectory = path.dirname(socketPath)
+    assert.ok((await fs.lstat(socketPath)).isSocket())
+
+    assert.deepEqual(
+      await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+        const timer = setTimeout(() => {
+          child.kill('SIGKILL')
+          resolve({ code: null, signal: 'SIGKILL' })
+        }, 5_000)
+        child.once('exit', (code, signal) => {
+          clearTimeout(timer)
+          resolve({ code, signal })
+        })
+        child.kill('SIGTERM')
+      }),
+      { code: 1, signal: null },
+      stderr,
+    )
+    await assert.rejects(fs.lstat(socketPath), { code: 'ENOENT' })
+    await assert.rejects(fs.lstat(relayDirectory), { code: 'ENOENT' })
+  } finally {
+    if (relayDirectory !== undefined) {
+      await fs.rm(relayDirectory, { recursive: true, force: true })
+    }
+
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
 
 test('discord-op-runner: SIGTERM を bot に伝えて bot の drain が終わるまで待ってから 0 で終了する', async () => {
   const startPath = path.join(os.tmpdir(), `araya-op-bot-start-${process.pid}.json`)
@@ -524,7 +738,10 @@ process.exit(0)
     // launcher log は 1 行 1 record で読めることが必要（改行がリテラル \n になると 1 行に連結する）
     assert.ok(!result.stderr.includes('\\n'), JSON.stringify(result.stderr))
     assert.ok(!result.stderr.includes('resolved-by-op'), 'resolved secret をそのまま出さない')
-    assert.ok(!result.stderr.includes('stdout is ignored'), 'bot の stdout は launcher log に流さない')
+    assert.ok(
+      !result.stderr.includes('stdout is ignored'),
+      'bot の stdout は launcher log に流さない',
+    )
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
