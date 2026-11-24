@@ -6,9 +6,9 @@ import {
   launchChildAndWait,
   launcherStopWaitMs,
   stderrLineWriter,
-} from '../src/infrastructure/child-launcher.ts'
-import { discordUnitSections } from '../src/infrastructure/systemd.ts'
-import { SHUTDOWN_BUDGET_TOTAL_MS } from '../src/discord/bot.ts'
+} from './child-launcher.ts'
+import { discordUnitSections } from './systemd.ts'
+import { SHUTDOWN_BUDGET_TOTAL_MS } from '../discord/bot.ts'
 
 test('child launcher: stderrLineWriter は 1 件を 1 行として書き、改行を二重エスケープしない', () => {
   const chunks: string[] = []

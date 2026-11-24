@@ -14,9 +14,9 @@ import {
   type DiscordGatewayHandlers,
   type DiscordMessageCreateEvent,
   type DiscordTypingChannel,
-} from '../src/discord/gateway.ts'
-import type { DiscordChatMessage, DiscordChatMessageMetadata } from '../src/discord/chat.ts'
-import type { DiscordConfig } from '../src/discord/config.ts'
+} from './gateway.ts'
+import type { DiscordChatMessage, DiscordChatMessageMetadata } from './chat.ts'
+import type { DiscordConfig } from './config.ts'
 
 test('discord gateway: nonce payload は enforce_nonce を有効にする', () => {
   assert.deepEqual(discordNotificationPayload('Task update', 'nonce-1'), {

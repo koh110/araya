@@ -11,10 +11,10 @@ import {
   splitDiscordChatReply,
   stripDiscordBotMention,
   type DiscordChatMessageMetadata,
-} from '../src/discord/chat.ts'
-import { createRedactor } from '../src/infrastructure/redaction.ts'
-import { readHootState, upsertProposal } from '../src/hoot/store.ts'
-import type { DiscordConfig } from '../src/discord/config.ts'
+} from './chat.ts'
+import { createRedactor } from '../infrastructure/redaction.ts'
+import { readHootState, upsertProposal } from '../hoot/store.ts'
+import type { DiscordConfig } from './config.ts'
 
 // control command は state file を読むので deps に dataDir が必要（この test の既存ケースは
 // HOOT を触らないので、存在しなくて readHootState は default state を返すだけ）

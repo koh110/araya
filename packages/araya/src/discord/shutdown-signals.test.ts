@@ -7,9 +7,9 @@ import process from 'node:process'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 
-import { installShutdownSignals } from '../src/discord/shutdown-signals.ts'
+import { installShutdownSignals } from './shutdown-signals.ts'
 
-const SRC_DIR = path.resolve(fileURLToPath(import.meta.url), '../../src')
+const SRC_DIR = path.resolve(fileURLToPath(import.meta.url), '../../')
 const SIGNAL_HELPER_PATH = path.join(SRC_DIR, 'discord/shutdown-signals.ts')
 const CHILD_LAUNCHER_PATH = path.join(SRC_DIR, 'infrastructure/child-launcher.ts')
 

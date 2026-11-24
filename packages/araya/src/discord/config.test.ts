@@ -13,7 +13,7 @@ import {
   parseDiscordEnvFile,
   readDiscordEnvFile,
   validateDiscordSettings,
-} from '../src/discord/config.ts'
+} from './config.ts'
 
 const BOT_TOKEN = 'discord-b…alue'
 const APPLICATION_ID = '123456789012345678'

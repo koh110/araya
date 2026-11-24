@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
-import { loadConfigFile } from '../src/config/file.ts'
+import { loadConfigFile } from './file.ts'
 
 async function makeTempDir() {
   return fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'araya-config-file-test-')))

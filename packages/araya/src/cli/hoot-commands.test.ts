@@ -4,8 +4,8 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
-import { parseHootArguments, runHootCommand } from '../src/cli/hoot-commands.ts'
-import { readHootState, upsertProposal, writeHootState } from '../src/hoot/store.ts'
+import { parseHootArguments, runHootCommand } from './hoot-commands.ts'
+import { readHootState, upsertProposal, writeHootState } from '../hoot/store.ts'
 import {
   DEFAULT_NOTIFY_DECISIONS,
   defaultState,
@@ -13,9 +13,9 @@ import {
   type HootProposal,
   type HootRun,
   type HootState,
-} from '../src/hoot/model.ts'
-import { createHootLoop } from '../src/hoot/tick.ts'
-import { collectSecretValues, createRedactor } from '../src/infrastructure/redaction.ts'
+} from '../hoot/model.ts'
+import { createHootLoop } from '../hoot/tick.ts'
+import { collectSecretValues, createRedactor } from '../infrastructure/redaction.ts'
 
 const HOOT_NOW_ISO = '2026-11-19T09:00:00.000Z'
 

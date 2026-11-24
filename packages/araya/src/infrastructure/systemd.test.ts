@@ -20,7 +20,7 @@ import {
   selectUnitEnvironment,
   shellQuote,
   unitFilePath,
-} from '../src/infrastructure/systemd.ts'
+} from './systemd.ts'
 
 async function makeRoot(prefix: string) {
   return fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), prefix)))
@@ -273,7 +273,7 @@ test('systemd-units: systemd-creds --user encrypt はcredentialをstdinで渡し
   const calls: {
     command: string
     args: readonly string[]
-    options: import('../src/infrastructure/process.ts').BoundedCommandOptions
+    options: import('./process.ts').BoundedCommandOptions
   }[] = []
   const result = await encryptSystemdCredential(plaintext, 'op-service-account-token', {
     resolveExecutable: async () => {

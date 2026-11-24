@@ -24,7 +24,7 @@ import {
   updateSettings,
   upsertProposal,
   writeHootState,
-} from '../src/hoot/store.ts'
+} from './store.ts'
 import {
   DEFAULT_GOAL_REVIEW_DAYS,
   DEFAULT_INJECT_COOLDOWN_MINUTES,
@@ -53,7 +53,7 @@ import {
   type HootRun,
   type HootSettings,
   type HootState,
-} from '../src/hoot/model.ts'
+} from './model.ts'
 
 const DAY_MS = 86_400_000
 const HOUR_MS = 3_600_000

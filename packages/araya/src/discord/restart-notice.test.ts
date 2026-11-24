@@ -7,7 +7,7 @@ import {
   RESTART_STOPPING_TEXT,
   discordRestartStartedText,
   postDiscordRestartNotice,
-} from '../src/discord/restart-notice.ts'
+} from './restart-notice.ts'
 
 const BOT_TOKEN = 'synthetic-token'
 const CHANNEL_ID = '32345678901234567'

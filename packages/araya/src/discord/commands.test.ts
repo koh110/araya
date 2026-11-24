@@ -8,9 +8,9 @@ import {
   createDiscordControlCommands,
   hootArgumentsOf,
   type DiscordControlContext,
-} from '../src/discord/commands.ts'
-import { ARAYA_SLASH_COMMANDS, HOOT_COMMAND, validateArayaSlashCommands } from '../src/discord/slash.ts'
-import { readHootState, setGoal, updateSettings, upsertProposal } from '../src/hoot/store.ts'
+} from './commands.ts'
+import { ARAYA_SLASH_COMMANDS, HOOT_COMMAND, validateArayaSlashCommands } from './slash.ts'
+import { readHootState, setGoal, updateSettings, upsertProposal } from '../hoot/store.ts'
 
 function fakeContext(options: { dataDir?: string } = {}) {
   const sends: string[] = []

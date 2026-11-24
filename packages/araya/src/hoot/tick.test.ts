@@ -4,8 +4,8 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
-import { createHootLoop, type HootInjectInput, type HootTickOutcome } from '../src/hoot/tick.ts'
-import { readHootState, setGoalStatus, writeHootState } from '../src/hoot/store.ts'
+import { createHootLoop, type HootInjectInput, type HootTickOutcome } from './tick.ts'
+import { readHootState, setGoalStatus, writeHootState } from './store.ts'
 import {
   MAX_INJECT_ATTEMPTS,
   defaultState,
@@ -15,9 +15,9 @@ import {
   type HootProposal,
   type HootSettings,
   type HootState,
-} from '../src/hoot/model.ts'
-import { collectSecretValues, createRedactor } from '../src/infrastructure/redaction.ts'
-import type { BoundedProcessResult } from '../src/infrastructure/process.ts'
+} from './model.ts'
+import { collectSecretValues, createRedactor } from '../infrastructure/redaction.ts'
+import type { BoundedProcessResult } from '../infrastructure/process.ts'
 
 function ghResult(payload: unknown): BoundedProcessResult {
   const stdout = JSON.stringify(payload)

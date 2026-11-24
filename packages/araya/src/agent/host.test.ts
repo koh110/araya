@@ -6,9 +6,9 @@ import test from 'node:test'
 
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
 
-import { openArayaAgentHost } from '../src/agent/host.ts'
-import { createRedactor } from '../src/infrastructure/redaction.ts'
-import { answer, createFauxModels, toolCall } from './support/faux-shiki.ts'
+import { openArayaAgentHost } from './host.ts'
+import { createRedactor } from '../infrastructure/redaction.ts'
+import { answer, createFauxModels, toolCall } from '../../test/support/faux-shiki.ts'
 
 async function makeAgentFixture() {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'araya-agent-host-test-')))

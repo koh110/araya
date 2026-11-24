@@ -4,9 +4,9 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
-import { formatDiscordStatusReport, readDiscordUnitStatus } from '../src/cli/discord-status.ts'
-import { DISCORD_STATE_VERSION, discordStateFilePath } from '../src/discord/state.ts'
-import { dataDirHash, discordUnitName, unitFilePath, type CommandResult, type SystemdOps } from '../src/infrastructure/systemd.ts'
+import { formatDiscordStatusReport, readDiscordUnitStatus } from './discord-status.ts'
+import { DISCORD_STATE_VERSION, discordStateFilePath } from '../discord/state.ts'
+import { dataDirHash, discordUnitName, unitFilePath, type CommandResult, type SystemdOps } from '../infrastructure/systemd.ts'
 
 const SHOW_PROPERTIES = 'ActiveState,SubState,UnitFileState,NRestarts,ExecMainStartTimestamp'
 
