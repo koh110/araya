@@ -550,10 +550,25 @@ test('discord chat: /araya status は実行中のターンを待たずに応答�
   const submitted: string[] = []
   const replies: string[] = []
   const commandReplies: string[] = []
+  const nowMs = Date.parse('2026-06-30T09:00:00.000Z')
+  const statusDescription = {
+    conversationId: 42,
+    progress: {
+      main: {
+        operation: 'bash' as const,
+        phaseStartedAtMs: nowMs - 12_000,
+        phaseStartedAtIsEstimated: true,
+      },
+      children: [],
+    },
+  }
   const handler = createDiscordChatHandler({
     config,
     botUserId: '12345678901234567',
     dataDir: chatDataDir,
+    nowMs: () => {
+      return nowMs
+    },
     redactor: createRedactor([]),
     session: {
       submit: async (content) => {
@@ -564,7 +579,7 @@ test('discord chat: /araya status は実行中のターンを待たずに応答�
       },
       reset: async () => {},
       describe: () => {
-        return { conversationId: 42 }
+        return statusDescription
       },
     },
     log: () => {},
@@ -587,6 +602,8 @@ test('discord chat: /araya status は実行中のターンを待たずに応答�
 
   assert.equal(commandReplies.length, 1, 'slash command は実行中でも queue を待たずに応答する')
   assert.match(commandReplies[0] ?? '', /main conversation #42 \/ 実行中 1 \/ 待ち 0/u)
+  assert.match(commandReplies[0] ?? '', /現在の処理: コマンドを実行中/u)
+  assert.match(commandReplies[0] ?? '', /この工程 少なくとも12秒（観測時点から）/u)
   assert.deepEqual(submitted, ['Discord user 42345678901234567 said:\n長い作業をして'])
 
   releaseTurn?.()

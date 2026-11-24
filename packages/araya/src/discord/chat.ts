@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { Redactor } from '../infrastructure/redaction.ts'
+import type { ProgressSnapshot } from '../agent/progress.ts'
 import { createDiscordControlCommands, type DiscordControlCommands } from './commands.ts'
 import type { DiscordConfig } from './config.ts'
 import type { DiscordCommandRequest } from './gateway.ts'
@@ -148,7 +149,7 @@ export type DiscordChatSession = {
   stop?(): Promise<void>
   close?(): Promise<void>
   // control command の status 表示用。main conversation の durable id を返す
-  describe?(): { conversationId: number | null }
+  describe?(): { conversationId: number | null; progress?: ProgressSnapshot | null }
 }
 
 export type DiscordChatReply = (content: string, nonce: string) => Promise<void>
@@ -221,9 +222,9 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
       log: deps.log,
     })
 
-  function conversationIdOf() {
+  function sessionDescription() {
     try {
-      return deps.session?.describe?.().conversationId ?? null
+      return deps.session?.describe?.() ?? null
     } catch {
       return null
     }
@@ -287,12 +288,14 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
   // send だけ差し替え可能にして、Discord の ephemeral reply と CLI の control request で同じ kernel を通す
   async function runCommand(request: DiscordCommandRequest, send: (text: string) => Promise<void>) {
     const cancelledCount = { value: 0 }
+    const description = sessionDescription()
 
     await control.handle(request, {
-      conversationId: conversationIdOf(),
+      conversationId: description?.conversationId ?? null,
       runningCount: processing,
       queuedCount: queued.length,
       sessionAvailable: deps.session !== null,
+      progress: description?.progress ?? null,
       send,
       cancelQueued: () => {
         let cancelled = 0

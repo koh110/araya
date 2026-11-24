@@ -10,7 +10,6 @@ import { obj, opt, str, int } from '@earendil-works/pi-schema'
 import {
   configure,
   createRegistry,
-  defineDoc,
   defineExtension,
   defineTask,
   defineTool,
@@ -37,6 +36,12 @@ import { loadConfig } from '../config/environment.ts'
 import { loadConfigFile } from '../config/file.ts'
 import type { Redactor } from '../infrastructure/redaction.ts'
 import { createModelRuntime, createPiModelSettings, resolveAgentModel } from './model.ts'
+import {
+  createArayaProgressMonitorBestEffort,
+  SubagentsDoc,
+  type ArayaProgressMonitor,
+  type ProgressSnapshot,
+} from './progress.ts'
 
 // session-first の Araya agent host。Discord bot の process が pi-durable の Harness を持ち、
 // main conversation が coding tools（read / write / edit / bash）を直接使って作業する。
@@ -94,24 +99,6 @@ async function answerText(tx: Tx, conversationId: ConversationId, entryId: Entry
     })
     .join('')
 }
-
-// name -> child conversation の対応。tool task ではなく session-scoped document に保持し、restart でも復元する
-type SubagentRecord = { conversationId: ConversationId; updatedAt: number }
-type SubagentsState = { agents: Record<string, SubagentRecord> }
-
-const SubagentsDoc = defineDoc<SubagentsState>({
-  kind: 'araya.subagents',
-  version: 1,
-  scope: 'conversation',
-  history: 'latest',
-  fork: 'current',
-  initial: () => {
-    return { agents: {} }
-  },
-  checkpointWhen: () => {
-    return false
-  },
-})
 
 type ReporterInput = {
   name: string
@@ -315,6 +302,7 @@ type TaskToolDependencies = {
   reporterTask: ReturnType<typeof createReporterTask>
   devRoot: string
   getHarness: () => HarnessInstance | undefined
+  registerChild(name: string, conversationId: ConversationId, requestStartedAtMs: number): void
 }
 
 type HarnessInstance = Awaited<ReturnType<typeof Harness.open>>
@@ -357,7 +345,7 @@ function createTaskTool(deps: TaskToolDependencies) {
             const doc = await tx.doc(SubagentsDoc, api.conversationId)
 
             if (doc.agents[name] !== undefined) {
-              return { alreadyExists: true, conversationId: null }
+              return { alreadyExists: true } satisfies { alreadyExists: true }
             }
 
             const child = await tx.createConversation({
@@ -381,9 +369,14 @@ function createTaskTool(deps: TaskToolDependencies) {
               },
               { background: true, ownership: { kind: 'conversation' } },
             )
-            doc.agents[name] = { conversationId: child.id, updatedAt: api.now() }
+            const updatedAt = api.now()
+            doc.agents[name] = { conversationId: child.id, updatedAt }
 
-            return { alreadyExists: false }
+            return {
+              alreadyExists: false,
+              conversationId: child.id,
+              updatedAt,
+            } satisfies { alreadyExists: false; conversationId: ConversationId; updatedAt: number }
           },
           context,
         )
@@ -391,6 +384,8 @@ function createTaskTool(deps: TaskToolDependencies) {
         if (created.alreadyExists) {
           return textResult(`task[${name}] は既にあります。send か stop を使ってください。`, true)
         }
+
+        deps.registerChild(name, created.conversationId, created.updatedAt)
 
         return textResult(`task[${name}] を開始しました。完了したら報告がこの会話に届きます。`)
       }
@@ -400,7 +395,7 @@ function createTaskTool(deps: TaskToolDependencies) {
           return textResult('send には message が必要です。', true)
         }
 
-        const conversationId = await api.commit(
+        const child = await api.commit(
           async (tx) => {
             const doc = await tx.doc(SubagentsDoc, api.conversationId)
             const entry = doc.agents[name]
@@ -409,22 +404,25 @@ function createTaskTool(deps: TaskToolDependencies) {
               return null
             }
 
-            entry.updatedAt = api.now()
+            const updatedAt = api.now()
+            entry.updatedAt = updatedAt
 
-            return entry.conversationId
+            return { conversationId: entry.conversationId, updatedAt }
           },
           context,
         )
 
-        if (conversationId === null) {
+        if (child === null) {
           return textResult(`task[${name}] はありません。status で一覧を確認してください。`, true)
         }
+
+        deps.registerChild(name, child.conversationId, child.updatedAt)
 
         await api.createTask(
           deps.reporterTask,
           {
             name,
-            childConversationId: conversationId,
+            childConversationId: child.conversationId,
             mainConversationId: api.conversationId,
             message: args.message,
           },
@@ -558,13 +556,7 @@ function createConversationReadTool(deps: ConversationReadToolDependencies) {
       `1 判断 run につき最大 ${CONVERSATION_READ_CALLS_PER_RUN} 回・合計 ${CONVERSATION_READ_CHARS_PER_RUN} 文字まで。参照は run の記録に残る。`,
     ].join(' '),
     parameters: obj({
-      limit: opt(
-        int({
-          description: '取得する entry 数',
-          minimum: CONVERSATION_READ_LIMIT_MIN,
-          maximum: CONVERSATION_READ_LIMIT_MAX,
-        })
-      ),
+      limit: opt(int({ description: '取得する entry 数', minimum: CONVERSATION_READ_LIMIT_MIN, maximum: CONVERSATION_READ_LIMIT_MAX })),
       before: opt(str({ description: 'この entryId より古い entry から読む（前回の nextEntryId）', maxLength: 40 })),
       match: opt(str({ description: 'この text を含む entry だけ返す（大文字小文字無視）', maxLength: CONVERSATION_READ_MATCH_MAX })),
     }),
@@ -693,6 +685,8 @@ export type OpenArayaAgentHostInput = {
   model: { provider: string; modelId: string; thinkingLevel: ThinkingLevel }
   redactor: Redactor
   deliverReport: (name: string, text: string, nonce: string) => Promise<void>
+  deliverProgress?: (text: string, nonce: string) => Promise<void>
+  log?: (entry: Record<string, unknown>) => void
   /** 配送失敗時の再試行間隔 (ms)。既定 15000 */
   deliveryRetryMs?: number
   context: Context
@@ -703,8 +697,8 @@ export type ArayaAgentSession = {
   reset(requestId: string): Promise<void>
   stop?(): Promise<void>
   close(): Promise<void>
-  // control command の status 表示用。main conversation の durable id（Pi durable の数値 id）
-  describe(): { conversationId: number | null }
+  // control command の status 表示用。main conversation と live progress
+  describe(): { conversationId: number | null; progress?: ProgressSnapshot }
   // HOOT 判断 run を 1 回走らせる。main 会話とは別の、tool を持たない専用の会話を使う
   hootDecide?(input: HootDecideRequest): Promise<HootDecideResult>
 }
@@ -736,6 +730,7 @@ export async function openArayaAgentHost(
   const storagePath = path.join(directory, 'agent.sqlite')
   const storage = await openNodeSqliteStorage(storagePath)
   let harness: HarnessInstance | undefined
+  let progressMonitor: ArayaProgressMonitor | undefined
 
   try {
     await fs.chmod(storagePath, 0o600)
@@ -760,6 +755,9 @@ export async function openArayaAgentHost(
       codingTools,
       reporterTask,
       devRoot: input.devRoot,
+      registerChild: (name, conversationId, requestStartedAtMs) => {
+        progressMonitor?.registerChild(name, conversationId, requestStartedAtMs)
+      },
       getHarness: () => {
         return harness
       },
@@ -814,8 +812,15 @@ export async function openArayaAgentHost(
       },
     )
     mainConversation = root
-    harness.resume()
     const activeHarness = harness
+    progressMonitor = await createArayaProgressMonitorBestEffort({
+      harness: activeHarness,
+      root,
+      context: input.context,
+      deliverProgress: input.deliverProgress,
+      log: input.log,
+    })
+    activeHarness.resume()
 
     // HOOT 判断 run 用の conversation。coding tool・task tool を持たないので、判断 run は file も
     // child も変更できない。id を覚えておき、再起動後は同じ transcript を続ける
@@ -942,17 +947,23 @@ export async function openArayaAgentHost(
         }
       },
       describe: () => {
-        return { conversationId: root.id }
+        return {
+          conversationId: root.id,
+          ...(progressMonitor === undefined ? {} : { progress: progressMonitor.snapshot() }),
+        }
       },
       // main の実行中 run・queued input と、その background child まで止める
       stop: async () => {
         await root.abort(input.context, { background: true })
       },
       close: async () => {
-        await harness?.close(input.context)
+        await progressMonitor?.close()
+        await activeHarness.close(input.context)
       },
     }
   } catch (error) {
+    await progressMonitor?.close()
+
     if (harness === undefined) {
       await storage.close(input.context)
     } else {
@@ -969,6 +980,8 @@ export async function createDefaultArayaAgentSession(input: {
   env: Readonly<Record<string, string | undefined>>
   redactor: Redactor
   deliverReport: (name: string, text: string, nonce: string) => Promise<void>
+  deliverProgress?: (text: string, nonce: string) => Promise<void>
+  log?: (entry: Record<string, unknown>) => void
   deliveryRetryMs?: number
 }) {
   const config = loadConfig({ ...input.env, ARAYA_DATA_DIR: input.dataDir })
@@ -1000,6 +1013,8 @@ export async function createDefaultArayaAgentSession(input: {
     },
     redactor: input.redactor,
     deliverReport: input.deliverReport,
+    deliverProgress: input.deliverProgress,
+    log: input.log,
     deliveryRetryMs: input.deliveryRetryMs,
     context: BACKGROUND_CONTEXT,
   })

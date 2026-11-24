@@ -497,6 +497,16 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     }
   }
 
+  async function deliverProgress(text: string, nonce: string) {
+    const settlement = await gatewayReady
+
+    if (!settlement.ok) {
+      throw settlement.error
+    }
+
+    await settlement.gateway.sendText(redactor.redact(text), nonce)
+  }
+
   async function closeChatSession() {
     try {
       await chatSession?.close?.()
@@ -511,6 +521,8 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
       env: deps.env,
       redactor,
       deliverReport,
+      deliverProgress,
+      log: logSafe,
     })
     logSafe({ type: 'discord_chat_ready' })
   } catch (error) {

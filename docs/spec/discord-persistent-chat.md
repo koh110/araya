@@ -34,6 +34,16 @@
 - Discord へ出る文字列と log への external 由来文字列は、既知の secret 相当を `[REDACTED]` に置き換えてから書く。Pi durable の保存 transcript（reply・tool 実行ログ）は redaction 対象外で、そのまま保存される。credential 等を会話に投稿しないことは利用者の責務である。
 - HOOT inject は main conversation に submit する前に content を redaction する（state に残った model・gh 由来の text をそのまま渡さない）。inject に対して channel へ返すのは「何を自動化したか」の 1 文（notice）と main conversation の answer の 2 件で、notice と answer は別の messageId を使う（同じ messageId / chunk index だと reply nonce が重複して送信 dedupe で answer が落ちる）。answer が空だった場合は `応答を生成できませんでした。` を送る。
 
+## 進捗可視化
+
+- `/araya status` と `araya status` は、実行中の main conversation の現在の処理種別・その処理の経過時間と、実行中の named child session の名前・現在の処理種別・依頼からの経過時間を表示する。制御 command は既存のとおり会話 queue の外で応答する。
+- child の LiveDoc から現在の処理種別をまだ観測できない間は「次の処理を準備中」と表示し、「ツールの実行待ち」は明示的な pending tool があるときだけ使う。
+- 進捗は Pi durable の `LiveDoc` / task graph から読む。Araya 独自の task 台帳・runner は追加しない。処理種別は allowlist による汎用表示（モデル応答生成、file read/write/edit、shell command、background task、context compaction）。未知の tool は名前や引数を表示せず「その他の処理」とする。
+- 達成率・完了予定時刻は表示しない（model の作業に安定した総工程数がない）。`LiveDoc` に処理開始時刻がないため、main / child の工程時間は監視側が処理種別を観測した時刻からの下限として「少なくとも N 秒（観測時点から）」と表示し、正確な経過時間と誤認させない。child の「依頼から」は依頼登録時刻を基準にする。
+- 自動進捗 message は、実作業の種別（file read/write/edit、shell command、background task 等）を初めて観測したとき、または種別が変わったときだけ設定 channel へ送る。連続する同一種別の操作はまとめ、モデル応答生成中の状態や同じ処理の反復は通知しない。定期 heartbeat は送らず、完了は通常の最終 reply で伝える。
+- 自動進捗 message は汎用的な処理種別だけを含め、Discord の message 本文、model の途中出力・reasoning、tool 引数・command・path・出力は含めない。status の child 名は許可された利用者への ephemeral 応答に限って表示する。
+- 進捗通知の送信は best-effort とし、失敗しても会話処理・最終 reply を止めない。bot 再起動時は durable state から status を復元するが、watch 開始時点の進捗を自動再通知しない。
+
 ## 可用性
 
 - bot は gateway 接続・ready・reply 送信を fake gateway でテストできる構造にする（実 Discord を test で使わない）。
