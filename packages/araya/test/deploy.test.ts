@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import test from 'node:test'
+import { test } from 'vite-plus/test'
 import { fileURLToPath } from 'node:url'
 
 import { shellQuote } from '../src/infrastructure/systemd.ts'
@@ -414,64 +414,66 @@ test('deploy: npm install が失敗したときは、discord install を実行�
   }
 })
 
-test('deploy: 本物の npm で npm run deploy を実行しても、npm run が足した PATH の entry を外して discord install を実行する', async (t) => {
-  const npmCli = await findNpmCli()
+const npmCli = await findNpmCli()
 
-  if (npmCli === null) {
-    t.skip('npm が見つかりません')
-    return
-  }
+test.skipIf(npmCli === null)(
+  'deploy: 本物の npm で npm run deploy を実行しても、npm run が足した PATH の entry を外して discord install を実行する',
+  async () => {
+    assert.ok(npmCli)
+    const fixture = await makeDeployFixture()
 
-  const fixture = await makeDeployFixture()
+    try {
+      // npm run deploy を実行する package。npm run が PATH の先頭に足す node_modules/.bin に偽物の npm を置くので、deploy.sh の中の npm はその偽物になる
+      const packageDir = path.join(fixture.root, 'package')
+      await fs.mkdir(path.join(packageDir, 'node_modules', '.bin'), { recursive: true })
+      await fs.writeFile(path.join(packageDir, 'node_modules', '.bin', 'npm'), FAKE_NPM, {
+        mode: 0o755,
+      })
+      await fs.writeFile(
+        path.join(packageDir, 'package.json'),
+        JSON.stringify({
+          private: true,
+          name: 'araya-deploy-test',
+          version: '0.0.0',
+          scripts: { deploy: `sh ${shellQuote(DEPLOY_SCRIPT)}` },
+        }),
+        'utf8',
+      )
+      const outerPath = '/usr/bin:/bin'
+      const result = await runProcess(
+        process.execPath,
+        [npmCli, 'run', 'deploy'],
+        {
+          ...fixture.env,
+          PATH: outerPath,
+          npm_config_cache: path.join(fixture.root, 'npm-cache'),
+          npm_config_update_notifier: 'false',
+        },
+        packageDir,
+      )
 
-  try {
-    // npm run deploy を実行する package。npm run が PATH の先頭に足す node_modules/.bin に偽物の npm を置くので、deploy.sh の中の npm はその偽物になる
-    const packageDir = path.join(fixture.root, 'package')
-    await fs.mkdir(path.join(packageDir, 'node_modules', '.bin'), { recursive: true })
-    await fs.writeFile(path.join(packageDir, 'node_modules', '.bin', 'npm'), FAKE_NPM, {
-      mode: 0o755,
-    })
-    await fs.writeFile(
-      path.join(packageDir, 'package.json'),
-      JSON.stringify({
-        private: true,
-        name: 'araya-deploy-test',
-        version: '0.0.0',
-        scripts: { deploy: `sh ${shellQuote(DEPLOY_SCRIPT)}` },
-      }),
-      'utf8',
-    )
-    const outerPath = '/usr/bin:/bin'
-    const result = await runProcess(
-      process.execPath,
-      [npmCli, 'run', 'deploy'],
-      {
-        ...fixture.env,
-        PATH: outerPath,
-        npm_config_cache: path.join(fixture.root, 'npm-cache'),
-        npm_config_update_notifier: 'false',
-      },
-      packageDir,
-    )
-
-    assert.deepEqual(result.exit, { code: 0, signal: null }, result.stderr)
-    const calls = await readCalls(fixture.logPath)
-    assert.deepEqual(commandsOf(calls), [
-      'npm pack',
-      'npm uninstall',
-      'npm install',
-      'araya discord',
-    ])
-    // deploy.sh の中の npm は、npm run が足した entry の付いた PATH で動いた
-    const pack = calls[0]
-    assert.ok(pack)
-    assert.ok(pack.path.startsWith(`${path.join(packageDir, 'node_modules', '.bin')}:`), pack.path)
-    assert.ok(pack.path.endsWith(`/node-gyp-bin:${outerPath}`), pack.path)
-    assert.equal(calls[3]?.path, outerPath)
-  } finally {
-    await fs.rm(fixture.root, { recursive: true, force: true })
-  }
-})
+      assert.deepEqual(result.exit, { code: 0, signal: null }, result.stderr)
+      const calls = await readCalls(fixture.logPath)
+      assert.deepEqual(commandsOf(calls), [
+        'npm pack',
+        'npm uninstall',
+        'npm install',
+        'araya discord',
+      ])
+      // deploy.sh の中の npm は、npm run が足した entry の付いた PATH で動いた
+      const pack = calls[0]
+      assert.ok(pack)
+      assert.ok(
+        pack.path.startsWith(`${path.join(packageDir, 'node_modules', '.bin')}:`),
+        pack.path,
+      )
+      assert.ok(pack.path.endsWith(`/node-gyp-bin:${outerPath}`), pack.path)
+      assert.equal(calls[3]?.path, outerPath)
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true })
+    }
+  },
+)
 
 // npm が入れる araya の代わりに checkout の araya の CLI を置いて、deploy.sh を実行する。
 // systemctl・loginctl は、呼ばれたら記録する偽物。systemdMode 'offline' は終了 code 1（user manager に接続できない環境）、
@@ -739,13 +741,21 @@ test('deploy: .env の op:// がコメント行にしか無いときは、op を
   try {
     const envPath = path.join(fixture.dataDir, '.env')
     const plain = await fs.readFile(envPath, 'utf8')
-    await fs.writeFile(envPath, ['# ARAYA_DISCORD_BOT_TOKEN=op://deploy-test/discord/token', plain].join('\n'))
+    await fs.writeFile(
+      envPath,
+      ['# ARAYA_DISCORD_BOT_TOKEN=op://deploy-test/discord/token', plain].join('\n'),
+    )
     await fs.writeFile(path.join(fixture.binDir, 'op'), FAKE_OP, { mode: 0o755 })
     const result = await runDeployScript(fixture, fixture.originalPath)
 
     assert.deepEqual(result.exit, { code: 0, signal: null }, result.stderr)
     const calls = await readCalls(fixture.logPath)
-    assert.deepEqual(commandsOf(calls), ['npm pack', 'npm uninstall', 'npm install', 'araya discord'])
+    assert.deepEqual(commandsOf(calls), [
+      'npm pack',
+      'npm uninstall',
+      'npm install',
+      'araya discord',
+    ])
     assert.equal(calls[3]?.args, 'discord install')
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })

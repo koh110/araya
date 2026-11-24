@@ -2,11 +2,17 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import test from 'node:test'
+import { test } from 'vite-plus/test'
 
 import { formatDiscordStatusReport, readDiscordUnitStatus } from './discord-status.ts'
 import { DISCORD_STATE_VERSION, discordStateFilePath } from '../discord/state.ts'
-import { dataDirHash, discordUnitName, unitFilePath, type CommandResult, type SystemdOps } from '../infrastructure/systemd.ts'
+import {
+  dataDirHash,
+  discordUnitName,
+  unitFilePath,
+  type CommandResult,
+  type SystemdOps,
+} from '../infrastructure/systemd.ts'
 
 const SHOW_PROPERTIES = 'ActiveState,SubState,UnitFileState,NRestarts,ExecMainStartTimestamp'
 
@@ -20,7 +26,10 @@ function fakeOps(stdout: string, exitCode = 0): SystemdOps {
       const result: CommandResult = {
         exitCode,
         stdout,
-        stderr: exitCode === 0 ? '' : 'Failed to get unit file state for unknown unit: No such device or address',
+        stderr:
+          exitCode === 0
+            ? ''
+            : 'Failed to get unit file state for unknown unit: No such device or address',
         timedOut: false,
       }
 
@@ -41,7 +50,11 @@ test('araya discord status: unit file・systemctl show・ready 記録をまと�
   const unitPath = unitFilePath({}, homeDir, unit)
 
   await fs.mkdir(path.dirname(unitPath), { recursive: true })
-  await fs.writeFile(unitPath, '[Unit]\nDescription=araya Discord bot (fake)\n[Service]\nExecStart=/bin/true\n', 'utf8')
+  await fs.writeFile(
+    unitPath,
+    '[Unit]\nDescription=araya Discord bot (fake)\n[Service]\nExecStart=/bin/true\n',
+    'utf8',
+  )
   await fs.mkdir(path.dirname(discordStateFilePath(dataDir)), { recursive: true })
   await fs.writeFile(
     discordStateFilePath(dataDir),
@@ -83,7 +96,10 @@ test('araya discord status: unit file・systemctl show・ready 記録をまと�
 
 test('araya discord status: unit が無いときは install 前だと案内する（command は失敗しない）', async () => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-status-missing-'))
-  const ops = fakeOps(`ActiveState=inactive\nSubState=dead\nUnitFileState=invalid\nNRestarts=0\n`, 1)
+  const ops = fakeOps(
+    `ActiveState=inactive\nSubState=dead\nUnitFileState=invalid\nNRestarts=0\n`,
+    1,
+  )
 
   const report = await readDiscordUnitStatus(ops, dataDir, dataDir, {})
   assert.equal(report.installed, false)
@@ -113,7 +129,9 @@ test('araya discord status: 読み取る property は state 用の名前一覧�
   await readDiscordUnitStatus(ops, dataDir, dataDir, {})
   const args = captured[0] ?? []
   assert.deepEqual(args.slice(0, 3), ['--user', 'show', `--property=${SHOW_PROPERTIES}`])
-  assert.ok(!args.some((arg) => {
-    return arg.includes('Environment') || arg.includes('Token')
-  }))
+  assert.ok(
+    !args.some((arg) => {
+      return arg.includes('Environment') || arg.includes('Token')
+    }),
+  )
 })

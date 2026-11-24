@@ -4,7 +4,7 @@ import { once } from 'node:events'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import test from 'node:test'
+import { test } from 'vite-plus/test'
 import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
 
@@ -14,8 +14,18 @@ import { CHAT_SHUTDOWN_UNPROCESSED_REPLY } from '../src/discord/chat.ts'
 import { OBSOLETE_COMMAND_REPLY, routeSlashCommandInteraction } from '../src/discord/gateway.ts'
 import { newState, readDiscordBotState, writeDiscordBotState } from '../src/discord/state.ts'
 import { BOT_STARTED_TEXT, RESTART_STARTED_TEXT } from '../src/discord/restart-notice.ts'
-import { readHootState, enqueueHootInject, setGoal, updateSettings, upsertProposal } from '../src/hoot/store.ts'
-import { controlRequestId, readControlResult, writeControlRequest } from '../src/infrastructure/control-bus.ts'
+import {
+  readHootState,
+  enqueueHootInject,
+  setGoal,
+  updateSettings,
+  upsertProposal,
+} from '../src/hoot/store.ts'
+import {
+  controlRequestId,
+  readControlResult,
+  writeControlRequest,
+} from '../src/infrastructure/control-bus.ts'
 
 import { defaultState, proposalKeyOf } from '../src/hoot/model.ts'
 
@@ -111,7 +121,7 @@ function makeSlashInteraction(
 }
 
 // 通知投稿の stub。bot テストが実 Discord REST へ行かないように共通で注入する
-const noticeStubFetch = async () => ({ ok: true } as const)
+const noticeStubFetch = async () => ({ ok: true }) as const
 
 test('discord bot: 別 process が同じ dataDir を使用中なら2つ目は起動しない', async () => {
   const dataDir = await fs.realpath(
@@ -314,7 +324,9 @@ test('discord bot: SIGKILL 後の残留 lock を stale 待ちなく起動直後�
       'stale 待ちの起動失敗を挟まない',
     )
     // 回収した側が owner record を引き継ぎ、exit で消している
-    await assert.rejects(fs.access(path.join(dataDir, '.discord-bot.lock-owner.json')), { code: 'ENOENT' })
+    await assert.rejects(fs.access(path.join(dataDir, '.discord-bot.lock-owner.json')), {
+      code: 'ENOENT',
+    })
     await assert.rejects(fs.access(path.join(dataDir, '.discord-bot.lock')), { code: 'ENOENT' })
   } finally {
     if (child.exitCode === null && child.signalCode === null) {
@@ -407,9 +419,11 @@ test('discord bot: 指定 channel の mention なし投稿を会話 session に�
           },
           async sendText() {},
           async registerCommands(commands) {
-            registeredCommands.push(commands.map((command) => {
-              return { name: command.name }
-            }))
+            registeredCommands.push(
+              commands.map((command) => {
+                return { name: command.name }
+              }),
+            )
 
             return commands.length
           },
@@ -521,7 +535,11 @@ test('discord bot: 会話 session 初期化に失敗すると会話利用不可�
       }),
       '会話機能の利用不可を返信する',
     )
-    assert.equal(typeof interactionHandlerSeen, 'function', 'bot は slash command handler を gateway に渡す')
+    assert.equal(
+      typeof interactionHandlerSeen,
+      'function',
+      'bot は slash command handler を gateway に渡す',
+    )
     assert.ok(
       chatReplies.some((content) => {
         return content.includes('会話 session は開けていません')
@@ -576,7 +594,11 @@ test('discord bot: 撤去済み slash command の返信と log に bot token を
             handlers.onReady()
 
             // 撤去応答は production の routeSlashCommandInteraction -> bot の handler をそのまま通す
-            assert.equal(typeof handlers.onInteraction, 'function', 'bot は slash command handler を gateway に渡す')
+            assert.equal(
+              typeof handlers.onInteraction,
+              'function',
+              'bot は slash command handler を gateway に渡す',
+            )
 
             for (const subcommand of ['submit', 'cancel', 'retry', 'list', 'show']) {
               await routeSlashCommandInteraction(
@@ -749,7 +771,7 @@ test('discord bot: shutdown は進行中の chat reply を送ってから gatewa
 })
 
 // #36: drain に上限が無いと unit の TimeoutStopSec（30 s）を越えて SIGKILL され、残留 lock（#37）と
-// 無受信窓を増やす。budget で打ち切って gateway / session を閉じ、取りこぼしを reply と log で示す
+// message を受信できない時間を増やす。budget で打ち切って gateway / session を閉じ、取りこぼしを reply と log で示す
 // ことを実際の hang で確かめる
 test('discord bot: shutdown は drain budget で打ち切って gateway と session を閉じる', async () => {
   const dataDir = await fs.realpath(
@@ -1016,7 +1038,7 @@ test('discord bot: HOOT state が有効なら wakeup loop を走らせて判断�
                 mentionsBot: false,
                 content: 'hello',
               },
-              async () => {}
+              async () => {},
             )
 
             // HOOT loop は gateway ready 後に 1 件送る。それを待ってから stop する
@@ -1182,7 +1204,7 @@ test('discord bot: CLI で承認した HOOT dispatch を main 会話 session に
                 mentionsBot: false,
                 content: 'human message',
               },
-              async () => {}
+              async () => {},
             )
 
             // poll が state を拾うのを待つの実測待ち。8 s は CI load で届いたことがあり、余裕を持たせる
@@ -1191,7 +1213,8 @@ test('discord bot: CLI で承認した HOOT dispatch を main 会話 session に
             while (
               !submissions.some((entry) => {
                 return entry.requestId.startsWith('hoot-inject:')
-              }) && Date.now() < deadline
+              }) &&
+              Date.now() < deadline
             ) {
               await new Promise((resolve) => {
                 setTimeout(resolve, 50)
@@ -1220,7 +1243,10 @@ test('discord bot: CLI で承認した HOOT dispatch を main 会話 session に
     })
     assert.notEqual(injectSubmission, undefined)
     assert.match(injectSubmission?.content ?? '', /open issue と draft PR を拾う/u)
-    assert.match(injectSubmission?.content ?? '', new RegExp(`araya hoot dispatch --key ${proposalKey}`, 'u'))
+    assert.match(
+      injectSubmission?.content ?? '',
+      new RegExp(`araya hoot dispatch --key ${proposalKey}`, 'u'),
+    )
     assert.match(injectSubmission?.content ?? '', /この承認では許可されていません/u)
     // 人間の message と inject が同じ main 会話 session を通る（submit 2 件）
     assert.equal(submissions.length, 2)
@@ -1335,7 +1361,11 @@ test('discord bot: Discord の /hoot dispatch 承認を同じ process の poll �
             // 人間の承認は Discord の slash command から打つ（CLI を叩きに行かない）
             await routeSlashCommandInteraction(
               makeSlashInteraction(
-                { commandName: 'hoot', subcommand: 'dispatch', options: [{ name: 'key', value: proposalKey }] },
+                {
+                  commandName: 'hoot',
+                  subcommand: 'dispatch',
+                  options: [{ name: 'key', value: proposalKey }],
+                },
                 (content) => {
                   notices.push({ content, nonce: 'interaction-dispatch' })
                 },
@@ -1355,7 +1385,8 @@ test('discord bot: Discord の /hoot dispatch 承認を同じ process の poll �
             while (
               !notices.some((entry) => {
                 return entry.content.includes('HOOT 案件を進めました')
-              }) && Date.now() < deadline
+              }) &&
+              Date.now() < deadline
             ) {
               await new Promise((resolve) => {
                 setTimeout(resolve, 50)
@@ -1776,7 +1807,7 @@ test('discord bot: CLI の control request（araya reset）を startup 後の po
 
             // runControl は queue を通さないので、会話の投稿を待たずに reset が効く
             for (let index = 0; index < 100; index += 1) {
-              if (await readControlResult(dataDir, requestId) !== null) {
+              if ((await readControlResult(dataDir, requestId)) !== null) {
                 break
               }
 
@@ -1823,7 +1854,7 @@ test('discord bot: CLI の control request（araya reset）を startup 後の po
   }
 })
 
-// #36: gateway が閉じていた窓に投稿された message は Discord が再配信しない。ready 後に history を読み、
+// #36: gateway が閉じている間に投稿された message は Discord が再配信しない。ready 後に history を読み、
 // cursor より新しい物だけを会話へ流し込むことを bot の loop 経由で確かめる
 const DISCORD_EPOCH_MS = 1_420_070_400_000
 
@@ -1831,7 +1862,7 @@ function snowflakeAge(ageMs: number) {
   return String((BigInt(Date.now() - ageMs - DISCORD_EPOCH_MS) << 22n) + 1n)
 }
 
-test('discord bot: 再起動の窓に投稿された message を ready 後に history から取り直す', async () => {
+test('discord bot: 再起動中に投稿された message を ready 後に history から取り直す', async () => {
   const dataDir = await fs.realpath(
     await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-backfill-test-')),
   )
@@ -1839,7 +1870,7 @@ test('discord bot: 再起動の窓に投稿された message を ready 後に hi
   const logs: Record<string, unknown>[] = []
   const submits: { content: string; requestId: string }[] = []
   const cursorId = snowflakeAge(60_000)
-  const windowId = snowflakeAge(20_000)
+  const duringStopId = snowflakeAge(20_000)
   const beforeCursorId = snowflakeAge(90_000)
 
   writeDiscordBotState(dataDir, {
@@ -1900,7 +1931,7 @@ test('discord bot: 再起動の窓に投稿された message を ready 後に hi
                 isWebhook: false,
                 isSystem: false,
                 mentionsBot: false,
-                messageId: windowId,
+                messageId: duringStopId,
                 content: '再起動中に出ていた message',
               },
               {
@@ -1927,7 +1958,7 @@ test('discord bot: 再起動の窓に投稿された message を ready 後に hi
 
     assert.equal(exitCode, 0)
     assert.equal(submits.length, 1, JSON.stringify(logs))
-    assert.equal(submits[0]?.requestId, windowId)
+    assert.equal(submits[0]?.requestId, duringStopId)
     assert.match(submits[0]?.content ?? '', /再起動中に出ていた message/)
 
     const received = logs.find((entry) => {
@@ -1935,7 +1966,7 @@ test('discord bot: 再起動の窓に投稿された message を ready 後に hi
     })
 
     assert.ok(received !== undefined, JSON.stringify(logs))
-    assert.equal(received.messageId, windowId)
+    assert.equal(received.messageId, duringStopId)
     assert.ok(
       logs.some((entry) => {
         return entry.type === 'discord_backfill' && entry.handled === 1
@@ -1946,7 +1977,7 @@ test('discord bot: 再起動の窓に投稿された message を ready 後に hi
     const state = readDiscordBotState(dataDir)
 
     assert.ok(state !== null)
-    assert.equal(state.lastSeenMessageId, windowId)
+    assert.equal(state.lastSeenMessageId, duringStopId)
   } finally {
     stopController.abort()
     await fs.rm(dataDir, { recursive: true, force: true })
@@ -2035,14 +2066,20 @@ test('discord bot: drain で置き去りにした message は cursor を進め�
             await handlers.onMessage(liveChatMessage(doneId, '完了する turn'), async (content) => {
               firstReplies.push({ content, gatewayClosed: false })
             })
-            void handlers.onMessage(liveChatMessage(stuckId, '終わらない turn'), async (content) => {
-              firstReplies.push({ content, gatewayClosed: false })
-            })
+            void handlers.onMessage(
+              liveChatMessage(stuckId, '終わらない turn'),
+              async (content) => {
+                firstReplies.push({ content, gatewayClosed: false })
+              },
+            )
             await stuck
             // stuck の後ろで待って shutdown で打ち切られる message
-            void handlers.onMessage(liveChatMessage(queuedId, '打ち切られる message'), async (content) => {
-              firstReplies.push({ content, gatewayClosed: false })
-            })
+            void handlers.onMessage(
+              liveChatMessage(queuedId, '打ち切られる message'),
+              async (content) => {
+                firstReplies.push({ content, gatewayClosed: false })
+              },
+            )
             await new Promise((resolve) => {
               setTimeout(resolve, 60)
             })

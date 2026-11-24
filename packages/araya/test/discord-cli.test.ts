@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import test from 'node:test'
+import { afterEach, test, vi } from 'vite-plus/test'
 
 import { runCli } from '../src/cli/main.ts'
 import { dataDirHash, discordUnitName, type CommandResult } from '../src/infrastructure/systemd.ts'
@@ -20,6 +20,10 @@ import {
   writeDiscordBotState,
 } from '../src/discord/state.ts'
 import { commandResult, createFakeSystemd } from './support/fake-systemd.ts'
+
+afterEach(() => {
+  vi.restoreAllMocks()
+})
 
 const BOT_TOKEN = 'discord-b…alue'
 const APPLICATION_ID = '123456789012345678'
@@ -680,7 +684,7 @@ test('discord install: ~/.araya の置換可能な ancestor を拒否して unit
   }
 })
 
-test('discord install: 所有者が service user 以外の mode 0755 ~/.araya ancestor を拒否して unit を変更しない', async (t) => {
+test('discord install: 所有者が service user 以外の mode 0755 ~/.araya ancestor を拒否して unit を変更しない', async () => {
   const installEnv = await makeInstallEnv()
 
   await writeDiscordEnv(installEnv)
@@ -692,7 +696,7 @@ test('discord install: 所有者が service user 以外の mode 0755 ~/.araya an
   installEnv.env.HOME = unsafeHome
 
   const originalLstat = fs.lstat.bind(fs)
-  t.mock.method(fs, 'lstat', async (filePath: Parameters<typeof fs.lstat>[0]) => {
+  vi.spyOn(fs, 'lstat').mockImplementation(async (filePath: Parameters<typeof fs.lstat>[0]) => {
     const stat = await originalLstat(filePath)
 
     if (path.resolve(String(filePath)) !== unsafeAncestor) {
@@ -826,7 +830,15 @@ test('discord install: 暗号化 credential と LoadCredentialEncrypted を使�
 
     assert.deepEqual(systemdCalls(fake), [
       ['systemctl', '--user', 'is-system-running', '10000'],
-      ['systemctl', '--user', 'list-unit-files', 'araya-runner-*.service', '--no-legend', '--full', '30000'],
+      [
+        'systemctl',
+        '--user',
+        'list-unit-files',
+        'araya-runner-*.service',
+        '--no-legend',
+        '--full',
+        '30000',
+      ],
       ['systemctl', '--user', 'show', '--property=Version', '--value', '10000'],
       ['systemctl', '--user', 'daemon-reload', '30000'],
       ['systemctl', '--user', 'show', '--property=FragmentPath', '--value', unit, '30000'],
@@ -1347,7 +1359,10 @@ test('discord uninstall: unit file を消して daemon-reload。state.json は�
     assert.equal(readField(output, 'removed'), true)
     assert.equal(readField(output, 'stateFile'), discordStateFilePath(installEnv.dataDir))
     assert.equal(await exists(unitPath), false)
-    assert.equal(readField(readDiscordBotState(installEnv.dataDir), 'lastReadyAt'), '2026-10-31T00:00:00.000Z')
+    assert.equal(
+      readField(readDiscordBotState(installEnv.dataDir), 'lastReadyAt'),
+      '2026-10-31T00:00:00.000Z',
+    )
     assert.ok(
       systemdCalls(fake).some((entry) => {
         return entry[0] === 'systemctl' && entry[1] === '--user' && entry[2] === 'disable'
@@ -1399,7 +1414,7 @@ test('discord uninstall: unit が無いことの systemctl の失敗だけ無視
   }
 })
 
-// #36: 常駐の再起動は約67秒の無受信窓を作る。restart 前に停止通知を送る
+// #36: 常駐の再起動は約67秒 message を受信できない時間を作る。restart 前に停止通知を送る
 test('discord install: 常駐を再起動する前に停止通知を channel へ投稿する', async () => {
   const installEnv = await makeInstallEnv()
 

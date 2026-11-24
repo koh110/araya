@@ -71,7 +71,7 @@ const DISCORD_PROCESS_LOCK_UPDATE_MS = 10_000
 const DISCORD_PROCESS_LOCK_MIN_RECLAIM_AGE_MS = DISCORD_PROCESS_LOCK_UPDATE_MS / 2
 const DEFAULT_POLL_MS = 5_000
 // #36: shutdown は budget 付きで進める。unit の TimeoutStopSec=30 に収まる合計にする（越えた分は SIGKILL になり、
-// 残留 lock（#37）と無受信窓を増やす）。drain を無制限に待つことが 67 s 窓の一方の要因だった
+// 残留 lock（#37）と message を受信できない時間を増やす）。drain を無制限に待つことが 67 s の取りこぼしの一方の要因だった
 export const SHUTDOWN_WAIT_MS = {
   // HOOT 判断 run。判断 state は durable なので、待てなくても次の tick で resume する
   hootMs: 5_000,
@@ -240,7 +240,7 @@ async function verifyDiscordUnit(
 }
 
 // systemd と foreground の同じ dataDir 起動を排他し、異常終了後は残留 lock を即回収する（#37）。
-// proper-lockfile の stale（30 s）だけを待つと SIGKILL 後に 20〜40 s 起動できない窓ができる。
+// proper-lockfile の stale（30 s）だけを待つと SIGKILL 後に 20〜40 s 起動できない状態が続く。
 // owner record で「 holder が実在しない」と確かめられた分だけ先に回収し、生存 holder の排他は保つ。
 // ELOCKED には判定理由（owner PID・lock age）を載せて、呼び出し側の log で追えるようにする。
 async function acquireDiscordProcessLock(
@@ -630,7 +630,7 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
         }
       })()
 
-      // #36: gateway が閉じていた窓に投稿された message は Discord が再配信しないので、cursor より新しい
+      // #36: gateway が閉じている間に投稿された message は Discord が再配信しないので、cursor より新しい
       // history だけを古い順に会話 queue へ流し込む。ready 後の 1 回だけ。失敗しても会話機能は止めない
       void (async () => {
         const chatHandler = chatHandlerRef.current

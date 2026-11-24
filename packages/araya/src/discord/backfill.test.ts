@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import { test } from 'vite-plus/test'
 
-import { DISCORD_TEST_NOW_MS as NOW_MS, messageIdAtAge } from '../../test/support/discord-snowflake.ts'
+import {
+  DISCORD_TEST_NOW_MS as NOW_MS,
+  messageIdAtAge,
+} from '../../test/support/discord-snowflake.ts'
 
 import {
   BACKFILL_MAX_AGE_MS,
@@ -10,10 +13,7 @@ import {
   runDiscordRestartBackfill,
   selectBackfillMessages,
 } from './backfill.ts'
-import {
-  newState,
-  noteDiscordSeenMessageId,
-} from './state.ts'
+import { newState, noteDiscordSeenMessageId } from './state.ts'
 import type { DiscordConfig } from './config.ts'
 import type { DiscordGateway, DiscordHistoryMessage } from './gateway.ts'
 import type { DiscordChatHandler, DiscordChatMessage } from './chat.ts'
@@ -81,7 +81,7 @@ test('backfill: cursor より新しい message だけ、古い順に選ぶ（bot
     config,
     botUserId: BOT_USER_ID,
     nowMs: () => NOW_MS,
-    // 窓の上限を 60s にして、90s 前の message が stale で落ちることを確かめる
+    // stale 上限を 60s にして、90s 前の message が stale で落ちることを確かめる
     maxAgeMs: 60_000,
   })
 
@@ -111,9 +111,12 @@ test('backfill: cursor が無い instance は history を処理しない', () =>
   assert.deepEqual(selection.skipped, [])
 })
 
-test('backfill: 上限を越える窓では新しい側を残し、古い側を over_limit で落とす', () => {
+test('backfill: 上限より多い history では新しい側を残し、古い側を over_limit で落とす', () => {
   const cursor = messageIdAtAge(300_000)
-  const ages = Array.from({ length: BACKFILL_MAX_MESSAGES + 3 }, (_unused, index) => 5_000 + index * 100)
+  const ages = Array.from(
+    { length: BACKFILL_MAX_MESSAGES + 3 },
+    (_unused, index) => 5_000 + index * 100,
+  )
 
   const selection = selectBackfillMessages({
     history: ages.map((age) => historyMessage(messageIdAtAge(age))).reverse(),
@@ -202,7 +205,10 @@ function createBackfillHarness(
 
 test('backfill: cursor が無い起動では history の newest を cursor に置いて今回は処理しない', async () => {
   const newest = messageIdAtAge(1_000)
-  const harness = createBackfillHarness([historyMessage(newest), historyMessage(messageIdAtAge(9_000))])
+  const harness = createBackfillHarness([
+    historyMessage(newest),
+    historyMessage(messageIdAtAge(9_000)),
+  ])
   let state: DiscordBotState = newState()
 
   const outcome = await runDiscordRestartBackfill({
@@ -228,10 +234,14 @@ test('backfill: cursor が無い起動では history の newest を cursor に�
   assert.equal(state.lastSeenMessageId, newest)
   assert.deepEqual(harness.saved, [newest])
   assert.deepEqual(harness.handled, [])
-  assert.ok(harness.logs.some((entry) => entry.type === 'discord_backfill_seeded' && entry.messageId === newest))
+  assert.ok(
+    harness.logs.some(
+      (entry) => entry.type === 'discord_backfill_seeded' && entry.messageId === newest,
+    ),
+  )
 })
 
-test('backfill: 窓中の message を古い順に会話へ流し、1 件ごとに cursor を保存する', async () => {
+test('backfill: 停止中に届いた message を古い順に会話へ流し、1 件ごとに cursor を保存する', async () => {
   const cursor = messageIdAtAge(90_000)
   const first = messageIdAtAge(30_000)
   const second = messageIdAtAge(5_000)
@@ -324,7 +334,9 @@ test('backfill: live で既に処理した message は取り直さない', async
   assert.deepEqual(harness.handled, [])
   assert.equal(state.lastSeenMessageId, cursor, 'live で処理済みの id で cursor を動かし直さない')
   assert.ok(
-    harness.logs.some((entry) => entry.type === 'discord_backfill_ignored' && entry.reason === 'already_handled'),
+    harness.logs.some(
+      (entry) => entry.type === 'discord_backfill_ignored' && entry.reason === 'already_handled',
+    ),
   )
 })
 
@@ -352,7 +364,12 @@ test('backfill: history が読めなくても bot の起動を止めない（理
 
   assert.deepEqual(outcome.handled, [])
   assert.equal(state.lastSeenMessageId, cursor)
-  assert.ok(harness.logs.some((entry) => entry.type === 'discord_backfill_skipped' && entry.reason === 'history_fetch_failed'))
+  assert.ok(
+    harness.logs.some(
+      (entry) =>
+        entry.type === 'discord_backfill_skipped' && entry.reason === 'history_fetch_failed',
+    ),
+  )
 
   // gateway が history API を持たない（古い fake など）場合も飛ばす
   const noApi = createBackfillHarness([])
@@ -378,7 +395,7 @@ test('backfill: history が読めなくても bot の起動を止めない（理
 test('backfill: snowflake からの復元時刻が Discord REST の timestamp と一致する（#36 の epoch 実測）', () => {
   // 2026-11-24 に channel の history を REST で読んだ実測（Discord が自分で返した timestamp）。
   // 以前使っていた epoch 1_420_064_800_000 ではここが 5600.000 s ずれ、age 上限 15 分を常に越えて
-  // 窓内の message が全部 stale で捨れた（human backfill が 1 件も処理されなかった実因）
+  // 取り直しの対象になった message が全部 stale で捨れた（human backfill が 1 件も処理されなかった実因）
   const observed: [string, string][] = [
     ['1574678984665337868', '2026-11-24T06:52:06.065Z'],
     ['1574678607257669644', '2026-11-24T06:50:36.084Z'],
@@ -394,10 +411,10 @@ test('backfill: snowflake からの復元時刻が Discord REST の timestamp �
   }
 })
 
-test('backfill: 無受信窓の message は age 上限で捨てられず、窓の長さを log に残す', async () => {
+test('backfill: 停止中に届いた message は age 上限で捨てられず、受信できていなかった期間を log に残す', async () => {
   const cursor = messageIdAtAge(200_000)
-  const windowId = messageIdAtAge(20_000)
-  const harness = createBackfillHarness([historyMessage(windowId), historyMessage(cursor)])
+  const duringStopId = messageIdAtAge(20_000)
+  const harness = createBackfillHarness([historyMessage(duringStopId), historyMessage(cursor)])
   const state = noteDiscordSeenMessageId(newState(), cursor)
 
   const outcome = await runDiscordRestartBackfill({
@@ -419,7 +436,7 @@ test('backfill: 無受信窓の message は age 上限で捨てられず、窓�
     markHandled: () => {},
   })
 
-  assert.deepEqual(outcome.handled, [windowId])
+  assert.deepEqual(outcome.handled, [duringStopId])
 
   const received = harness.logs.find((entry) => {
     return entry.type === 'discord_backfill_received'
@@ -433,8 +450,10 @@ test('backfill: 無受信窓の message は age 上限で捨てられず、窓�
   })
 
   assert.ok(summary !== undefined)
-  assert.equal(summary.windowMs, 180_000, 'cursor から history の最新 id までの Discord 側の窓')
+  assert.equal(
+    summary.unreceivedMs,
+    180_000,
+    'cursor から history の最新 id までの Discord 側の時間差',
+  )
   assert.equal(summary.cursor, cursor)
 })
-
-

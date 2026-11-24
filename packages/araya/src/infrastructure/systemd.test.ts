@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import test from 'node:test'
+import { test } from 'vite-plus/test'
 import { pathToFileURL } from 'node:url'
 
 import {
@@ -191,10 +191,7 @@ test('systemd-units: Discord service unit は標準 .env と任意1Password mode
     environment: [...environment],
   })
 
-  assert.ok(
-    plain.includes(`ExecStart=/usr/bin/node ${botEntrypoint} --data-dir ${dataDir}`),
-    plain,
-  )
+  assert.ok(plain.includes(`ExecStart=/usr/bin/node ${botEntrypoint} --data-dir ${dataDir}`), plain)
   assert.ok(plain.includes(`LoadCredential=discord-env:${dataDir}/.env`), plain)
   assert.ok(!plain.includes('op-service-account-token'), plain)
   assert.ok(!plain.includes('OP_SERVICE_ACCOUNT_TOKEN'), plain)
@@ -309,7 +306,6 @@ test('systemd-units: systemd-creds --user encrypt はcredentialをstdinで渡し
   assert.deepEqual(calls[0]?.options.env, {})
 })
 
-
 test('systemd-units: unit file の path は XDG_CONFIG_HOME が絶対 path のときだけ使い、それ以外は ~/.config', () => {
   const unit = 'araya-discord-0123456789ab.service'
 
@@ -323,7 +319,6 @@ test('systemd-units: unit file の path は XDG_CONFIG_HOME が絶対 path の�
   )
   assert.equal(unitFilePath({}, '/home/user', unit), `/home/user/.config/systemd/user/${unit}`)
 })
-
 
 // PATH に置く偽の systemctl。呼ばれた引数を1行の JSON で記録し、file に書いた応答（stdout・stderr・終了 code）を返す
 async function makeFakeSystemctlBin(root: string) {
@@ -379,7 +374,10 @@ test('systemd-units: 本物の SystemdOps は PATH から探した systemctl を
     const shown = await ops.systemctl(['--user', 'show', 'unit'], 10_000)
     assert.equal(shown.exitCode, 0)
     const recorded = await fake.calls()
-    assert.deepEqual(recorded.map((entry) => entry.slice(1)), [['--user', 'show', 'unit']])
+    assert.deepEqual(
+      recorded.map((entry) => entry.slice(1)),
+      [['--user', 'show', 'unit']],
+    )
     assert.equal(recorded[0]?.[0], path.join(fake.binDir, 'systemctl'))
 
     // loginctl は PATH に無いとき、起動せずに失敗の結果だけを返す
@@ -394,7 +392,6 @@ test('systemd-units: 本物の SystemdOps は PATH から探した systemctl を
     await fs.rm(root, { recursive: true, force: true })
   }
 })
-
 
 test('systemd-units: systemctl の出力が上限を超えて先頭を切ったときだけ、先頭の境界の秘密の値と userinfo を置き換える', async () => {
   const root = await makeRoot('araya-systemd-ops-test-')

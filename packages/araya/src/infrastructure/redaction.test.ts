@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import { test } from 'vite-plus/test'
 
 import { collectSecretValues, createRedactor, isSecretEnvName, REDACTED } from './redaction.ts'
 
@@ -15,7 +15,7 @@ test('redaction: 名前を大文字にして決まった語を含む環境変数
     'GOOGLE_APPLICATION_CREDENTIALS',
     'X_AUTH',
     // 仕様の規則どおり、AUTH を含む普通の名前も当たる
-    'GIT_AUTHOR_NAME'
+    'GIT_AUTHOR_NAME',
   ]) {
     assert.equal(isSecretEnvName(name), true, name)
   }
@@ -33,7 +33,7 @@ test('redaction: 8 文字以上の値だけを、重複を除いて長い順に�
     C_SECRET: 'abcdefghijkl',
     SSH_AUTH_SOCK: '/run/user/1000/ssh-agent.socket',
     PATH: '/usr/bin:/bin',
-    EMPTY_TOKEN: undefined
+    EMPTY_TOKEN: undefined,
   })
 
   assert.deepEqual(values, ['abcdefghijkl', '12345678'])
@@ -42,22 +42,33 @@ test('redaction: 8 文字以上の値だけを、重複を除いて長い順に�
 test('redaction: 値と URL の userinfo を置き換えて回数を数え、object の key は変えない', () => {
   const redactor = createRedactor(['secret-value-1', 'secret-value-123'])
 
-  assert.equal(redactor.redact('a secret-value-123 b secret-value-1'), `a ${REDACTED} b ${REDACTED}`)
+  assert.equal(
+    redactor.redact('a secret-value-123 b secret-value-1'),
+    `a ${REDACTED} b ${REDACTED}`,
+  )
   assert.equal(redactor.count, 2)
 
   assert.equal(
-    redactor.redact('clone https://user:pass@example.invalid/repo.git and ssh://git@example.invalid'),
-    `clone https://${REDACTED}@example.invalid/repo.git and ssh://${REDACTED}@example.invalid`
+    redactor.redact(
+      'clone https://user:pass@example.invalid/repo.git and ssh://git@example.invalid',
+    ),
+    `clone https://${REDACTED}@example.invalid/repo.git and ssh://${REDACTED}@example.invalid`,
   )
   assert.equal(redactor.count, 4)
 
   // 既に置き換えた userinfo は数え直さない
-  assert.equal(redactor.redact(`https://${REDACTED}@example.invalid`), `https://${REDACTED}@example.invalid`)
+  assert.equal(
+    redactor.redact(`https://${REDACTED}@example.invalid`),
+    `https://${REDACTED}@example.invalid`,
+  )
   assert.equal(redactor.count, 4)
 
   assert.deepEqual(
-    redactor.redactDeep({ 'secret-value-1': ['x secret-value-1', 3, null, { nested: 'secret-value-1' }], flag: true }),
-    { 'secret-value-1': [`x ${REDACTED}`, 3, null, { nested: REDACTED }], flag: true }
+    redactor.redactDeep({
+      'secret-value-1': ['x secret-value-1', 3, null, { nested: 'secret-value-1' }],
+      flag: true,
+    }),
+    { 'secret-value-1': [`x ${REDACTED}`, 3, null, { nested: REDACTED }], flag: true },
   )
   assert.equal(redactor.count, 6)
 })
@@ -78,14 +89,20 @@ test('redaction: 末尾を切った文字列は、末尾の秘密の値の先頭
   // 1 文字でも置き換える
   assert.equal(redactor.redactTruncated('a line Z', 'end'), `a line ${REDACTED}`)
   assert.equal(redactor.count, 2)
-  assert.equal(redactor.redactTruncated('clone https://user:pa', 'end'), `clone https://${REDACTED}`)
+  assert.equal(
+    redactor.redactTruncated('clone https://user:pa', 'end'),
+    `clone https://${REDACTED}`,
+  )
   assert.equal(redactor.count, 3)
   assert.equal(redactor.redactTruncated('clone ssh://git', 'end'), `clone ssh://${REDACTED}`)
   assert.equal(redactor.count, 4)
   // 境界に当たらなければ、通常の置き換えだけを行う
   assert.equal(
-    redactor.redactTruncated('Zq8kW3mX9pL2vN7r and https://user:pass@example.invalid/repo.git and https://example.invalid/x', 'end'),
-    `${REDACTED} and https://${REDACTED}@example.invalid/repo.git and https://example.invalid/x`
+    redactor.redactTruncated(
+      'Zq8kW3mX9pL2vN7r and https://user:pass@example.invalid/repo.git and https://example.invalid/x',
+      'end',
+    ),
+    `${REDACTED} and https://${REDACTED}@example.invalid/repo.git and https://example.invalid/x`,
   )
   assert.equal(redactor.count, 6)
   assert.equal(redactor.redactTruncated('nothing here', 'end'), 'nothing here')
@@ -99,10 +116,16 @@ test('redaction: 先頭を切った文字列は、先頭の秘密の値の末尾
   assert.equal(redactor.count, 1)
   assert.equal(redactor.redactTruncated('r remains', 'start'), `${REDACTED} remains`)
   assert.equal(redactor.count, 2)
-  assert.equal(redactor.redactTruncated('er:pass@example.invalid/repo.git', 'start'), `${REDACTED}@example.invalid/repo.git`)
+  assert.equal(
+    redactor.redactTruncated('er:pass@example.invalid/repo.git', 'start'),
+    `${REDACTED}@example.invalid/repo.git`,
+  )
   assert.equal(redactor.count, 3)
   // 先頭から @ までに空白か / があれば、userinfo の一部ではない
-  assert.equal(redactor.redactTruncated('see mail@example.invalid', 'start'), 'see mail@example.invalid')
+  assert.equal(
+    redactor.redactTruncated('see mail@example.invalid', 'start'),
+    'see mail@example.invalid',
+  )
   assert.equal(redactor.redactTruncated('a/b@example.invalid', 'start'), 'a/b@example.invalid')
   assert.equal(redactor.count, 3)
   // 先頭の文字の途中で切れた置換文字は、境界の一部として扱う
@@ -125,7 +148,10 @@ test('redaction: redact は切っていない文字列として扱い、境界�
   const redactor = createRedactor(['Zq8kW3mX9pL2vN7r'])
 
   assert.equal(redactor.redact('L2vN7r and Zq8kW3'), 'L2vN7r and Zq8kW3')
-  assert.equal(redactor.redact('er:pass@example.invalid and https://user:pa'), 'er:pass@example.invalid and https://user:pa')
+  assert.equal(
+    redactor.redact('er:pass@example.invalid and https://user:pa'),
+    'er:pass@example.invalid and https://user:pa',
+  )
   assert.equal(redactor.count, 0)
 })
 
@@ -134,15 +160,18 @@ const REGEX_URL_USERINFO_PATTERN = /([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^\s/?#]+)@/g
 
 function redactUserinfoByRegex(text: string) {
   let count = 0
-  const result = text.replaceAll(REGEX_URL_USERINFO_PATTERN, (match: string, scheme: string, userinfo: string) => {
-    if (userinfo === REDACTED) {
-      return match
-    }
+  const result = text.replaceAll(
+    REGEX_URL_USERINFO_PATTERN,
+    (match: string, scheme: string, userinfo: string) => {
+      if (userinfo === REDACTED) {
+        return match
+      }
 
-    count += 1
+      count += 1
 
-    return `${scheme}${REDACTED}@`
-  })
+      return `${scheme}${REDACTED}@`
+    },
+  )
 
   return { text: result, count }
 }
@@ -169,8 +198,32 @@ function createRandom(seed: number) {
 }
 
 const RANDOM_PIECES = [
-  'a', 'x', 'Z', 'h', ':', '/', '@', ' ', '?', '#', '.', '+', '-', '1', '9', '\n', '\t',
-  'é', 'あ', '\u3000', '😀', '://', '://', 'https://', REDACTED, `${REDACTED}@`
+  'a',
+  'x',
+  'Z',
+  'h',
+  ':',
+  '/',
+  '@',
+  ' ',
+  '?',
+  '#',
+  '.',
+  '+',
+  '-',
+  '1',
+  '9',
+  '\n',
+  '\t',
+  'é',
+  'あ',
+  '\u3000',
+  '😀',
+  '://',
+  '://',
+  'https://',
+  REDACTED,
+  `${REDACTED}@`,
 ] as const
 
 test('redaction: URL の userinfo の置き換えは、境界の例とランダムな文字列で、前の正規表現と同じ文字列と回数になる', () => {
@@ -202,11 +255,15 @@ test('redaction: URL の userinfo の置き換えは、境界の例とランダ�
     'a://u@b://v@h',
     'a://u@h://v@w',
     'é://u@h',
-    ''
+    '',
   ]
 
   for (const text of edgeCases) {
-    assert.deepEqual(redactUserinfoByRedactor(text), redactUserinfoByRegex(text), JSON.stringify(text))
+    assert.deepEqual(
+      redactUserinfoByRedactor(text),
+      redactUserinfoByRegex(text),
+      JSON.stringify(text),
+    )
   }
 
   const random = createRandom(20261024)
@@ -219,7 +276,11 @@ test('redaction: URL の userinfo の置き換えは、境界の例とランダ�
       text += RANDOM_PIECES[Math.floor(random() * RANDOM_PIECES.length)]
     }
 
-    assert.deepEqual(redactUserinfoByRedactor(text), redactUserinfoByRegex(text), JSON.stringify(text))
+    assert.deepEqual(
+      redactUserinfoByRedactor(text),
+      redactUserinfoByRegex(text),
+      JSON.stringify(text),
+    )
   }
 })
 
@@ -231,7 +292,7 @@ test('redaction: 区切りの無い長い文字列でも、URL の userinfo の�
     'a://'.repeat(size / 4),
     `${'x'.repeat(size)}://u@h`,
     `https://${'@'.repeat(size)}`,
-    `https://${':'.repeat(size)}`
+    `https://${':'.repeat(size)}`,
   ]
 
   const slow: string[] = []
@@ -251,7 +312,9 @@ test('redaction: 区切りの無い長い文字列でも、URL の userinfo の�
       const elapsed = performance.now() - started
 
       if (elapsed >= 2000) {
-        slow.push(`${cut ?? 'redact'}: ${JSON.stringify(text.slice(0, 16))}… (${text.length} 文字) に ${Math.round(elapsed)} ms かかった`)
+        slow.push(
+          `${cut ?? 'redact'}: ${JSON.stringify(text.slice(0, 16))}… (${text.length} 文字) に ${Math.round(elapsed)} ms かかった`,
+        )
       }
     }
   }

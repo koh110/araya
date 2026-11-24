@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import test from 'node:test'
+import { test } from 'vite-plus/test'
 
 import { messageIdAtAge } from '../../test/support/discord-snowflake.ts'
 
@@ -94,7 +94,12 @@ test('discord state: a future state version is rejected', async () => {
       lastReadyAt: null,
     })
 
-    assert.throws(() => readDiscordBotState(dataDir), { code: 'discord_state_invalid' })
+    assert.throws(
+      () => {
+        return readDiscordBotState(dataDir)
+      },
+      { code: 'discord_state_invalid' },
+    )
   })
 })
 
@@ -107,25 +112,27 @@ test('discord state: an invalid cursor id is rejected', async () => {
       lastSeenMessageId: 'not-an-id',
     })
 
-    assert.throws(() => readDiscordBotState(dataDir), { code: 'discord_state_invalid' })
+    assert.throws(
+      () => {
+        return readDiscordBotState(dataDir)
+      },
+      { code: 'discord_state_invalid' },
+    )
   })
 })
 
 test('discord state: the cursor only advances and updates do not mutate the previous state', () => {
   const initial = newState()
-  const older = messageIdAtAge(40_000)
   const cursor = messageIdAtAge(30_000)
   const newer = messageIdAtAge(1_000)
   const first = noteDiscordSeenMessageId(initial, cursor)
 
   assert.equal(first.lastSeenMessageId, cursor)
-  assert.equal(noteDiscordSeenMessageId(first, older), first)
+  assert.equal(noteDiscordSeenMessageId(first, messageIdAtAge(40_000)), first)
   assert.equal(noteDiscordSeenMessageId(first, 'invalid'), first)
   assert.equal(noteDiscordSeenMessageId(first, ''), first)
 
-  const second = noteDiscordSeenMessageId(first, newer)
-
-  assert.equal(second.lastSeenMessageId, newer)
+  assert.equal(noteDiscordSeenMessageId(first, newer).lastSeenMessageId, newer)
   assert.equal(first.lastSeenMessageId, cursor)
   assert.equal(initial.lastSeenMessageId, null)
 })

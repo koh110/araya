@@ -1,6 +1,6 @@
 // 再起動の間に投稿された message を channel の history から取り直す（Issue #36）。
 // Discord gateway は切断中に生成された messageCreate を再接続後に再配信しないため、unit を stop して
-// ready になるまでの窓に投稿された message は黙って消える。bot は live で処理を終えた message id を
+// ready になるまでの間に投稿された message は黙って消える。bot は live で処理を終えた message id を
 // state.json の cursor に記録しているので、ready 後に「cursor より新しい history」だけを
 // 古い順に会話 queue へ流し込む。
 // cursor は turn が終わってから進む（at-least-once）。実行中に kill された message は cursor より
@@ -11,10 +11,10 @@ import type { DiscordConfig } from './config.ts'
 import type { DiscordGateway, DiscordHistoryMessage } from './gateway.ts'
 import { isDiscordMessageIdNewer, noteDiscordSeenMessageId, type DiscordBotState } from './state.ts'
 
-// history は 1 回の fetch で 100 件まで。取り直すのは直近の窓だけで十分なので、処理するのは新しい 20 件
+// history は 1 回の fetch で 100 件まで。取り直すのは直近の message だけで十分なので、処理するのは新しい 20 件
 export const BACKFILL_FETCH_LIMIT = 100
 export const BACKFILL_MAX_MESSAGES = 20
-// 窓が長かった（bot が落ちてしばらく起動していなかった）ときに、古い会話を後から走らせない上限
+// stop していた期間が長かった（bot が落ちてしばらく起動していなかった）ときに、古い会話を後から走らせない上限
 export const BACKFILL_MAX_AGE_MS = 15 * 60_000
 // history fetch が止まっても shutdown を止めない
 export const BACKFILL_FETCH_TIMEOUT_MS = 8_000
@@ -22,7 +22,7 @@ export const BACKFILL_FETCH_TIMEOUT_MS = 8_000
 // Discord snowflake: 先頭 42 bit が millisecond timestamp（Discord epoch 2015-01-01T00:00:00Z）。
 // Discord REST が返す timestamp と一致する値を使う。1_420_064_800_000（2014-12-31T22:26:40Z）を
 // 使っていた過去実装では、復元した投稿時刻が 5_600_000 ms 古くなり、host clock 基準の age 判定で
-// 窓内の message が全て stale になっていた（#36 の human backfill が一発も処理されなかった実因）
+// 取り直しの対象になった message が全て stale になっていた（#36 の human backfill が一発も処理されなかった実因）
 const DISCORD_EPOCH_MS = 1_420_070_400_000
 
 export type BackfillSkipReason = 'self_message' | 'not_allowed' | 'empty' | 'stale' | 'over_limit'
@@ -38,7 +38,7 @@ export function discordMessageTimestampMs(messageId: string): number | null {
   }
 }
 
-// 窓の長さを測るための、history の中で最新の id 時刻。id 単調増加なので比較だけで決まる
+// 受信できていなかった期間の長さを測るための、history の中で最新の id 時刻。id 単調増加なので比較だけで決まる
 export function latestDiscordHistoryTimestampMs(
   history: readonly DiscordHistoryMessage[],
 ): number | null {
@@ -300,8 +300,8 @@ export async function runDiscordRestartBackfill(
       handled: handled.length,
       skipped: selection.skipped.length,
       cursor,
-      // cursor から history の最新 id までの Discord 側の窓の長さ（取りこぼし窓の実測用）
-      windowMs: (() => {
+      // cursor から history の最新 id までの Discord 側の時間差（message を受信できていなかった期間の実測用）
+      unreceivedMs: (() => {
         const cursorMs = discordMessageTimestampMs(cursor)
         const newestMs = latestDiscordHistoryTimestampMs(history)
 

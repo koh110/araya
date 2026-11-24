@@ -15,6 +15,7 @@
   "include": [
     "packages/araya/bin/**/*.ts",
     "packages/araya/src/**/*.ts",
-    "packages/araya/test/**/*.ts"
+    "packages/araya/test/**/*.ts",
+    "vite.config.ts"
   ]
 }

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import test from 'node:test'
+import { test } from 'vite-plus/test'
 
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
 
@@ -83,9 +83,12 @@ test('agent host: task tool の spawn で child が作業し、報告が main �
       assert.match(answerText, /main まとめ/)
       assert.doesNotMatch(answerText, /secret-value/u)
 
-      assert.ok(await waitUntil(() => {
-        return reports.length > 0
-      }, 20_000), 'deliverReport が呼ばれなかった')
+      assert.ok(
+        await waitUntil(() => {
+          return reports.length > 0
+        }, 20_000),
+        'deliverReport が呼ばれなかった',
+      )
       assert.equal(reports[0]?.name, 'worker-1')
       assert.match(reports[0]?.text ?? '', /main まとめ/u)
     } finally {
@@ -166,7 +169,11 @@ test('agent host: deliverReport 失敗後は durable state から同じ nonce �
       }
 
       if (view.toolResults.length === 0) {
-        return toolCall('task', { action: 'spawn', name: 'retry-worker', message: 'CHILD-WORK を実施' })
+        return toolCall('task', {
+          action: 'spawn',
+          name: 'retry-worker',
+          message: 'CHILD-WORK を実施',
+        })
       }
 
       return answer('main まとめ')
