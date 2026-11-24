@@ -749,7 +749,7 @@ test('discord bot: shutdown は進行中の chat reply を送ってから gatewa
 })
 
 // #36: drain に上限が無いと unit の TimeoutStopSec（30 s）を越えて SIGKILL され、残留 lock（#37）と
-// 無受信窓を増やす。budget で打ち切って gateway / session を閉じ、取りこぼしを reply と log で示す
+// message を受信できない時間を増やす。budget で打ち切って gateway / session を閉じ、取りこぼしを reply と log で示す
 // ことを実際の hang で確かめる
 test('discord bot: shutdown は drain budget で打ち切って gateway と session を閉じる', async () => {
   const dataDir = await fs.realpath(
@@ -1823,7 +1823,7 @@ test('discord bot: CLI の control request（araya reset）を startup 後の po
   }
 })
 
-// #36: gateway が閉じていた窓に投稿された message は Discord が再配信しない。ready 後に history を読み、
+// #36: gateway が閉じている間に投稿された message は Discord が再配信しない。ready 後に history を読み、
 // cursor より新しい物だけを会話へ流し込むことを bot の loop 経由で確かめる
 const DISCORD_EPOCH_MS = 1_420_070_400_000
 
@@ -1831,7 +1831,7 @@ function snowflakeAge(ageMs: number) {
   return String((BigInt(Date.now() - ageMs - DISCORD_EPOCH_MS) << 22n) + 1n)
 }
 
-test('discord bot: 再起動の窓に投稿された message を ready 後に history から取り直す', async () => {
+test('discord bot: 再起動中に投稿された message を ready 後に history から取り直す', async () => {
   const dataDir = await fs.realpath(
     await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-backfill-test-')),
   )
@@ -1839,7 +1839,7 @@ test('discord bot: 再起動の窓に投稿された message を ready 後に hi
   const logs: Record<string, unknown>[] = []
   const submits: { content: string; requestId: string }[] = []
   const cursorId = snowflakeAge(60_000)
-  const windowId = snowflakeAge(20_000)
+  const duringStopId = snowflakeAge(20_000)
   const beforeCursorId = snowflakeAge(90_000)
 
   writeDiscordBotState(dataDir, {
@@ -1900,7 +1900,7 @@ test('discord bot: 再起動の窓に投稿された message を ready 後に hi
                 isWebhook: false,
                 isSystem: false,
                 mentionsBot: false,
-                messageId: windowId,
+                messageId: duringStopId,
                 content: '再起動中に出ていた message',
               },
               {
@@ -1927,7 +1927,7 @@ test('discord bot: 再起動の窓に投稿された message を ready 後に hi
 
     assert.equal(exitCode, 0)
     assert.equal(submits.length, 1, JSON.stringify(logs))
-    assert.equal(submits[0]?.requestId, windowId)
+    assert.equal(submits[0]?.requestId, duringStopId)
     assert.match(submits[0]?.content ?? '', /再起動中に出ていた message/)
 
     const received = logs.find((entry) => {
@@ -1935,7 +1935,7 @@ test('discord bot: 再起動の窓に投稿された message を ready 後に hi
     })
 
     assert.ok(received !== undefined, JSON.stringify(logs))
-    assert.equal(received.messageId, windowId)
+    assert.equal(received.messageId, duringStopId)
     assert.ok(
       logs.some((entry) => {
         return entry.type === 'discord_backfill' && entry.handled === 1
@@ -1946,7 +1946,7 @@ test('discord bot: 再起動の窓に投稿された message を ready 後に hi
     const state = readDiscordBotState(dataDir)
 
     assert.ok(state !== null)
-    assert.equal(state.lastSeenMessageId, windowId)
+    assert.equal(state.lastSeenMessageId, duringStopId)
   } finally {
     stopController.abort()
     await fs.rm(dataDir, { recursive: true, force: true })

@@ -1399,7 +1399,7 @@ test('discord uninstall: unit が無いことの systemctl の失敗だけ無視
   }
 })
 
-// #36: 常駐の再起動は約67秒の無受信窓を作る。restart 前に停止通知を送る
+// #36: 常駐の再起動は約67秒 message を受信できない時間を作る。restart 前に停止通知を送る
 test('discord install: 常駐を再起動する前に停止通知を channel へ投稿する', async () => {
   const installEnv = await makeInstallEnv()
 

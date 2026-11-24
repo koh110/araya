@@ -1,7 +1,7 @@
 // Discord bot の process lock（issue #37 対応）。
 // proper-lockfile の lock は directory だけで所有者情報を残さないため、SIGKILL 後の残留 lock は
 // stale（30 s）が切れるまで起動側は ELOCKED を返すだけだった。実測で異常終了後に 20〜40 s 起動できない
-// 窓が再現していた（unit の SIGKILL と組み合わさると #36 の無受信窓も伸ばす）。
+// 状態が再現していた（unit の SIGKILL と組み合わさると #36 で message を受信できていない期間も伸ばす）。
 // ここでは dataDir に owner record（PID と /proc starttime）を書き、「holder が実在しない」かつ
 // 「lock が refresh で更新されていない」場合だけ先に回収する。生存 holder の排他は従来どおり保つ。
 
