@@ -117,7 +117,7 @@ export async function runControlCommand(
       const hootText = await hootStatusText(dataDir, deps)
 
       deps.stdout(
-        `${hootText}\n\n（会話 session の状態は稼働中の bot が答えます。応答がなかったので bot の稼働を araya discord status で確かめてください）`,
+        `${hootText}\n\n（bot から会話 session の状態応答がありませんでした。bot unit の稼働状態は araya discord status で確認できます）`,
       )
 
       return
