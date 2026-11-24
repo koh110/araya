@@ -19,8 +19,11 @@ export const BACKFILL_MAX_AGE_MS = 15 * 60_000
 // history fetch が止まっても shutdown を止めない
 export const BACKFILL_FETCH_TIMEOUT_MS = 8_000
 
-// Discord snowflake: 先頭 42 bit が millisecond timestamp（Discord epoch 2015-01-01T00:00:00Z）
-const DISCORD_EPOCH_MS = 1_420_064_800_000
+// Discord snowflake: 先頭 42 bit が millisecond timestamp（Discord epoch 2015-01-01T00:00:00Z）。
+// Discord REST が返す timestamp と一致する値を使う。1_420_064_800_000（2014-12-31T22:26:40Z）を
+// 使っていた過去実装では、復元した投稿時刻が 5_600_000 ms 古くなり、host clock 基準の age 判定で
+// 窓内の message が全て stale になっていた（#36 の human backfill が一発も処理されなかった実因）
+const DISCORD_EPOCH_MS = 1_420_070_400_000
 
 export type BackfillSkipReason = 'self_message' | 'not_allowed' | 'empty' | 'stale' | 'over_limit'
 export type BackfillSkip = { messageId: string; reason: BackfillSkipReason }
@@ -35,14 +38,10 @@ export function discordMessageTimestampMs(messageId: string): number | null {
   }
 }
 
-// stale 判定の基準時刻。bot の wall clock は Discord の id 時刻とずれ続ける実測がある
-// （discord.log の messageId と ts を突き合わせた実測 5600.1〜5600.5 s、2 日間 136 件で一定）。
-// wall clock 基準だと取り直すべき message が全部 stale で捨れるので、id 単調増加を使って
-// 「history の中で最新の id から見て何秒前か」で窓を測る
-export function discordBackfillReferenceMs(
+// 窓の長さを測るための、history の中で最新の id 時刻。id 単調増加なので比較だけで決まる
+export function latestDiscordHistoryTimestampMs(
   history: readonly DiscordHistoryMessage[],
-  fallbackMs: number,
-): number {
+): number | null {
   let newest: number | null = null
 
   for (const message of history) {
@@ -53,7 +52,7 @@ export function discordBackfillReferenceMs(
     }
   }
 
-  return newest ?? fallbackMs
+  return newest
 }
 
 // cursor より新しい message だけを対象に、live と同じ admission gate を通して古い順に並べ直す。
@@ -76,8 +75,6 @@ export function selectBackfillMessages(
   if (input.cursor === null) {
     return { candidates: [], skipped }
   }
-
-  const referenceMs = discordBackfillReferenceMs(input.history, input.nowMs())
 
   const candidates: DiscordHistoryMessage[] = []
 
@@ -108,7 +105,7 @@ export function selectBackfillMessages(
 
     const createdMs = discordMessageTimestampMs(message.messageId)
 
-    if (createdMs === null || referenceMs - createdMs > maxAgeMs) {
+    if (createdMs === null || input.nowMs() - createdMs > maxAgeMs) {
       skipped.push({ messageId: message.messageId, reason: 'stale' })
 
       continue
@@ -238,8 +235,6 @@ export async function runDiscordRestartBackfill(
     return { handled: [], skipped: [], seeded: true }
   }
 
-  // ageMs の基準も selection と同じ Discord 側の時間軸（history の最新 id）
-  const referenceMs = discordBackfillReferenceMs(history, nowMs())
   const selection = selectBackfillMessages({
     history,
     cursor,
@@ -268,7 +263,7 @@ export async function runDiscordRestartBackfill(
     const ageMs = (() => {
       const createdMs = discordMessageTimestampMs(message.messageId)
 
-      return createdMs === null ? null : Math.max(0, referenceMs - createdMs)
+      return createdMs === null ? null : Math.max(0, nowMs() - createdMs)
     })()
 
     deps.log({
@@ -308,8 +303,13 @@ export async function runDiscordRestartBackfill(
       // cursor から history の最新 id までの Discord 側の窓の長さ（取りこぼし窓の実測用）
       windowMs: (() => {
         const cursorMs = discordMessageTimestampMs(cursor)
+        const newestMs = latestDiscordHistoryTimestampMs(history)
 
-        return cursorMs === null ? null : Math.max(0, referenceMs - cursorMs)
+        if (cursorMs === null || newestMs === null) {
+          return null
+        }
+
+        return Math.max(0, newestMs - cursorMs)
       })(),
     })
   }

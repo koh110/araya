@@ -1825,7 +1825,7 @@ test('discord bot: CLI の control request（araya reset）を startup 後の po
 
 // #36: gateway が閉じていた窓に投稿された message は Discord が再配信しない。ready 後に history を読み、
 // cursor より新しい物だけを会話へ流し込むことを bot の loop 経由で確かめる
-const DISCORD_EPOCH_MS = 1_420_064_800_000
+const DISCORD_EPOCH_MS = 1_420_070_400_000
 
 function snowflakeAge(ageMs: number) {
   return String((BigInt(Date.now() - ageMs - DISCORD_EPOCH_MS) << 22n) + 1n)
