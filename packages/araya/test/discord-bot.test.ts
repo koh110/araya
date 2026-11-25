@@ -2212,3 +2212,479 @@ test('discord bot: drain で置き去りにした message は cursor を進め�
     await fs.rm(dataDir, { recursive: true, force: true })
   }
 })
+
+test('discord bot: state.json の unfinished を restart 後に復元し、self message で cursor をその後ろへ進めない', async () => {
+  // 2026-11-24 の incident の入口。unfinished が memory 上にしか無い状態で、bot 自身の応答の echo が
+  // discard 経路を通り、cursor が unfinished 3 件より後ろへ進んで恒久的に処理されなかった。
+  // 同じ dataDir から unfinished を復元した bot が同じ経路で cursor を越えないことを測る
+  const dataDir = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-unfinished-restore-test-')),
+  )
+  const stopController = new AbortController()
+  const logs: Record<string, unknown>[] = []
+  const seedCursor = snowflakeAge(200_000)
+  const unfinishedId = snowflakeAge(90_000)
+  const selfEchoId = snowflakeAge(10_000)
+
+  writeDiscordBotState(dataDir, {
+    ...newState(),
+    unit: 'araya-discord-seed',
+    readyId: 'ready-seed',
+    lastReadyAt: '2026-11-24T00:00:00.000Z',
+    lastSeenMessageId: seedCursor,
+    unfinishedMessageIds: [unfinishedId],
+  })
+
+  try {
+    const exitCode = await runDiscordBot({
+      fetch: noticeStubFetch,
+      dataDir,
+      env: {
+        ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
+        ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
+        ARAYA_DISCORD_GUILD_ID: GUILD_ID,
+        ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
+        ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
+      },
+      stopSignal: stopController.signal,
+      verifyUnit: false,
+      sleep: async () => {},
+      createChatSession: createInertChatSession,
+      createGateway: async (_config, handlers) => {
+        return {
+          async connect() {
+            await handlers.onReady('998877665544332211')
+            // unfinished より新しい bot 自身の message（応答の echo）。discard 経路で cursor を進めようとする
+            handlers.onIgnored?.(
+              {
+                guildId: GUILD_ID,
+                channelId: CHANNEL_ID,
+                userId: '998877665544332211',
+                isBot: true,
+                isWebhook: false,
+                isSystem: false,
+                mentionsBot: false,
+                messageId: selfEchoId,
+              },
+              ['is_bot'],
+            )
+            await new Promise((resolve) => {
+              setTimeout(resolve, 100)
+            })
+            stopController.abort()
+          },
+          async sendText() {},
+          async registerCommands() {
+            return 2
+          },
+          // unfinished な message は history の fetch 範囲外（削除された・100 件より古い）
+          async fetchRecentMessages() {
+            return []
+          },
+          async close() {},
+        }
+      },
+      log: (entry) => {
+        return logs.push(entry)
+      },
+    })
+
+    assert.equal(exitCode, 0)
+
+    const restored = logs.find((entry) => {
+      return entry.type === 'discord_unfinished_restored'
+    })
+
+    assert.ok(restored !== undefined, JSON.stringify(logs))
+    assert.equal(restored.count, 1)
+    assert.deepEqual(restored.messageIds, [unfinishedId])
+    assert.ok(
+      logs.some((entry) => {
+        return entry.type === 'discord_message_ignored' && entry.messageId === selfEchoId
+      }),
+      JSON.stringify(logs),
+    )
+
+    const state = readDiscordBotState(dataDir)
+
+    assert.ok(state !== null)
+    assert.equal(state.lastSeenMessageId, seedCursor, 'unfinished より後ろへ cursor を進めない')
+    assert.deepEqual(state.unfinishedMessageIds, [unfinishedId], 'unfinished は state.json に残す')
+  } finally {
+    stopController.abort()
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('discord bot: 15 分以上前に受理した unfinished を restart 後の backfill が取り直す（2026-11-24 incident）', async () => {
+  // incident で処理されなかった message の age は cursor から 1554 ms 分以上離れていた。
+  // 受理済みで turn が終わっていない id は age 上限を見ないことを、process をまたいで測る
+  const dataDir = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-old-unfinished-test-')),
+  )
+  const seedCursor = snowflakeAge(4 * 60 * 60_000)
+  const stuckId = snowflakeAge(3 * 60 * 60_000)
+  const firstStop = new AbortController()
+  const secondStop = new AbortController()
+  const firstLogs: Record<string, unknown>[] = []
+  const secondLogs: Record<string, unknown>[] = []
+  const submits: { content: string; requestId: string }[] = []
+  let stuckStarted: (() => void) | undefined
+  const stuck = new Promise<void>((resolve) => {
+    stuckStarted = resolve
+  })
+
+  writeDiscordBotState(dataDir, {
+    ...newState(),
+    unit: 'araya-discord-seed',
+    readyId: 'ready-seed',
+    lastReadyAt: '2026-11-24T00:00:00.000Z',
+    lastSeenMessageId: seedCursor,
+  })
+
+  try {
+    const firstExitCode = await runDiscordBot({
+      fetch: noticeStubFetch,
+      dataDir,
+      env: {
+        ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
+        ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
+        ARAYA_DISCORD_GUILD_ID: GUILD_ID,
+        ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
+        ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
+      },
+      stopSignal: firstStop.signal,
+      verifyUnit: false,
+      shutdownWaits: { hootMs: 50, drainMs: 300, gatewayMs: 300, sessionMs: 300 },
+      createChatSession: async () => {
+        return {
+          describe: () => {
+            return { conversationId: 7 }
+          },
+          async submit(_content: string, requestId: string) {
+            if (requestId === stuckId) {
+              stuckStarted?.()
+
+              return await new Promise<string>(() => {})
+            }
+
+            return `answer ${requestId}`
+          },
+          async reset() {},
+          async close() {},
+        }
+      },
+      createGateway: async (_config, handlers) => {
+        return {
+          async connect() {
+            await handlers.onReady('998877665544332211')
+            // 3 時間前に投稿された message が live で届いて turn が終わらない
+            void handlers.onMessage(liveChatMessage(stuckId, '終わらない turn'), async () => {})
+            await stuck
+            await new Promise((resolve) => {
+              setTimeout(resolve, 60)
+            })
+            firstStop.abort()
+          },
+          async sendText() {},
+          async registerCommands() {
+            return 2
+          },
+          async fetchRecentMessages() {
+            return []
+          },
+          async close() {},
+        }
+      },
+      log: (entry) => {
+        return firstLogs.push(entry)
+      },
+    })
+
+    assert.equal(firstExitCode, 0)
+
+    const unfinished = firstLogs.find((entry) => {
+      return entry.type === 'discord_shutdown_unfinished'
+    })
+
+    assert.ok(unfinished !== undefined, JSON.stringify(firstLogs))
+    assert.deepEqual(unfinished.messageIds, [stuckId])
+
+    const stateAfterFirst = readDiscordBotState(dataDir)
+
+    assert.ok(stateAfterFirst !== null)
+    assert.equal(stateAfterFirst.lastSeenMessageId, seedCursor)
+    assert.deepEqual(
+      stateAfterFirst.unfinishedMessageIds,
+      [stuckId],
+      '置き去りにした ids は state.json に保存する',
+    )
+
+    const secondExitCode = await runDiscordBot({
+      fetch: noticeStubFetch,
+      dataDir,
+      env: {
+        ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
+        ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
+        ARAYA_DISCORD_GUILD_ID: GUILD_ID,
+        ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
+        ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
+      },
+      stopSignal: secondStop.signal,
+      verifyUnit: false,
+      createChatSession: async () => {
+        return {
+          describe: () => {
+            return { conversationId: 7 }
+          },
+          async submit(content: string, requestId: string) {
+            submits.push({ content, requestId })
+
+            return `取り直しました ${requestId}`
+          },
+          async reset() {},
+          async close() {},
+        }
+      },
+      createGateway: async (_config, handlers) => {
+        return {
+          async connect() {
+            await handlers.onReady('998877665544332211')
+            await new Promise((resolve) => {
+              setTimeout(resolve, 300)
+            })
+            secondStop.abort()
+          },
+          async sendText() {},
+          async registerCommands() {
+            return 2
+          },
+          async fetchRecentMessages() {
+            return [liveChatMessage(stuckId, '終わらない turn')]
+          },
+          async close() {},
+        }
+      },
+      log: (entry) => {
+        return secondLogs.push(entry)
+      },
+    })
+
+    assert.equal(secondExitCode, 0)
+    assert.deepEqual(
+      submits.map((entry) => entry.requestId),
+      [stuckId],
+      'age 上限（15 分）を大きく越えていても取り直す',
+    )
+    assert.ok(
+      !secondLogs.some((entry) => {
+        return entry.type === 'discord_backfill_ignored' && entry.messageId === stuckId
+      }),
+      JSON.stringify(secondLogs),
+    )
+
+    const restored = secondLogs.find((entry) => {
+      return entry.type === 'discord_unfinished_restored'
+    })
+
+    assert.ok(restored !== undefined, JSON.stringify(secondLogs))
+    assert.deepEqual(restored.messageIds, [stuckId])
+
+    const received = secondLogs.find((entry) => {
+      return entry.type === 'discord_backfill_received'
+    })
+
+    assert.ok(received !== undefined, JSON.stringify(secondLogs))
+    assert.ok(
+      (received.ageMs as number) > 3 * 60 * 60_000,
+      `ageMs=${String(received.ageMs)}（incident の stale と同じ条件）`,
+    )
+
+    const stateAfterSecond = readDiscordBotState(dataDir)
+
+    assert.ok(stateAfterSecond !== null)
+    assert.equal(stateAfterSecond.lastSeenMessageId, stuckId)
+    assert.deepEqual(stateAfterSecond.unfinishedMessageIds, [], '取り直した unfinished は state から出す')
+  } finally {
+    firstStop.abort()
+    secondStop.abort()
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('discord bot: 応答を送った message を restart 後の backfill で二度処理しない（nonce ではなく answeredMessageIds で止める）', async () => {
+  // 応答を送った message でも、より古い unfinished のせいで cursor が届いていないことがある。
+  // Discord が同じ author + 同じ nonce を 1 通にまとめるのは過去数分のあいだだけ（discord-api-types の docs）
+  // なので、restart が空いたケースは nonce では抑えられない。answeredMessageIds を state.json に保存して止める
+  const dataDir = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-answered-test-')),
+  )
+  const seedCursor = snowflakeAge(300_000)
+  const unfinishedId = snowflakeAge(200_000)
+  const answeredId = snowflakeAge(50_000)
+  const firstStop = new AbortController()
+  const secondStop = new AbortController()
+  const firstLogs: Record<string, unknown>[] = []
+  const secondLogs: Record<string, unknown>[] = []
+  const submits: { content: string; requestId: string }[] = []
+
+  writeDiscordBotState(dataDir, {
+    ...newState(),
+    unit: 'araya-discord-seed',
+    readyId: 'ready-seed',
+    lastReadyAt: '2026-11-24T00:00:00.000Z',
+    lastSeenMessageId: seedCursor,
+    unfinishedMessageIds: [unfinishedId],
+  })
+
+  try {
+    const firstExitCode = await runDiscordBot({
+      fetch: noticeStubFetch,
+      dataDir,
+      env: {
+        ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
+        ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
+        ARAYA_DISCORD_GUILD_ID: GUILD_ID,
+        ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
+        ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
+      },
+      stopSignal: firstStop.signal,
+      verifyUnit: false,
+      createChatSession: async () => {
+        return {
+          describe: () => {
+            return { conversationId: 7 }
+          },
+          async submit(content: string, requestId: string) {
+            submits.push({ content, requestId })
+
+            return `answer ${requestId}`
+          },
+          async reset() {},
+          async close() {},
+        }
+      },
+      createGateway: async (_config, handlers) => {
+        return {
+          async connect() {
+            await handlers.onReady('998877665544332211')
+            // turn は終わるが、より古い unfinished が cursor を止める
+            await handlers.onMessage(liveChatMessage(answeredId, '完了する turn'), async () => {})
+            await new Promise((resolve) => {
+              setTimeout(resolve, 100)
+            })
+            firstStop.abort()
+          },
+          async sendText() {},
+          async registerCommands() {
+            return 2
+          },
+          async fetchRecentMessages() {
+            return []
+          },
+          async close() {},
+        }
+      },
+      log: (entry) => {
+        return firstLogs.push(entry)
+      },
+    })
+
+    assert.equal(firstExitCode, 0)
+    assert.deepEqual(
+      submits.map((entry) => entry.requestId),
+      [answeredId],
+      'live で 1 通応答している',
+    )
+
+    const stateAfterFirst = readDiscordBotState(dataDir)
+
+    assert.ok(stateAfterFirst !== null)
+    assert.equal(stateAfterFirst.lastSeenMessageId, seedCursor, 'unfinished が cursor を止める')
+    assert.deepEqual(stateAfterFirst.unfinishedMessageIds, [unfinishedId])
+    assert.deepEqual(
+      stateAfterFirst.answeredMessageIds,
+      [answeredId],
+      '応答を送った事実を state.json に保存する',
+    )
+
+    const secondExitCode = await runDiscordBot({
+      fetch: noticeStubFetch,
+      dataDir,
+      env: {
+        ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
+        ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
+        ARAYA_DISCORD_GUILD_ID: GUILD_ID,
+        ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
+        ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
+      },
+      stopSignal: secondStop.signal,
+      verifyUnit: false,
+      createChatSession: async () => {
+        return {
+          describe: () => {
+            return { conversationId: 7 }
+          },
+          async submit(content: string, requestId: string) {
+            submits.push({ content, requestId })
+
+            return `取り直しました ${requestId}`
+          },
+          async reset() {},
+          async close() {},
+        }
+      },
+      createGateway: async (_config, handlers) => {
+        return {
+          async connect() {
+            await handlers.onReady('998877665544332211')
+            await new Promise((resolve) => {
+              setTimeout(resolve, 300)
+            })
+            secondStop.abort()
+          },
+          async sendText() {},
+          async registerCommands() {
+            return 2
+          },
+          async fetchRecentMessages() {
+            // gateway の history は新しい順（応答済みの message が unfinished より新しい側に残っている）
+            return [liveChatMessage(answeredId, '完了する turn'), liveChatMessage(unfinishedId, '終わらない turn')]
+          },
+          async close() {},
+        }
+      },
+      log: (entry) => {
+        return secondLogs.push(entry)
+      },
+    })
+
+    assert.equal(secondExitCode, 0)
+    assert.deepEqual(
+      submits.map((entry) => entry.requestId),
+      [answeredId, unfinishedId],
+      '取り直すのは unfinished だけ（応答済み message は再応答しない）',
+    )
+    assert.ok(
+      secondLogs.some((entry) => {
+        return entry.type === 'discord_backfill_ignored' && entry.reason === 'already_handled' && entry.messageId === answeredId
+      }),
+      JSON.stringify(secondLogs),
+    )
+
+    const stateAfterSecond = readDiscordBotState(dataDir)
+
+    assert.ok(stateAfterSecond !== null)
+    assert.equal(stateAfterSecond.lastSeenMessageId, unfinishedId, '取り直した unfinished まで cursor が進む')
+    assert.deepEqual(stateAfterSecond.unfinishedMessageIds, [])
+    assert.deepEqual(
+      stateAfterSecond.answeredMessageIds,
+      [answeredId],
+      'cursor が届いていない answered は記録に残す',
+    )
+  } finally {
+    firstStop.abort()
+    secondStop.abort()
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})

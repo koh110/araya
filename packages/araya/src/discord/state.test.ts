@@ -9,6 +9,8 @@ import { messageIdAtAge } from '../../test/support/discord-snowflake.ts'
 import {
   DISCORD_STATE_VERSION,
   DISCORD_STATE_VERSION_BEFORE_CURSOR,
+  DISCORD_STATE_VERSION_BEFORE_UNFINISHED,
+  canAdvanceCursorPast,
   discordStateFilePath,
   isDiscordMessageIdNewer,
   newState,
@@ -119,6 +121,103 @@ test('discord state: an invalid cursor id is rejected', async () => {
       { code: 'discord_state_invalid' },
     )
   })
+})
+
+test('discord state: a v2 file (no unfinished ids) opens with empty id lists without rewriting the file', async () => {
+  await withTemporaryDataDir(async (dataDir) => {
+    const cursor = messageIdAtAge(60_000)
+
+    await writeStateFile(dataDir, {
+      version: DISCORD_STATE_VERSION_BEFORE_UNFINISHED,
+      unit: 'araya-discord-old',
+      readyId: 'ready-old',
+      lastReadyAt: '2026-11-24T00:00:00.000Z',
+      lastSeenMessageId: cursor,
+    })
+
+    const state = readDiscordBotState(dataDir)
+
+    assert.ok(state !== null)
+    assert.equal(state.version, DISCORD_STATE_VERSION)
+    assert.equal(state.unit, 'araya-discord-old')
+    assert.equal(state.lastSeenMessageId, cursor, 'cursor はそのまま引き継ぐ')
+    assert.deepEqual(state.unfinishedMessageIds, [])
+    assert.deepEqual(state.answeredMessageIds, [])
+    assert.equal(
+      JSON.parse(await fs.readFile(discordStateFilePath(dataDir), 'utf8')).version,
+      DISCORD_STATE_VERSION_BEFORE_UNFINISHED,
+      'read だけでは file を書き換えない',
+    )
+  })
+})
+
+test('discord state: unfinished / answered ids survive a write and read round trip', async () => {
+  await withTemporaryDataDir(async (dataDir) => {
+    const cursor = messageIdAtAge(60_000)
+    const unfinished = [messageIdAtAge(40_000), messageIdAtAge(20_000)]
+    const answered = [messageIdAtAge(10_000)]
+
+    writeDiscordBotState(dataDir, {
+      ...newState(),
+      unit: 'araya-discord-test',
+      readyId: 'ready-1',
+      lastReadyAt: '2026-11-24T00:00:00.000Z',
+      lastSeenMessageId: cursor,
+      unfinishedMessageIds: unfinished,
+      answeredMessageIds: answered,
+    })
+
+    const state = readDiscordBotState(dataDir)
+
+    assert.ok(state !== null)
+    assert.equal(state.version, DISCORD_STATE_VERSION)
+    assert.deepEqual(state.unfinishedMessageIds, unfinished)
+    assert.deepEqual(state.answeredMessageIds, answered)
+
+    // 書き直し（cursor を進める）しても集合は消えない
+    writeDiscordBotState(dataDir, noteDiscordSeenMessageId(state, messageIdAtAge(5_000)))
+    const reread = readDiscordBotState(dataDir)
+
+    assert.ok(reread !== null)
+    assert.deepEqual(reread.unfinishedMessageIds, unfinished)
+    assert.deepEqual(reread.answeredMessageIds, answered)
+  })
+})
+
+test('discord state: a malformed unfinished id list is rejected', async () => {
+  await withTemporaryDataDir(async (dataDir) => {
+    for (const unfinishedMessageIds of [['not-an-id'], 'not-a-list', { 0: messageIdAtAge(1_000) }]) {
+      await writeStateFile(dataDir, {
+        version: DISCORD_STATE_VERSION,
+        unit: null,
+        lastReadyAt: null,
+        lastSeenMessageId: messageIdAtAge(60_000),
+        unfinishedMessageIds,
+      })
+
+      assert.throws(
+        () => {
+          return readDiscordBotState(dataDir)
+        },
+        { code: 'discord_state_invalid' },
+        `unfinishedMessageIds=${JSON.stringify(unfinishedMessageIds)}`,
+      )
+    }
+  })
+})
+
+test('discord state: the cursor gate refuses to pass an older unfinished id', () => {
+  const unfinishedOlder = messageIdAtAge(40_000)
+  const unfinishedNewer = messageIdAtAge(1_000)
+  const messageId = messageIdAtAge(20_000)
+
+  // unfinished に自分より古い id が残っている間は進めない
+  assert.equal(canAdvanceCursorPast([unfinishedOlder], messageId), false)
+  assert.equal(canAdvanceCursorPast(new Set<string>([unfinishedNewer, unfinishedOlder]), messageId), false)
+  // 自分より新しい unfinished だけなら進める。集合が空なら進める
+  assert.equal(canAdvanceCursorPast([unfinishedNewer], messageId), true)
+  assert.equal(canAdvanceCursorPast([], messageId), true)
+  assert.equal(canAdvanceCursorPast(new Set<string>(), messageId), true)
 })
 
 test('discord state: the cursor only advances and updates do not mutate the previous state', () => {

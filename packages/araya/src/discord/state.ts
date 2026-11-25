@@ -6,9 +6,13 @@ import path from 'node:path'
 // 続ける位置（lastSeenMessageId）を持つ。通知の配送 retry は agent host の durable task 側が持つ。
 // 書くのは bot process だけ（process lock で 1 process が保証されている）
 
-export const DISCORD_STATE_VERSION = 2
+export const DISCORD_STATE_VERSION = 3
 // backfill cursor を持つ前の state。read 時に migration して lastSeenMessageId を null で埋める
 export const DISCORD_STATE_VERSION_BEFORE_CURSOR = 1
+// unfinished / answered の id 集合を持つ前の state。read 時に migration して空配列で埋める。
+// 2026-11-24 の incident で unfinished が memory 上にしか無く、restart で消えた。cursor が unfinished より
+// 後ろへ進み、受理済みの message 3 件が恒久的に処理されなかった。cursor と同じ file で保持する
+export const DISCORD_STATE_VERSION_BEFORE_UNFINISHED = 2
 
 export type DiscordBotState = {
   version: number
@@ -21,6 +25,13 @@ export type DiscordBotState = {
   // 受理しただけで turn が終わっていない id は進めない。Discord の snowflake は単調増加なので id だけで比較できる。
   // 旧 state には無いので読み込み時は optional
   lastSeenMessageId?: string | null
+  // 受理したが turn が終わっていない ids。restart 後の backfill が「age 上限を越えていても」取り直す対象。
+  // 旧 state には無いので読み込み時は optional（migration で空配列）
+  unfinishedMessageIds?: string[]
+  // turn を終えて応答を送ったが、cursor がより古い unfinished で止まっているために cursor が届いていない ids。
+  // restart 後の backfill が同じ message に二度応答するのを防ぐ記録（Discord が同じ author + 同じ nonce を
+  // 1 通にまとめるのは過去数分のあいだだけ）
+  answeredMessageIds?: string[]
 }
 
 export function discordStateFilePath(dataDir: string) {
@@ -39,7 +50,16 @@ function isStateShape(value: unknown): value is DiscordBotState {
   }
 
   // 未来の version は読まない（downgrade 時の state 破棄を避ける）
-  if (state.version !== DISCORD_STATE_VERSION && state.version !== DISCORD_STATE_VERSION_BEFORE_CURSOR) {
+  if (
+    state.version !== DISCORD_STATE_VERSION &&
+    state.version !== DISCORD_STATE_VERSION_BEFORE_UNFINISHED &&
+    state.version !== DISCORD_STATE_VERSION_BEFORE_CURSOR
+  ) {
+    return false
+  }
+
+  // id 集合は有ってよい形（message id の array）だけ。中身の形が壊れているものは読まない
+  if (!(isDiscordMessageIdList(state.unfinishedMessageIds) && isDiscordMessageIdList(state.answeredMessageIds))) {
     return false
   }
 
@@ -68,6 +88,21 @@ function isStateShape(value: unknown): value is DiscordBotState {
   }
 
   return true
+}
+
+// id 集合の形。旧 version の file は key が無いので migration 側で空配列に埋める
+function isDiscordMessageIdList(value: unknown) {
+  if (value === undefined || value === null) {
+    return true
+  }
+
+  if (!Array.isArray(value)) {
+    return false
+  }
+
+  return value.every((entry) => {
+    return typeof entry === 'string' && isDiscordMessageId(entry)
+  })
 }
 
 // state.json が無ければ null。形が壊れているときは誤り（bot は restart policy で再起動し、人間が直す）
@@ -103,9 +138,16 @@ export function readDiscordBotState(dataDir: string) {
     )
   }
 
-  // v1 -> v2: cursor を null で埋める。read だけでは file を書き換えない（次の ready 書き込みで v2 になる）
-  if (value.version === DISCORD_STATE_VERSION_BEFORE_CURSOR) {
-    return { ...value, version: DISCORD_STATE_VERSION, lastSeenMessageId: null }
+  // v1 / v2 -> v3: cursor を null、id 集合を空配列で埋める。read だけでは file を書き換えない
+  // （次の state 書き込みで v3 になる）
+  if (value.version !== DISCORD_STATE_VERSION) {
+    return {
+      ...value,
+      version: DISCORD_STATE_VERSION,
+      lastSeenMessageId: value.lastSeenMessageId ?? null,
+      unfinishedMessageIds: value.unfinishedMessageIds ?? [],
+      answeredMessageIds: value.answeredMessageIds ?? [],
+    }
   }
 
   return value
@@ -118,6 +160,8 @@ export function newState() {
     readyId: null,
     lastReadyAt: null,
     lastSeenMessageId: null,
+    unfinishedMessageIds: [],
+    answeredMessageIds: [],
   }
 
   return state
@@ -152,6 +196,22 @@ export function noteDiscordSeenMessageId(state: DiscordBotState, messageId: stri
   }
 
   return { ...state, lastSeenMessageId: messageId }
+}
+
+// cursor を messageId まで進めてよいかの gate。unfinished に messageId より古い id が残っている間は
+// 進めてはいけない。cursor が unfinished を越えると、その id は backfill の取り直し対象から消えて
+// 二度と処理されない（at-least-once の gate）。live（bot.ts）と backfill で同じ判定を使う
+export function canAdvanceCursorPast(
+  unfinishedMessageIds: Iterable<string>,
+  messageId: string,
+): boolean {
+  for (const pending of unfinishedMessageIds) {
+    if (isDiscordMessageIdNewer(messageId, pending)) {
+      return false
+    }
+  }
+
+  return true
 }
 
 // 同じ directory の一時 file（mode 0600）に書いてから rename する。directory が無ければ mode 0700 で作る
