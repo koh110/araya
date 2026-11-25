@@ -9,7 +9,7 @@ import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
 
 import { openArayaAgentHost } from './host.ts'
 import { createRedactor } from '../infrastructure/redaction.ts'
-import { answer, createFauxModels, toolCall } from '../../test/support/faux-shiki.ts'
+import { answer, createFauxModels, modelError, toolCall } from '../../test/support/faux-shiki.ts'
 
 async function makeAgentFixture() {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'araya-agent-host-test-')))
@@ -273,6 +273,90 @@ test('agent host: 選択中モデルの要約出力枠を使う compaction reser
   } finally {
     await host?.close()
     vi.restoreAllMocks()
+    await removeAgentFixture(fixture)
+  }
+})
+
+test('agent host: run が model_error で失敗しても後ろに queued の input を走らせる（既定 keep だと Discord 側の待ちで解鍵されない）', async () => {
+  const fixture = await makeAgentFixture()
+  const models = await createFauxModels(fixture)
+  const startedPath = path.join(fixture.devRoot, 'stalled-tool-started')
+  const releasePath = path.join(fixture.devRoot, 'stalled-tool-release')
+  const exists = async (target: string) => {
+    try {
+      await fs.stat(target)
+
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  try {
+    // 1 turn 目の tool は release file ができるまで待つ（= run が実行中だと external に確定できる）。
+    // 2 turn 目で model_error を返して run を失敗させる。
+    models.faux.setResponses([
+      toolCall('bash', {
+        command:
+          `printf started > ${startedPath}; while [ ! -f ${releasePath} ]; do sleep 0.02; done; printf stalled`,
+      }),
+      modelError('araya test forced model failure'),
+      answer('queued input の応答'),
+      answer('queued input の応答'),
+    ])
+
+    const host = await openArayaAgentHost({
+      dataDir: fixture.dataDir,
+      devRoot: fixture.devRoot,
+      models: models.runtime,
+      model: { provider: models.model.provider, modelId: models.model.id, thinkingLevel: 'medium' },
+      redactor: createRedactor([]),
+      deliverReport: async () => {},
+      context: BACKGROUND_CONTEXT,
+    })
+
+    try {
+      const failed = host.submit('CASE-STALLED-RUN', 'message-stalled')
+      let toolStarted = false
+
+      for (let attempt = 0; attempt < 200 && !toolStarted; attempt += 1) {
+        toolStarted = await exists(startedPath)
+
+        if (!toolStarted) {
+          await new Promise((resolve) => {
+            setTimeout(resolve, 100)
+          })
+        }
+      }
+
+      assert.equal(toolStarted, true, 'tool が始まらない')
+
+      // run 実行中に届いた input → queued。この input が失敗後も流れるか
+      const queuedBehind = host.submit('CASE-QUEUED-BEHIND', 'message-queued-behind')
+      await fs.writeFile(releasePath, 'release')
+
+      await assert.rejects(failed, /araya_agent_unanswered/u)
+
+      const settled = await Promise.race([
+        queuedBehind.then(
+          (text) => `resolved:${text}` as string,
+          () => 'rejected' as string,
+        ),
+        new Promise<string>((resolve) => {
+          const timer = setTimeout(() => resolve('pending'), 20_000)
+          timer.unref()
+        }),
+      ])
+
+      assert.equal(
+        settled,
+        'resolved:queued input の応答',
+        'afterFailedRun: continue にしたので失敗 run の後ろの queued input が新しい run で流れる（keep だと pending のまま解鍵されない）',
+      )
+    } finally {
+      await host.close()
+    }
+  } finally {
     await removeAgentFixture(fixture)
   }
 })

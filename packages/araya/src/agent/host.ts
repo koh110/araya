@@ -797,6 +797,13 @@ export async function openArayaAgentHost(
               },
             },
           },
+          // 失敗で終わった run の後ろに queued になった input をそのまま走らせる。pi-durable の既定 "keep" は
+          // 「次の input か queued write があるまで待たせる」なので、Discord 側が turn を待っている間は次の submit
+          // が来ず、queued のまま解鍵されない（2026-11-24T09:02Z の message 1574711804037308467 は compaction の
+          // model_error で失敗した run の後ろに 15h37m 留まり、人間の /araya reset（queued write）でのみ流れた）。
+          // continue は失敗 run の直後に boundary を切って queued input で new run を始める（submissions.js の
+          // 「items an earlier failed run left queued」経路と同じく、queued が残ったまま解鍵されない状態を防ぐ）
+          afterFailedRun: 'continue',
         },
         // worker も含む全 conversation に dev root を基点の shell 環境を与える。実行制限は instructions 側で示す
         // （旧 ARAYA_AGENT_SESSION 目印は撤去した。HOOT の承認・setting 変更・会話 control の境界は

@@ -219,8 +219,9 @@ function createBackfillHarness(
     },
     stopAccepting() {},
     async drain() {},
+    tick() {},
     pendingCount: () => {
-      return { queued: 0, processing: 0 }
+      return { queued: 0, processing: 0, elapsedMs: null }
     },
   }
 

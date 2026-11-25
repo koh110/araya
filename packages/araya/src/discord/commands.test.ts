@@ -589,3 +589,64 @@ test('usage には slash command 形と operation の境界を書く', () => {
   assert.equal(DISCORD_CONTROL_USAGE.includes('同じ kernel を通ります'), true)
   assert.equal(DISCORD_CONTROL_USAGE.includes('agent session の内側から'), false)
 })
+
+test('Discord control command: /araya status は実行中の turn の経過時間を出す（status だけで停滞の長さを読めるように）', async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-turn-elapsed-'))
+
+  try {
+    const commands = createDiscordControlCommands({
+      dataDir,
+      nowMs: () => {
+        return Date.parse('2026-06-30T09:00:00.000Z')
+      },
+      log: () => {},
+    })
+
+    const running = {
+      ...fakeContext({ dataDir }),
+      progress: null,
+      // 2026-11-24 に起きた 15h37m の停滞と同じ桁
+      runningElapsedMs: 54_120_000,
+    }
+    await commands.handle(
+      {
+        interactionId: 'turn-elapsed-running',
+        commandName: 'araya',
+        userId: 'u',
+        guildId: 'g',
+        channelId: 'c',
+        subcommandGroup: null,
+        subcommand: 'status',
+        options: {},
+      },
+      running,
+    )
+    assert.match(running.sends[0] ?? '', /実行中 1（うち 15時間2分）/u)
+
+    // 実行中 0 件なら経過時間を付けない（idle を「何か走っている」に見せない）
+    const idle = {
+      ...fakeContext({ dataDir }),
+      runningCount: 0,
+      queuedCount: 0,
+      progress: null,
+      runningElapsedMs: null,
+    }
+    await commands.handle(
+      {
+        interactionId: 'turn-elapsed-idle',
+        commandName: 'araya',
+        userId: 'u',
+        guildId: 'g',
+        channelId: 'c',
+        subcommandGroup: null,
+        subcommand: 'status',
+        options: {},
+      },
+      idle,
+    )
+    assert.match(idle.sends[0] ?? '', /実行中 0 \/ 待ち 0/u)
+    assert.doesNotMatch(idle.sends[0] ?? '', /うち /u)
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
