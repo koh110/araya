@@ -51,6 +51,7 @@ export const ARAYA_AGENT_EXTENSION_NAME = 'araya-agent'
 export const ARAYA_TASK_TOOL_NAME = 'task'
 
 const SUBAGENT_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/u
+const ARAYA_COMPACTION_RESERVE_TOKENS = 20_480
 
 type CodingTool = ToolRegistration
 
@@ -788,6 +789,15 @@ export async function openArayaAgentHost(
       {
         models: input.models,
         registry,
+        settings: {
+          compaction: {
+            modelOverrides: {
+              [`${input.model.provider}/${input.model.modelId}`]: {
+                reserveTokens: ARAYA_COMPACTION_RESERVE_TOKENS,
+              },
+            },
+          },
+        },
         // worker も含む全 conversation に dev root を基点の shell 環境を与える。実行制限は instructions 側で示す
         // （旧 ARAYA_AGENT_SESSION 目印は撤去した。HOOT の承認・setting 変更・会話 control の境界は
         // filesystem の owner と Discord の allowlist のsideだけで持つ）

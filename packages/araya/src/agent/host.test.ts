@@ -241,6 +241,42 @@ test('agent host: describe から実行中 child の処理種別・経過時間�
   }
 })
 
+test('agent host: 選択中モデルの要約出力枠を使う compaction reserve を設定する', async () => {
+  const fixture = await makeAgentFixture()
+  const models = await createFauxModels(fixture)
+  const openHarness = Harness.open
+  let observedReserveTokens: number | undefined
+  const modelKey = `${models.model.provider}/${models.model.id}`
+  vi.spyOn(Harness, 'open').mockImplementation(async (storage, options, context) => {
+    const settings = typeof options.settings === 'function' ? options.settings() : options.settings
+    observedReserveTokens = settings?.compaction?.modelOverrides?.[modelKey]?.reserveTokens
+    return await openHarness(storage, options, context)
+  })
+  let host: Awaited<ReturnType<typeof openArayaAgentHost>> | undefined
+
+  try {
+    models.script(() => {
+      return answer('設定確認')
+    })
+    host = await openArayaAgentHost({
+      dataDir: fixture.dataDir,
+      devRoot: fixture.devRoot,
+      models: models.runtime,
+      model: { provider: models.model.provider, modelId: models.model.id, thinkingLevel: 'medium' },
+      redactor: createRedactor([]),
+      deliverReport: async () => {},
+      context: BACKGROUND_CONTEXT,
+    })
+
+    assert.equal(observedReserveTokens, 20_480)
+    assert.equal(await host.submit('設定確認', 'compaction-reserve-1'), '設定確認')
+  } finally {
+    await host?.close()
+    vi.restoreAllMocks()
+    await removeAgentFixture(fixture)
+  }
+})
+
 test('agent host: progress monitor の初期化失敗があっても会話を続ける', async () => {
   const fixture = await makeAgentFixture()
   const models = await createFauxModels(fixture)
