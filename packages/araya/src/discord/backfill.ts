@@ -6,15 +6,23 @@
 // cursor は turn が終わってから進む（at-least-once）。実行中に kill された message は cursor より
 // 古い側に残るので、次の restart でここに取り直される
 
+import { createHash } from 'node:crypto'
 import { discordChatAdmissionFailures, type DiscordChatHandler } from './chat.ts'
 import type { DiscordConfig } from './config.ts'
 import type { DiscordGateway, DiscordHistoryMessage } from './gateway.ts'
-import { isDiscordMessageIdNewer, noteDiscordSeenMessageId, type DiscordBotState } from './state.ts'
+import {
+  canAdvanceCursorPast,
+  isDiscordMessageIdNewer,
+  noteDiscordSeenMessageId,
+  type DiscordBotState,
+} from './state.ts'
 
 // history は 1 回の fetch で 100 件まで。取り直すのは直近の message だけで十分なので、処理するのは新しい 20 件
 export const BACKFILL_FETCH_LIMIT = 100
 export const BACKFILL_MAX_MESSAGES = 20
-// stop していた期間が長かった（bot が落ちてしばらく起動していなかった）ときに、古い会話を後から走らせない上限
+// stop していた期間が長かった（bot が落ちてしばらく起動していなかった）ときに、古い会話を後から走らせない上限。
+// unfinished（受理済みで turn が終わっていない）の id はこの上限を見ない：at-least-once の約束で
+// 必ず取り直す対象なので、cursor より新しい unfinished を age で捨てるとそのまま恒久的に消える
 export const BACKFILL_MAX_AGE_MS = 15 * 60_000
 // history fetch が止まっても shutdown を止めない
 export const BACKFILL_FETCH_TIMEOUT_MS = 8_000
@@ -66,10 +74,13 @@ export function selectBackfillMessages(
     nowMs: () => number
     maxAgeMs?: number
     limit?: number
+    // restart 前に受理して turn が終わっていない ids。含まれる id は age 上限を無視して取り直す
+    unfinishedMessageIds?: ReadonlySet<string>
   },
 ): BackfillSelection {
   const maxAgeMs = input.maxAgeMs ?? BACKFILL_MAX_AGE_MS
   const limit = input.limit ?? BACKFILL_MAX_MESSAGES
+  const unfinishedMessageIds = input.unfinishedMessageIds ?? new Set<string>()
   const skipped: BackfillSkip[] = []
 
   if (input.cursor === null) {
@@ -105,7 +116,13 @@ export function selectBackfillMessages(
 
     const createdMs = discordMessageTimestampMs(message.messageId)
 
-    if (createdMs === null || input.nowMs() - createdMs > maxAgeMs) {
+    // age 上限は「stop していた期間が長いときに古い会話を後から走らせない」ためのもの。unfinished の id は
+    // すでに受理されていて turn が終わっていないので、age に関係なく取り直す（2026-11-24 の incident では
+    // 08:00 の shutdown 以降の 3 件が 15 分を越えたというだけで discord_backfill_ignored reason:"stale" になった）
+    if (
+      createdMs === null ||
+      (!unfinishedMessageIds.has(message.messageId) && input.nowMs() - createdMs > maxAgeMs)
+    ) {
       skipped.push({ messageId: message.messageId, reason: 'stale' })
 
       continue
@@ -120,13 +137,45 @@ export function selectBackfillMessages(
   })
 
   if (candidates.length > limit) {
-    const dropped = candidates.slice(0, candidates.length - limit)
+    const overflow = candidates.length - limit
+    const droppedIds = new Set<string>()
 
-    for (const message of dropped) {
-      skipped.push({ messageId: message.messageId, reason: 'over_limit' })
+    // 上限を越える分は unfinished ではない古い側から落とす。unfinished を over_limit で捨てると cursor が
+    // その id を越えられず（unfinished gate）、次の restart でもまた落とされて取り直せない
+    for (const message of candidates) {
+      if (droppedIds.size >= overflow) {
+        break
+      }
+
+      if (!unfinishedMessageIds.has(message.messageId)) {
+        droppedIds.add(message.messageId)
+      }
     }
 
-    return { candidates: candidates.slice(candidates.length - limit), skipped }
+    // unfinished だけで上限を越えているときは、古い順に続けるので古い側から落とす
+    for (const message of candidates) {
+      if (droppedIds.size >= overflow) {
+        break
+      }
+
+      if (!droppedIds.has(message.messageId)) {
+        droppedIds.add(message.messageId)
+      }
+    }
+
+    const kept: DiscordHistoryMessage[] = []
+
+    for (const message of candidates) {
+      if (droppedIds.has(message.messageId)) {
+        skipped.push({ messageId: message.messageId, reason: 'over_limit' })
+
+        continue
+      }
+
+      kept.push(message)
+    }
+
+    return { candidates: kept, skipped }
   }
 
   return { candidates, skipped }
@@ -154,6 +203,24 @@ export type DiscordBackfillDependencies = {
   isHandled(messageId: string): boolean
   // backfill で処理した id を live 側にも伝える（shutdown 後の重複を防ぐ）
   markHandled(messageId: string): void
+  // backfill で turn を終えた id（応答を送り終えた）。restart 後の再応答を抑える記録へ live 側が使う
+  markAnswered(messageId: string): void
+  // restart 前に受理して turn が終わっていなかった ids。含まれる id は age 上限を無視して取り直し、
+  // 取り直して処理を終えるまで cursor をその id より後ろへ進めない。bot.ts は state.json から復元した
+  // Set を渡す（backfill が処理を終えた id をここから除く）
+  unfinishedMessageIds: Set<string>
+}
+
+// live の answer と restart 後の取り直しで同じ nonce を使い回さないための namespace。
+// Discord の enforce_nonce（gateway payload の enforceNonce: true）は「過去数分のあいだ同じ author +
+// 同じ nonce」を 1 通にまとめる（discord-api-types の docs に明記）。chat.ts の shutdown notice は
+// CHAT_SHUTDOWN_UNPROCESSED_REPLY を messageId + chunk 0 の nonce（discordChatReplyNonce）で送るので、
+// 取り直しの answer も同じ nonce にすると、再起動が数分以内に終わった場合に answer の 1 chunk 目が
+// Discord 側で落ちる（notice だけが残り、取り直したのに応答が見えない）。取り直し側だけを別の
+// namespace にすると notice と answer は別の message になり、取り直し同士の重複（取り直し中に kill
+// されて次の restart で再取り直し）は同じ nonce として Discord 側にまとめられる
+export function discordBackfillReplyNonce(messageId: string, chunkIndex: number) {
+  return `araya-${createHash('sha256').update(`backfill:${messageId}:${chunkIndex}`).digest('hex').slice(0, 18)}`
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -241,10 +308,42 @@ export async function runDiscordRestartBackfill(
     config: deps.config,
     botUserId: deps.botUserId,
     nowMs,
+    unfinishedMessageIds: deps.unfinishedMessageIds,
   })
+
+  // history の fetch 結果に無い unfinished は、message が削除されたか fetch 範囲（新しい 100 件）の外。backfill は
+  // history 以外を取り直す手段が無いので、これを unfinished に残したままにすると cursor が恒久的に止まる
+  // （稼働中の log で測った 1574692480371392604 は 2026-11-24T08:00:14Z の shutdown で unfinished に出たが、
+  // 09:02:01Z の restart 後の history に 1 度も現れず、取り直されなかった）。cursor を止めたままにはしないので
+  // 対象から出して log に残す。fetch した後に届いた live message は history に無いだけなので除く
+  // （deps.isHandled はこの process が live で受理した id を含む）
+  const fetchedMessageIds = new Set<string>()
+
+  for (const message of history) {
+    fetchedMessageIds.add(message.messageId)
+  }
+
+  // history が 0 件の fetch（channel が見えない・API が 0 件を返した）では「fetch 結果に無い」ことから
+  // 何も言えないので、unfinished を対象から出さない
+  if (fetchedMessageIds.size > 0) {
+    for (const messageId of [...deps.unfinishedMessageIds]) {
+      if (fetchedMessageIds.has(messageId) || deps.isHandled(messageId)) {
+        continue
+      }
+
+      deps.unfinishedMessageIds.delete(messageId)
+      deps.log({ type: 'discord_backfill_unfinished_unreachable', messageId, historyCount: history.length })
+    }
+  }
 
   for (const skip of selection.skipped) {
     deps.log({ type: 'discord_backfill_ignored', messageId: skip.messageId, reason: skip.reason })
+
+    // 会話にならない id（bot 自身・許可外 user・空本文）は live の discard と同じ扱い。unfinished に
+    // 残したままにすると cursor がその id で止まり続けて、後ろの message も取り直せなくなる
+    if (skip.reason === 'self_message' || skip.reason === 'not_allowed' || skip.reason === 'empty') {
+      deps.unfinishedMessageIds.delete(skip.messageId)
+    }
   }
 
   const handled: string[] = []
@@ -252,7 +351,8 @@ export async function runDiscordRestartBackfill(
 
   for (const message of selection.candidates) {
     if (deps.isHandled(message.messageId)) {
-      // live で既に処理した id。nonce が同じなので送っても Discord では 1 通にまとまるが、会話を二重に走らせない
+      // live（この process）か前回の process で既に処理した id。Discord は同じ author + 同じ nonce を過去数分の
+      // あいだ 1 通にまとめるだけで、数分以上経った再送信は channel に届く。会話を二重に走らせないここで止める
       deps.log({ type: 'discord_backfill_ignored', messageId: message.messageId, reason: 'already_handled' })
 
       continue
@@ -275,23 +375,34 @@ export async function runDiscordRestartBackfill(
       ageMs,
     })
 
-    // backfill の返信は channel への send（live の message.reply と同じ nonce rule）。
-    // chatHandler 側で chunk と nonce を決めるので、ここでは送るだけにする
-    const reply = async (content: string, nonce: string) => {
-      await deps.gateway.sendText(content, nonce)
+    // chatHandler が渡す nonce は live の answer と同じ値（discordChatReplyNonce は messageId と chunk
+    // index だけから決まり、restart しても同じ値になる）なので捨てて、取り直し専用の nonce を送る
+    // （上の discordBackfillReplyNonce の comment）。chunk 順は chatHandler が決める順のまま数える
+    const chunkIndexByMessageId = new Map<string, number>()
+    const reply = async (content: string, liveNonce: string) => {
+      void liveNonce
+      const chunkIndex = chunkIndexByMessageId.get(message.messageId) ?? 0
+
+      chunkIndexByMessageId.set(message.messageId, chunkIndex + 1)
+      await deps.gateway.sendText(content, discordBackfillReplyNonce(message.messageId, chunkIndex))
     }
 
     await deps.chatHandler.handle(message, reply)
     handled.push(message.messageId)
+    deps.markAnswered(message.messageId)
+    // 取り直しが終わった id は unfinished から出す（age 上限を無視して取り直す対象はここまでの分だけ）
+    deps.unfinishedMessageIds.delete(message.messageId)
 
     // cursor を 1 件ずつ前に進める。live と同じ規則で turn が終わってから進めるので、
-    // 処理中に kill された message は次の restart の backfill が取り直します（at-least-once）
+    // 処理中に kill された message は次の restart の backfill が取り直します（at-least-once）。
+    // まだ取り直していない unfinished より後ろへは進めない（bot.ts の discard 経路と同じ gate）
     const advanced = noteDiscordSeenMessageId(current, message.messageId)
 
-    if (advanced !== current) {
+    if (advanced !== current && canAdvanceCursorPast(deps.unfinishedMessageIds, message.messageId)) {
       current = advanced
-      deps.saveState(advanced)
     }
+
+    deps.saveState(current)
   }
 
   if (handled.length > 0 || selection.skipped.length > 0) {
@@ -300,6 +411,9 @@ export async function runDiscordRestartBackfill(
       handled: handled.length,
       skipped: selection.skipped.length,
       cursor,
+      // 取り直しを終えた位置の cursor。unfinished が残っている間はここが進んでいないことを discord.log から
+      // 確かめる（cursor は取り直し開始前の位置）
+      cursorAfter: current.lastSeenMessageId ?? null,
       // cursor から history の最新 id までの Discord 側の時間差（message を受信できていなかった期間の実測用）
       unreceivedMs: (() => {
         const cursorMs = discordMessageTimestampMs(cursor)
@@ -311,6 +425,9 @@ export async function runDiscordRestartBackfill(
 
         return Math.max(0, newestMs - cursorMs)
       })(),
+      // 取り直しを終えた後も残っている unfinished。history に届かなかった id は unreachable として log 出しするので、
+      // ここに残る id は次の restart の history 候補として取り直せる id だけ
+      unfinishedRemaining: deps.unfinishedMessageIds.size,
     })
   }
 
