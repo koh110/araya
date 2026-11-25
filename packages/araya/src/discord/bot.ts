@@ -11,6 +11,7 @@ import { collectSecretValues, createRedactor } from '../infrastructure/redaction
 import { dataDirHash, discordUnitName } from '../infrastructure/systemd.ts'
 import { loadDiscordConfig, type DiscordConfig } from './config.ts'
 import {
+  CHAT_SHUTDOWN_UNPROCESSED_REPLY,
   CHAT_UNAVAILABLE_REPLY,
   createDiscordChatHandler,
   splitDiscordChatReply,
@@ -531,8 +532,14 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
   }
 
   const chatHandlerRef: { current: DiscordChatHandler | null } = { current: null }
-  // #36: live で処理・破棄した message id。backfill は cursor とこの Set で重複を飛ばす
+  // #36: この process が処理を終えた（turn を完走・破棄した / backfill が処理を始めた）message id。
+  // backfill は cursor とこの Set で重複を飛ばす。受理しただけの id はここへ書かない（次へ）
   const liveMessageIds = new Set<string>()
+  // 受理して turn が実行中の ids。live と backfill が同じ message を二重に走らせないための排他で、
+  // backfill はこの id を discord_backfill_ignored reason:"live_processing" で飛ばす。
+  // 受理の事実を liveMessageIds に書いて gate にすると、unfinished の id が live gate で止まって
+  // backfill が取り直せなくなる（at-least-once）。実行中である事実だけを書く
+  const liveProcessingMessageIds = new Set<string>()
   // #36: 受理したが turn が終わっていない id。cursor をこの Set より新しい所へ進めると、
   // 実行中に kill された message が backfill の対象から消えて二度と処理されない（at-least-once の gate）。
   // memory だけだと restart で消える（2026-11-24 の incident で 08:00 の shutdown 後に unfinished が無いまま
@@ -548,12 +555,21 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
   let shuttingDown = false
 
   if (unfinishedMessageIds.size > 0) {
+    const restoredCursor = state.lastSeenMessageId ?? null
+    // cursor の invariant は「この id より古い message を全て処理し終えた」位置。state file 上の unfinished が
+    // cursor より古い側にある = invariant が壊れた state（cursor gate の無い build が書いた・state file を
+    // 手で編集した）。backfill は cursor を戻さずにこれらの id だけ history から取り直す
+    const behindCursor = sortedMessageIds(unfinishedMessageIds).filter((messageId) => {
+      return restoredCursor !== null && !isDiscordMessageIdNewer(messageId, restoredCursor)
+    })
+
     // state.json から復元した unfinished。取り直し（backfill）が走る前に「何が置き去りだったか」を出しておく
     logSafe({
       type: 'discord_unfinished_restored',
       count: unfinishedMessageIds.size,
       messageIds: sortedMessageIds(unfinishedMessageIds).slice(0, 20),
-      cursor: state.lastSeenMessageId ?? null,
+      cursor: restoredCursor,
+      behindCursor: behindCursor.length,
     })
   }
 
@@ -564,18 +580,18 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     })
   }
 
-  // cursor が越えた id の記録は backfill が見ないので持っても意味が無い。Set は中身だけ塗り替える
-  // （backfill と共有している object への参照は保つ）
+  // cursor が越えた answered の記録は backfill が見ないので持っても意味が無い。Set は中身だけ塗り替える
+  // （backfill と共有している object への参照は保つ）。unfinished は逆に、cursor より古い側に残っている
+  // こと自体が「受理したが終わっていない id を cursor が越えた」証拠なので残す。backfill は cursor より
+  // 古い unfinished も history から取り直す（selectBackfillMessages の unfinished gate）
   function pruneIdsBehindCursor(cursor: string | null) {
     if (cursor === null) {
       return
     }
 
-    for (const ids of [unfinishedMessageIds, answeredMessageIds]) {
-      for (const id of ids) {
-        if (!isDiscordMessageIdNewer(id, cursor)) {
-          ids.delete(id)
-        }
+    for (const id of answeredMessageIds) {
+      if (!isDiscordMessageIdNewer(id, cursor)) {
+        answeredMessageIds.delete(id)
       }
     }
   }
@@ -596,11 +612,12 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     }
   }
 
-  // 受理した ids を cursor より古い unfinished に加える。backfill は live で取り直さないために
-  // 受理の事実をすぐ liveMessageIds へ書く（同じ message を live と backfill で二重に走らせない）。
-  // unfinished は受理の時点で state file へ書く（ここで書いておかないと SIGKILL で失われる）
+  // 受理した ids を cursor より古い unfinished に加える。処理中である事実だけ liveProcessingMessageIds に書き、
+  // turn が終わるまで liveMessageIds には書かない（受理の事実だけで live gate を作ると unfinished の id が
+  // backfill の取り直しから外れる）。unfinished は受理の時点で state file へ書く（ここで書いておかないと
+  // SIGKILL で失われる）
   function noteLiveMessageReceived(messageId: string) {
-    liveMessageIds.add(messageId)
+    liveProcessingMessageIds.add(messageId)
     unfinishedMessageIds.add(messageId)
     saveDiscordState(state)
   }
@@ -612,14 +629,29 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     return canAdvanceCursorPast(unfinishedMessageIds, messageId)
   }
 
-  function commitLiveMessageSeen(messageId: string) {
+  // sentAnswer: chat.ts が案内ではなく実応答の chunk を 1 つ以上送れたかどうか（onMessage で reply を
+  // 追跡して数える）。案内だけ送った turn を answered にすると、Discord 側への送信結果に処理の完了を
+  // 依存させることになる
+  function commitLiveMessageSeen(messageId: string, sentAnswer: boolean) {
+    liveProcessingMessageIds.delete(messageId)
+
     if (shuttingDown) {
-      // 置き去りにした turn の id は unfinished に残す（discord_shutdown_unfinished に載る）
+      // 置き去りにした turn の id は unfinished に残す（discord_shutdown_unfinished に載る）。drain が送る
+      // 「今回は処理できませんでした。」（self notice）は送信結果であって処理の完了ではない。2026-11-24 の
+      // incident ではこの案内自体が Discord に届いていない（1574692480371392604 で
+      // discord_chat_reply_failed）ので、notice の送信記録を取り直しの skip 条件にしない
       return
     }
 
+    // turn を完走した id は unfinished から出す（unfinished に残すと cursor がその id で止まり続ける）。
+    // answered に記録するのは実応答を送れた場合だけ。会話 session が無くて CHAT_UNAVAILABLE_REPLY だけを
+    // 送った turn などは answered にならないので、cursor がその id に届いていなければ次の restart の
+    // backfill が取り直す
     unfinishedMessageIds.delete(messageId)
-    answeredMessageIds.add(messageId)
+
+    if (sentAnswer) {
+      answeredMessageIds.add(messageId)
+    }
 
     if (!canAdvanceCursor(messageId)) {
       // unfinished が残る間は cursor を進めない。取り直した側が cursor を動かすまで待つ。
@@ -713,10 +745,17 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
             saveDiscordState(noteDiscordSeenMessageId(state, next.lastSeenMessageId ?? ''))
           },
           isHandled: (messageId) => {
-            // live（この process）で処理・破棄した id か、前回の process で応答まで送った id。
-            // 後者は state.json から復元した（Discord が同じ nonce を 1 通にまとめるのは過去数分のあいだだけなので、
-            // restart 後の再送信は nonce では抑えられない）
-            return liveMessageIds.has(messageId) || answeredMessageIds.has(messageId)
+            // live gate は「受理した事実」ではない。飛ばすのは (1) この process が処理中
+            // （liveProcessingMessageIds）、(2) この process が処理を終えた（liveMessageIds: turn 完走・破棄 /
+            // backfill が処理を始めた）、(3) 前回の process で実応答を送った（answeredMessageIds）id だけ。
+            // unfinished の id は unfinished 側を優先する（案内だけ送った id が answered に混ざった state file
+            // でも取り直される）。Discord が同じ author + 同じ nonce を 1 通にまとめるのは過去数分のあいだだけ
+            // なので、(3) は state.json の記録で止めている
+            return (
+              liveMessageIds.has(messageId) ||
+              liveProcessingMessageIds.has(messageId) ||
+              (answeredMessageIds.has(messageId) && !unfinishedMessageIds.has(messageId))
+            )
           },
           markHandled: (messageId) => {
             liveMessageIds.add(messageId)
@@ -727,6 +766,9 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
           // state.json から復元した unfinished。backfill はこの id を age 上限を無視して取り直し、
           // 取り直す間は cursor をその id より後ろへ進めない
           unfinishedMessageIds,
+          // live で受理して turn が実行中の ids。backfill はこれを reason:"live_processing" で飛ばす
+          // （live 側が終わってから同じ id を取り直す）
+          liveProcessingMessageIds,
         })
       })().catch((error: unknown) => {
         logError('discord_backfill_failed', error)
@@ -735,12 +777,35 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     onMessage: async (message, reply) => {
       // #36: cursor は turn が終わった後に進める。drain budget で置き去りにされた message は cursor が
       // 動いていないので、restart 後の backfill が同じ id から取り直します（at-least-once）
+      // 排他: backfill が処理を始めた／終えた id を live で再び走らせない（Discord が同じ message を 2 度
+      // 配信したときの二重応答もここで止める）
+      if (liveMessageIds.has(message.messageId) || liveProcessingMessageIds.has(message.messageId)) {
+        logSafe({
+          type: 'discord_chat_duplicate_skipped',
+          messageId: message.messageId,
+          reason: liveMessageIds.has(message.messageId) ? 'already_processed' : 'already_processing',
+        })
+
+        return
+      }
+
       noteLiveMessageReceived(message.messageId)
+      // chat.ts が送る reply を数える。self notice（CHAT_SHUTDOWN_UNPROCESSED_REPLY）と会話機能不可の案内
+      // （CHAT_UNAVAILABLE_REPLY）は Discord 側への送信結果であって処理の完了ではないので、これだけを
+      // 送った turn を answered に記録しない。会話を実行して失敗した旨の案内（CHAT_ERROR_REPLY）は turn が
+      // 走った結果なので answered に数える（失敗した message を restart ごとに試し直さない）
+      let answerChunks = 0
 
       try {
-        await chatHandlerRef.current?.handle(message, reply)
+        await chatHandlerRef.current?.handle(message, async (content, nonce) => {
+          if (content !== CHAT_SHUTDOWN_UNPROCESSED_REPLY && content !== CHAT_UNAVAILABLE_REPLY) {
+            answerChunks += 1
+          }
+
+          await reply(content, nonce)
+        })
       } finally {
-        commitLiveMessageSeen(message.messageId)
+        commitLiveMessageSeen(message.messageId, answerChunks > 0)
       }
     },
     // slash command（/araya ... / /hoot ...）。queue を通さないので会話の実行中でも効く

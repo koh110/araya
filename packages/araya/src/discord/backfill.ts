@@ -7,7 +7,12 @@
 // 古い側に残るので、次の restart でここに取り直される
 
 import { createHash } from 'node:crypto'
-import { discordChatAdmissionFailures, type DiscordChatHandler } from './chat.ts'
+import {
+  CHAT_SHUTDOWN_UNPROCESSED_REPLY,
+  CHAT_UNAVAILABLE_REPLY,
+  discordChatAdmissionFailures,
+  type DiscordChatHandler,
+} from './chat.ts'
 import type { DiscordConfig } from './config.ts'
 import type { DiscordGateway, DiscordHistoryMessage } from './gateway.ts'
 import {
@@ -90,8 +95,9 @@ export function selectBackfillMessages(
   const candidates: DiscordHistoryMessage[] = []
 
   for (const message of input.history) {
-    // live で既に処理・破棄した id は取り直さない
-    if (!isDiscordMessageIdNewer(message.messageId, input.cursor)) {
+    // cursor gate 以前に書かれた state file など、cursor の invariant が壊れた state 上の unfinished もここで
+    // 取り直す（上の selectBackfillMessages の unfinished gate）
+    if (!isDiscordMessageIdNewer(message.messageId, input.cursor) && !unfinishedMessageIds.has(message.messageId)) {
       continue
     }
 
@@ -199,16 +205,23 @@ export type DiscordBackfillDependencies = {
   state: DiscordBotState
   // cursor を前に進めた state を保存する（bot.ts は state.json へ書く）
   saveState(state: DiscordBotState): void
-  // 同じ message を live で既に処理していたら取り直さない
+  // 同じ message を live で既に処理しているか、前回の process で応答を送り終えた id なら取り直さない。
+  // 「受理した事実」だけでは飛ばさない（liveProcessingMessageIds は実行中の id だけ）。unfinished の id は
+  // どの記録に入っていても unfinished 側を優先して取り直す（案内の送信記録に処理完了を依存させない）
   isHandled(messageId: string): boolean
   // backfill で処理した id を live 側にも伝える（shutdown 後の重複を防ぐ）
   markHandled(messageId: string): void
-  // backfill で turn を終えた id（応答を送り終えた）。restart 後の再応答を抑える記録へ live 側が使う
+  // backfill で turn を終えて実応答の chunk を送れた id。restart 後の再応答を抑える記録（案内だけ送った
+  // turn はここに記録しない）
   markAnswered(messageId: string): void
   // restart 前に受理して turn が終わっていなかった ids。含まれる id は age 上限を無視して取り直し、
   // 取り直して処理を終えるまで cursor をその id より後ろへ進めない。bot.ts は state.json から復元した
   // Set を渡す（backfill が処理を終えた id をここから除く）
   unfinishedMessageIds: Set<string>
+  // live（この process）で受理して turn が実行中の ids。同じ message を live と backfill で二重に走らせない
+  // ための排他。この id は reason:"live_processing" で飛ばし、unfinished には残したままにする（live 側が
+  // 終わるか、process が kill されて次の restart の取り直しまで待ち合わせる）
+  liveProcessingMessageIds: Set<string>
 }
 
 // live の answer と restart 後の取り直しで同じ nonce を使い回さないための namespace。
@@ -327,7 +340,9 @@ export async function runDiscordRestartBackfill(
   // 何も言えないので、unfinished を対象から出さない
   if (fetchedMessageIds.size > 0) {
     for (const messageId of [...deps.unfinishedMessageIds]) {
-      if (fetchedMessageIds.has(messageId) || deps.isHandled(messageId)) {
+      // live で受理して実行中の id は history の fetch より後に届いただけなので「fetch 結果に無い」だけで
+      // 対象から出せない（案 1 では受理の事実を liveMessageIds に書かないので、isHandled にも入っていない）
+      if (fetchedMessageIds.has(messageId) || deps.liveProcessingMessageIds.has(messageId) || deps.isHandled(messageId)) {
         continue
       }
 
@@ -351,9 +366,11 @@ export async function runDiscordRestartBackfill(
 
   for (const message of selection.candidates) {
     if (deps.isHandled(message.messageId)) {
-      // live（この process）か前回の process で既に処理した id。Discord は同じ author + 同じ nonce を過去数分の
-      // あいだ 1 通にまとめるだけで、数分以上経った再送信は channel に届く。会話を二重に走らせないここで止める
-      deps.log({ type: 'discord_backfill_ignored', messageId: message.messageId, reason: 'already_handled' })
+      // live gate で飛ばすのは「処理中」か「処理を終えた」id だけ。受理した事実は gate ではないので、
+      // unfinished の id はここで飛ばされない（live が処理中の id は live 側が終わるまで待つ）
+      const reason = deps.liveProcessingMessageIds.has(message.messageId) ? 'live_processing' : 'already_handled'
+
+      deps.log({ type: 'discord_backfill_ignored', messageId: message.messageId, reason })
 
       continue
     }
@@ -379,18 +396,33 @@ export async function runDiscordRestartBackfill(
     // index だけから決まり、restart しても同じ値になる）なので捨てて、取り直し専用の nonce を送る
     // （上の discordBackfillReplyNonce の comment）。chunk 順は chatHandler が決める順のまま数える
     const chunkIndexByMessageId = new Map<string, number>()
+    // 実応答の chunk を送れたか数える。self notice（CHAT_SHUTDOWN_UNPROCESSED_REPLY）と会話機能不可の案内
+    // （CHAT_UNAVAILABLE_REPLY）は Discord 側への送信結果であって処理の完了ではないので、これだけ送った
+    // turn を answered に記録しない（notice の送信記録に取り直し判断を依存させない）。会話を実行して
+    // 失敗した旨の案内（CHAT_ERROR_REPLY）は turn が走った結果なので answered に数える
+    let answerChunks = 0
     const reply = async (content: string, liveNonce: string) => {
       void liveNonce
       const chunkIndex = chunkIndexByMessageId.get(message.messageId) ?? 0
 
       chunkIndexByMessageId.set(message.messageId, chunkIndex + 1)
+
+      if (content !== CHAT_SHUTDOWN_UNPROCESSED_REPLY && content !== CHAT_UNAVAILABLE_REPLY) {
+        answerChunks += 1
+      }
+
       await deps.gateway.sendText(content, discordBackfillReplyNonce(message.messageId, chunkIndex))
     }
 
     await deps.chatHandler.handle(message, reply)
     handled.push(message.messageId)
-    deps.markAnswered(message.messageId)
-    // 取り直しが終わった id は unfinished から出す（age 上限を無視して取り直す対象はここまでの分だけ）
+
+    if (answerChunks > 0) {
+      deps.markAnswered(message.messageId)
+    }
+
+    // 取り直して turn を終えた id は unfinished から出す（残すと cursor がその id で止まり続ける）。
+    // age 上限を無視して取り直す対象はここまでの分だけ
     deps.unfinishedMessageIds.delete(message.messageId)
 
     // cursor を 1 件ずつ前に進める。live と同じ規則で turn が終わってから進めるので、
