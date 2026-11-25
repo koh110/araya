@@ -12,6 +12,7 @@ import {
   DISCORD_STATE_VERSION_BEFORE_UNFINISHED,
   canAdvanceCursorPast,
   discordStateFilePath,
+  idsBehindCursor,
   isDiscordMessageIdNewer,
   newState,
   noteDiscordSeenMessageId,
@@ -218,6 +219,21 @@ test('discord state: the cursor gate refuses to pass an older unfinished id', ()
   assert.equal(canAdvanceCursorPast([unfinishedNewer], messageId), true)
   assert.equal(canAdvanceCursorPast([], messageId), true)
   assert.equal(canAdvanceCursorPast(new Set<string>(), messageId), true)
+})
+
+test('discord state: idsBehindCursor drops the ids the cursor already passed and keeps newer unfinished', () => {
+  const cursor = messageIdAtAge(30_000)
+  const older = messageIdAtAge(60_000)
+  const newer = messageIdAtAge(5_000)
+
+  // cursor が既に越えた id は unfinished / answered 両方で prune 対象（state file が膨れないため）
+  assert.deepEqual(idsBehindCursor([older], cursor), [older])
+  assert.deepEqual(idsBehindCursor(new Set<string>([older, newer]), cursor), [older])
+  // unfinished が cursor より新しい間は残す（まだ backfill の取り直し対象）
+  assert.deepEqual(idsBehindCursor([newer], cursor), [])
+  assert.deepEqual(idsBehindCursor(new Set<string>([newer]), cursor), [])
+  // cursor が無い state では何も落とさない（取り直しの対象を消さない）
+  assert.deepEqual(idsBehindCursor([older, newer], null), [])
 })
 
 test('discord state: the cursor only advances and updates do not mutate the previous state', () => {

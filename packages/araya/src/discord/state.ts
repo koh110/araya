@@ -28,9 +28,14 @@ export type DiscordBotState = {
   // 受理したが turn が終わっていない ids。restart 後の backfill が「age 上限を越えていても」取り直す対象。
   // 旧 state には無いので読み込み時は optional（migration で空配列）
   unfinishedMessageIds?: string[]
-  // turn を終えて応答を送ったが、cursor がより古い unfinished で止まっているために cursor が届いていない ids。
-  // restart 後の backfill が同じ message に二度応答するのを防ぐ記録（Discord が同じ author + 同じ nonce を
-  // 1 通にまとめるのは過去数分のあいだだけ）
+  // turn を終えて実応答を送れた ids。cursor がより古い unfinished で止まっている間は cursor がその id に
+  // 届かないので、restart 後の backfill が同じ message に二度応答するのを防ぐ記録として残す。
+  // 設計の択は「nonce だけに依存せず、state file に保存した answered で skip する」方。Discord が同じ
+  // author + 同じ nonce を 1 通にまとめるのは過去数分のあいだだけなので、restart をまたいだ再応答は nonce
+  // では止められない。at-least-once は壊れない: unfinished かつ answered でない id は age 上限を無視して
+  // 必ず取り直し、turn 完了＋応答送信済みは処理完了なので再実行しない。応答送信中に process が消えた case は
+  // answered に入らないので unfinished のまま残り、次の restart が取り直して二度走ることがある
+  // （at-least-once の副作用として許容する。二重送信を防ぎすぎて取り直しを止めるより軽い）
   answeredMessageIds?: string[]
 }
 
@@ -212,6 +217,28 @@ export function canAdvanceCursorPast(
   }
 
   return true
+}
+
+// cursor が既に越えている ids を返す（state file に書く前の prune 用）。cursor が無い state では何も
+// 返さない。cursor が届いた側の ids を持ち続けると state file が無制限に膨れる：answered は backfill が
+// cursor より新しい物だけを見るので持つ意味が無く、unfinished は cursor がその id を越えた時点で backfill の
+// 取り直し対象から外れる（取り直しを待って持ち続けると cursor が恒久的に止まる）。unfinished を cursor
+// より新しい間（＝まだ取り直し対象）は残す。起動直後の save での pruning だけは bot.ts で例外にしている
+// （cursor gate 以前に書かれた state の unfinished を、backfill が読む前に消さないため）
+export function idsBehindCursor(ids: Iterable<string>, cursor: string | null): string[] {
+  if (cursor === null) {
+    return []
+  }
+
+  const behind: string[] = []
+
+  for (const id of ids) {
+    if (!isDiscordMessageIdNewer(id, cursor)) {
+      behind.push(id)
+    }
+  }
+
+  return behind
 }
 
 // 同じ directory の一時 file（mode 0600）に書いてから rename する。directory が無ければ mode 0700 で作る

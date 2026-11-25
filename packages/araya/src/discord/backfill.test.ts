@@ -7,6 +7,7 @@ import {
 } from '../../test/support/discord-snowflake.ts'
 
 import {
+  BACKFILL_FETCH_LIMIT,
   BACKFILL_MAX_AGE_MS,
   BACKFILL_MAX_MESSAGES,
   discordBackfillReplyNonce,
@@ -132,6 +133,8 @@ test('backfill: 上限より多い history では新しい側を残し、古い�
   assert.equal(selection.candidates.length, BACKFILL_MAX_MESSAGES)
   assert.equal(selection.skipped.length, 3)
   assert.ok(selection.skipped.every((skip) => skip.reason === 'over_limit'))
+  // unfinished ではない古い側だけで足りたので stuck は無い
+  assert.deepEqual(selection.stuckUnfinishedMessageIds, [])
   // 落としたのは一番古い 3 件（age が最大の物）
   assert.deepEqual(
     selection.skipped.map((skip) => skip.messageId).sort(),
@@ -162,6 +165,9 @@ function createBackfillHarness(
   history: readonly DiscordHistoryMessage[],
   options: {
     failFetch?: boolean
+    // gateway が history API を持たない case（DiscordGateway.fetchRecentMessages が optional なので、
+    // 古い fake・API を閉じた build を模する）。undefined にしないとこの case を通せない
+    noHistoryApi?: boolean
     // chatHandler が送る本文。既定では実応答。CHAT_UNAVAILABLE_REPLY など案内だけ送らせるテストで使う
     replyTextFor?: (message: DiscordChatMessage) => string
   } = {},
@@ -179,11 +185,13 @@ function createBackfillHarness(
     async sendText(content, nonce) {
       sent.push({ content, nonce })
     },
-    fetchRecentMessages: options.failFetch
-      ? async () => {
-          throw new Error('history fetch failed')
-        }
-      : async () => [...history],
+    fetchRecentMessages: options.noHistoryApi
+      ? undefined
+      : options.failFetch
+        ? async () => {
+            throw new Error('history fetch failed')
+          }
+        : async () => [...history],
     async registerCommands() {
       return 2
     },
@@ -389,17 +397,17 @@ test('backfill: history が読めなくても bot の起動を止めない（理
     ),
   )
 
-  // gateway が history API を持たない（古い fake など）場合も飛ばす
-  const noApi = createBackfillHarness([])
+  // gateway が history API を持たない（harness の noHistoryApi）場合も飛ばす
+  const noApi = createBackfillHarness([], { noHistoryApi: true })
   const outcomeNoApi = await runDiscordRestartBackfill({
     ...harnessDeps(noApi),
-    gateway: { ...noApi.gateway, fetchRecentMessages: undefined },
     state: newState(),
     saveState: () => {},
     isHandled: () => false,
     markHandled: () => {},
   })
 
+  assert.equal(noApi.gateway.fetchRecentMessages, undefined)
   assert.equal(outcomeNoApi.seeded, false)
   assert.ok(noApi.logs.some((entry) => entry.reason === 'history_api_unavailable'))
 })
@@ -764,6 +772,86 @@ test('backfill: over_limit で取り直せなかった unfinished より後ろ�
   assert.ok(summary !== undefined)
   assert.equal(summary.unfinishedRemaining, 1)
   assert.equal(summary.cursorAfter, cursor, '取り直せなかった unfinished より後ろへ進んでいない')
+})
+
+test('backfill: over_limit で落とした unfinished は stuckUnfinishedMessageIds と discord_backfill_unfinished_stuck に出す', async () => {
+  // 黙って cursor を止める状態（取り直し対象なのに 20 件の上限で落とされた unfinished）を log で見られるようにする
+  const cursor = messageIdAtAge(300_000)
+  const unfinishedIds: string[] = []
+
+  for (let index = 0; index < BACKFILL_MAX_MESSAGES + 1; index += 1) {
+    unfinishedIds.push(messageIdAtAge(200_000 - index * 1_000))
+  }
+
+  const droppedId = unfinishedIds[0]!
+  const history: DiscordHistoryMessage[] = [historyMessage(cursor)]
+
+  for (const messageId of unfinishedIds) {
+    history.push(historyMessage(messageId))
+  }
+
+  const harness = createBackfillHarness(history)
+
+  for (const messageId of unfinishedIds) {
+    harness.unfinishedMessageIds.add(messageId)
+  }
+
+  let state: DiscordBotState = {
+    ...newState(),
+    lastSeenMessageId: cursor,
+    unfinishedMessageIds: [...unfinishedIds],
+  }
+
+  await runDiscordRestartBackfill({
+    ...harnessDeps(harness),
+    state,
+    saveState: (next) => {
+      state = next
+    },
+    isHandled: () => false,
+    markHandled: () => {},
+  })
+
+  const stuck = harness.logs.find((entry) => {
+    return entry.type === 'discord_backfill_unfinished_stuck'
+  })
+
+  assert.ok(stuck !== undefined, 'over_limit で落とした unfinished を log に出す')
+  assert.equal(stuck.count, 1)
+  assert.deepEqual(stuck.messageIds, [droppedId])
+  assert.equal(stuck.cursor, cursor)
+  assert.equal(stuck.maxMessages, BACKFILL_MAX_MESSAGES)
+  assert.equal(stuck.fetchLimit, BACKFILL_FETCH_LIMIT)
+})
+
+test('backfill: selectBackfillMessages は unfinished ではない古い側を落としたぶんだけ stuck に出す', () => {
+  const cursor = messageIdAtAge(300_000)
+  const ids: string[] = []
+
+  for (let index = 0; index < BACKFILL_MAX_MESSAGES + 3; index += 1) {
+    ids.push(messageIdAtAge(200_000 - index * 1_000))
+  }
+
+  // 古い 22 件が unfinished、新しい 1 件だけ unfinished ではない（overflow 3 のうち 1 件は捨ててよい古い側）
+  const unfinishedMessageIds = new Set<string>(ids.slice(0, ids.length - 1))
+  const selection = selectBackfillMessages({
+    history: ids.map((messageId) => {
+      return historyMessage(messageId)
+    }),
+    cursor,
+    config,
+    botUserId: BOT_USER_ID,
+    nowMs: () => NOW_MS,
+    unfinishedMessageIds,
+  })
+
+  assert.equal(selection.candidates.length, BACKFILL_MAX_MESSAGES)
+  assert.deepEqual(selection.stuckUnfinishedMessageIds, [ids[0], ids[1]])
+  assert.ok(
+    selection.skipped.every((skip) => {
+      return skip.reason === 'over_limit'
+    }),
+  )
 })
 
 test('backfill: 会話にならない unfinished（bot 自身・許可外 user）は unfinished から出して cursor を止めたままにしない', async () => {
