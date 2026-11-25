@@ -1107,8 +1107,11 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
       logSafe({ type: 'discord_restart_notice', ok })
     })
 
-    // report 配送は agent host の durable task 側で進む。bot loop は stop まで待つ
+    // report 配送は agent host の durable task 側で進む。bot loop は stop まで待つ。
+    // 待っているだけの区間で chat の停滞検査だけを動かす（実行中の turn が CHAT_STALL_WARN_MS を
+    // 超えたら discord_chat_stalled に 1 回残る。status を開いていない停滞もここで可視化する）
     while (!deps.stopSignal.aborted) {
+      chatHandlerRef.current?.tick()
       await sleep(pollMs, deps.stopSignal)
     }
   } finally {
@@ -1132,7 +1135,7 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
 
     const chatHandler = chatHandlerRef.current
     chatHandler?.stopAccepting()
-    const pending = chatHandler?.pendingCount() ?? { queued: 0, processing: 0 }
+    const pending = chatHandler?.pendingCount() ?? { queued: 0, processing: 0, elapsedMs: null }
     // drain がどこまで進んだかの実測できる証跡（#36: graceful drain が動いているかを log で確かめる）
     logSafe({
       type: 'discord_stopping',

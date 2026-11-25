@@ -18,6 +18,8 @@ export type DiscordControlContext = {
   // main conversation の durable id（session が未開なら null）
   conversationId: number | null
   runningCount: number
+  // 実行中の turn が始まってからの経過時間（ms）。実行中 0 件なら null
+  runningElapsedMs?: number | null
   queuedCount: number
   sessionAvailable: boolean
   progress?: ProgressSnapshot | null
@@ -118,6 +120,27 @@ function elapsedLabel(nowMs: number, startedAtMs: number | null, isEstimated: bo
   }
 
   return isEstimated ? `少なくとも${label}（観測時点から）` : label
+}
+
+function durationLabel(elapsedMs: number | null | undefined) {
+  // 開始直後（< 1 秒）の「うち 0秒」は情報にならないので出さない。停滞を見たいときの表示
+  if (elapsedMs === null || elapsedMs === undefined || !Number.isFinite(elapsedMs) || elapsedMs < 1_000) {
+    return ''
+  }
+
+  const totalSeconds = Math.max(0, Math.floor(elapsedMs / 1_000))
+
+  if (totalSeconds < 60) {
+    return `（うち ${totalSeconds.toString()}秒）`
+  }
+
+  const minutes = Math.floor(totalSeconds / 60)
+
+  if (minutes < 60) {
+    return `（うち ${minutes.toString()}分）`
+  }
+
+  return `（うち ${Math.floor(minutes / 60).toString()}時間${(minutes % 60).toString()}分）`
 }
 
 function progressLines(progress: ProgressSnapshot, nowMs: number, runningCount: number) {
@@ -344,7 +367,9 @@ export function createDiscordControlCommands(
         const session =
           context.conversationId === null
             ? '会話 session は開けていません（agent session がありません）'
-            : `会話: main conversation #${context.conversationId.toString()} / 実行中 ${context.runningCount.toString()} / 待ち ${context.queuedCount.toString()}`
+            : `会話: main conversation #${context.conversationId.toString()} / 実行中 ${context.runningCount.toString()}${
+                context.runningCount > 0 ? durationLabel(context.runningElapsedMs) : ''
+              } / 待ち ${context.queuedCount.toString()}`
         let hootText: string
 
         try {

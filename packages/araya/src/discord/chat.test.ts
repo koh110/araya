@@ -6,6 +6,7 @@ import { join } from 'node:path'
 
 import {
   createDiscordChatHandler,
+  CHAT_STALL_WARN_MS,
   discordChatReplyNonce,
   isDiscordChatMessageAllowed,
   splitDiscordChatReply,
@@ -1208,4 +1209,83 @@ test('discord chat: runControl は Discord の allowlist を要求しない（CL
   // runControl は bot process 内の control 経路なので Discord の allowlist は通さない（境界は control dir を書ける OS user）
   const text = await handler.runControl(commandRequest({ subcommand: 'status', userId: 'cli' }))
   assert.match(text, /main conversation #3/)
+})
+
+test('discord chat: 実行中の turn が CHAT_STALL_WARN_MS を超えたら discord_chat_stalled を 1 回だけ log に出す', async () => {
+  const logs: Record<string, unknown>[] = []
+  let clockMs = 1_000_000
+  let releaseTurn: (() => void) | undefined
+  let submitCount = 0
+  const handler = createDiscordChatHandler({
+    config,
+    botUserId: '12345678901234567',
+    dataDir: chatDataDir,
+    redactor: createRedactor([]),
+    nowMs: () => {
+      return clockMs
+    },
+    session: {
+      submit: async () => {
+        submitCount += 1
+
+        // 1 件目の turn だけ完了させない（main 会話を待っている状態を再現する）
+        if (submitCount === 1) {
+          await new Promise<void>((resolve) => {
+            releaseTurn = resolve
+          })
+        }
+
+        return '遅い回答'
+      },
+      reset: async () => {},
+    },
+    log: (entry) => {
+      logs.push(entry)
+    },
+  })
+
+  const stuck = handler.handle(
+    { ...message, messageId: '92345678901234701', content: '時間のかかる依頼' },
+    async () => {},
+  )
+  // tail 上で turn が始まる（processing が 1 になる）まで待つ
+  await new Promise((resolve) => {
+    setTimeout(resolve, 0)
+  })
+  const waiting = handler.handle(
+    { ...message, messageId: '92345678901234702', content: '待ちの依頼' },
+    async () => {},
+  )
+
+  // 基準未満の tick では log を出さない
+  handler.tick()
+  assert.deepEqual(logs.filter((entry) => entry.type === 'discord_chat_stalled'), [])
+  assert.equal(handler.pendingCount().processing, 1)
+  assert.equal(handler.pendingCount().queued, 1)
+
+  clockMs += CHAT_STALL_WARN_MS
+  handler.tick()
+  handler.tick()
+
+  const stalled = logs.filter((entry) => {
+    return entry.type === 'discord_chat_stalled'
+  })
+  assert.equal(stalled.length, 1, '停滞 log は turn ごとに 1 回だけ')
+  assert.equal(stalled[0]?.messageId, '92345678901234701')
+  assert.ok((stalled[0]?.elapsedMs as number) >= CHAT_STALL_WARN_MS)
+  assert.equal(stalled[0]?.queued, 1)
+  assert.ok((handler.pendingCount().elapsedMs as number) >= CHAT_STALL_WARN_MS)
+
+  releaseTurn?.()
+  await stuck
+  await waiting
+
+  // turn が終わったら経過時間は null（次回 turn でまた 1 回だけ log に出る）
+  assert.equal(handler.pendingCount().elapsedMs, null)
+  assert.equal(
+    logs.filter((entry) => {
+      return entry.type === 'discord_chat_stalled'
+    }).length,
+    1,
+  )
 })

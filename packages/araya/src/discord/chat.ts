@@ -189,9 +189,15 @@ export type DiscordChatHandler = {
   inject(injection: DiscordChatInjection, reply: DiscordChatReply): Promise<string>
   stopAccepting(): void
   drain(): Promise<void>
-  // shutdown log 用の pending 内訳（実行待ちの queue 残り と 実行中の turn）
-  pendingCount(): { queued: number; processing: number }
+  // 実行中の turn が CHAT_STALL_WARN_MS を超えて続いているかを log に出す（bot の poll loop から呼ぶ）
+  tick(): void
+  // shutdown log 用の pending 内訳（実行待ちの queue 残り と 実行中の turn。elapsedMs は turn の経過時間）
+  pendingCount(): { queued: number; processing: number; elapsedMs: number | null }
 }
+
+// 「実行中」が続くturn を停滞として log に出す基準。HOOT の dispatch も含む main 会話の turn は
+// 数分で終わるのが普通なので、5 分すぎたら人間が気づける証跡を残す
+export const CHAT_STALL_WARN_MS = 5 * 60_000
 
 export const CHAT_UNAVAILABLE_REPLY =
   '現在、Araya の会話機能を利用できません。管理者は discord.log を確認してください。'
@@ -214,11 +220,17 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
   const queued: { message: DiscordChatMessage; reply: DiscordChatReply; cancelled: boolean }[] = []
   // 実行中の turn 数（status 表示用）
   let processing = 0
+  // 実行中の turn が始まり、まだ終わっていない message id（stall log・status 表示共用）
+  let processingMessageId: string | null = null
+  let processingStartedAtMs: number | null = null
+  // 停滞 log は turn ごとに 1 回だけ（5 秒おきの tick で log を埋めない）
+  let stallLogged = false
+  const nowMs = deps.nowMs ?? ((): number => Date.now())
   const control =
     deps.control ??
     createDiscordControlCommands({
       dataDir: deps.dataDir,
-      nowMs: deps.nowMs ?? ((): number => Date.now()),
+      nowMs,
       log: deps.log,
     })
 
@@ -228,6 +240,40 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
     } catch {
       return null
     }
+  }
+
+  // 実行中の turn が始まってからどれだけ経ったか（0 件なら null）
+  function processingElapsedMs() {
+    if (processingStartedAtMs === null) {
+      return null
+    }
+
+    return Math.max(0, nowMs() - processingStartedAtMs)
+  }
+
+  // main 会話を待っている turn が CHAT_STALL_WARN_MS を超えたら 1 回だけ log に残す。
+  // 2026-11-24 の 15h 停滞は「実行中 1 / 待ち 1」の数だけで、人間が `araya status` を見た時にしか
+  // 経過時間が読めなかった（log には received / failed の間が何も無い）。経過時間を log 側にも出す
+  function reportStall() {
+    if (processing === 0 || stallLogged) {
+      return
+    }
+
+    const elapsedMs = processingElapsedMs()
+
+    if (elapsedMs === null || elapsedMs < CHAT_STALL_WARN_MS) {
+      return
+    }
+
+    stallLogged = true
+    deps.log({
+      type: 'discord_chat_stalled',
+      messageId: processingMessageId,
+      elapsedMs,
+      processing,
+      queued: queued.length,
+      conversationId: sessionDescription()?.conversationId ?? null,
+    })
   }
 
   async function sendText(reply: DiscordChatReply, messageId: string, content: string) {
@@ -269,6 +315,9 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
     }
 
     processing += 1
+    processingMessageId = message.messageId
+    processingStartedAtMs = nowMs()
+    stallLogged = false
 
     try {
       const answer = await deps.session.submit(
@@ -281,6 +330,12 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
       await send(message, reply, CHAT_ERROR_REPLY)
     } finally {
       processing -= 1
+
+      if (processing === 0) {
+        processingMessageId = null
+        processingStartedAtMs = null
+        stallLogged = false
+      }
     }
   }
 
@@ -293,6 +348,7 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
     await control.handle(request, {
       conversationId: description?.conversationId ?? null,
       runningCount: processing,
+      runningElapsedMs: processingElapsedMs(),
       queuedCount: queued.length,
       sessionAvailable: deps.session !== null,
       progress: description?.progress ?? null,
@@ -469,15 +525,31 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
           requestId: injection.requestId,
           contentChars: injection.content.length,
         })
-        // state に残った text（model・gh 由来）を main 会話に渡す前に秘密を置き換える
-        const answer = await deps.session.submit(deps.redactor.redact(injection.content), injection.requestId)
+        // inject も main 会話の turn なので、人間の message と同じ基準で経過時間を見る
+        processing += 1
+        processingMessageId = injection.requestId
+        processingStartedAtMs = nowMs()
+        stallLogged = false
 
-        // notice と answer は別の messageId で送る（同じ messageId / chunk index だと reply nonce が重複して
-        // gateway の dedupe で answer が落ちる）
-        await sendText(reply, noticeId, injection.notice)
-        await sendText(reply, answerId, answer === '' ? '応答を生成できませんでした。' : answer)
+        try {
+          // state に残った text（model・gh 由来）を main 会話に渡す前に秘密を置き換える
+          const answer = await deps.session.submit(deps.redactor.redact(injection.content), injection.requestId)
 
-        return answer
+          // notice と answer は別の messageId で送る（同じ messageId / chunk index だと reply nonce が重複して
+          // gateway の dedupe で answer が落ちる）
+          await sendText(reply, noticeId, injection.notice)
+          await sendText(reply, answerId, answer === '' ? '応答を生成できませんでした。' : answer)
+
+          return answer
+        } finally {
+          processing -= 1
+
+          if (processing === 0) {
+            processingMessageId = null
+            processingStartedAtMs = null
+            stallLogged = false
+          }
+        }
       })
       // inject が失敗しても queue は止めない（tail は void を返す連鎖なので result は捨ててつなぐ）
       tail = operation.then(
@@ -510,8 +582,13 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
         await notice.catch(() => undefined)
       }
     },
+    // 定期 tick（bot の poll loop から呼ぶ）。実行中の turn が CHAT_STALL_WARN_MS を超えて続いているかを
+    // log に出す。会話の完了を待たずに検知するので、status を開いていない停滞もここに記録が残る
+    tick: () => {
+      reportStall()
+    },
     pendingCount: () => {
-      return { queued: queued.length, processing }
+      return { queued: queued.length, processing, elapsedMs: processingElapsedMs() }
     },
   }
 }

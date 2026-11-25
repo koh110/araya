@@ -67,6 +67,12 @@ export function answer(text: string) {
 
 // faux の model と、それを登録した ModelRuntime（host と同じ options。実際の Pi の auth は読まない）。
 // reasoning を true にすると、thinking level に対応する model（faux-reasoning-1）にする
+// model が失敗して run が terminal になる応答（pi-durable の model_error 経路）。
+// retry 対象にしないため、本文は一時的障害を示す語（rate limit / 500 など）を避ける
+export function modelError(text: string) {
+  return fauxAssistantMessage('', { stopReason: 'error', errorMessage: text })
+}
+
 export async function createFauxModels(input: { agentDir: string; dataDir: string }, options: { reasoning?: boolean } = {}) {
   const faux = fauxProvider(options.reasoning === true ? { models: [{ id: 'faux-reasoning-1', reasoning: true }] } : {})
   const runtime = await ModelRuntime.create({
