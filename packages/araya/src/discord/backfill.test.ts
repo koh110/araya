@@ -14,7 +14,7 @@ import {
   runDiscordRestartBackfill,
   selectBackfillMessages,
 } from './backfill.ts'
-import { discordChatReplyNonce } from './chat.ts'
+import { CHAT_UNAVAILABLE_REPLY, discordChatReplyNonce } from './chat.ts'
 import { newState, noteDiscordSeenMessageId } from './state.ts'
 import type { DiscordConfig } from './config.ts'
 import type { DiscordGateway, DiscordHistoryMessage } from './gateway.ts'
@@ -152,13 +152,19 @@ type BackfillHarness = {
   answered: string[]
   // bot.ts が state.json から復元した unfinished を模する Set。backfill と共有する object
   unfinishedMessageIds: Set<string>
+  // bot.ts が live で受理して turn を実行中にしている ids を模する Set。backfill と共有する object
+  liveProcessingMessageIds: Set<string>
   gateway: DiscordGateway
   chatHandler: DiscordChatHandler
 }
 
 function createBackfillHarness(
   history: readonly DiscordHistoryMessage[],
-  options: { failFetch?: boolean } = {},
+  options: {
+    failFetch?: boolean
+    // chatHandler が送る本文。既定では実応答。CHAT_UNAVAILABLE_REPLY など案内だけ送らせるテストで使う
+    replyTextFor?: (message: DiscordChatMessage) => string
+  } = {},
 ): BackfillHarness {
   const logs: Record<string, unknown>[] = []
   const saved: string[] = []
@@ -166,6 +172,7 @@ function createBackfillHarness(
   const sent: { content: string; nonce: string }[] = []
   const answered: string[] = []
   const unfinishedMessageIds = new Set<string>()
+  const liveProcessingMessageIds = new Set<string>()
 
   const gateway: DiscordGateway = {
     async connect() {},
@@ -189,9 +196,10 @@ function createBackfillHarness(
         messageId: message.messageId,
         content: message.content,
       }
+      const replyText = options.replyTextFor === undefined ? 'response' : options.replyTextFor(message)
       // chatHandler は chunk と nonce を決める側。backfill の reply closure が呼ばれる
-      await reply('response', `nonce-${message.messageId}`)
-      record.replyText = 'response'
+      await reply(replyText, `nonce-${message.messageId}`)
+      record.replyText = replyText
       handled.push(record)
     },
     async handleCommand() {},
@@ -208,7 +216,17 @@ function createBackfillHarness(
     },
   }
 
-  return { logs, saved, handled, sent, answered, unfinishedMessageIds, gateway, chatHandler }
+  return {
+    logs,
+    saved,
+    handled,
+    sent,
+    answered,
+    unfinishedMessageIds,
+    liveProcessingMessageIds,
+    gateway,
+    chatHandler,
+  }
 }
 
 // bot.ts が backfill へ渡す deps の内、harness 側で決まる部分（テストごとに state・saveState・isHandled を足す）
@@ -223,6 +241,7 @@ function harnessDeps(harness: BackfillHarness) {
     },
     nowMs: () => NOW_MS,
     unfinishedMessageIds: harness.unfinishedMessageIds,
+    liveProcessingMessageIds: harness.liveProcessingMessageIds,
     markAnswered: (messageId: string) => {
       harness.answered.push(messageId)
     },
@@ -886,4 +905,170 @@ test('backfill: 取り直しの複数 chunk に live と違う nonce が順に�
   for (const [index, entry] of harness.sent.entries()) {
     assert.notEqual(entry.nonce, discordChatReplyNonce(replayId, index), 'live の answer nonce を使わない')
   }
+})
+
+test('backfill: unfinished の id は cursor より古い側・age 上限の向こう側でも history から取り直す', async () => {
+  // state.json 上の unfinished が cursor より古い側にある = cursor の invariant（この id より古い message は
+  // 全て処理し終えた）が壊れた state。cursor を後ろへ戻して続けると cursor より新しい message も再処理して
+  // 応答が重複するので、unfinished の id だけを選ぶ
+  const cursor = messageIdAtAge(60_000)
+  const unfinishedBehind = messageIdAtAge(20 * 60_000)
+  const otherBehind = messageIdAtAge(25 * 60_000)
+  const fresh = messageIdAtAge(10_000)
+  const harness = createBackfillHarness([
+    historyMessage(fresh),
+    historyMessage(cursor),
+    historyMessage(unfinishedBehind),
+    historyMessage(otherBehind),
+  ])
+  harness.unfinishedMessageIds.add(unfinishedBehind)
+  let state: DiscordBotState = { ...newState(), lastSeenMessageId: cursor }
+
+  const outcome = await runDiscordRestartBackfill({
+    ...harnessDeps(harness),
+    state,
+    saveState: (next) => {
+      state = next
+      harness.saved.push(next.lastSeenMessageId ?? '')
+    },
+    isHandled: () => {
+      return false
+    },
+    markHandled: () => {},
+  })
+
+  assert.deepEqual(
+    outcome.handled,
+    [unfinishedBehind, fresh],
+    'cursor より古い unfinished を先に、そのあと cursor より新しい取り直し（古い順）',
+  )
+  assert.equal(
+    harness.logs.some((entry) => entry.messageId === otherBehind),
+    false,
+    'unfinished でない cursor より古い id は取り直さない（応答の重複を防ぐ）',
+  )
+  assert.equal(state.lastSeenMessageId, fresh, '取り直した分だけ cursor が進む')
+  assert.deepEqual([...harness.unfinishedMessageIds], [], '取り直しを終えた unfinished は空になる')
+})
+
+test('backfill: live で処理中の id は reason:"live_processing" で飛ばし unfinished には残す', async () => {
+  // live path が受理して turn が動いている message が history にも出てくる（ready 直後の live 受信）。
+  // backfill が同じ id に turn を走らせると応答が二重になる。unfinished でも実行中であることを飛ばす理由に
+  // するので、log の reason でどちらだったか切り分ける
+  const cursor = messageIdAtAge(60_000)
+  const liveId = messageIdAtAge(20_000)
+  const harness = createBackfillHarness([historyMessage(liveId), historyMessage(cursor)])
+  harness.unfinishedMessageIds.add(liveId)
+  harness.liveProcessingMessageIds.add(liveId)
+  const markHandled: string[] = []
+  let state: DiscordBotState = { ...newState(), lastSeenMessageId: cursor }
+
+  const outcome = await runDiscordRestartBackfill({
+    ...harnessDeps(harness),
+    state,
+    saveState: (next) => {
+      state = next
+      harness.saved.push(next.lastSeenMessageId ?? '')
+    },
+    // bot.ts の isHandled と同じ形（処理中もここで飛ばす）
+    isHandled: (messageId) => {
+      return harness.liveProcessingMessageIds.has(messageId)
+    },
+    markHandled: (messageId) => {
+      markHandled.push(messageId)
+    },
+  })
+
+  assert.deepEqual(outcome.handled, [], JSON.stringify(harness.logs))
+  assert.equal(harness.handled.length, 0, 'live 処理中の message へ backfill が turn を走らせない')
+  assert.deepEqual(markHandled, [], 'live 側の処理に任せる')
+  assert.ok(
+    harness.logs.some(
+      (entry) =>
+        entry.type === 'discord_backfill_ignored' && entry.messageId === liveId && entry.reason === 'live_processing',
+    ),
+    JSON.stringify(harness.logs),
+  )
+  assert.ok(harness.unfinishedMessageIds.has(liveId), 'live 側が終わるか次の restart まで unfinished に残す')
+  assert.equal(state.lastSeenMessageId, cursor, 'cursor を live 処理中の id より後ろへ進めない')
+})
+
+test('backfill: live 処理中の unfinished が history に届いていないときは unreachable にしない', async () => {
+  // history は fetch 時点の快照。fetch より後に届いた live message はここに出ないだけで、message が無い
+  // 証拠ではない（案 1 では受理の事実を liveMessageIds に書かないので isHandled にも入っていない）
+  const cursor = messageIdAtAge(60_000)
+  const liveId = messageIdAtAge(30_000)
+  const goneId = messageIdAtAge(40_000)
+  const freshId = messageIdAtAge(10_000)
+  const harness = createBackfillHarness([historyMessage(freshId)])
+  harness.unfinishedMessageIds.add(liveId)
+  harness.unfinishedMessageIds.add(goneId)
+  harness.liveProcessingMessageIds.add(liveId)
+  let state: DiscordBotState = { ...newState(), lastSeenMessageId: cursor }
+
+  const outcome = await runDiscordRestartBackfill({
+    ...harnessDeps(harness),
+    state,
+    saveState: (next) => {
+      state = next
+      harness.saved.push(next.lastSeenMessageId ?? '')
+    },
+    isHandled: () => {
+      return false
+    },
+    markHandled: () => {},
+  })
+
+  assert.deepEqual(outcome.handled, [freshId])
+  assert.ok(
+    harness.unfinishedMessageIds.has(liveId),
+    'live で受理して実行中の id は fetch 結果に無いだけなので対象から出さない',
+  )
+  assert.ok(
+    harness.logs.some(
+      (entry) =>
+        entry.type === 'discord_backfill_unfinished_unreachable' && entry.messageId === goneId,
+    ),
+    JSON.stringify(harness.logs),
+  )
+  assert.equal(
+    harness.logs.some(
+      (entry) =>
+        entry.type === 'discord_backfill_unfinished_unreachable' && entry.messageId === liveId,
+    ),
+    false,
+    JSON.stringify(harness.logs),
+  )
+})
+
+test('backfill: 案内だけ送った turn は answered に記録しない（notice の送信記録で再応答を止めない）', async () => {
+  // chat.ts が送る CHAT_UNAVAILABLE_REPLY は「会話機能を走らせなかった」という送信結果。これを answered に
+  // すると、notice が届いたかどうかで取り直しが決まる（2026-11-24 の incident では notice 自体が
+  // discord_chat_reply_failed で Discord に届いていない）。turn を終えた id は unfinished から出すので、
+  // cursor が恒久的に止まるのも防ぐ
+  const cursor = messageIdAtAge(60_000)
+  const noticeId = messageIdAtAge(20_000)
+  const harness = createBackfillHarness([historyMessage(noticeId), historyMessage(cursor)], {
+    replyTextFor: () => CHAT_UNAVAILABLE_REPLY,
+  })
+  let state: DiscordBotState = { ...newState(), lastSeenMessageId: cursor }
+
+  const outcome = await runDiscordRestartBackfill({
+    ...harnessDeps(harness),
+    state,
+    saveState: (next) => {
+      state = next
+      harness.saved.push(next.lastSeenMessageId ?? '')
+    },
+    isHandled: () => {
+      return false
+    },
+    markHandled: () => {},
+  })
+
+  assert.deepEqual(outcome.handled, [noticeId])
+  assert.deepEqual(harness.answered, [], '案内だけの turn を応答済みとして記録しない')
+  assert.deepEqual(harness.sent.map((entry) => entry.content), [CHAT_UNAVAILABLE_REPLY])
+  assert.equal(harness.unfinishedMessageIds.size, 0, 'turn を終えた id は unfinished から出す')
+  assert.deepEqual(harness.saved, [noticeId])
 })
