@@ -41,7 +41,14 @@ const DISCORD_EPOCH_MS = 1_420_070_400_000
 export type BackfillSkipReason = 'self_message' | 'not_allowed' | 'empty' | 'stale' | 'over_limit'
 export type BackfillSkip = { messageId: string; reason: BackfillSkipReason }
 
-export type BackfillSelection = { candidates: DiscordHistoryMessage[]; skipped: BackfillSkip[] }
+export type BackfillSelection = {
+  candidates: DiscordHistoryMessage[]
+  skipped: BackfillSkip[]
+  // 件数上限（BACKFILL_MAX_MESSAGES）でこの round に落とされた unfinished。取り直し対象なのに history の
+  // fetch window と件数上限で取り直せないので、cursor をその id より後ろへ進めない（runDiscordRestartBackfill
+  // が discord_backfill_unfinished_stuck として log する）
+  stuckUnfinishedMessageIds: string[]
+}
 
 export function discordMessageTimestampMs(messageId: string): number | null {
   try {
@@ -89,7 +96,7 @@ export function selectBackfillMessages(
   const skipped: BackfillSkip[] = []
 
   if (input.cursor === null) {
-    return { candidates: [], skipped }
+    return { candidates: [], skipped, stuckUnfinishedMessageIds: [] }
   }
 
   const candidates: DiscordHistoryMessage[] = []
@@ -145,6 +152,7 @@ export function selectBackfillMessages(
   if (candidates.length > limit) {
     const overflow = candidates.length - limit
     const droppedIds = new Set<string>()
+    const stuckUnfinishedMessageIds: string[] = []
 
     // 上限を越える分は unfinished ではない古い側から落とす。unfinished を over_limit で捨てると cursor が
     // その id を越えられず（unfinished gate）、次の restart でもまた落とされて取り直せない
@@ -158,7 +166,8 @@ export function selectBackfillMessages(
       }
     }
 
-    // unfinished だけで上限を越えているときは、古い順に続けるので古い側から落とす
+    // unfinished だけで上限を越えているときは、古い順に続けるので古い側から落とす。落とした unfinished は
+    // この round で取り直せない（stuck）ので、id を selection.stuckUnfinishedMessageIds に出して黙らせない
     for (const message of candidates) {
       if (droppedIds.size >= overflow) {
         break
@@ -166,6 +175,10 @@ export function selectBackfillMessages(
 
       if (!droppedIds.has(message.messageId)) {
         droppedIds.add(message.messageId)
+
+        if (unfinishedMessageIds.has(message.messageId)) {
+          stuckUnfinishedMessageIds.push(message.messageId)
+        }
       }
     }
 
@@ -181,10 +194,10 @@ export function selectBackfillMessages(
       kept.push(message)
     }
 
-    return { candidates: kept, skipped }
+    return { candidates: kept, skipped, stuckUnfinishedMessageIds }
   }
 
-  return { candidates, skipped }
+  return { candidates, skipped, stuckUnfinishedMessageIds: [] }
 }
 
 export type DiscordBackfillOutcome = {
@@ -192,6 +205,10 @@ export type DiscordBackfillOutcome = {
   skipped: BackfillSkip[]
   // cursor が無かった instance。history の newest を cursor に置き、今回は何も処理しない
   seeded: boolean
+  // history の fetch まで辿り着いたか（API 無し・fetch 失敗は false）。bot.ts はこれで「取り直しを試みる
+  // ことができたか」を判断し、history を読めない起動で cursor より古い unfinished を prune しない
+  // （fetch 失敗で prune すると、次の restart で取り直せたはずの id を黙って落とす）
+  historyFetched: boolean
 }
 
 export type DiscordBackfillDependencies = {
@@ -259,7 +276,7 @@ export async function runDiscordRestartBackfill(
   deps: DiscordBackfillDependencies,
 ): Promise<DiscordBackfillOutcome> {
   const nowMs = deps.nowMs
-  const noop: DiscordBackfillOutcome = { handled: [], skipped: [], seeded: false }
+  const noop: DiscordBackfillOutcome = { handled: [], skipped: [], seeded: false, historyFetched: false }
 
   if (deps.gateway.fetchRecentMessages === undefined) {
     deps.log({ type: 'discord_backfill_skipped', reason: 'history_api_unavailable' })
@@ -301,7 +318,7 @@ export async function runDiscordRestartBackfill(
     if (newest === null) {
       deps.log({ type: 'discord_backfill_skipped', reason: 'no_history' })
 
-      return noop
+      return { handled: [], skipped: [], seeded: false, historyFetched: true }
     }
 
     const seeded = noteDiscordSeenMessageId(deps.state, newest)
@@ -312,7 +329,7 @@ export async function runDiscordRestartBackfill(
 
     deps.log({ type: 'discord_backfill_seeded', messageId: newest, historyCount: history.length })
 
-    return { handled: [], skipped: [], seeded: true }
+    return { handled: [], skipped: [], seeded: true, historyFetched: true }
   }
 
   const selection = selectBackfillMessages({
@@ -323,6 +340,22 @@ export async function runDiscordRestartBackfill(
     nowMs,
     unfinishedMessageIds: deps.unfinishedMessageIds,
   })
+
+  // 取り直し対象（unfinished）なのに 20 件の上限でこの round に落とされた ids。cursor はこれらの id より
+  // 後ろへ進めない（下の canAdvanceCursorPast）ので、取り直しが進まない限り毎 round 同じ fetch window
+  // （新しい 100 件）を読み直し、cursor は動かず candidates も同じ 100 件ままになる。黙って cursor を
+  // 止めないため id を log に出す（state file 側の prune は bot.ts が担当し、落とした事は
+  // discord_unfinished_pruned に出す）
+  if (selection.stuckUnfinishedMessageIds.length > 0) {
+    deps.log({
+      type: 'discord_backfill_unfinished_stuck',
+      count: selection.stuckUnfinishedMessageIds.length,
+      messageIds: selection.stuckUnfinishedMessageIds.slice(0, 20),
+      cursor,
+      maxMessages: BACKFILL_MAX_MESSAGES,
+      fetchLimit: BACKFILL_FETCH_LIMIT,
+    })
+  }
 
   // history の fetch 結果に無い unfinished は、message が削除されたか fetch 範囲（新しい 100 件）の外。backfill は
   // history 以外を取り直す手段が無いので、これを unfinished に残したままにすると cursor が恒久的に止まる
@@ -418,6 +451,12 @@ export async function runDiscordRestartBackfill(
     handled.push(message.messageId)
 
     if (answerChunks > 0) {
+      // 応答を送った ids を answered に記録する択（nonce だけに依存しない）。Discord の enforce_nonce の
+      // 重複窓は過去数分のあいだだけなので、restart をまたいだ二度応答は nonce では止められない。
+      // at-least-once は壊れない: unfinished かつ answered でない id は age 上限を無視して取り直し、
+      // turn 完了＋応答送信済みは処理完了なので再実行しない。応答送信中に process が消えた case は
+      // answered に入らないので unfinished のまま残り、次の restart が取り直して二度走ることがある
+      // （at-least-once の副作用として許容）
       deps.markAnswered(message.messageId)
     }
 
@@ -427,7 +466,10 @@ export async function runDiscordRestartBackfill(
 
     // cursor を 1 件ずつ前に進める。live と同じ規則で turn が終わってから進めるので、
     // 処理中に kill された message は次の restart の backfill が取り直します（at-least-once）。
-    // まだ取り直していない unfinished より後ろへは進めない（bot.ts の discard 経路と同じ gate）
+    // まだ取り直していない unfinished より後ろへは進めない。gate の向きは live 側（bot.ts の turn 完了・
+    // discard 経路）と同じで、「unfinished に messageId より古い id が残っているなら進めない」方向。
+    // 逆（unfinished が newer なら止める）にすると、取り直していない古い id を cursor が越えて
+    // 二度と取り直せなくなる（2026-11-24 の incident の形）
     const advanced = noteDiscordSeenMessageId(current, message.messageId)
 
     if (advanced !== current && canAdvanceCursorPast(deps.unfinishedMessageIds, message.messageId)) {
@@ -463,5 +505,5 @@ export async function runDiscordRestartBackfill(
     })
   }
 
-  return { handled, skipped: selection.skipped, seeded: false }
+  return { handled, skipped: selection.skipped, seeded: false, historyFetched: true }
 }

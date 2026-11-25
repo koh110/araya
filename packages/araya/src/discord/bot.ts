@@ -31,6 +31,7 @@ import {
 import {
   isDiscordMessageIdNewer,
   canAdvanceCursorPast,
+  idsBehindCursor,
   newState,
   noteDiscordSeenMessageId,
   readDiscordBotState,
@@ -546,13 +547,18 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
   // Araya 自身の message で cursor が unfinished より後ろへ進み、3 件が恒久的に処理されなかった）ので
   // state.json に書き、起動時にここへ復元する
   const unfinishedMessageIds = new Set<string>(state.unfinishedMessageIds ?? [])
-  // turn を終えて応答を送ったが、cursor がより古い unfinished で止まっている ids。Discord は同じ author +
+  // turn を終えて実応答を送れたが、cursor がより古い unfinished で止まっている ids。Discord は同じ author +
   // 同じ nonce を過去数分のあいだ 1 通にまとめるだけなので、restart 後の再応答は nonce では止められない。
-  // state.json に残して再応答を抑える
+  // state.json に残して再応答を抑える（answered だけに依存する択は state.ts の field comment に書いた）
   const answeredMessageIds = new Set<string>(state.answeredMessageIds ?? [])
   // shutdown に入ったら cursor を進めない。drain budget で置き去りにした turn の promise が後で
   // 解決して cursor が動くと、その message が backfill の対象から消える
   let shuttingDown = false
+  // 起動時の backfill が 1 回走り終わったかどうか。走るまでの state 書き込みでは、state.json から復元した
+  // cursor より古い unfinished を prune しない（prune すると backfill が読む前に取り直し対象が消える）
+  let startupBackfillSettled = false
+  // 復元時点で cursor より古い側の unfinished（invariant 壊れの candidate）。prune の例外はこの id だけ
+  const restoredUnfinishedBehindCursor = new Set<string>()
 
   if (unfinishedMessageIds.size > 0) {
     const restoredCursor = state.lastSeenMessageId ?? null
@@ -562,6 +568,10 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     const behindCursor = sortedMessageIds(unfinishedMessageIds).filter((messageId) => {
       return restoredCursor !== null && !isDiscordMessageIdNewer(messageId, restoredCursor)
     })
+
+    for (const messageId of behindCursor) {
+      restoredUnfinishedBehindCursor.add(messageId)
+    }
 
     // state.json から復元した unfinished。取り直し（backfill）が走る前に「何が置き去りだったか」を出しておく
     logSafe({
@@ -580,24 +590,48 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     })
   }
 
-  // cursor が越えた answered の記録は backfill が見ないので持っても意味が無い。Set は中身だけ塗り替える
-  // （backfill と共有している object への参照は保つ）。unfinished は逆に、cursor より古い側に残っている
-  // こと自体が「受理したが終わっていない id を cursor が越えた」証拠なので残す。backfill は cursor より
-  // 古い unfinished も history から取り直す（selectBackfillMessages の unfinished gate）
+  // cursor が越えた ids を state file から落とす（集合が無制限に膨れないため）。answered は cursor が届いた
+  // 側では backfill が見ないので持っても意味が無く、unfinished も cursor が越えた時点で取り直し対象から外れる
+  // （持ち続けると cursor が恒久的に止まる）。unfinished を cursor より新しい間（まだ取り直し対象）は残す。
+  // 復元した unfinished は、起動時の backfill が読む前に消さない（startupBackfillSettled まで keep）。
+  // Set は中身だけ塗り替える（backfill と共有している object への参照は保つ）
   function pruneIdsBehindCursor(cursor: string | null) {
     if (cursor === null) {
       return
     }
 
-    for (const id of answeredMessageIds) {
-      if (!isDiscordMessageIdNewer(id, cursor)) {
-        answeredMessageIds.delete(id)
+    for (const id of idsBehindCursor(answeredMessageIds, cursor)) {
+      answeredMessageIds.delete(id)
+    }
+
+    const droppedUnfinished: string[] = []
+
+    for (const id of idsBehindCursor(unfinishedMessageIds, cursor)) {
+      if (!startupBackfillSettled && restoredUnfinishedBehindCursor.has(id)) {
+        continue
       }
+
+      unfinishedMessageIds.delete(id)
+      droppedUnfinished.push(id)
+    }
+
+    // cursor が unfinished を越えた（＝その id はこの先 backfill で取り直さない）ことを黙らせない。
+    // 越えた理由が Discord 側で unknown な case（fetch window の外の unfinished などを over_limit で落とし、
+    // その間に cursor が進んだ）はここに載る
+    if (droppedUnfinished.length > 0) {
+      logSafe({
+        type: 'discord_unfinished_pruned',
+        count: droppedUnfinished.length,
+        messageIds: droppedUnfinished.slice(0, 20),
+        cursor,
+      })
     }
   }
 
   function saveDiscordState(next: DiscordBotState) {
-    // unfinished / answered の集合は memory の Set が正。書く直前に state へ写し込む
+    // unfinished / answered の集合は memory の Set が正。書く直前に state へ写し込む。state file の書き込み
+    // 失敗（discord_state_write_failed）はここで log して握り潰す：state が書けないのは observability の
+    // 問題で、受理済みの会話を止める理由にはしない（noteLiveMessageReceived も同じ経由なので会話は続く）
     pruneIdsBehindCursor(next.lastSeenMessageId ?? null)
     state = {
       ...next,
@@ -642,6 +676,11 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
       // discord_chat_reply_failed）ので、notice の送信記録を取り直しの skip 条件にしない
       return
     }
+
+    // turn を完走した id は liveMessageIds（この process が処理を終えた id）に書く。Discord が同じ message を
+    // 2 度配信したとき（echo・再接続後の再 delivery）、live 側が同じ id に 2 度 turn を走らせないための記録。
+    // 受理しただけの id はここに書かない（noteLiveMessageReceived は liveProcessingMessageIds だけ）
+    liveMessageIds.add(messageId)
 
     // turn を完走した id は unfinished から出す（unfinished に残すと cursor がその id で止まり続ける）。
     // answered に記録するのは実応答を送れた場合だけ。会話 session が無くて CHAT_UNAVAILABLE_REPLY だけを
@@ -731,7 +770,7 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
           return
         }
 
-        await runDiscordRestartBackfill({
+        const outcome = await runDiscordRestartBackfill({
           config,
           botUserId: botUserId ?? '',
           gateway,
@@ -770,6 +809,13 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
           // （live 側が終わってから同じ id を取り直す）
           liveProcessingMessageIds,
         })
+        // history を読めた起動なら、以降の state 書き込みで cursor が越えた unfinished を prune してよい
+        // （取り直せなかった unfinished を持ち続けると集合と cursor が膨れっ放しになる。落とした事は
+        // discord_unfinished_pruned に出す）。history を読めなかった起動では prune しない：次の restart で
+        // 取り直せたはずの id を黙って落とす方を選ぶ。fetch 失敗の繰り返しの間は log
+        // （discord_unfinished_restored）に載り続ける
+        startupBackfillSettled = outcome.historyFetched
+        saveDiscordState(state)
       })().catch((error: unknown) => {
         logError('discord_backfill_failed', error)
       })
