@@ -110,8 +110,38 @@ function isDiscordMessageIdList(value: unknown) {
   })
 }
 
+// state file に在ってよい key。#29（task 機構撤去）で無くなった通知配送 retry 用の `cursor`（number）と
+// `backoff` を state.json に残した file が今も動く。誰も読まない key を state の一部として持ち回ると、
+// 同じ名前の state field を将来増やしたときに型の違う値（backfill の cursor は lastSeenMessageId の string id
+// の事）を state として読む形になるので read で落とす。次の state 書き込みで file から消える
+export const DISCORD_STATE_KEYS = new Set<string>([
+  'version',
+  'unit',
+  'readyId',
+  'lastReadyAt',
+  'lastSeenMessageId',
+  'unfinishedMessageIds',
+  'answeredMessageIds',
+])
+
+// 読み込んだ object から既知 key だけを持つ state を作る（state file の形を DiscordBotState に一致させる）。
+// 無い key は migration 側で埋める値で埋める
+function toKnownStateKeys(state: DiscordBotState): DiscordBotState {
+  return {
+    version: DISCORD_STATE_VERSION,
+    unit: state.unit,
+    readyId: state.readyId ?? null,
+    lastReadyAt: state.lastReadyAt ?? null,
+    lastSeenMessageId: state.lastSeenMessageId ?? null,
+    unfinishedMessageIds: state.unfinishedMessageIds ?? [],
+    answeredMessageIds: state.answeredMessageIds ?? [],
+  }
+}
+
 // state.json が無ければ null。形が壊れているときは誤り（bot は restart policy で再起動し、人間が直す）
-export function readDiscordBotState(dataDir: string) {
+// onExtraKeys: 既知 key 以外が file に在ったときの報告（bot 側 log 用）。未知 key を理由に起動は止めない
+// （rollback や手当てで書いた key を壊さない。未知 key は state へ引き込まない）
+export function readDiscordBotState(dataDir: string, onExtraKeys?: (keys: string[]) => void) {
   const filePath = discordStateFilePath(dataDir)
   let text: string
 
@@ -143,19 +173,18 @@ export function readDiscordBotState(dataDir: string) {
     )
   }
 
-  // v1 / v2 -> v3: cursor を null、id 集合を空配列で埋める。read だけでは file を書き換えない
-  // （次の state 書き込みで v3 になる）
-  if (value.version !== DISCORD_STATE_VERSION) {
-    return {
-      ...value,
-      version: DISCORD_STATE_VERSION,
-      lastSeenMessageId: value.lastSeenMessageId ?? null,
-      unfinishedMessageIds: value.unfinishedMessageIds ?? [],
-      answeredMessageIds: value.answeredMessageIds ?? [],
-    }
+  const extraKeys = Object.keys(value).filter((key) => {
+    return !DISCORD_STATE_KEYS.has(key)
+  })
+
+  if (extraKeys.length > 0) {
+    onExtraKeys?.(extraKeys)
   }
 
-  return value
+  // v1 / v2 -> v3: 無い key だけを埋める（既存の lastSeenMessageId は保持するので、v2 の cursor が v3 で
+  // null に戻る事はない）。read だけでは file を書き換えない（次の state 書き込みで v3 になる）。
+  // 既知 key 以外（cursor・backoff など）はここで落とす
+  return toKnownStateKeys(value)
 }
 
 export function newState() {

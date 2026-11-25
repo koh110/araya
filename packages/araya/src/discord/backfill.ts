@@ -305,18 +305,43 @@ export async function runDiscordRestartBackfill(
   const cursor = deps.state.lastSeenMessageId ?? null
 
   // cursor が無い状態では「どこまで見たか」を確定できない。history の newest を cursor に置いて
-  // 次の再起動から取り直せるようにし、今回は何も処理しない
+  // 次の再起動から取り直せるようにし、今回は何も処理しない。
+  // seed も live・取り直しと同じ cursor gate（canAdvanceCursorPast）を通す。state file に unfinished を持つ
+  // 起動（初回起動で history fetch が失敗した後 live が受理して kill された等）で gate を無視して newest を
+  // 置くとその unfinished は invariant を壊れ方（cursor が越えている）で残り、selectBackfillMessages の
+  // cursor gate で candidate から外れ、その後の state 書き込みの prune（discord_unfinished_pruned）で
+  // state file から消える。seed できないときは cursor を null のまま置いた方が、prune が cursor null で
+  // early return して unfinished を守る（次の restart が history から取り直せる）
   if (cursor === null) {
     let newest: string | null = null
 
     for (const message of history) {
-      if (isDiscordMessageIdNewer(message.messageId, newest)) {
+      // unfinished 自身の id を seed 位置にしない。cursor は「この id より古い message は処理済み」の位置なので
+      // unfinished と同じ id を seed すると、その id は candidate から外れ（cursor gate）その後の prune で
+      // state file から消える（discord_unfinished_pruned）。seed 位置は常に unfinished より古い側
+      if (
+        !deps.unfinishedMessageIds.has(message.messageId) &&
+        isDiscordMessageIdNewer(message.messageId, newest) &&
+        canAdvanceCursorPast(deps.unfinishedMessageIds, message.messageId)
+      ) {
         newest = message.messageId
       }
     }
 
     if (newest === null) {
-      deps.log({ type: 'discord_backfill_skipped', reason: 'no_history' })
+      if (history.length === 0) {
+        deps.log({ type: 'discord_backfill_skipped', reason: 'no_history' })
+
+        return { handled: [], skipped: [], seeded: false, historyFetched: true }
+      }
+
+      // history 自体は読めたが、unfinished より後ろへ進める id が 1 件も無かった。cursor を動かさない
+      deps.log({
+        type: 'discord_backfill_skipped',
+        reason: 'no_seedable_history',
+        unfinishedCount: deps.unfinishedMessageIds.size,
+        historyCount: history.length,
+      })
 
       return { handled: [], skipped: [], seeded: false, historyFetched: true }
     }

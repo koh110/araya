@@ -7,6 +7,7 @@ import { test } from 'vite-plus/test'
 import { messageIdAtAge } from '../../test/support/discord-snowflake.ts'
 
 import {
+  DISCORD_STATE_KEYS,
   DISCORD_STATE_VERSION,
   DISCORD_STATE_VERSION_BEFORE_CURSOR,
   DISCORD_STATE_VERSION_BEFORE_UNFINISHED,
@@ -250,4 +251,77 @@ test('discord state: the cursor only advances and updates do not mutate the prev
   assert.equal(noteDiscordSeenMessageId(first, newer).lastSeenMessageId, newer)
   assert.equal(first.lastSeenMessageId, cursor)
   assert.equal(initial.lastSeenMessageId, null)
+})
+
+test('discord state: 旧 version が残した未知 key（cursor / backoff）は read で落ち、log に出て、次の write で file から消える', async () => {
+  // #29（task 機構撤去）より前の build が書いた file の形。cursor（number・task_events.seq）と backoff
+  // （通知配送 retry）は今の state の key ではない。実 file（/home/koh110/.araya/discord/state.json）に
+  // cursor: 602 / backoff: null が残っているのを 2026-11-25 に測った
+  await withTemporaryDataDir(async (dataDir) => {
+    const cursorId = messageIdAtAge(60_000)
+
+    await writeStateFile(dataDir, {
+      version: DISCORD_STATE_VERSION_BEFORE_UNFINISHED,
+      cursor: 602,
+      backoff: null,
+      unit: 'araya-discord-old',
+      readyId: 'ready-old',
+      lastReadyAt: '2026-11-24T00:00:00.000Z',
+      lastSeenMessageId: cursorId,
+    })
+
+    const reported: string[][] = []
+    const state = readDiscordBotState(dataDir, (keys) => {
+      reported.push(keys)
+    })
+
+    assert.ok(state !== null, '未知 key を理由に discord_state_invalid にしない（rollback・手当てを壊さない）')
+    assert.deepEqual(
+      [...reported[0] ?? []].sort(),
+      ['backoff', 'cursor'],
+      'read が未知 key を報告する（bot 側 log 用）',
+    )
+    assert.equal(state.version, DISCORD_STATE_VERSION)
+    assert.equal(state.lastSeenMessageId, cursorId, 'backfill の cursor は lastSeenMessageId。旧 cursor とは無関係')
+
+    const asRecord = state as unknown as Record<string, unknown>
+
+    assert.equal(asRecord.cursor, undefined, '未知 key を state へ引き込まない')
+    assert.equal(asRecord.backoff, undefined)
+    assert.deepEqual(
+      Object.keys(state).sort(),
+      [...DISCORD_STATE_KEYS].sort(),
+      'read が返す object の key は既知 key だけ',
+    )
+
+    writeDiscordBotState(dataDir, state)
+
+    const raw = JSON.parse(await fs.readFile(discordStateFilePath(dataDir), 'utf8')) as Record<string, unknown>
+
+    assert.equal(raw.version, DISCORD_STATE_VERSION)
+    assert.equal('cursor' in raw, false, '次の state 書き込みで file から消える')
+    assert.equal('backoff' in raw, false)
+
+    // v3 の file に未知 key が混ざっても同じ（read で落とす）。rollback で v2 build が読める形にはしない
+    await writeStateFile(dataDir, {
+      ...state,
+      backoff: { eventSeq: 1, attempts: 2, nextAttemptAtMs: 3 },
+    })
+    const secondReport: string[][] = []
+    const reread = readDiscordBotState(dataDir, (keys) => {
+      secondReport.push(keys)
+    })
+
+    assert.ok(reread !== null)
+    assert.deepEqual(
+      [...secondReport[0] ?? []].sort(),
+      ['backoff'],
+      'v3 file の未知 key も read で落とす',
+    )
+    assert.deepEqual(
+      Object.keys(reread).sort(),
+      [...DISCORD_STATE_KEYS].sort(),
+      '未知 key は id 集合の migration・検証に影響しない',
+    )
+  })
 })
