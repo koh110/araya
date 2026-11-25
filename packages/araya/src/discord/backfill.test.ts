@@ -1160,3 +1160,130 @@ test('backfill: 案内だけ送った turn は answered に記録しない（not
   assert.equal(harness.unfinishedMessageIds.size, 0, 'turn を終えた id は unfinished から出す')
   assert.deepEqual(harness.saved, [noticeId])
 })
+
+test('backfill: cursor が無い起動で unfinished があるとき、seed は unfinished より後ろへ進まない', async () => {
+  // seed は cursor gate の無い経路だった。state file に unfinished を持つ起動（history fetch 失敗後に live が
+  // 受理して kill された等）で history の newest を cursor にすると、その unfinished は cursor が越えた側に
+  // 残り、selectBackfillMessages の candidate から外れてその後の prune（discord_unfinished_pruned）で
+  // state file から消える。seed も同じ gate を通し、進められないなら cursor を null のまま置く
+  const unfinishedId = messageIdAtAge(30_000)
+  const newerId = messageIdAtAge(1_000)
+  const olderId = messageIdAtAge(90_000)
+  const harness = createBackfillHarness([historyMessage(newerId), historyMessage(unfinishedId)])
+
+  harness.unfinishedMessageIds.add(unfinishedId)
+
+  let state: DiscordBotState = {
+    ...newState(),
+    lastSeenMessageId: null,
+    unfinishedMessageIds: [unfinishedId],
+  }
+
+  const outcome = await runDiscordRestartBackfill({
+    ...harnessDeps(harness),
+    state,
+    saveState: (next) => {
+      state = next
+      harness.saved.push(next.lastSeenMessageId ?? '')
+    },
+    isHandled: () => {
+      return false
+    },
+    markHandled: () => {},
+  })
+
+  assert.equal(outcome.seeded, false, 'unfinished より後ろへ seed しない')
+  assert.equal(outcome.historyFetched, true, 'history fetch 自体は成功している')
+  assert.deepEqual(outcome.handled, [])
+  assert.deepEqual(harness.handled, [], 'cursor が無い起動では history を処理しない')
+  assert.equal(state.lastSeenMessageId, null, 'cursor を null のまま置く（prune が early return して unfinished が守れる）')
+  assert.deepEqual(harness.saved, [], 'state 書き込みで cursor を進めない')
+  assert.deepEqual([...harness.unfinishedMessageIds], [unfinishedId], 'unfinished を残す')
+  assert.ok(
+    !harness.logs.some((entry) => {
+      return entry.type === 'discord_backfill_seeded'
+    }),
+    JSON.stringify(harness.logs),
+  )
+
+  const skipped = harness.logs.find((entry) => {
+    return entry.type === 'discord_backfill_skipped'
+  })
+
+  assert.ok(skipped !== undefined, JSON.stringify(harness.logs))
+  assert.equal(skipped.reason, 'no_seedable_history', 'history は読めたが seed できる id が無い')
+  assert.equal(skipped.unfinishedCount, 1)
+  assert.equal(skipped.historyCount, 2)
+
+  // unfinished より古い id だけの history なら seed できる（seed 位置は常に unfinished より古い側）
+  const olderOnlyHarness = createBackfillHarness([historyMessage(olderId), historyMessage(unfinishedId)])
+
+  olderOnlyHarness.unfinishedMessageIds.add(unfinishedId)
+
+  let olderOnlyState: DiscordBotState = {
+    ...newState(),
+    lastSeenMessageId: null,
+    unfinishedMessageIds: [unfinishedId],
+  }
+
+  const olderOnlyOutcome = await runDiscordRestartBackfill({
+    ...harnessDeps(olderOnlyHarness),
+    state: olderOnlyState,
+    saveState: (next) => {
+      olderOnlyState = next
+    },
+    isHandled: () => {
+      return false
+    },
+    markHandled: () => {},
+  })
+
+  assert.equal(olderOnlyOutcome.seeded, true)
+  assert.equal(olderOnlyState.lastSeenMessageId, olderId)
+  assert.deepEqual([...olderOnlyHarness.unfinishedMessageIds], [unfinishedId], 'unfinished より古い位置に置く')
+})
+
+test('backfill: unfinished と answered が同時に limit を超えるとき stuck に出すのは unfinished だけ', () => {
+  // answered（前回の process で実応答を送った ids）は取り直し対象ではない。上限で落とすのは unfinished では
+  // ない古い側からで、stuck（この round で取り直せない取り直し対象）に answered が混ざると log が意味を失う。
+  // older-first の candidates: U1 / U2 / A1 / U3、limit 2 で overflow 2
+  const cursor = messageIdAtAge(400_000)
+  const u1 = messageIdAtAge(100_000)
+  const u2 = messageIdAtAge(90_000)
+  const a1 = messageIdAtAge(80_000)
+  const u3 = messageIdAtAge(70_000)
+  const selection = selectBackfillMessages({
+    // gateway の fetch は新しい順
+    history: [historyMessage(u3), historyMessage(a1), historyMessage(u2), historyMessage(u1)],
+    cursor,
+    config,
+    botUserId: BOT_USER_ID,
+    nowMs: () => NOW_MS,
+    maxAgeMs: 30 * 60_000,
+    limit: 2,
+    unfinishedMessageIds: new Set<string>([u1, u2, u3]),
+  })
+
+  assert.deepEqual(
+    selection.candidates.map((message) => {
+      return message.messageId
+    }),
+    [u2, u3],
+    ' unfinished ではない古い側（A1）を先に落とし、残りも古い unfinished から落とす',
+  )
+  assert.deepEqual(selection.stuckUnfinishedMessageIds, [u1], '取り直せなかった unfinished だけを出す')
+  assert.ok(
+    !selection.stuckUnfinishedMessageIds.includes(a1),
+    JSON.stringify(selection.stuckUnfinishedMessageIds),
+    'answered だけの id を stuck に出さない',
+  )
+  assert.deepEqual(
+    selection.skipped.map((skip) => {
+      return [skip.messageId, skip.reason]
+    }),
+    [
+      [u1, 'over_limit'],
+      [a1, 'over_limit'],
+    ],
+  )
+})

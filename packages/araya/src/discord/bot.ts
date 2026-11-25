@@ -466,7 +466,12 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
   let state: DiscordBotState
 
   try {
-    state = readDiscordBotState(dataDir) ?? newState()
+    // 旧 version が残した既知 key 以外（通知 retry 用の cursor・backoff など）は state へ引き込まない。
+    // ここで log に出すので、次の state 書き込みで file から消える（unknown key を理由に起動は止めない）
+    state =
+      readDiscordBotState(dataDir, (keys) => {
+        logSafe({ type: 'discord_state_extra_keys', keys })
+      }) ?? newState()
   } catch (error) {
     logError('discord_state_failed', error)
 
@@ -780,8 +785,34 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
           state,
           saveState: (next) => {
             // backfill は ready 時の state を参照しているので、live 側で cursor が先に進んでいることがある。
-            // 今の state にマージしてから保存し、cursor を後ろへ戻さない
-            saveDiscordState(noteDiscordSeenMessageId(state, next.lastSeenMessageId ?? ''))
+            // 今の state にマージしてから保存し、cursor を後ろへ戻さない。
+            // merge にも live と同じ unfinished gate を通す。backfill 側の cursor が unfinished を越えていれば
+            // ここで止める（越えた unfinished は次の state 書き込みの prune で state file から消えるため）。
+            // 現在の配線では unfinished の Set を backfill と共有しているので live 側の per-message gate が
+            // 先に効く。ここは defense の gate（backfill に別の集合を渡す変更を入れたときに最初の gate になる）
+            const nextCursor = next.lastSeenMessageId ?? null
+            const advanced = nextCursor === null ? state : noteDiscordSeenMessageId(state, nextCursor)
+
+            if (advanced === state) {
+              // cursor は進まない（backfill 側の cursor が今より後ろに無い）。id 集合だけ書き直す
+              saveDiscordState(state)
+
+              return
+            }
+
+            if (!canAdvanceCursorPast(unfinishedMessageIds, advanced.lastSeenMessageId ?? '')) {
+              logSafe({
+                type: 'discord_backfill_cursor_merge_blocked',
+                cursor: state.lastSeenMessageId ?? null,
+                requestedCursor: advanced.lastSeenMessageId ?? null,
+                unfinishedMessageIds: sortedMessageIds(unfinishedMessageIds).slice(0, 20),
+              })
+              saveDiscordState(state)
+
+              return
+            }
+
+            saveDiscordState(advanced)
           },
           isHandled: (messageId) => {
             // live gate は「受理した事実」ではない。飛ばすのは (1) この process が処理中
@@ -835,6 +866,24 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
         return
       }
 
+      // onReady（chatHandler 生成）より前に message を受け取った形。turn を走らせていないのに処理完了扱いに
+      // すると、unfinished から出て answered にも入らないまま cursor だけが進む（discord_chat_received
+      // も discord_chat_ignored にも載らない）。受理したが未処理なので unfinished に書き、cursor は進めない
+      // （liveProcessingMessageIds には書かない：実行中の id ではないので backfill の取り直しを止める）
+      const chatHandler = chatHandlerRef.current
+
+      if (chatHandler === null) {
+        logSafe({
+          type: 'discord_chat_ignored',
+          messageId: message.messageId,
+          reason: 'handler_not_ready',
+        })
+        unfinishedMessageIds.add(message.messageId)
+        saveDiscordState(state)
+
+        return
+      }
+
       noteLiveMessageReceived(message.messageId)
       // chat.ts が送る reply を数える。self notice（CHAT_SHUTDOWN_UNPROCESSED_REPLY）と会話機能不可の案内
       // （CHAT_UNAVAILABLE_REPLY）は Discord 側への送信結果であって処理の完了ではないので、これだけを
@@ -843,7 +892,7 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
       let answerChunks = 0
 
       try {
-        await chatHandlerRef.current?.handle(message, async (content, nonce) => {
+        await chatHandler.handle(message, async (content, nonce) => {
           if (content !== CHAT_SHUTDOWN_UNPROCESSED_REPLY && content !== CHAT_UNAVAILABLE_REPLY) {
             answerChunks += 1
           }
