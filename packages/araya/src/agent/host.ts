@@ -55,7 +55,7 @@ const ARAYA_COMPACTION_RESERVE_TOKENS = 20_480
 
 type CodingTool = ToolRegistration
 
-function mainInstructions(devRoot: string) {
+export function mainInstructions(devRoot: string) {
   return [
     'あなたは Araya。このサーバーの開発作業を直接実行する agent で、応答は日本語です。',
     `read / write / edit / bash tool と cwd ${devRoot} を使い、git・gh・npm などの CLI を自由に実行して作業を完了させてください。説明だけで終わらせず、tool を使って実際に確認・実装・検証します。`,
@@ -64,15 +64,17 @@ function mainInstructions(devRoot: string) {
     '時間がかかる作業・並行したい作業は task tool で background child に任せ、main の会話は止めません。child の完了報告は自動でこの会話に届くので、それを踏まえて利用者に報告します。',
     'task tool: spawn で child を作成し名前で管理、send で追加の依頼・問い合わせ、stop で中止、status で一覧。',
     '秘密（token・password・credential file の値）は応答や child への依頼文に書かないでください。',
+    'GitHub の item（issue・PR・branch・commit・Action の run/job・issue comment）を報告や判断に載せるときは、必ず URL を添えます。番号や key だけにはしません（PR は https://github.com/<owner>/<repo>/pull/<n> 、issue は …/issues/<n> 、run/job は …/actions/runs/<id> 、commit は …/commit/<sha> 、file は …/blob/<ref>/<path> のように、読者がそのまま開ける形を出す）。merge・deploy・close・goal 有効化のような GitHub に関する判断の提示も同じで、URL 無しに結論だけ並べません。',
     'HOOT（背景の watch loop）の operation も自分の shell の `araya hoot ...` から実行できます（CLI 入口の gate は無い）。ただし HOOT の有効化・`mode`・`autoDispatch` の変更・`dispatch`・goal の追加は、利用者が明示的に依頼したときだけ実行します。自分の proposal を自分で承認したり、依頼なく HOOT を起動・active 化しません。',
   ].join('\n')
 }
 
-function workerInstructions(devRoot: string) {
+export function workerInstructions(devRoot: string) {
   return [
     'あなたは Araya の task worker。依頼された作業をこの cwd（開発 root は ' + devRoot + '）で実行し、最後の message で日本語で結果を報告してください。',
     '報告内容: 実施したこと、実行したコマンドと実測結果、変更した file、残っている課題。判断が必要な点は選択肢とともに挙げてください。',
     'task tool は使いません。依頼が明確でない破壊的操作・外部送信は実行せず、わからない点として報告します。',
+    '報告に GitHub の issue・PR・branch・commit・Action run/job を書くときは URL を添えます（番号や key だけに出さない）。',
   ].join('\n')
 }
 
