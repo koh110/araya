@@ -4,7 +4,7 @@
 
 HOOT は「Araya が人間の依頼を待っている時間」に、設定した目的（goal）について **観測し、次の一手を判断し、記録する** loop。判断 result は state に残り、必要なら Discord へ 1 件通知する。**HOOT の判断 run 自身には tool が無い**（model に tool を渡さず、file を書き換えず、process を起動しない）。判断 run が `dispatch` を出しても、ここで作業は始まらない。
 
-作業に繋がる導線は 1 本だけ。承認された `dispatch` を **main Discord 会話（channel ごとの main agent session）へ inject** し、実際の作業はその会話の agent が進める（Issue #31 の 1A。詳細は「main Discord 会話への inject」）。承認を作るのは人間の CLI（`araya hoot dispatch --key <proposal key>`）か Discord の slash command（`/hoot dispatch key:<proposal key>`）か `mode=active` + `autoDispatch=true` で、**既定（`autoDispatch=false`）では人間の承認が無い限り inject しない**。main agent session の bash から承認系 command は実行できない（「CLI」の「Discord から打つ hoot command」）。
+作業に繋がる導線は 1 本だけ。承認された `dispatch` / `investigate` proposal を **main Discord 会話（channel ごとの main agent session）へ inject** し、実際の作業や read-only 調査はその会話の agent が進める（`investigate` は main 会話側の read-only 調査案件で、HOOT 判断 run 自身に tool は無い）（Issue #31 の 1A。詳細は「main Discord 会話への inject」）。承認を作るのは人間の CLI（`araya hoot dispatch --key <proposal key>`）か Discord の slash command（`/hoot dispatch key:<proposal key>`）か `mode=active` + `autoDispatch=true` で、**既定（`autoDispatch=false`）では人間の承認が無い限り inject しない**。main agent session の bash から承認系 command は実行できない（「CLI」の「Discord から打つ hoot command」）。
 
 Discord bot process の中に loop として常駐し、`<dataDir>/hoot/state.json` を single source of truth にする。CLI（`araya hoot`）と同じ file を lock で共有する。
 
@@ -40,7 +40,7 @@ model を呼ぶかどうか・人間に何を返すか・main 会話へ何を流
 | key | default | 意味 |
 | --- | --- | --- |
 | `enabled` | `false` | false の間は model も gh も呼ばない（tick gate を抜けない）。**inject の poll も走らない**（pending request を作らず submit しない） |
-| `mode` | `dry_run` | `dry_run` は判断の記録だけ（inject request を**作らない**。`enqueueHootInject` は `hoot_mode_dry_run`）。`active` は「承認済みの dispatch を main 会話へ inject してよい」を意味する（**`hoot_mode_unimplemented` での拒否は廃止**）。`active` でも既定は `autoDispatch=false` で、人間の `araya hoot dispatch` の承認が無い限り inject しない |
+| `mode` | `dry_run` | `dry_run` は判断の記録だけ（inject request を**作らない**。`enqueueHootInject` は `hoot_mode_dry_run`）。`active` は「承認済みの dispatch / investigate proposal を main 会話へ inject してよい」を意味する（**`hoot_mode_unimplemented` での拒否は廃止**）。`active` でも既定は `autoDispatch=false` で、人間の `araya hoot dispatch` の承認が無い限り inject しない |
 | `tickMinutes` | `60` | schedule occurrence の間隔（5〜1440） |
 | `maxRunsPerDay` | `8` | UTC 1 日あたりの判断 run 上限（1〜48）。**model を呼んだ run だけ**を数える。precheck の noop は budget を使わない |
 | `notifyDecisions` | `["request_human", "invalid"]` | 即時 Discord に送る decision の allowlist。`noop` / `wait` 等は digest に出す（`notifyNoop` は撤去） |
@@ -160,7 +160,7 @@ occurrence ごとの判断結果を `runs` に積む。tool を持たない判�
 
 ## main Discord 会話への inject（dispatch の実行経路 / 1A）
 
-`dispatch` を実行するのは main Discord 会話（channel ごとの main agent session）だけ。HOOT 判断 run に tool は渡さないまま、**承認された dispatch だけ**を main 会話の input として流す。経路は `src/hoot/store.ts`（request の生成）→ `src/hoot/tick.ts` の `injectOnce()` → `src/discord/bot.ts` の `dispatchInject` → `src/discord/chat.ts` の `inject()`（main 会話の `session.submit`）。
+`dispatch` を実行するのは main Discord 会話（channel ごとの main agent session）だけ。HOOT 判断 run に tool は渡さないまま、**承認された dispatch / investigate だけ**を main 会話の input として流す（`investigate` は file 変更・commit・deploy・merge をしない read-only 調査）。経路は `src/hoot/store.ts`（request の生成）→ `src/hoot/tick.ts` の `injectOnce()` → `src/discord/bot.ts` の `dispatchInject` → `src/discord/chat.ts` の `inject()`（main 会話の `session.submit`）。
 
 ### request を作るのは「承認」だけ（`enqueueHootInject`）
 
