@@ -51,20 +51,21 @@ export const DISCORD_CONTROL_USAGE = [
   '  /hoot dispatch key:<proposal key> … 承認済みの dispatch を main 会話へ inject する承認',
   '  /hoot inject list … inject request の状態',
   '  /hoot runs     … 判断 run の記録',
+  '  /hoot evidence … delivery 前后の観測差（open list の比較。read-only）',
   '  /hoot goal list / pause / resume / retire key:<key> … goal の一覧と status 変更',
   '  /hoot goal add key:<key> objective:<1 文> [scope:github:owner/repo,...] [constraint:...] [review-at:YYYY-MM-DD|none]',
   '  /hoot goal update key:<key> … 指定した field だけ更新（未指定は現状維持）',
-  '  /hoot proposal list / resolve key:<key> … 提案の一覧と解決済み化',
+  '  /hoot proposal list / history / resolve key:<key> … 提案の一覧（open のみ）・closed 履歴・解決済み化',
   '  /hoot settings show / set … 設定（enabled・mode・auto-dispatch・conversation-read・max-injects-per-day・inject-cooldown-minutes など）',
   '  /hoot reset-schedule … schedule だけ戻す（run 記録・settings・proposals・inject request は保つ）',
   '（HOOT の operation は人間の CLI・Discord の slash command・agent の shell のどこからでも同じ kernel を通ります。作業を実行するのは承認済みの dispatch を受け取った main 会話だけ）',
 ].join('\n')
 
 // hoot command の option を CLI の引数配列へ変換する対応表。Discord 側は option 名だけを渡す
-const HOOT_TOP_SUBCOMMANDS = new Set(['status', 'dispatch', 'runs', 'reset-schedule'])
+const HOOT_TOP_SUBCOMMANDS = new Set(['status', 'dispatch', 'runs', 'evidence', 'reset-schedule'])
 const HOOT_GOAL_SUBCOMMANDS = new Set(['list', 'add', 'update', 'pause', 'resume', 'retire'])
 const HOOT_SETTINGS_SUBCOMMANDS = new Set(['show', 'set'])
-const HOOT_PROPOSAL_SUBCOMMANDS = new Set(['list', 'resolve'])
+const HOOT_PROPOSAL_SUBCOMMANDS = new Set(['list', 'history', 'resolve'])
 const HOOT_INJECT_SUBCOMMANDS = new Set(['list'])
 const HOOT_SETTINGS_FLAGS = [
   'enabled',
@@ -295,7 +296,7 @@ export function hootArgumentsOf(request: DiscordCommandRequest): string[] {
 
   if (group === 'proposal') {
     if (!HOOT_PROPOSAL_SUBCOMMANDS.has(subcommand)) {
-      throw invalid(`/hoot proposal ${subcommand} は知りません（list / resolve）`)
+      throw invalid(`/hoot proposal ${subcommand} は知りません（list / history / resolve）`)
     }
 
     const args = ['proposal', subcommand]

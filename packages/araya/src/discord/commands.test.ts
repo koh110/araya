@@ -56,7 +56,7 @@ test('slash command 定義は Discord の constraints を満たす', () => {
   )
   assert.deepEqual(
     HOOT_COMMAND.options.map((entry) => entry.name),
-    ['status', 'dispatch', 'runs', 'inject', 'goal', 'settings', 'proposal', 'reset-schedule'],
+    ['status', 'dispatch', 'runs', 'inject', 'evidence', 'goal', 'settings', 'proposal', 'reset-schedule'],
   )
 })
 
@@ -582,9 +582,156 @@ test('/hoot status・inject list・runs は bot process の dataDir を読む（
   }
 })
 
+test('/hoot proposal history と /hoot evidence は araya hoot と同じ引数列へ変換する（未知の proposal subcommand は list / history / resolve に案内）', () => {
+  assert.deepEqual(hootArgumentsOf(hootRequest({ group: 'proposal', subcommand: 'history' })), [
+    'proposal',
+    'history',
+  ])
+  assert.deepEqual(hootArgumentsOf(hootRequest({ subcommand: 'evidence' })), ['evidence'])
+  // closed 履歴を読むのに --key は要らない（resolve は今まで通り --key 必須）
+  assert.throws(
+    () => hootArgumentsOf(hootRequest({ group: 'proposal', subcommand: 'resolve' })),
+    /hoot_invalid_argument/u,
+  )
+  // --data-dir は option 定義に無いが、万一来ても拒否して bot process の dataDir を正とする
+  assert.throws(
+    () =>
+      hootArgumentsOf(
+        hootRequest({ group: 'proposal', subcommand: 'history', options: { 'data-dir': '/tmp/x' } }),
+      ),
+    /Discord から --data-dir/u,
+  )
+  assert.throws(
+    () => hootArgumentsOf(hootRequest({ group: 'proposal', subcommand: 'archive' })),
+    /proposal archive は知りません（list \/ history \/ resolve）/u,
+  )
+})
+
+test('Discord control command: /hoot proposal list・history と /hoot evidence は bot process の dataDir を読む（read-only）', async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-proposal-history-'))
+
+  try {
+    const logs: Record<string, unknown>[] = []
+    const control = createDiscordControlCommands({
+      dataDir,
+      nowMs: (): number => Date.parse('2026-06-30T09:00:00.000Z'),
+      log: (entry) => {
+        logs.push(entry)
+      },
+    })
+    await setGoal(
+      dataDir,
+      {
+        key: 'watch-ci',
+        objective: 'CI の失敗を追跡する',
+        scope: [],
+        constraints: [],
+      },
+      { replace: true },
+    )
+    await upsertProposal(dataDir, {
+      key: 'open-one',
+      decision: 'request_human',
+      goalKeys: ['watch-ci'],
+      reason: '優先順位を決めてください',
+      occurrenceKey: 'hoot:2026-06-30T08:00:00.000Z',
+      nowMs: Date.parse('2026-06-30T08:00:00.000Z'),
+    })
+    await upsertProposal(dataDir, {
+      key: 'closed-one',
+      decision: 'dispatch',
+      goalKeys: ['watch-ci'],
+      reason: 'CI が失敗しています',
+      occurrenceKey: 'hoot:2026-06-30T07:00:00.000Z',
+      nowMs: Date.parse('2026-06-30T07:00:00.000Z'),
+    })
+
+    const context = fakeContext({ dataDir })
+    // /hoot proposal resolve は state に効く（ここだけは書き換え）
+    await control.handle(
+      hootRequest({ group: 'proposal', subcommand: 'resolve', options: { key: 'closed-one' } }),
+      context,
+    )
+    assert.match(context.sends[0] ?? '', /resolved にしました/u)
+
+    // list は open だけ。closed の中身は出さず、総数と履歴への案内だけ
+    await control.handle(hootRequest({ group: 'proposal', subcommand: 'list' }), context)
+    assert.match(context.sends[1] ?? '', /open 1 \/ closed 1/u)
+    assert.equal((context.sends[1] ?? '').includes('closed-one'), false)
+    assert.match(
+      context.sends[1] ?? '',
+      /araya hoot proposal history \/ Discord は \/hoot proposal history/u,
+      JSON.stringify(context.sends[1]),
+    )
+
+    // history は closed だけ、updatedAt の新しい順に最大 5 件
+    await control.handle(hootRequest({ group: 'proposal', subcommand: 'history' }), context)
+    assert.match(context.sends[2] ?? '', /closed 1（updatedAt の新しい順に直近 5 件）/u)
+    assert.match(context.sends[2] ?? '', /closed-one \[resolved\]/u)
+    assert.equal((context.sends[2] ?? '').includes('open-one'), false)
+
+    // evidence は CLI と同じ read-only 表示（bot process の dataDir）
+    await control.handle(hootRequest({ subcommand: 'evidence' }), context)
+    assert.match(context.sends[3] ?? '', /delivery/u, JSON.stringify(context.sends[3]))
+
+    // 読むだけの command が state を書き換えていない（resolve 以降も closed は 1 件のまま）
+    const state = await readHootState(dataDir)
+    assert.equal(
+      state.proposals.filter((proposal) => {
+        return proposal.status !== 'open'
+      }).length,
+      1,
+    )
+    assert.equal(
+      logs.some((entry) => {
+        return entry.type === 'discord_control_command' && String(entry.command) === 'hoot proposal history'
+      }),
+      true,
+    )
+    assert.equal(
+      logs.some((entry) => {
+        return entry.type === 'discord_control_command' && String(entry.command) === 'hoot evidence'
+      }),
+      true,
+    )
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('Discord control command: /hoot proposal の未知の subcommand は ephemeral に list / history / resolve と返す', async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-proposal-unknown-'))
+
+  try {
+    const logs: Record<string, unknown>[] = []
+    const control = createDiscordControlCommands({
+      dataDir,
+      nowMs: (): number => Date.parse('2026-06-30T09:00:00.000Z'),
+      log: (entry) => {
+        logs.push(entry)
+      },
+    })
+    const context = fakeContext({ dataDir })
+
+    await control.handle(hootRequest({ group: 'proposal', subcommand: 'archive' }), context)
+    assert.match(context.sends[0] ?? '', /できませんでした: hoot_invalid_argument: \/hoot proposal archive は知りません（list \/ history \/ resolve）/u)
+    assert.equal(
+      logs.some((entry) => {
+        return entry.type === 'discord_control_failed' && String(entry.command) === 'hoot proposal archive'
+      }),
+      true,
+    )
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
 test('usage には slash command 形と operation の境界を書く', () => {
   assert.equal(DISCORD_CONTROL_USAGE.includes('/araya help'), true)
   assert.equal(DISCORD_CONTROL_USAGE.includes('/hoot settings'), true)
+  // closed 履歴と delivery の観測差も slash command 側にある（CLI 専用ではない）
+  assert.equal(DISCORD_CONTROL_USAGE.includes('/hoot proposal list / history / resolve'), true)
+  assert.equal(DISCORD_CONTROL_USAGE.includes('/hoot evidence'), true)
   // 境界は「どの shell から叩いたか」ではなく「承認済みの dispatch を受け取った main 会話だけ」側で説明する
   assert.equal(DISCORD_CONTROL_USAGE.includes('同じ kernel を通ります'), true)
   assert.equal(DISCORD_CONTROL_USAGE.includes('agent session の内側から'), false)
