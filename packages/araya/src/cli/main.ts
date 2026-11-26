@@ -66,7 +66,7 @@ function printHelp() {
     /hoot settings show・set                           = araya hoot settings show・set（16 の field 名が同じ）
     /hoot proposal list・history・resolve key:<key> = araya hoot proposal list・history・resolve --key <key>
     araya discord init・install・uninstall・run・status は CLI 専用（unit・token を触る操作を Discord からは叩かない）
-    /hoot evidence                                   = araya hoot evidence（delivery 前后の観測差。read-only）
+    /hoot evidence                                   = araya hoot evidence（delivery 前後の観測差。read-only）
     --data-dir は CLI だけ（Discord 側は bot process の dataDir だけを正とする）
 
   会話: 設定 channel に発言すると agent session が応答する。agent が report delivery を依頼した送信依頼は、

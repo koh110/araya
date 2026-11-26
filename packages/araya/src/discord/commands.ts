@@ -51,7 +51,7 @@ export const DISCORD_CONTROL_USAGE = [
   '  /hoot dispatch key:<proposal key> … 承認済みの dispatch を main 会話へ inject する承認',
   '  /hoot inject list … inject request の状態',
   '  /hoot runs     … 判断 run の記録',
-  '  /hoot evidence … delivery 前后の観測差（open list の比較。read-only）',
+  '  /hoot evidence … delivery 前後の観測差（open list の比較。read-only）',
   '  /hoot goal list / pause / resume / retire key:<key> … goal の一覧と status 変更',
   '  /hoot goal add key:<key> objective:<1 文> [scope:github:owner/repo,...] [constraint:...] [review-at:YYYY-MM-DD|none]',
   '  /hoot goal update key:<key> … 指定した field だけ更新（未指定は現状維持）',
