@@ -1060,7 +1060,7 @@ function snapshotRepoOf(snapshot: HootObservationSnapshot | undefined, repo: str
   return found === undefined || found.fingerprint === null ? undefined : found
 }
 
-// delivery 以前に届いた snapshot（before）と、delivery 以降に届いた最初の snapshot（after）
+// delivery 以前に届いた snapshot（before）と、delivery 以降に観測れた最新の snapshot（after）
 function evidenceSidesOf(state: HootState, delivery: HootInjectRequest, nowMs: number) {
   const before =
     delivery.deliveredEvidenceKey === null
@@ -1079,9 +1079,9 @@ function evidenceSidesOf(state: HootState, delivery: HootInjectRequest, nowMs: n
       continue
     }
 
+    // observations は古い順。after は delivery 以降で一番新しい観測（delivery 直後の 1 回だけ見て打ち切らない。
+    // 修正が数 occurrence 後に効いた場合も goal への効果として見える）
     after = snapshot
-
-    break
   }
 
   return { before, after }
@@ -1134,7 +1134,8 @@ function githubReposOfScope(scope: readonly string[]) {
   return repos
 }
 
-// goal ごとに delivery（inject）直後の観測差を並べる。retired goal は出さない（比較の意味がない）
+// goal ごとに delivery（inject）の前後の観測差を並べる。retired goal も出す（retire が妥当だったかを
+// delivery 後の open list で確かめるのがこの evidence の目的なので、status で filter しない）
 export function goalEvidenceOf(state: HootState, nowMs: number): HootGoalEvidence[] {
   const injected = state.injectRequests
     .filter((request) => {
@@ -1148,10 +1149,6 @@ export function goalEvidenceOf(state: HootState, nowMs: number): HootGoalEvidenc
   const evidence: HootGoalEvidence[] = []
 
   for (const goal of state.goals) {
-    if (goal.status === 'retired') {
-      continue
-    }
-
     const repos = githubReposOfScope(goal.scope)
 
     if (repos.length === 0) {

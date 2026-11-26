@@ -5,7 +5,7 @@ import path from 'node:path'
 import { test } from 'vite-plus/test'
 
 import { createHootLoop, type HootInjectInput, type HootTickOutcome } from './tick.ts'
-import { readHootState, setGoalStatus, writeHootState } from './store.ts'
+import { readHootState, goalEvidenceOf, setGoalStatus, writeHootState } from './store.ts'
 import {
   MAX_INJECT_ATTEMPTS,
   OBSERVATION_SNAPSHOTS_KEPT,
@@ -1631,6 +1631,48 @@ test('hoot tick: snapshot の保持は直近 OBSERVATION_SNAPSHOTS_KEPT 件（de
     assert.equal(state.loop.observations.some((entry) => {
       return entry.occurrenceKey === prefilled[0]?.occurrenceKey
     }), false)
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot tick: delivery が参照している snapshot は window から落ちない（delivery 数 occurrence 後の評価に before 側を残す）', async () => {
+  const prefilled = Array.from({ length: 12 }, (_entry, index) => {
+    return tickSnapshotFixture(`2026-11-18T${String(index).padStart(2, '0')}:30:00.000Z`, {
+      issueNumbers: [String(index)],
+    })
+  })
+  const fixture = await makeHootLoopFixture({
+    settings: { enabled: true, tickMinutes: 5 },
+    goals: [goalFixture()],
+    loop: { observations: prefilled },
+    injectRequests: [
+      pendingInjectFixture({
+        status: 'injected',
+        injectedAt: '2026-11-19T00:35:00.000Z',
+        deliveredEvidenceKey: prefilled[0]?.occurrenceKey ?? null,
+      }),
+    ],
+  })
+
+  try {
+    const outcome = await fixture.loop.tickOnce()
+    assert.equal(outcome.kind, 'ran')
+    const state = await fixture.readState()
+    // window の 8 件外加えて、evidence が指す snapshot は残っている
+    assert.equal(state.loop.observations.length, OBSERVATION_SNAPSHOTS_KEPT + 1)
+    assert.equal(state.loop.observations.some((entry) => {
+      return entry.occurrenceKey === prefilled[0]?.occurrenceKey
+    }), true)
+    // pinned していない古い side は window の外へ出る
+    assert.equal(state.loop.observations.some((entry) => {
+      return entry.occurrenceKey === prefilled[1]?.occurrenceKey
+    }), false)
+    assert.equal(state.loop.observations.at(-1)?.occurrenceKey, outcome.occurrenceKey)
+    const evidence = goalEvidenceOf(state, Date.parse('2026-11-19T10:00:00.000Z'))
+    // delivery 時点の観測と delivery 後の最新の観測を比較できる
+    assert.equal(evidence[0]?.deliveries[0]?.delta[0]?.beforeKey, prefilled[0]?.occurrenceKey)
+    assert.equal(evidence[0]?.deliveries[0]?.delta[0]?.afterKey, outcome.occurrenceKey)
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }

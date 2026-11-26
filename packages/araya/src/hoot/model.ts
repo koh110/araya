@@ -65,6 +65,9 @@ export const MAX_INJECTS_KEPT = 20
 export const OBSERVATION_SNAPSHOT_REPOS_MAX = 6
 export const OBSERVATION_SNAPSHOT_ITEMS_MAX = 30
 export const OBSERVATION_SNAPSHOTS_KEPT = 8
+// delivery 時点の evidence（inject request の deliveredEvidenceKey）が指す snapshot は window から落とさない。
+// pinned になれるのは inject request の数までなので、合計はこの bound を超えない
+export const OBSERVATION_SNAPSHOTS_MAX = OBSERVATION_SNAPSHOTS_KEPT + MAX_INJECTS_KEPT
 // goal に出す evidence delivery の上限（直近 3 件）
 export const MAX_GOAL_EVIDENCE_DELIVERIES = 3
 // 1 件の inject request で submit を試行する回数。crash で pending に戻っても無限に再試行しない
@@ -320,17 +323,39 @@ export function goalEvidenceDeltaText(delta: HootGoalEvidenceDelta) {
   return parts.join(' / ')
 }
 
-// snapshot を古い順に保持する（同じ occurrenceKey の書き直しは 1 件に揃え、直近 OBSERVATION_SNAPSHOTS_KEPT だけ残す）
+// 参照されている evidence key（delivery 済み request が指す occurrence key）。これらの snapshot は window から落とさない
+export function pinnedEvidenceKeysOf(state: HootState): Set<string> {
+  const keys = new Set<string>()
+
+  for (const request of state.injectRequests) {
+    if (request.deliveredEvidenceKey !== null && request.deliveredEvidenceKey !== '') {
+      keys.add(request.deliveredEvidenceKey)
+    }
+  }
+
+  return keys
+}
+
+// snapshot を古い順に保持する（同じ occurrenceKey の書き直しは 1 件に揃える）。
+// 直近 OBSERVATION_SNAPSHOTS_KEPT 件 + delivery の evidence が参照している snapshot だけ残す。
+// evidence を window から落とすと、goal への効果を確かめる前に before 側が消える（delivery 数時間後に評価できない）
 export function appendObservationSnapshot(
   observations: readonly HootObservationSnapshot[],
-  snapshot: HootObservationSnapshot
+  snapshot: HootObservationSnapshot,
+  pinnedKeys: ReadonlySet<string> = new Set()
 ): HootObservationSnapshot[] {
   const kept = observations.filter((entry) => {
     return entry.occurrenceKey !== snapshot.occurrenceKey
   })
   kept.push(snapshot)
 
-  return kept.slice(-OBSERVATION_SNAPSHOTS_KEPT)
+  const windowStart = Math.max(0, kept.length - OBSERVATION_SNAPSHOTS_KEPT)
+  const pruned = kept.filter((entry, index) => {
+    return index >= windowStart || pinnedKeys.has(entry.occurrenceKey)
+  })
+
+  // pinned になれる数は inject request の数以下なので、ここでは pinned は落ちない
+  return pruned.slice(-OBSERVATION_SNAPSHOTS_MAX)
 }
 
 export type HootLoopState = {
@@ -1036,7 +1061,7 @@ function isRepoSnapshotShape(value: unknown): value is HootRepoSnapshot {
 
 // 壊れた snapshot は hoot_state_invalid にする（migration で黙って捨てない）
 export function isObservationsShape(value: unknown): value is HootObservationSnapshot[] {
-  if (!Array.isArray(value) || value.length > OBSERVATION_SNAPSHOTS_KEPT) {
+  if (!Array.isArray(value) || value.length > OBSERVATION_SNAPSHOTS_MAX) {
     return false
   }
 
