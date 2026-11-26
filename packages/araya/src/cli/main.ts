@@ -64,9 +64,9 @@ function printHelp() {
     /hoot dispatch key:<key>                          = araya hoot dispatch --key <key>
     /hoot goal list・add・update・pause・resume・retire  = araya hoot goal …（--key --objective --scope --constraint --review-at）
     /hoot settings show・set                           = araya hoot settings show・set（16 の field 名が同じ）
-    /hoot proposal list・resolve key:<key>            = araya hoot proposal list・resolve --key <key>
+    /hoot proposal list・history・resolve key:<key> = araya hoot proposal list・history・resolve --key <key>
     araya discord init・install・uninstall・run・status は CLI 専用（unit・token を触る操作を Discord からは叩かない）
-    araya hoot evidence は CLI 専用（delivery 後の観測差。Discord の slash にはまだ無い。follow-up）
+    /hoot evidence                                   = araya hoot evidence（delivery 前后の観測差。read-only）
     --data-dir は CLI だけ（Discord 側は bot process の dataDir だけを正とする）
 
   会話: 設定 channel に発言すると agent session が応答する。agent が report delivery を依頼した送信依頼は、
@@ -93,8 +93,13 @@ function printHelp() {
     inject してよい decision は dispatch / investigate（investigate は main 会話の read-only 調査案件になる）。dry_run では作りません。mode=active でも autoDispatch=false ならこの command が承認です。
   araya hoot inject list
     inject request（pending / injected / failed）を新しい順に表示する。失敗が重なったら proposal list で作り直す。
-  araya hoot proposal list | resolve --key <key>
-    人間の応答を待つ未解決の提案（investigate / dispatch / request_human）の一覧と解決。期限切れは expired になります。
+  araya hoot proposal list | history | resolve --key <key>
+    人間の応答を待つ未解決の提案（investigate / dispatch / request_human）の一覧と解決。list は open だけを出し、closed
+    になった案件は総数と「araya hoot proposal history」への案内だけに出します。期限切れは expired になります。
+  araya hoot proposal history
+    closed になった proposal の履歴を総数付きで読む（updatedAt の新しい順に最大 5 件。1 件ずつ key・status・decision・
+    goals・reason・created / confirmed / expires / reminders・inject 対応の latest / oldest を出す。read-only で proposal・
+    inject request・観測・goal の status を書き換えず、state の schema も version も変えない）。
   araya hoot evidence
     main 会話に渡した案件（delivery）の前後で GitHub の open list がどう変わったかを、state file の観測 snapshot から
     決定的に計算して表示する（read-only。closed / merged の区別は観測しておらず、goal の status は変更しません）。
