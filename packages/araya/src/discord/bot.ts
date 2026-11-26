@@ -621,7 +621,7 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
     }
 
     // cursor が unfinished を越えた（＝その id はこの先 backfill で取り直さない）ことを黙らせない。
-    // 越えた理由が Discord 側で unknown な case（fetch window の外の unfinished などを over_limit で落とし、
+    // 越えた理由が Discord 側で unknown な case（fetch 範囲（新しい 100 件）の外にある unfinished などを over_limit で落とし、
     // その間に cursor が進んだ）はここに載る
     if (droppedUnfinished.length > 0) {
       logSafe({

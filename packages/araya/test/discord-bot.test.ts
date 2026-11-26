@@ -3514,7 +3514,7 @@ test('discord bot: 処理を終えた id は state file に溜め続けらない
 })
 
 test('discord bot: 取り直せない unfinished（history に届かず cursor が既に越えている）は落として log に出す', async () => {
-  // cursor gate の無い build が書いた state の legacy unfinished かつ、history の fetch window の外（fetch は
+  // cursor gate の無い build が書いた state の legacy unfinished かつ、history の fetch 範囲（新しい 100 件）の外（fetch は
   // 成功したが 0 件）という状態。unfinished に持ち続けると集合が膨れ続けて取り直し対象にもならないので、
   // state file から落とし、落とした事を discord_unfinished_pruned に出す
   const dataDir = await fs.realpath(

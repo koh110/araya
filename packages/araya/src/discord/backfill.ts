@@ -45,7 +45,7 @@ export type BackfillSelection = {
   candidates: DiscordHistoryMessage[]
   skipped: BackfillSkip[]
   // 件数上限（BACKFILL_MAX_MESSAGES）でこの round に落とされた unfinished。取り直し対象なのに history の
-  // fetch window と件数上限で取り直せないので、cursor をその id より後ろへ進めない（runDiscordRestartBackfill
+  // fetch 範囲（新しい 100 件）と件数上限で取り直せないので、cursor をその id より後ろへ進めない（runDiscordRestartBackfill
   // が discord_backfill_unfinished_stuck として log する）
   stuckUnfinishedMessageIds: string[]
 }
@@ -367,7 +367,7 @@ export async function runDiscordRestartBackfill(
   })
 
   // 取り直し対象（unfinished）なのに 20 件の上限でこの round に落とされた ids。cursor はこれらの id より
-  // 後ろへ進めない（下の canAdvanceCursorPast）ので、取り直しが進まない限り毎 round 同じ fetch window
+  // 後ろへ進めない（下の canAdvanceCursorPast）ので、取り直しが進まない限り毎 round 同じ fetch 範囲
   // （新しい 100 件）を読み直し、cursor は動かず candidates も同じ 100 件ままになる。黙って cursor を
   // 止めないため id を log に出す（state file 側の prune は bot.ts が担当し、落とした事は
   // discord_unfinished_pruned に出す）
@@ -477,7 +477,7 @@ export async function runDiscordRestartBackfill(
 
     if (answerChunks > 0) {
       // 応答を送った ids を answered に記録する択（nonce だけに依存しない）。Discord の enforce_nonce の
-      // 重複窓は過去数分のあいだだけなので、restart をまたいだ二度応答は nonce では止められない。
+      // 同じ nonce の delivery を 1 通にまとめるのは過去数分のあいだだけなので、restart をまたいだ二度応答は nonce では止められない。
       // at-least-once は壊れない: unfinished かつ answered でない id は age 上限を無視して取り直し、
       // turn 完了＋応答送信済みは処理完了なので再実行しない。応答送信中に process が消えた case は
       // answered に入らないので unfinished のまま残り、次の restart が取り直して二度走ることがある
