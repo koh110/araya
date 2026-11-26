@@ -1597,7 +1597,7 @@ test('hoot cli evidence: 比較できる snapshot が無いときは空だと言
     const noBefore = await fixture.run(['evidence'])
     assert.equal(noBefore.ok, true, noBefore.message)
     assert.match(noBefore.output, /evidence 未取得/u)
-    assert.match(noBefore.output, /比較できる観測 snapshot がまだ届いていません/u)
+    assert.match(noBefore.output, /比較可能な前後の観測 snapshot がありません/u)
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }

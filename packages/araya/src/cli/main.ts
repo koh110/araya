@@ -103,7 +103,7 @@ function printHelp() {
   araya hoot evidence
     main 会話に渡した案件（delivery）の前後で GitHub の open list がどう変わったかを、state file の観測 snapshot から
     決定的に計算して表示する（read-only。closed / merged の区別は観測しておらず、goal の status は変更しません）。
-    観測 snapshot は直近 8 occurrence、goal に出す delivery は直近 3 件まで。
+    観測 snapshot は直近 8 occurrence（delivery が参照する snapshot はそれより古くても保持）、goal に出す delivery は直近 3 件まで。
   araya hoot runs [--limit N]
     判断 run の記録（decision と reason、source は model / precheck）を新しい順に表示する。
   araya hoot reset-schedule

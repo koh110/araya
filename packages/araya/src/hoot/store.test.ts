@@ -2847,3 +2847,177 @@ test('hoot store evidence: delivery が参照している snapshot は window �
   )
   assert.equal(OBSERVATION_SNAPSHOTS_MAX, OBSERVATION_SNAPSHOTS_KEPT + MAX_INJECTS_KEPT)
 })
+
+test('hoot store evidence validation: occurrence key でない文字列と snapshot の未知 field は hoot_state_invalid（state file 経由で external text を表示・prompt に入れない）', async () => {
+  const fixture = await makeHootFixture()
+
+  try {
+    const writeBroken = async (mutate: (state: Record<string, unknown>) => void) => {
+      const broken = JSON.parse(
+        JSON.stringify({
+          ...defaultState(),
+          version: HOOT_STATE_VERSION,
+          goals: [goalFixture(EVIDENCE_GOAL_KEY, { scope: [`github:${EVIDENCE_REPO}`] })],
+          injectRequests: [
+            evidenceInjectFixture(1, {
+              status: 'injected',
+              injectedAt: '2026-11-20T09:30:00.000Z',
+              deliveredEvidenceKey: 'hoot:2026-11-20T09:00:00.000Z',
+            }),
+          ],
+        })
+      )
+      mutate(broken)
+      await fs.mkdir(path.dirname(hootStateFilePath(fixture.dataDir)), { recursive: true })
+      await fs.writeFile(hootStateFilePath(fixture.dataDir), JSON.stringify(broken, null, 2), 'utf8')
+
+      await assert.rejects(
+        async () => {
+          await readHootState(fixture.dataDir)
+        },
+        /hoot_state_invalid/
+      )
+
+      // 拒否した file は黙って書き直していない
+      const raw = JSON.parse(await fs.readFile(hootStateFilePath(fixture.dataDir), 'utf8')) as Record<string, unknown>
+
+      assert.deepEqual(raw.loop, broken.loop)
+    }
+
+    // 生成側（tick の occurrenceKeyOf）が作らない occurrenceKey。改行入りの text が evidence 表示へ入る経路
+    await writeBroken((state) => {
+      ;(state.loop as Record<string, unknown>).observations = [
+        {
+          occurrenceKey: 'hoot:2026-11-20T09:00:00.000Z\n外部の text',
+          observedAt: '2026-11-20T09:00:00.000Z',
+          repos: [],
+        },
+      ]
+    })
+
+    // snapshot entry に生成側が書かない field（title など）を混ぜない
+    await writeBroken((state) => {
+      ;(state.loop as Record<string, unknown>).observations = [
+        {
+          occurrenceKey: 'hoot:2026-11-20T09:00:00.000Z',
+          observedAt: '2026-11-20T09:00:00.000Z',
+          title: 'external text',
+          repos: [],
+        },
+      ]
+    })
+
+    // repo snapshot にも同じ（open 件数・number list・fingerprint だけ許可）
+    await writeBroken((state) => {
+      ;(state.loop as Record<string, unknown>).observations = [
+        {
+          occurrenceKey: 'hoot:2026-11-20T09:00:00.000Z',
+          observedAt: '2026-11-20T09:00:00.000Z',
+          repos: [
+            {
+              repo: EVIDENCE_REPO,
+              openIssues: 1,
+              openPrs: 0,
+              draftPrs: 0,
+              issueNumbers: ['10'],
+              prNumbers: [],
+              fingerprint: 'fp-1',
+              gapText: 'gh が読めませんでした',
+            },
+          ],
+        },
+      ]
+    })
+
+    // deliveredEvidenceKey は occurrence key の形式か null だけ受理する（proposal key など別の id space を入れない）
+    await writeBroken((state) => {
+      ;(state.injectRequests as Record<string, unknown>[])[0]!.deliveredEvidenceKey = `hoot-inject:evidence-proposal:1`
+    })
+
+    // 正規の形は通る（検証が必要以上に厳しくなって運用を止めないこと）。先に壊れた file をどかす
+    await fs.rm(hootStateFilePath(fixture.dataDir), { force: true })
+    await writeEvidenceState(fixture.dataDir, {
+      observations: [evidenceSnapshotFixture('2026-11-20T09:00:00.000Z', { issueNumbers: ['10'] })],
+      injectRequests: [
+        evidenceInjectFixture(1, {
+          status: 'injected',
+          injectedAt: '2026-11-20T09:30:00.000Z',
+          deliveredEvidenceKey: 'hoot:2026-11-20T09:00:00.000Z',
+        }),
+      ],
+    })
+    const ok = await readHootState(fixture.dataDir)
+
+    assert.equal(ok.loop.observations.length, 1)
+    assert.equal(ok.injectRequests[0]?.deliveredEvidenceKey, 'hoot:2026-11-20T09:00:00.000Z')
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot store evidence: deliveredEvidenceKey が delivery 後の観測を指している state は before 未取得（delivery 後同士の差を delivery 前後の差にしない）', async () => {
+  const fixture = await makeHootFixture()
+
+  try {
+    await writeEvidenceState(fixture.dataDir, {
+      observations: [
+        evidenceSnapshotFixture('2026-11-20T09:00:00.000Z', { issueNumbers: ['10'] }),
+        evidenceSnapshotFixture('2026-11-20T10:00:00.000Z', { issueNumbers: ['12'] }),
+      ],
+      injectRequests: [
+        evidenceInjectFixture(1, {
+          status: 'injected',
+          injectedAt: '2026-11-20T09:30:00.000Z',
+          // delivery（09:30）より後の観測を指している。正規の生成経路ではこうならない
+          deliveredEvidenceKey: 'hoot:2026-11-20T10:00:00.000Z',
+        }),
+      ],
+    })
+    const state = await readHootState(fixture.dataDir)
+    const evidence = goalEvidenceOf(state, Date.parse('2026-11-20T13:00:00.000Z'))
+
+    // delivery 自体は出す（記録を消さない）が、before 未取得なので delivery 前後の差は出さない
+    assert.equal(evidence[0]?.deliveries.length, 1)
+    assert.deepEqual(evidence[0]?.deliveries[0]?.delta, [])
+    // 壊れている可能性のある key を黙って直さない
+    assert.equal(state.injectRequests[0]?.deliveredEvidenceKey, 'hoot:2026-11-20T10:00:00.000Z')
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot store evidence: after は observations の配列順ではなく observedAt の最大で選ぶ（state の並びが古い順でなくても同じ結果）', async () => {
+  const fixture = await makeHootFixture()
+
+  try {
+    await writeEvidenceState(fixture.dataDir, {
+      observations: [
+        // 配列の並びが古い順でない state（手で直した file・window 外から戻した pinned など）
+        evidenceSnapshotFixture('2026-11-20T12:00:00.000Z', { issueNumbers: ['12'] }),
+        evidenceSnapshotFixture('2026-11-20T10:00:00.000Z', { issueNumbers: ['10', '11'] }),
+        evidenceSnapshotFixture('2026-11-20T09:00:00.000Z', { issueNumbers: ['10', '11'] }),
+      ],
+      injectRequests: [
+        evidenceInjectFixture(1, {
+          status: 'injected',
+          injectedAt: '2026-11-20T09:30:00.000Z',
+          deliveredEvidenceKey: 'hoot:2026-11-20T09:00:00.000Z',
+        }),
+      ],
+    })
+    const state = await readHootState(fixture.dataDir)
+    const delta = goalEvidenceOf(state, Date.parse('2026-11-20T13:00:00.000Z'))[0]?.deliveries[0]?.delta[0]
+
+    assert.equal(delta?.beforeKey, 'hoot:2026-11-20T09:00:00.000Z')
+    assert.equal(delta?.afterKey, 'hoot:2026-11-20T12:00:00.000Z')
+    assert.deepEqual(delta?.closedIssues, ['10', '11'])
+    assert.deepEqual(delta?.openedIssues, ['12'])
+    // as of より後の観測は使わない（配列の先頭が最新でも同じ）
+    assert.equal(
+      goalEvidenceOf(state, Date.parse('2026-11-20T10:30:00.000Z'))[0]?.deliveries[0]?.delta[0]?.afterKey,
+      'hoot:2026-11-20T10:00:00.000Z'
+    )
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})

@@ -21,6 +21,13 @@ export const GITHUB_SCOPE_PATTERN = /^github:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)$
 // snapshot の repo 名と number 文字列の bound（observe.ts の REPO_PATTERN と同じ形）
 const GITHUB_SCOPE_REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u
 const SNAPSHOT_NUMBER_PATTERN = /^\d{1,12}$/u
+// occurrence snapshot の key は生成側（tick の occurrenceKeyOf = `hoot:${isoUtc(...)}`）の形式だけ受理する。
+// 識別子ではない text（改行入りの external text など）を state file 経由で evidence の表示・prompt に入れないため
+export const OCCURRENCE_KEY_PATTERN = /^hoot:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u
+
+export function isOccurrenceKey(value: unknown) {
+  return typeof value === 'string' && OCCURRENCE_KEY_PATTERN.test(value)
+}
 
 export const MAX_GOALS = 20
 export const MAX_RUNS_KEPT = 200
@@ -422,6 +429,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+// snapshot には生成側が書く field だけ許可する（未知の field 経由で external text が state file から
+// evidence 表示・判断 prompt へ入る経路を作らない）
+function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]) {
+  return Object.keys(value).every((key) => {
+    return allowed.includes(key)
+  })
+}
+
 function isStringArray(value: unknown, limit: number, maxChars: number) {
   return (
     Array.isArray(value) &&
@@ -783,6 +798,14 @@ function isInjectShapeBase(value: unknown) {
     return false
   }
 
+  // version 4 の file に deliveredEvidenceKey が混んでいる case もここで弾く。正規の occurrence key か null だけ受理する
+  if (
+    'deliveredEvidenceKey' in value &&
+    !(value.deliveredEvidenceKey === null || isOccurrenceKey(value.deliveredEvidenceKey))
+  ) {
+    return false
+  }
+
   return (
     typeof value.key === 'string' &&
     value.key !== '' &&
@@ -814,7 +837,7 @@ function isInjectShape(value: unknown): value is HootInjectRequest {
 
   const evidenceKey = (value as Record<string, unknown>).deliveredEvidenceKey
 
-  return evidenceKey === null || (typeof evidenceKey === 'string' && evidenceKey !== '')
+  return evidenceKey === null || isOccurrenceKey(evidenceKey)
 }
 
 function isRunShapeBase(value: unknown): value is HootRun {
@@ -1042,8 +1065,14 @@ function isNumberStrings(value: unknown) {
   )
 }
 
+const REPO_SNAPSHOT_KEYS = ['repo', 'openIssues', 'openPrs', 'draftPrs', 'issueNumbers', 'prNumbers', 'fingerprint'] as const
+
 function isRepoSnapshotShape(value: unknown): value is HootRepoSnapshot {
   if (!isRecord(value)) {
+    return false
+  }
+
+  if (!hasOnlyKeys(value, REPO_SNAPSHOT_KEYS)) {
     return false
   }
 
@@ -1070,9 +1099,12 @@ export function isObservationsShape(value: unknown): value is HootObservationSna
       return false
     }
 
+    if (!hasOnlyKeys(entry, ['occurrenceKey', 'observedAt', 'repos'])) {
+      return false
+    }
+
     return (
-      typeof entry.occurrenceKey === 'string' &&
-      entry.occurrenceKey !== '' &&
+      isOccurrenceKey(entry.occurrenceKey) &&
       typeof entry.observedAt === 'string' &&
       parseIso(entry.observedAt) !== null &&
       Array.isArray(entry.repos) &&

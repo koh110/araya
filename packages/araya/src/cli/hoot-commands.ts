@@ -235,7 +235,7 @@ function evidenceGoalLines(evidence: readonly HootGoalEvidence[]) {
       )
 
       if (delivery.delta.length === 0) {
-        lines.push('    比較できる観測 snapshot がまだ届いていません（観測は直近 ' + OBSERVATION_SNAPSHOTS_KEPT + ' occurrence だけ保持します）')
+        lines.push('    比較可能な前後の観測 snapshot がありません（before が未取得、または delivery 以降の観測がまだ届いていません。観測は直近 ' + OBSERVATION_SNAPSHOTS_KEPT + ' occurrence と delivery が参照する snapshot を保持します）')
 
         continue
       }
