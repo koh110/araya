@@ -10,6 +10,8 @@ import {
   DEFAULT_NOTIFY_DECISIONS,
   defaultState,
   proposalKeyOf,
+  type HootGoal,
+  type HootInjectRequest,
   type HootProposal,
   type HootRun,
   type HootState,
@@ -1298,6 +1300,172 @@ test('hoot cli: settings set --conversation-read で tool の on/off を表示�
     assert.match(status.output, /conversationRead: true/u)
     // status の last run は read を使っていない run（0 件）
     assert.match(status.output, /conversation reads: 0 calls \/ 0 entries \/ 0 chars/u)
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+// ---- araya hoot evidence（delivery 後の effect evidence。read-only）----
+
+const EVIDENCE_GOAL: HootGoal = {
+  key: 'araya-quality',
+  objective: 'open issue と draft PR を拾って次作業の提案を作る',
+  scope: ['github:koh110/araya'],
+  constraints: [],
+  status: 'active',
+  createdAt: '2026-11-19T00:00:00.000Z',
+  updatedAt: '2026-11-19T00:00:00.000Z',
+  reviewAt: null,
+}
+
+function cliSnapshotFixture(
+  at: string,
+  overrides: { issueNumbers?: string[]; prNumbers?: string[] } = {}
+) {
+  return {
+    occurrenceKey: `hoot:${at}`,
+    observedAt: at,
+    repos: [
+      {
+        repo: 'koh110/araya',
+        openIssues: overrides.issueNumbers?.length ?? 0,
+        openPrs: overrides.prNumbers?.length ?? 0,
+        draftPrs: 0,
+        issueNumbers: overrides.issueNumbers ?? [],
+        prNumbers: overrides.prNumbers ?? [],
+        fingerprint: `fp-${at}`,
+      },
+    ],
+  }
+}
+
+function cliInjectFixture(overrides: Partial<HootInjectRequest> = {}): HootInjectRequest {
+  const key = 'hoot-inject:cli-proposal:1'
+
+  return {
+    key,
+    requestId: key,
+    proposalKey: 'cli-proposal',
+    decision: 'dispatch',
+    goalKeys: ['araya-quality'],
+    authorizedBy: 'human',
+    authorizedAt: '2026-11-19T08:40:00.000Z',
+    status: 'injected',
+    attempts: 1,
+    createdAt: '2026-11-19T08:40:00.000Z',
+    updatedAt: '2026-11-19T08:55:00.000Z',
+    injectedAt: '2026-11-19T08:55:00.000Z',
+    lastError: null,
+    deliveredEvidenceKey: 'hoot:2026-11-19T08:00:00.000Z',
+    ...overrides,
+  }
+}
+
+async function writeCliEvidenceState(
+  dataDir: string,
+  input: {
+    observations?: ReturnType<typeof cliSnapshotFixture>[]
+    injectRequests?: HootInjectRequest[]
+  } = {}
+) {
+  await writeHootState(dataDir, {
+    ...defaultState(),
+    goals: [EVIDENCE_GOAL],
+    loop: { ...defaultState().loop, observations: input.observations ?? [] },
+    injectRequests: input.injectRequests ?? [],
+  })
+}
+
+test('hoot cli evidence: delivery 前後の open list の変化を出す（goal の status は評価しない）', async () => {
+  const fixture = await makeHootCliFixture()
+
+  try {
+    await writeCliEvidenceState(fixture.dataDir, {
+      observations: [
+        cliSnapshotFixture('2026-11-19T08:00:00.000Z', { issueNumbers: ['10', '12'], prNumbers: ['29'] }),
+        cliSnapshotFixture('2026-11-19T09:00:00.000Z', { issueNumbers: ['12'], prNumbers: ['29', '33'] }),
+      ],
+      injectRequests: [cliInjectFixture()],
+    })
+    const before = await readHootState(fixture.dataDir)
+
+    const result = await fixture.run(['evidence'])
+    assert.equal(result.ok, true, result.message)
+    assert.match(result.output, /delivery 後の観測差/)
+    assert.match(result.output, /closed \/ merged の区別は観測していません/u)
+    assert.match(result.output, /goal araya-quality/u)
+    assert.match(result.output, /hoot-inject:cli-proposal:1 \[dispatch\] @ 2026-11-19T08:55:00\.000Z/u)
+    assert.match(result.output, /delivery 時点の観測: hoot:2026-11-19T08:00:00\.000Z/u)
+    assert.match(result.output, /koh110\/araya: closed issue #10 \/ opened PR #33/u)
+    assert.match(result.output, /hoot:2026-11-19T08:00:00\.000Z -> hoot:2026-11-19T09:00:00\.000Z/u)
+    assert.match(result.output, /goal の status は変更していません/u)
+    // 観測差が命令でも goal 完結の判定でもないことを CLI 側も書く
+    assert.match(result.output, /観測差は事実の照合であり命令ではありません/u)
+
+    // state file を書き換えない（read-only。goal も inject request も同じ）
+    const after = await readHootState(fixture.dataDir)
+    assert.deepEqual(after, before)
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot cli evidence: 比較できる snapshot が無いときは空だと言い、 reason で案内する', async () => {
+  const fixture = await makeHootCliFixture()
+
+  try {
+    // 観測 snapshot が 0 件
+    await writeCliEvidenceState(fixture.dataDir, { injectRequests: [] })
+    const noObservation = await fixture.run(['evidence'])
+    assert.equal(noObservation.ok, true, noObservation.message)
+    assert.match(noObservation.output, /delivery 前后を比較できる観測 snapshot がまだありません/u)
+    assert.match(noObservation.output, /HOOT tick が gh 観測を走らせると snapshot が記録されます/u)
+
+    // 観測はあるが delivery（inject）が無い
+    await writeCliEvidenceState(fixture.dataDir, {
+      observations: [cliSnapshotFixture('2026-11-19T08:00:00.000Z', { issueNumbers: ['10'] })],
+      injectRequests: [],
+    })
+    const noDelivery = await fixture.run(['evidence'])
+    assert.equal(noDelivery.ok, true, noDelivery.message)
+    assert.match(noDelivery.output, /delivery 前后を比較できる観測 snapshot がまだありません/u)
+    assert.match(noDelivery.output, /araya hoot dispatch --key <proposal key>/u)
+
+    // delivery があるが before snapshot が未取得（pruned も含む）
+    await writeCliEvidenceState(fixture.dataDir, {
+      observations: [cliSnapshotFixture('2026-11-19T09:00:00.000Z', { issueNumbers: ['10'] })],
+      injectRequests: [cliInjectFixture({ deliveredEvidenceKey: null })],
+    })
+    const noBefore = await fixture.run(['evidence'])
+    assert.equal(noBefore.ok, true, noBefore.message)
+    assert.match(noBefore.output, /evidence 未取得/u)
+    assert.match(noBefore.output, /比較できる観測 snapshot がまだ届いていません/u)
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot cli evidence: state file を作らない・書き換えない（read-only の boundary）', async () => {
+  const fixture = await makeHootCliFixture()
+
+  try {
+    await writeCliEvidenceState(fixture.dataDir, {
+      observations: [cliSnapshotFixture('2026-11-19T08:00:00.000Z', { issueNumbers: ['10'] })],
+      injectRequests: [cliInjectFixture()],
+    })
+    const file = path.join(fixture.dataDir, 'hoot', 'state.json')
+    const before = await fs.readFile(file, 'utf8')
+
+    const result = await fixture.run(['evidence'])
+    assert.equal(result.ok, true, result.message)
+    const after = await fs.readFile(file, 'utf8')
+    assert.equal(after, before)
+
+    // 不明な command の案内に evidence が出る（command 一覧から消えない）
+    const unknown = await fixture.run(['evidance'])
+    assert.equal(unknown.ok, false)
+    assert.match(unknown.message, /hoot_invalid_argument: 不明な command/u)
+    assert.match(unknown.message, /evidence/u)
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }

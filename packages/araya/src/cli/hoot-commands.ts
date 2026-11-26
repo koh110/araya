@@ -6,6 +6,8 @@ import {
   DEFAULT_TICK_MINUTES,
   HOOT_DECISIONS,
   INJECT_COOLDOWN_MINUTES_MAX,
+  MAX_GOAL_EVIDENCE_DELIVERIES,
+  OBSERVATION_SNAPSHOTS_KEPT,
   INJECT_COOLDOWN_MINUTES_MIN,
   MAX_GOALS,
   MAX_INJECTS_KEPT,
@@ -15,8 +17,10 @@ import {
   MAX_RUNS_KEPT,
   TICK_MINUTES_MAX,
   TICK_MINUTES_MIN,
+  goalEvidenceDeltaText,
   isoUtc,
   parseIso,
+  type HootGoalEvidence,
   type HootDecision,
   type HootGoal,
   type HootGoalStatus,
@@ -27,6 +31,7 @@ import {
 } from '../hoot/model.ts'
 import {
   enqueueHootInject,
+  goalEvidenceOf,
   readHootState,
   resolveProposal,
   resetSchedule,
@@ -205,6 +210,38 @@ function injectLine(request: HootInjectRequest) {
     `  authorized: ${request.authorizedBy} @ ${request.authorizedAt} / attempts: ${request.attempts}/${MAX_INJECT_ATTEMPTS}`,
     `  injectedAt: ${request.injectedAt ?? '（まだ）'}${error}`,
   ].join('\n')
+}
+
+// delivery 後の観測差（effect evidence）の human readable な block。
+// open list の比較だけで closed / merged の区別は観測していない。Goal の status は評価しない
+function evidenceGoalLines(evidence: readonly HootGoalEvidence[]) {
+  const lines: string[] = []
+
+  for (const goal of evidence) {
+    lines.push(`goal ${goal.goalKey}`)
+
+    for (const delivery of goal.deliveries) {
+      const evidenceNote =
+        delivery.deliveredEvidenceKey === null
+          ? 'delivery までに観測がなく evidence 未取得'
+          : `delivery 時点の観測: ${delivery.deliveredEvidenceKey}`
+      lines.push(
+        `  inject ${delivery.injectKey} [${delivery.decision}] @ ${delivery.injectedAt}（${evidenceNote}）`
+      )
+
+      if (delivery.delta.length === 0) {
+        lines.push('    比較できる観測 snapshot がまだ届いていません（観測は直近 ' + OBSERVATION_SNAPSHOTS_KEPT + ' occurrence だけ保持します）')
+
+        continue
+      }
+
+      for (const delta of delivery.delta) {
+        lines.push(`    ${delta.repo}: ${goalEvidenceDeltaText(delta)}（${delta.beforeKey} -> ${delta.afterKey}）`)
+      }
+    }
+  }
+
+  return lines
 }
 
 function nextOccurrenceOf(state: HootState, nowMs: number) {
@@ -579,6 +616,43 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
     return
   }
 
+  if (command === 'evidence') {
+    // 読むだけ。Goal の status も inject request も state も変更しない（docs/spec/hoot-minimal.md）
+    const state = await readHootState(dataDir)
+    const evidence = goalEvidenceOf(state, deps.nowMs())
+    const deliveries = evidence.reduce((total, goal) => {
+      return total + goal.deliveries.length
+    }, 0)
+
+    if (evidence.length === 0) {
+      const guidance =
+        state.loop.observations.length === 0
+          ? 'HOOT tick が gh 観測を走らせると snapshot が記録されます（観測は直近 ' + OBSERVATION_SNAPSHOTS_KEPT + ' occurrence）'
+          : state.injectRequests.length === 0
+            ? 'delivery（inject）の記録がありません（araya hoot dispatch --key <proposal key> / Discord の /hoot dispatch key:<proposal key>）'
+            : 'delivery までに届いた観測 snapshot と delivery 以降の観測がまだ揃っていません（次の tick の観測で比較できるようになります）'
+
+      deps.stdout(
+        [
+          'delivery 前后を比較できる観測 snapshot がまだありません（観測は直近 ' + OBSERVATION_SNAPSHOTS_KEPT + ' occurrence だけ保持します）',
+          guidance,
+        ].join('\n')
+      )
+
+      return
+    }
+
+    deps.stdout(
+      [
+        `delivery 後の観測差（open list の比較。closed / merged の区別は観測していません）: ${deliveries} delivery / 観測 snapshot ${state.loop.observations.length} 件（goal あたり直近 ${MAX_GOAL_EVIDENCE_DELIVERIES} delivery）`,
+        ...evidenceGoalLines(evidence),
+        'goal の status は変更していません（Goal が完結したかどうかは人間が決めます。観測差は事実の照合であり命令ではありません）',
+      ].join('\n')
+    )
+
+    return
+  }
+
   if (command === 'reset-schedule') {
     await resetSchedule(dataDir)
     deps.stdout('schedule をリセットしました（次の tick が occurrence になります）')
@@ -587,6 +661,6 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
   }
 
   throw new Error(
-    `hoot_invalid_argument: 不明な command: ${command}（status / goal / settings / proposal / dispatch / inject / runs / reset-schedule、記録の保持は直近 ${MAX_RUNS_KEPT} 件）`
+    `hoot_invalid_argument: 不明な command: ${command}（status / goal / settings / proposal / dispatch / inject / evidence / runs / reset-schedule、記録の保持は直近 ${MAX_RUNS_KEPT} 件）`
   )
 }

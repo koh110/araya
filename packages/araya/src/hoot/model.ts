@@ -5,17 +5,22 @@
 
 import { createHash } from 'node:crypto'
 
-export const HOOT_STATE_VERSION = 4
+export const HOOT_STATE_VERSION = 5
 // v1（goal review・precheck・proposal 以前）の file を読み替えるための migration 用 version
 export const HOOT_STATE_VERSION_PRECHECK = 1
 // v2（inject request 以前）の file を読み替えるための migration 用 version
 export const HOOT_STATE_VERSION_INJECT = 2
 // v3（main 会話を読む tool の settings と run の参照記録以前）の file を読み替えるための migration 用 version
 export const HOOT_STATE_VERSION_PRE_CONVERSATION_READ = 3
+// v4（delivery 後の effect を確かめる observation snapshot・inject の evidence key 以前）の migration 用 version
+export const HOOT_STATE_VERSION_PRE_OBSERVATION_EVIDENCE = 4
 
 export const HOOT_GOAL_KEY_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/u
 export const HOOT_GOAL_KEY_RULE = 'lowercase alphanumeric with `-` separators, 1-64 characters'
 export const GITHUB_SCOPE_PATTERN = /^github:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)$/u
+// snapshot の repo 名と number 文字列の bound（observe.ts の REPO_PATTERN と同じ形）
+const GITHUB_SCOPE_REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u
+const SNAPSHOT_NUMBER_PATTERN = /^\d{1,12}$/u
 
 export const MAX_GOALS = 20
 export const MAX_RUNS_KEPT = 200
@@ -55,6 +60,13 @@ export const DIGEST_HOUR_UTC_MAX = 23
 export const DEFAULT_DIGEST_HOUR_UTC = 21
 // inject request（main 会話へ流す承認済みの案件）。pending を溜め続けられないための保持上限
 export const MAX_INJECTS_KEPT = 20
+// delivery 後の effect を open list の変化で確かめる observation snapshot の bound。
+// observe.ts の OBSERVATION_REPOS_MAX / OBSERVATION_ITEM_LIMIT と揃える（test で一致を固定する）
+export const OBSERVATION_SNAPSHOT_REPOS_MAX = 6
+export const OBSERVATION_SNAPSHOT_ITEMS_MAX = 30
+export const OBSERVATION_SNAPSHOTS_KEPT = 8
+// goal に出す evidence delivery の上限（直近 3 件）
+export const MAX_GOAL_EVIDENCE_DELIVERIES = 3
 // 1 件の inject request で submit を試行する回数。crash で pending に戻っても無限に再試行しない
 export const MAX_INJECT_ATTEMPTS = 2
 export const MAX_INJECTS_PER_DAY_MIN = 0
@@ -127,6 +139,8 @@ export type HootInjectRequest = {
   injectedAt: string | null
   // 失敗時の error text（redaction 済み）
   lastError: string | null
+  // delivery（main 会話への inject）が届いた時点で届いていた観測 occurrence key。失敗した request は null
+  deliveredEvidenceKey: string | null
 }
 
 // 判断 run が出した「人間が応答すべき pending」。dry_run では作業は始めず、提案として保持する
@@ -215,6 +229,110 @@ export function conversationReadsOf(calls: number, entries: number, chars: numbe
   }
 }
 
+// ---- delivery 後の effect を確かめる observation snapshot（Issue #10 acceptance 5）----
+// title など external text は入れない。open 件数・number list・fingerprint・時刻だけ保持する
+export type HootRepoSnapshot = {
+  repo: string
+  openIssues: number | null
+  openPrs: number | null
+  draftPrs: number | null
+  // open list の number だけ（title は入れない。PR draft も number だけで表す）
+  issueNumbers: string[]
+  prNumbers: string[]
+  // 観測に gap がある repo は null（比較の side として使わない）
+  fingerprint: string | null
+}
+
+export type HootObservationSnapshot = {
+  // model を呼んだ occurrence にも precheck noop の occurrence にも付く（hoot:<ISO>）
+  occurrenceKey: string
+  observedAt: string
+  repos: HootRepoSnapshot[]
+}
+
+// delivery 以前の snapshot と delivery 以降の snapshot の比較。open list の membership 変化だけで
+// closed / merged の区別は観測していない（消えた reason を推測しない）
+export type HootGoalEvidenceDelta = {
+  repo: string
+  // before の open list にあって after に無い number
+  closedIssues: string[]
+  closedPrs: string[]
+  // after の open list にあって before に無い number
+  openedIssues: string[]
+  openedPrs: string[]
+  // 比較に使った snapshot の occurrence key（観測 gap などで比較できない場合は空 string）
+  beforeKey: string
+  afterKey: string
+}
+
+export type HootGoalEvidenceDelivery = {
+  injectKey: string
+  proposalKey: string
+  decision: HootDecision
+  injectedAt: string
+  // delivery 時点までに届いていた snapshot の occurrence key。無ければ null（evidence 未取得）
+  deliveredEvidenceKey: string | null
+  delta: HootGoalEvidenceDelta[]
+}
+
+export type HootGoalEvidence = {
+  goalKey: string
+  deliveries: HootGoalEvidenceDelivery[]
+}
+
+// 表示用の number list は long-lived な prompt を伸ばさない bound
+export const MAX_EVIDENCE_NUMBERS_SHOWN = 8
+
+function evidenceNumbersText(label: string, kind: string, numbers: readonly string[]) {
+  const shown = numbers.slice(0, MAX_EVIDENCE_NUMBERS_SHOWN)
+  const rest = numbers.length - shown.length
+  const listed = shown.map((entry) => {
+    return `#${entry}`
+  }).join(' ')
+
+  return `${label} ${kind} ${listed}${rest > 0 ? ` (+${rest})` : ''}`
+}
+
+// 「closed / opened」は open list の membership 変化のことで、merged や人間による close だと断定しない
+export function goalEvidenceDeltaText(delta: HootGoalEvidenceDelta) {
+  const parts: string[] = []
+
+  if (delta.closedIssues.length > 0) {
+    parts.push(evidenceNumbersText('closed', 'issue', delta.closedIssues))
+  }
+
+  if (delta.openedIssues.length > 0) {
+    parts.push(evidenceNumbersText('opened', 'issue', delta.openedIssues))
+  }
+
+  if (delta.closedPrs.length > 0) {
+    parts.push(evidenceNumbersText('closed', 'PR', delta.closedPrs))
+  }
+
+  if (delta.openedPrs.length > 0) {
+    parts.push(evidenceNumbersText('opened', 'PR', delta.openedPrs))
+  }
+
+  if (parts.length === 0) {
+    return 'open list の変化なし'
+  }
+
+  return parts.join(' / ')
+}
+
+// snapshot を古い順に保持する（同じ occurrenceKey の書き直しは 1 件に揃え、直近 OBSERVATION_SNAPSHOTS_KEPT だけ残す）
+export function appendObservationSnapshot(
+  observations: readonly HootObservationSnapshot[],
+  snapshot: HootObservationSnapshot
+): HootObservationSnapshot[] {
+  const kept = observations.filter((entry) => {
+    return entry.occurrenceKey !== snapshot.occurrenceKey
+  })
+  kept.push(snapshot)
+
+  return kept.slice(-OBSERVATION_SNAPSHOTS_KEPT)
+}
+
 export type HootLoopState = {
   lastOccurrenceAt: string | null
   lastRunAt: string | null
@@ -226,6 +344,8 @@ export type HootLoopState = {
   conversationRuns: number
   // goal key -> 最後に観測した fingerprint。precheck はこれと比較する
   goalFingerprints: Record<string, string>
+  // 直近 OBSERVATION_SNAPSHOTS_KEPT occurrence の観測 snapshot（古い順。number list だけで title は入れない）
+  observations: HootObservationSnapshot[]
   // HOOT 判断用の conversation（tool 無し）。pi-durable の conversation id（number）。
   // 再起動後に同じ会話を続ける
   conversationId: number | null
@@ -343,6 +463,7 @@ export function defaultState(): HootState {
       lastDigestAt: null,
       conversationRuns: 0,
       goalFingerprints: {},
+      observations: [],
       conversationId: null,
       consecutiveFailures: 0,
       failureCooldownUntil: null,
@@ -631,7 +752,8 @@ export function isSettingsShape(value: unknown): value is HootSettings {
   return typeof (value as Record<string, unknown>).conversationRead === 'boolean'
 }
 
-function isInjectShape(value: unknown): value is HootInjectRequest {
+// version 3・4 の inject request の形（deliveredEvidenceKey を要求しない）。migration 入力に使う
+function isInjectShapeBase(value: unknown) {
   if (!isRecord(value)) {
     return false
   }
@@ -656,6 +778,18 @@ function isInjectShape(value: unknown): value is HootInjectRequest {
     (value.injectedAt === null || typeof value.injectedAt === 'string') &&
     (value.lastError === null || (typeof value.lastError === 'string' && value.lastError.length <= MAX_INJECT_ERROR_CHARS))
   )
+}
+
+// version 5 の inject request。deliveredEvidenceKey を要求する（無い file は migration で埋めるが、
+// 値が壊れているものは黙って直さない）
+function isInjectShape(value: unknown): value is HootInjectRequest {
+  if (!isInjectShapeBase(value)) {
+    return false
+  }
+
+  const evidenceKey = (value as Record<string, unknown>).deliveredEvidenceKey
+
+  return evidenceKey === null || (typeof evidenceKey === 'string' && evidenceKey !== '')
 }
 
 function isRunShapeBase(value: unknown): value is HootRun {
@@ -780,7 +914,7 @@ export type HootStateV1 = {
   version: number
   settings: HootSettingsV1
   goals: Omit<HootGoal, 'reviewAt'>[]
-  loop: Omit<HootLoopState, 'lastModelRunAt' | 'lastDigestAt' | 'conversationRuns' | 'goalFingerprints'>
+  loop: Omit<HootLoopStateV4, 'lastModelRunAt' | 'lastDigestAt' | 'conversationRuns' | 'goalFingerprints'>
   runs: Omit<HootRun, 'source'>[]
 }
 
@@ -791,7 +925,7 @@ export type HootStateV2 = {
   version: number
   settings: HootSettingsV2
   goals: HootGoal[]
-  loop: HootLoopState
+  loop: HootLoopStateV4
   runs: HootRun[]
   proposals: HootProposal[]
 }
@@ -803,10 +937,24 @@ export type HootStateV3 = {
   version: number
   settings: HootSettingsV3
   goals: HootGoal[]
-  loop: HootLoopState
+  loop: HootLoopStateV4
   runs: Omit<HootRun, 'conversationReads'>[]
   proposals: HootProposal[]
-  injectRequests: HootInjectRequest[]
+  injectRequests: HootInjectRequestV4[]
+}
+
+// version 4（observation snapshot・deliveredEvidenceKey のない形）。v5 migration の入力
+export type HootLoopStateV4 = Omit<HootLoopState, 'observations'>
+export type HootInjectRequestV4 = Omit<HootInjectRequest, 'deliveredEvidenceKey'>
+
+export type HootStateV4 = {
+  version: number
+  settings: HootSettings
+  goals: HootGoal[]
+  loop: HootLoopStateV4
+  runs: HootRun[]
+  proposals: HootProposal[]
+  injectRequests: HootInjectRequestV4[]
 }
 
 export function isHootStateShapeV1(value: unknown): value is HootStateV1 {
@@ -854,11 +1002,67 @@ function isStateBodyShape(
   )
 }
 
-function isInjectRequestsShape(value: unknown) {
+function isNullableCount(value: unknown) {
+  return value === null || (typeof value === 'number' && Number.isInteger(value) && value >= 0)
+}
+
+// snapshot の number list は number 文字列だけ（title・`(draft)` などの飾りは入れない）
+function isNumberStrings(value: unknown) {
+  return (
+    Array.isArray(value) &&
+    value.length <= OBSERVATION_SNAPSHOT_ITEMS_MAX &&
+    value.every((entry) => {
+      return typeof entry === 'string' && SNAPSHOT_NUMBER_PATTERN.test(entry)
+    })
+  )
+}
+
+function isRepoSnapshotShape(value: unknown): value is HootRepoSnapshot {
+  if (!isRecord(value)) {
+    return false
+  }
+
+  return (
+    typeof value.repo === 'string' &&
+    GITHUB_SCOPE_REPO_PATTERN.test(value.repo) &&
+    isNullableCount(value.openIssues) &&
+    isNullableCount(value.openPrs) &&
+    isNullableCount(value.draftPrs) &&
+    isNumberStrings(value.issueNumbers) &&
+    isNumberStrings(value.prNumbers) &&
+    (value.fingerprint === null || (typeof value.fingerprint === 'string' && value.fingerprint.length <= 64))
+  )
+}
+
+// 壊れた snapshot は hoot_state_invalid にする（migration で黙って捨てない）
+export function isObservationsShape(value: unknown): value is HootObservationSnapshot[] {
+  if (!Array.isArray(value) || value.length > OBSERVATION_SNAPSHOTS_KEPT) {
+    return false
+  }
+
+  return value.every((entry) => {
+    if (!isRecord(entry)) {
+      return false
+    }
+
+    return (
+      typeof entry.occurrenceKey === 'string' &&
+      entry.occurrenceKey !== '' &&
+      typeof entry.observedAt === 'string' &&
+      parseIso(entry.observedAt) !== null &&
+      Array.isArray(entry.repos) &&
+      entry.repos.length <= OBSERVATION_SNAPSHOT_REPOS_MAX &&
+      entry.repos.every(isRepoSnapshotShape)
+    )
+  })
+}
+
+// inject request の list 検査。version で required field が違うので entry の検査を受け取る
+function isInjectRequestsShape(value: unknown, entryOk: (candidate: unknown) => boolean) {
   return (
     Array.isArray(value) &&
     value.length <= MAX_INJECTS_KEPT &&
-    value.every(isInjectShape)
+    value.every(entryOk)
   )
 }
 
@@ -881,7 +1085,20 @@ export function isHootStateShapeV3(value: unknown): value is HootStateV3 {
     return false
   }
 
-  return isInjectRequestsShape(value.injectRequests)
+  return isInjectRequestsShape(value.injectRequests, isInjectShapeBase)
+}
+
+// version 4（observation snapshot・deliveredEvidenceKey のない state file）。migration 入力に使う
+export function isHootStateShapeV4(value: unknown): value is HootStateV4 {
+  if (!isRecord(value) || value.version !== HOOT_STATE_VERSION_PRE_OBSERVATION_EVIDENCE) {
+    return false
+  }
+
+  if (!isStateBodyShape(value, isSettingsShape, isRunShape)) {
+    return false
+  }
+
+  return isInjectRequestsShape(value.injectRequests, isInjectShapeBase)
 }
 
 export function isHootStateShape(value: unknown): value is HootState {
@@ -893,7 +1110,11 @@ export function isHootStateShape(value: unknown): value is HootState {
     return false
   }
 
-  return isInjectRequestsShape(value.injectRequests)
+  if (!isObservationsShape((value.loop as Record<string, unknown>).observations)) {
+    return false
+  }
+
+  return isInjectRequestsShape(value.injectRequests, isInjectShape)
 }
 
 export type DecisionParse = {

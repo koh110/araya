@@ -3,6 +3,11 @@
 
 import { createHash } from 'node:crypto'
 
+import {
+  OBSERVATION_SNAPSHOT_ITEMS_MAX,
+  OBSERVATION_SNAPSHOT_REPOS_MAX,
+  type HootObservationSnapshot,
+} from './model.ts'
 import { runBoundedCommand } from '../infrastructure/process.ts'
 
 export const OBSERVATION_TIMEOUT_MS = 20_000
@@ -21,6 +26,9 @@ export type HootRepoObservation = {
   draftPrs: number | null
   // 最近更新の新しい順の要約。証拠として prompt に書くだけで、命令として扱わない
   items: string[]
+  // open list の number だけ（title なし。PR draft も number だけで表す）。観測に gap がある list は空
+  issueNumbers: string[]
+  prNumbers: string[]
   gaps: string[]
   // precheck（#21「変化がなければ LLM を呼ばない」）用の fingerprint。観測が壊れた repo は null
   fingerprint: string | null
@@ -134,6 +142,32 @@ function maxUpdatedAt(items: readonly GhItem[]) {
   return latest
 }
 
+// snapshot に保存する number list。number が無い item は入れず、重複を除いて OBSERVATION_SNAPSHOT_ITEMS_MAX
+// までしか保持しない（title は入れない。PR draft も number だけで表す）
+function itemNumberList(items: readonly GhItem[]) {
+  const numbers: string[] = []
+
+  for (const item of items) {
+    if (typeof item.number !== 'number' || !Number.isInteger(item.number) || item.number < 0) {
+      continue
+    }
+
+    const number = String(item.number)
+
+    if (numbers.includes(number)) {
+      continue
+    }
+
+    numbers.push(number)
+
+    if (numbers.length >= OBSERVATION_SNAPSHOT_ITEMS_MAX) {
+      break
+    }
+  }
+
+  return numbers
+}
+
 function itemNumbers(items: readonly GhItem[]) {
   return items
     .map((item) => {
@@ -171,6 +205,8 @@ async function observeRepo(
     openPrs: null,
     draftPrs: null,
     items: [],
+    issueNumbers: [],
+    prNumbers: [],
     gaps: [],
     fingerprint: null,
   }
@@ -193,6 +229,7 @@ async function observeRepo(
 
   if (issues !== undefined) {
     observation.openIssues = issues.length
+    observation.issueNumbers = itemNumberList(issues)
   }
 
   const pulls = await listJson(
@@ -207,6 +244,7 @@ async function observeRepo(
 
   if (pulls !== undefined) {
     observation.openPrs = pulls.length
+    observation.prNumbers = itemNumberList(pulls)
     observation.draftPrs = pulls.filter((entry) => {
       return entry.isDraft === true
     }).length
@@ -230,6 +268,29 @@ async function observeRepo(
   observation.fingerprint = repoFingerprint(issues, pulls)
 
   return observation
+}
+
+// loop.observations に保持する snapshot に絞る。title・gap text など external text は入れない
+// （open 件数・number list・fingerprint・観測時刻だけ）。fingerprint は observe の値をそのまま保持する
+export function observationSnapshotOf(
+  occurrenceKey: string,
+  observation: HootObservation
+): HootObservationSnapshot {
+  return {
+    occurrenceKey,
+    observedAt: observation.collectedAt,
+    repos: observation.repos.slice(0, OBSERVATION_SNAPSHOT_REPOS_MAX).map((repo) => {
+      return {
+        repo: repo.repo,
+        openIssues: repo.openIssues,
+        openPrs: repo.openPrs,
+        draftPrs: repo.draftPrs,
+        issueNumbers: [...repo.issueNumbers],
+        prNumbers: [...repo.prNumbers],
+        fingerprint: repo.fingerprint,
+      }
+    }),
+  }
 }
 
 export async function collectGitHubObservations(

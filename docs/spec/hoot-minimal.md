@@ -17,7 +17,9 @@ model を呼ぶかどうか・人間に何を返すか・main 会話へ何を流
 <ARAYA_DATA_DIR>/hoot/.state.lock  # proper-lockfile（bot loop と CLI の read-modify-write を直列化）
 ```
 
-- state の `version` は **4**（`HOOT_STATE_VERSION`）。version 3・version 2・version 1 の `state.json` は **読み取り時に v4 へ寄せる**（read だけで書き込まない。次の `updateHootState` で v4 で保存される）。
+- state の `version` は **5**（`HOOT_STATE_VERSION`）。version 4・version 3・version 2・version 1 の `state.json` は **読み取り時に v5 へ寄せる**（read だけで書き込まない。次の `updateHootState` で v5 で保存される）。
+  - **v4（`HOOT_STATE_VERSION_PRE_OBSERVATION_EVIDENCE=4`）-> v5 は idempotent で、値を作らない**: `loop.observations` が無いときだけ `[]` を入れ、`injectRequests` の各 request に `deliveredEvidenceKey` が無いときだけ `null` を入れる。goal・loop の他の field・runs・proposals はそのまま（read のたびに動く値は足さない）。**値が壊れている file は埋めない**: `loop.observations` が array 以外・observation snapshot の形に合わない・`deliveredEvidenceKey` が string か null 以外、どれも migration せず `hoot_state_invalid`
+  - **v3（`HOOT_STATE_VERSION_PRE_CONVERSATION_READ=3`）-> v4**（`settings.conversationRead` と `runs[].conversationReads` を埋めるだけ）を経由して v5 に寄せる
   - **v3（`HOOT_STATE_VERSION_PRE_CONVERSATION_READ=3`）-> v4 は idempotent で、値を作らない**: `settings.conversationRead` が無いときだけ既定 `false` を入れ、`runs` の各件に `conversationReads: { calls: 0, entries: 0, chars: 0 }` を埋める。goal・loop・proposals・injectRequests はそのまま（read のたびに動く値は足さない）。tool を有効化していない process が v4 file を読んでも値は変わらない
   - **v2（`HOOT_STATE_VERSION_INJECT=2`）-> v3 は idempotent で、値を作らない**: `injectRequests: []` を埋め、inject 用の settings（`autoDispatch` / `maxInjectsPerDay` / `injectCooldownMinutes`）が無いときだけ既定を入れる。goal・loop・runs・proposals はそのまま。時刻から決める値も足さない（read のたびに動く値が生まれない）。v2 まで使っていた file は読み直しても inject は走らない（`injectRequests` が空で `autoDispatch` は既定 false）
   - **v1（`HOOT_STATE_VERSION_PRECHECK=1`）は v2 → v3 → v4** に寄せる。v1 から埋めるもの:
@@ -28,7 +30,8 @@ model を呼ぶかどうか・人間に何を返すか・main 会話へ何を流
     - settings は新しい項目を既定値で埋める。`notifyNoop` は廃止で、`notifyNoop=true` なら `notifyDecisions` に `noop` を 1 本足す（`false`・**key 欠落**は既定の allowlist。型が違う値は v1 の形として受け付けない）
 - state は JSON 1 件。壊れた file は **復旧せず** `hoot_state_invalid` の誤りとして表面化する（黙って初期化しない）。restore は unit stop → file 差し替え → unit start。
 - 判断 run の記録（`runs`）は直近 200 件だけ保つ（`MAX_RUNS_KEPT`）。proposals は直近 50 件（`MAX_PROPOSALS_KEPT`。closed を古い順に落として open を残す）。open な proposal は最大 10 件（`MAX_OPEN_PROPOSALS`）。inject request（`injectRequests`）は直近 20 件（`MAX_INJECTS_KEPT`。terminal（`injected` / `failed`）を古い順に落とし、terminal が無いときだけ oldest pending を落とす）。
-- v4 の検証（`isHootStateShape`）は `injectRequests` が 20 件以内で、request が `key` / `proposalKey` / `goalKeys` / `decision` / `authorizedBy`（`human` / `mode_active`）/ `authorizedAt` / `status`（`pending` / `injected` / `failed`） / `requestId` / `createdAt` / `updatedAt` / `attempts` / `lastError`（`MAX_INJECT_ERROR_CHARS` = 300 文字まで）の形であることを要求し、加えて `settings.conversationRead` が boolean、`runs` の各件が `conversationReads`（`calls` / `entries` / `chars` の non-negative integer）を持つことを要求する。v3 までの形の file は migration で v4 に寄せる。形が違う file は migration せず `hoot_state_invalid`。
+- v5 の検証（`isHootStateShape`）は `injectRequests` が 20 件以内で、request が `key` / `proposalKey` / `goalKeys` / `decision` / `authorizedBy`（`human` / `mode_active`）/ `authorizedAt` / `status`（`pending` / `injected` / `failed`） / `requestId` / `createdAt` / `updatedAt` / `attempts` / `lastError`（`MAX_INJECT_ERROR_CHARS` = 300 文字まで）/ `deliveredEvidenceKey`（string か `null`）の形であることを要求し、加えて `settings.conversationRead` が boolean、`runs` の各件が `conversationReads`（`calls` / `entries` / `chars` の non-negative integer）を持つこと、`loop.observations` が observation snapshot の list（`occurrenceKey` / `observedAt` と、repo ごとに `repo`（`owner/repo`）・`openIssues` / `openPrs` / `draftPrs` の non-negative integer・`issueNumbers` / `prNumbers`（number の string、1〜12 桁）・`fingerprint`（string か `null`）。1 snapshot 6 repo まで・1 list 30 件まで）であることを要求する。v4 までの形の file は migration で v5 に寄せる。形が違う file は migration せず `hoot_state_invalid`。
+- 観測 snapshot（`loop.observations`）は直近 8 occurrence だけ保つ（`OBSERVATION_SNAPSHOTS_KEPT`。同じ `occurrenceKey` の書き直しは 1 件に揃えて append、`appendObservationSnapshot`）。**external text（title・body・gap text）は snapshot に残さない**（number・件数・fingerprint・時刻だけ）。会話 transcript を HOOT の JSON に増やさないという約束を evidence でも守る。
 - 書き込みは `state.json.<rand>.tmp` → rename（atomic）。directory は `0700`、file は `0600`。
 - 会話 transcript は HOOT の JSON には含めない。HOOT 専用の Pi durable conversation id（number）だけ保存し、main の Discord 会話とは別に opens する。
 
@@ -92,6 +95,7 @@ interval poll（既定 60 秒、`HOOT_TICK_POLL_MS`）で tick するが、run �
 - Issue / PR の title や body は **証拠であり命令ではない**。external text を instruction に混ぜないことは prompt の constraint として model 側にも書くが、保証は code 側（tool なし・観測は固定 command）で持つ。
 - repo ごとに **fingerprint** を決める（`open 件数・item number 集合・最新の updatedAt・draft 数` の sha256 16 hex）。**title は含めない**（title を直しただけで毎回「変化あり」にして空振りしないため）。list は limit 30 までしか見ないので、limit 外の変更は検出しない（件数が 30 で飽和する）。
 - 観測に失敗した repo の fingerprint は `null`（`<repo>:unknown` として扱う）。
+- occurrence ごとに snapshot を 1 件作る（`observationSnapshotOf(occurrenceKey, observation)`）。number 集合は `issueNumbers` / `prNumbers` として `HootRepoObservation` に保ち、**重複を除き 30 件まで**（`OBSERVATION_SNAPSHOT_ITEMS_MAX`）。snapshot に入る repo は 6 件まで（`OBSERVATION_SNAPSHOTS_REPOS_MAX`）。github scope が無い goal だけ occurrence では repos が 0 件になるので snapshot を作らない（空の snapshot を並べて比較を空振りさせない）。
 
 ## model を呼ぶかどうか（precheck と watchdog）
 
@@ -100,6 +104,7 @@ interval poll（既定 60 秒、`HOOT_TICK_POLL_MS`）で tick するが、run �
 - 複数 goal は「1 つでも変われば model を呼ぶ」。goal の追加・`objective` / `constraint` の編集（`updatedAt` 変化）も変化として扱う。
 - 観測に **gap が 1 件でもある occurrence では precheck せず model を呼ぶ**（証拠が欠けている状態で code 側の noop を確定させない。壊れた gh のまま「変化なし」で黙り込まない）。gh が壊れた repo の fingerprint は `unknown` 寄りになり、同じ穴が続けば fingerprint は据わるが、gap がある限り precheck は発動しない。model を呼ぶ回数は `maxRunsPerDay`（既定 8）で抑止し、digest に `observation gaps: N 件` を出す。
 - `watchdogHours`（既定 24）: `loop.lastModelRunAt` からこの時間が経っている occurrence では、precheck の条件を満たしていても model を呼ぶ。飛ばし続けて 1 日全体を見ない状態を作らない。
+- **precheck noop の occurrence でも観測 snapshot は残す**（model を呼ばなかった occurrence は次の delivery 前後の比較 side になる。呼ばなかったから証拠も捨てる、にしない）。
 
 ## 判断 run（model）
 
@@ -206,6 +211,19 @@ skip は誤りにせず `{ request: null, skipped }` で返し、CLI は理由�
 
 安全境界は「承認の gate（mode / autoDispatch / 人間の CLI）+ inject 文面の指示 + 人間の `stop` / `reset`」で持つ。inject を受けた main 会話の agent は tool を持つ（README・docs/development.md の「sandbox 無し」の約束が変わっていないことを inject 文面でも明記する）。
 
+## delivery 後の effect evidence（delivery 前後の観測差 / Issue #10 acceptance 5）
+
+main 会話に渡した案件（delivery）の後、GitHub の open list がどう変わったかを **code 側が決定的に計算して**判断 prompt と CLI に出す。goal が完結したかどうかは評価しない（Goal status を変えないし、「完了」を断定しない）。
+
+- **delivery 時点で届いていた観測を key として記録する**: `finishHootInject` は delivery に成功した request（`status: 'injected'`）だけ `deliveredEvidenceKey` に「`injectedAt` 以下の `observedAt` を持つ最新の snapshot の `occurrenceKey`」を入れる。delivery 以前に観測が無ければ `null`。delivery に失敗した request（pending / failed）には入れない（届いていない案件が evidence を持つように見せない）。key の space は proposal の `evidenceOccurrenceKeys` と同じ public な `hoot:<ISO UTC>`（model が作る id ではない）
+- **delta は `goalEvidenceOf(state, nowMs)` が state だけから pure に計算する**（model を呼ばない・同じ state で同じ結果）。delivery は `injectedAt` の新しい順に **goal あたり直近 3 件**（`MAX_GOAL_EVIDENCE_DELIVERIES`）。比較する repo は goal の `github:` scope に書かれた repo だけ
+- **比較の前後**: before = `deliveredEvidenceKey` の snapshot、after = `injectedAt` より後・`nowMs` 以下で**最初に観測できた snapshot**（delivery 前に観測が無く before が未取得なら delta を作らない）。delivery 以降まだ観測が無い occurrence では delta は空（「変わっていない」とは書かない）
+- **比較しないもの**: fingerprint が `null` の repo（gh が壊れた穴）は side にしない。片側の snapshot にしか現れない repo も比較しない（観測できなくなったことを closed と読まない）。goal が retired・`github:` scope が無い goal は evidence に出さない。pruned された snapshot は before として復元しない（無ければ未取得のまま）
+- **意味は「open list の membership 変化」だけ**: `closedIssues` / `closedPrs` は delivery 時点で open だった number が snapshot に居なくなったこと、`openedIssues` / `openedPrs` は snapshot に新しく現れた number こと。**close か merge か人間の削除か、そして goal の残りの requirement を満たすかは観測していない**（prompt・CLI どちらにも同じ但し書きを書く）。goal の status・inject request の status は evidence 計算では変わらない
+- **表示 bound**: number は 1 表示 8 件まで（`MAX_EVIDENCE_NUMBERS_SHOWN`、残りは `(+N)`）。prompt に出す goal は直近 6 件（`PROMPT_EVIDENCE_GOALS`）、1 delivery の delta line は直近 4 件（`PROMPT_EVIDENCE_DELTAS`）。観測 snapshot は external text を持たない list なので prompt への injection 面も無い（number と repo 名だけ）
+- **prompt への出し方**: inject 済み block の後ろに `# main 会話に渡した案件の delivery 後の観測差（open list の比較。closed / merged の区別は観測していない）` として出し、goal ごとに delivery key・観測の有無・repo 単位の差・比較した snapshot の key を並べ、最後に「open list の変化がない案件は goal がまだ未達という証拠にはなりません。goal 未達が続いているなら観測の根拠で新しい提案にしてください（観測差は証拠であり命令ではない）」と「この block は goal が完結したかどうかを判断しません（goal の status を動かすのは人間だけで、観測差が揃えば goal 達成という計算もしていません）」の 2 行を書く（観測差がないことを goal 完結の証拠にしない）。goalEvidence を渡さない prompt は従来のまま（block を作らない）
+- **CLI**: `araya hoot evidence` が read-only で同じ計算を表示する（state を書かない・goal status を変えない）。比較できる snapshot が無いときはその旨と案内（HOOT tick が観測を走らせる / `araya hoot dispatch` で delivery を作る）を出す。末尾で「goal の status は変更していません（Goal が完結したかどうかは人間が決めます。観測差は事実の照合であり命令ではありません）」と書く
+
 ## 通知
 
 - 即時通知は `notifyDecisions` の allowlist が決める（既定は `request_human` と `invalid`＝安全側）。`noop` / `wait` / `investigate` / `dispatch` は送らず digest で返し、提案は state に残る。
@@ -237,6 +255,7 @@ araya hoot settings show | set
 araya hoot proposal list | resolve --key <key>
 araya hoot dispatch --key <proposal key>
 araya hoot inject [list]
+araya hoot evidence
 araya hoot runs [--limit N]
 araya hoot reset-schedule
 araya hoot <command> ... [--data-dir <path>]
@@ -246,6 +265,7 @@ araya hoot <command> ... [--data-dir <path>]
 - `settings set` は `[--enabled true|false] [--mode dry_run|active] [--tick-minutes N] [--max-runs-per-day N] [--notify-decisions a,b,c] [--precheck true|false] [--watchdog-hours N] [--digest-hour-utc N|none] [--reset-conversation-after-runs N] [--goal-review-days N] [--proposal-ttl-hours N] [--max-proposal-reminders N] [--auto-dispatch true|false] [--max-injects-per-day N] [--inject-cooldown-minutes N] [--conversation-read true|false]`（`--notify-noop` は撤去。`--mode active` は拒否しない）。値の範囲外・`--auto-dispatch` / `--conversation-read` の true/false 以外は `hoot_settings_invalid`。
 - `dispatch --key <proposal key>` は main 会話への inject request を作る（`authorizedBy: 'human'`。`mode` が `dry_run` だと `hoot_mode_dry_run` で作れない）。成功時は request key と「Discord bot process が次の poll で main 会話に渡します（bot が動いていないと pending のままです）」を出す。skip（cooldown / daily_limit / already_pending / auto_dispatch_off）は終了 code 1 にせず、理由と settings の案内を出す。proposal が無い・open でない・`dispatch` 以外の decision は誤り（`hoot_proposal_not_found` / `hoot_inject_not_injectable`）。inject で `resolved` になった key を打ち直すと、その proposal は新しい open（新しい期限・提醒 0）としてやり直す。`--key` 欠落は `hoot_invalid_argument`。
 - `inject`（`list`）は inject request を直近 20 件、新しい順に 3 行で出す（`key [status] decision proposal=<proposal key> goals=…` / `authorized: <human|mode_active> @ <時刻> / attempts: <n>/2` / `injectedAt` と `lastError`）。記録が無ければ `araya hoot dispatch --key <proposal key>` への案内を出す。
+- `evidence` は read-only で delivery 後の観測差を出す（`goal <key> / inject <inject key> [decision] @ <injectedAt>`、`delivery 時点の観測: <snapshot key>|未取得`、repo ごとに `closed issue #… / opened PR #…（hoot:<before> -> hoot:<after>）`）。goal の status も inject request も書き換えない。比較できる snapshot が無いときは `delivery 前后を比較できる観測 snapshot がまだありません（観測は直近 8 occurrence だけ保持します）` と、観測・delivery を作る案内を出す
 - `status` / `proposal list` は open・closed をなく inject request の対応行を出す（`inject: N 件（latest <inject key> [<status>] @ <injectedAt>）`、pending inject が有れば「再提醒を抑止中」）。`status` は open proposals・`conversationRuns`・`lastModelRunAt`・`lastDigestAt`・goal の `reviewAt`・`inject: autoDispatch=… / maxInjectsPerDay=… / cooldown=…分` の 1 行を表示し、request が有れば `inject requests: pending N / injected N / failed N（保持 20 件）` と直近 3 件を追加する。`mode` の説明行も `dry_run` / `active`(+autoDispatch) / `active`(人間の承認要) で書き分ける。`settings` 行には `conversationRead=true|false`、last run の行には `conversation reads: N calls / M entries / K chars` を出す。
 - `proposal list` は open を全件、closed を直近 5 件表示して総数は `open N / closed M` に出す。1 件は key・status・decision・goals・reason・`created / confirmed / expires / reminders` の 3 行。`proposal resolve --key <key>` は open だけ（resolved / expired 済みの key も `hoot_proposal_not_found`）。closed を動かす導線は用意しない（proposal の life cycle は open -> resolved / expired の 1 往復だけ）
 
@@ -264,7 +284,8 @@ channel からの操作は Discord の slash command に統一する。CLI 側�
 
 ## 実装済みの歯止め
 
-- **state version 4**（v3・v2・v1 は読み取り時に migration。v3 -> v4 は `settings.conversationRead` と `runs[].conversationReads` を埋めるだけで値を作らない。v2 -> v3 は `injectRequests: []` と settings 既定を埋めるだけ。壊れた file は復旧しない）。
+- **state version 5**（v4・v3・v2・v1 は読み取り時に migration。v4 -> v5 は `loop.observations: []` と `injectRequests[].deliveredEvidenceKey: null` を埋めるだけで値を作らない。v3 -> v4 は `settings.conversationRead` と `runs[].conversationReads` を埋めるだけ。v2 -> v3 は `injectRequests: []` と settings 既定を埋めるだけ。壊れた file は復旧しない）。
+- **evidence は事実の照合だけ**（Issue #10 acceptance 5）: 観測 snapshot は直近 8 occurrence（`OBSERVATION_SNAPSHOTS_KEPT`）、1 snapshot 6 repo / 1 list 30 number、goal に出す delivery は直近 3 件、prompt の goal 6 件・delta 4 件・number 8 件。delivery 前後の open list の membership 変化だけを出し、closed / merged の区別と goal の完結は観測しない（`goalEvidenceOf` は pure で、goal status も inject status も変えない。`araya hoot evidence` は read-only）。
 - **precheck**: 観測 fingerprint（goal 単位）が変わらなければ model を呼ばず `source: 'precheck'` の noop を記録。複数 goal は 1 件でも変われば run。観測に gap が 1 件でもある occurrence は precheck しない。
 - **watchdog**: `watchdogHours` 以内に 1 回は model で全体を見せる。
 - **daily limit は model run だけ**数える（precheck noop は budget を使わない）。
@@ -287,7 +308,7 @@ channel からの操作は Discord の slash command に統一する。CLI 側�
 - **1A（dispatch の形）実装済み（Issue #31）**: dispatch は「HOOT 判断 run に tool を渡す」形にはしない。HOOT は判断 record と inject request を作り、main の Discord 会話（channel ごとの main agent session）に **承認済みの案件を input として inject** して、作業はその会話側で走らせる。HOOT 判断 run は tool を持たないまま。
 - **2A（呼ばないことを code で決める）**: precheck + watchdog。複数 goal 対応済み（goal 単位 fingerprint、1 件でも変われば model）。
 - **3A（goal の空腹を止める）**: `reviewAt` による自動 pause（resume / retire で人間が応答）。
-- **4A（evidence）**: state は JSON のまま `occurrenceKey` を public evidence ID として維持する（proposal の `evidenceOccurrenceKeys`）。
+- **4A（evidence）**: state は JSON のまま `occurrenceKey` を public evidence ID として維持する（proposal の `evidenceOccurrenceKeys`）。delivery 後の効果測定も同じ key space を使っている（`injectRequests[].deliveredEvidenceKey` と snapshot の `occurrenceKey`。model が作る id は無い）。
 - **5A（会話の自己強化を防ぐ）**: `resetConversationAfterRuns` による HOOT 判断会話の periodic reset。
 - **6A（人間への返し方）**: 即時通知は allowlist、他は digest に寄せる。
 
@@ -295,6 +316,7 @@ channel からの操作は Discord の slash command に統一する。CLI 側�
 
 - **mode=active + autoDispatch の承認審査**。autoDispatch は inject 可能な判断（`dispatch` / `investigate`）をそのまま inject するだけで、proposal の内容・危険さを model に判断させていない（gate は code 側の settings）。
 - **`read_conversation` の read 記録は使用量だけ**。使った回数・entry 数・文字数は残すが、読んだ entry の key や引用した本文は記録しない（transcript の写しを HOOT の state に増やさない）。proposal の reason に何を根拠にしたか書くのは model 侧。
+- **delivery 後の evidence は open list の変化まで**。GitHub の closed / merged の区別、merge された PR の判定、goal の requirement が満たされたかの評価はしていない（goal を自動で完結させないし、自動で止めない。「観測差がある＝goal 完結」を model に判断させないため、但し書きは code 側が書く）。delivery 後の観測がまだ無い delivery には delta を作らない。Discord slash の `/hoot evidence` は未実装（今のところ CLI の `araya hoot evidence` だけ。slash 側は follow-up）。
 - Issue label・webhook・Discord 反応などの event-driven wakeup。current 実装は interval schedule だけ。
 - task 台帳・runner・worktree 作成・PR 作成。session-first 構成では work の unit は Pi durable の named child conversation であり、HOOT の record と child session を結ぶ layer はまだ無い。
 - state への SQLite 採用（`state.json` + lock）。

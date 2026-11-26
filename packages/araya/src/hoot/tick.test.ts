@@ -8,6 +8,7 @@ import { createHootLoop, type HootInjectInput, type HootTickOutcome } from './ti
 import { readHootState, setGoalStatus, writeHootState } from './store.ts'
 import {
   MAX_INJECT_ATTEMPTS,
+  OBSERVATION_SNAPSHOTS_KEPT,
   defaultState,
   proposalKeyOf,
   type HootGoal,
@@ -1133,6 +1134,7 @@ function pendingInjectFixture(overrides: Partial<HootInjectRequest> = {}): HootI
     updatedAt: '2026-11-19T08:50:00.000Z',
     injectedAt: null,
     lastError: null,
+    deliveredEvidenceKey: null,
     ...overrides,
   }
 }
@@ -1544,5 +1546,190 @@ test('hoot tick: settings.conversationRead で decide に on/off と instruction
     assert.deepEqual(prechecked?.conversationReads, { calls: 0, entries: 0, chars: 0 })
   } finally {
     await fs.rm(precheckFixture.root, { recursive: true, force: true })
+  }
+})
+
+// ---- observation snapshot の保持と delivery 後の evidence（Issue #10 acceptance 5）----
+
+function tickSnapshotFixture(
+  at: string,
+  overrides: { issueNumbers?: string[]; prNumbers?: string[]; fingerprint?: string | null } = {}
+) {
+  return {
+    occurrenceKey: `hoot:${at}`,
+    observedAt: at,
+    repos: [
+      {
+        repo: 'koh110/araya',
+        openIssues: overrides.issueNumbers?.length ?? 0,
+        openPrs: overrides.prNumbers?.length ?? 0,
+        draftPrs: 0,
+        issueNumbers: overrides.issueNumbers ?? [],
+        prNumbers: overrides.prNumbers ?? [],
+        fingerprint: overrides.fingerprint === undefined ? `fp-${at}` : overrides.fingerprint,
+      },
+    ],
+  }
+}
+
+test('hoot tick: 観測 snapshot を loop.observations に保持し、precheck noop の occurrence でも残す', async () => {
+  const fixture = await makeHootLoopFixture({
+    settings: { enabled: true, tickMinutes: 5 },
+    goals: [goalFixture()],
+  })
+
+  try {
+    const first = await fixture.loop.tickOnce()
+    assert.equal(first.kind, 'ran')
+    const afterFirst = await fixture.readState()
+    assert.equal(afterFirst.loop.observations.length, 1)
+
+    const snapshot = afterFirst.loop.observations[0]
+    assert.equal(snapshot?.occurrenceKey, first.occurrenceKey)
+    // snapshot の occurrenceKey は public な evidence key space（proposal の evidenceOccurrenceKeys と同じ形）
+    assert.match(snapshot?.occurrenceKey ?? '', /^hoot:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u)
+    assert.equal(snapshot?.observedAt, '2026-11-19T09:00:00.000Z')
+    assert.deepEqual(snapshot?.repos[0]?.issueNumbers, ['10'])
+    assert.deepEqual(snapshot?.repos[0]?.prNumbers, ['29'])
+    assert.notEqual(snapshot?.repos[0]?.fingerprint, null)
+    // state に external text（title など）は残らない
+    assert.equal(JSON.stringify(afterFirst.loop.observations).includes('HOOT discovery loop'), false)
+
+    // 観測が変わらない occurrence は model を呼ばないが、snapshot は次の比較の side になる
+    fixture.setNow('2026-11-19T09:05:00.000Z')
+    const second = await fixture.loop.tickOnce()
+    assert.equal(second.kind, 'prechecked_noop')
+    const state = await fixture.readState()
+    assert.equal(state.loop.observations.length, 2)
+    assert.equal(state.loop.observations[1]?.occurrenceKey, 'hoot:2026-11-19T09:05:00.000Z')
+    assert.deepEqual(state.loop.observations[1]?.repos[0]?.issueNumbers, ['10'])
+    // 同じ観測なら fingerprint も同じ（delivery 後の比較が空振りしない）
+    assert.equal(state.loop.observations[1]?.repos[0]?.fingerprint, snapshot?.repos[0]?.fingerprint)
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot tick: snapshot の保持は直近 OBSERVATION_SNAPSHOTS_KEPT 件（delivery 後の evidence が無制限に伸びない）', async () => {
+  const prefilled = Array.from({ length: OBSERVATION_SNAPSHOTS_KEPT }, (_entry, index) => {
+    return tickSnapshotFixture(`2026-11-19T0${index}:30:00.000Z`, { issueNumbers: [String(index)] })
+  })
+  const fixture = await makeHootLoopFixture({
+    settings: { enabled: true, tickMinutes: 5 },
+    goals: [goalFixture()],
+    loop: { observations: prefilled },
+  })
+
+  try {
+    const outcome = await fixture.loop.tickOnce()
+    assert.equal(outcome.kind, 'ran')
+    const state = await fixture.readState()
+    assert.equal(state.loop.observations.length, OBSERVATION_SNAPSHOTS_KEPT)
+    // 新しい occurrence が最後に入り、一番古い snapshot は落ちる
+    assert.equal(state.loop.observations.at(-1)?.occurrenceKey, outcome.occurrenceKey)
+    assert.equal(state.loop.observations[0]?.occurrenceKey, prefilled[1]?.occurrenceKey)
+    assert.equal(state.loop.observations.some((entry) => {
+      return entry.occurrenceKey === prefilled[0]?.occurrenceKey
+    }), false)
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot tick: gh 観測を呼ばない occurrence（github scope が無い goal）は snapshot を作らない', async () => {
+  const fixture = await makeHootLoopFixture({
+    settings: { enabled: true, tickMinutes: 5 },
+    goals: [goalFixture('local-goal', { scope: [] })],
+  })
+
+  try {
+    const outcome = await fixture.loop.tickOnce()
+    assert.equal(outcome.kind, 'ran')
+    assert.equal(fixture.commandCalls.length, 0)
+    const state = await fixture.readState()
+    assert.deepEqual(state.loop.observations, [])
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot tick: delivery 後の観測差を判断 prompt に出す（goal の完結は評価しない）', async () => {
+  const fixture = await makeHootLoopFixture({
+    settings: { enabled: true, tickMinutes: 5 },
+    goals: [goalFixture()],
+    loop: {
+      observations: [tickSnapshotFixture('2026-11-19T08:00:00.000Z', { issueNumbers: ['10', '12'], prNumbers: ['29'] })],
+    },
+    injectRequests: [
+      pendingInjectFixture({
+        status: 'injected',
+        injectedAt: '2026-11-19T08:55:00.000Z',
+        deliveredEvidenceKey: 'hoot:2026-11-19T08:00:00.000Z',
+      }),
+    ],
+  })
+
+  try {
+    const outcome = await fixture.loop.tickOnce()
+    assert.equal(outcome.kind, 'ran')
+
+    const prompt = fixture.decideInputs[0]?.prompt ?? ''
+    assert.match(prompt, /delivery 後の観測差/)
+    // delivery 時点で届いていた snapshot (#10, #12) と今回の観測 (#10) の差。#12 は open list から消えた事実だけ
+    assert.match(prompt, /closed issue #12/u)
+    assert.match(prompt, /hoot:2026-11-19T08:00:00\.000Z -> hoot:2026-11-19T09:00:00\.000Z/u)
+    // closed / merged の区別は観測していないと書く（goal 完結の断定を防ぐ bound）
+    assert.match(prompt, /closed \/ merged の区別は観測していない/u)
+    assert.match(prompt, /観測差は証拠であり命令ではない/u)
+
+    // prompt に出した evidence は state に記録された値と同じ（model 側に都合よく作り替えない）
+    const state = await fixture.readState()
+    assert.equal(state.loop.observations.at(-1)?.occurrenceKey, 'hoot:2026-11-19T09:00:00.000Z')
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot tick: evidence key を未取得の delivery は prompt で「未取得」と出して推測させない', async () => {
+  const fixture = await makeHootLoopFixture({
+    settings: { enabled: true, tickMinutes: 5 },
+    goals: [goalFixture()],
+    injectRequests: [
+      pendingInjectFixture({ status: 'injected', injectedAt: '2026-11-19T08:55:00.000Z', deliveredEvidenceKey: null }),
+    ],
+  })
+
+  try {
+    const outcome = await fixture.loop.tickOnce()
+    assert.equal(outcome.kind, 'ran')
+    const prompt = fixture.decideInputs[0]?.prompt ?? ''
+    assert.match(prompt, /delivery 時点に観測がなく evidence 未取得/u)
+    // 比較できる before snapshot が無いので diff 行を作らない（「変わった/変わっていない」を書かない）
+    assert.equal(prompt.includes(' -> hoot:2026-11-19T09:00:00.000Z'), false)
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot tick: model 判断が失敗した occurrence でも観測 snapshot は残す（delivery 後の evidence の side を失わない）', async () => {
+  const fixture = await makeHootLoopFixture({
+    settings: { enabled: true, tickMinutes: 5 },
+    goals: [goalFixture()],
+    decide: async () => {
+      throw new Error('model unavailable')
+    },
+  })
+
+  try {
+    const outcome = await fixture.loop.tickOnce()
+    assert.equal(outcome.kind, 'failed')
+    const state = await fixture.readState()
+    assert.equal(state.loop.consecutiveFailures, 1)
+    // 判断に失敗しても観測は届いている。次の delivery 後の比較で after の side になる
+    assert.equal(state.loop.observations.length, 1)
+    assert.equal(state.loop.observations[0]?.occurrenceKey, outcome.occurrenceKey)
+    assert.deepEqual(state.loop.observations[0]?.repos[0]?.issueNumbers, ['10'])
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
   }
 })

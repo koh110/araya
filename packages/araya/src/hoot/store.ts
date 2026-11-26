@@ -17,11 +17,14 @@ import {
   HOOT_STATE_VERSION,
   HOOT_STATE_VERSION_INJECT,
   HOOT_STATE_VERSION_PRECHECK,
+  GITHUB_SCOPE_PATTERN,
   HOOT_STATE_VERSION_PRE_CONVERSATION_READ,
+  HOOT_STATE_VERSION_PRE_OBSERVATION_EVIDENCE,
   INJECTABLE_DECISIONS,
   INJECT_COOLDOWN_MINUTES_MAX,
   INJECT_COOLDOWN_MINUTES_MIN,
   MAX_GOALS,
+  MAX_GOAL_EVIDENCE_DELIVERIES,
   MAX_INJECTS_KEPT,
   MAX_INJECTS_PER_DAY_MAX,
   MAX_INJECTS_PER_DAY_MIN,
@@ -48,6 +51,8 @@ import {
   isHootStateShapeV1,
   isHootStateShapeV2,
   isHootStateShapeV3,
+  isHootStateShapeV4,
+  isObservationsShape,
   isSettingsShape,
   isSettingsShapeV1,
   reviewPassed,
@@ -55,7 +60,11 @@ import {
   EMPTY_CONVERSATION_READS,
   type HootDecision,
   type HootGoal,
+  type HootGoalEvidence,
+  type HootGoalEvidenceDelta,
+  type HootGoalEvidenceDelivery,
   type HootGoalInput,
+  type HootObservationSnapshot,
   type HootInjectAuthorizer,
   type HootInjectRequest,
   type HootProposal,
@@ -65,6 +74,7 @@ import {
   type HootStateV1,
   type HootStateV2,
   type HootStateV3,
+  type HootStateV4,
   defaultSettings,
   defaultState,
   isoUtc,
@@ -114,30 +124,36 @@ export async function readHootState(dataDir: string): Promise<HootState> {
     return value
   }
 
-  // version 3 の file は読み取り時に v4 へ寄せる（書かない）。次の updateHootState で v4 で保存される
+  // version 4 の file は読み取り時に v5 へ寄せる（書かない）。次の updateHootState で v5 で保存される
+  if (isHootStateShapeV4(value)) {
+    return migrateStateV4(value)
+  }
+
+  // version 3 の file は v4 を経由して v5 に寄せる（書かない）。次の updateHootState で v5 で保存される
   if (isHootStateShapeV3(value)) {
-    return migrateStateV3(value)
+    return migrateStateV4(migrateStateV3(value))
   }
 
-  // version 2 の file は v3 を経由して v4 に寄せる
+  // version 2 の file は v3・v4 を経由して v5 に寄せる
   if (isHootStateShapeV2(value)) {
-    return migrateStateV3(migrateStateV2(value))
+    return migrateStateV4(migrateStateV3(migrateStateV2(value)))
   }
 
-  // version 1 は v2・v3 を経由して v4 に寄せる
+  // version 1 は v2・v3・v4 を経由して v5 に寄せる
   if (isHootStateShapeV1(value) && isSettingsShapeV1(value.settings)) {
-    return migrateStateV3(migrateStateV2(migrateStateV1(value, Date.now())))
+    return migrateStateV4(migrateStateV3(migrateStateV2(migrateStateV1(value, Date.now()))))
   }
 
   throw hootError('hoot_state_invalid', `${filePath} が HOOT state の形ではありません`)
 }
 
 // version 3 -> 4。conversationRead の settings と run の参照記録が無くても読めるようにする
-function migrateStateV3(state: HootStateV3): HootState {
+// loop.observations と inject の deliveredEvidenceKey は migrateStateV4 で埋める
+function migrateStateV3(state: HootStateV3): HootStateV4 {
   const raw = state.settings as unknown as Record<string, unknown>
 
   return {
-    version: HOOT_STATE_VERSION,
+    version: HOOT_STATE_VERSION_PRE_OBSERVATION_EVIDENCE,
     settings: {
       ...state.settings,
       conversationRead:
@@ -150,6 +166,48 @@ function migrateStateV3(state: HootStateV3): HootState {
     }),
     proposals: state.proposals,
     injectRequests: state.injectRequests,
+  }
+}
+
+// version 4 -> 5。observation snapshot の list と inject の evidence key を埋める。
+// 無い field は empty / null で埋めるが、値が壊れている field（observations に array 以外や
+// 形が合わない snapshot が入っている file など）は migration で直さず hoot_state_invalid にする
+function migrateStateV4(state: HootStateV4): HootState {
+  const rawLoop = state.loop as unknown as Record<string, unknown>
+  // まだ無い file は empty。入っている file は形の検査を通るものだけ使う
+  const observations = rawLoop.observations === undefined ? [] : rawLoop.observations
+
+  if (!isObservationsShape(observations)) {
+    throw hootError(
+      'hoot_state_invalid',
+      'loop.observations が observation snapshot の形ではありません（state file を直してください）'
+    )
+  }
+
+  return {
+    ...state,
+    version: HOOT_STATE_VERSION,
+    loop: {
+      ...state.loop,
+      observations,
+    },
+    injectRequests: state.injectRequests.map((request) => {
+      const raw = request as unknown as Record<string, unknown>
+      const evidenceKey = raw.deliveredEvidenceKey
+
+      if (
+        evidenceKey !== undefined &&
+        evidenceKey !== null &&
+        !(typeof evidenceKey === 'string' && evidenceKey !== '')
+      ) {
+        throw hootError('hoot_state_invalid', `inject request ${request.key} の deliveredEvidenceKey が壊れています`)
+      }
+
+      return {
+        ...request,
+        deliveredEvidenceKey: typeof evidenceKey === 'string' ? evidenceKey : null,
+      }
+    }),
   }
 }
 
@@ -842,6 +900,8 @@ export async function enqueueHootInject(
       attempts: 0,
       injectedAt: null,
       lastError: null,
+      // delivery 前なので evidence はまだ未取得
+      deliveredEvidenceKey: null,
     }
     state.injectRequests.push(request)
 
@@ -914,6 +974,9 @@ export async function finishHootInject(
       request.status = 'injected'
       request.injectedAt = nowIso
       request.lastError = null
+      // delivery の時点で届いていた最新の観測 occurrence を記録する。以後の snapshot と比較して
+      // delivery 後の effect を evidence にする（観測がまだ無い request は null のまま「未取得」）
+      request.deliveredEvidenceKey = deliveredEvidenceKeyOf(state, input.nowMs)
 
       // 同じ key に open があっても closed（resolved / expired）しか無い場合は何もしない。
       // 人間が `hoot dispatch` で同じ案件を承認し直すと新しい open proposal としてやり直せる
@@ -935,6 +998,221 @@ export async function finishHootInject(
 
     return { request: { ...request } satisfies HootInjectRequest, proposalResolved } satisfies HootInjectFinish
   })
+}
+
+// ---- delivery 後の effect evidence（Issue #10 acceptance 5）----
+// state.json の inject request と loop.observations だけから決定的に計算する pure function。
+// Goal の完結は評価しない（「Goal を自動完結させない」）。delivery 後の open list の変化を事実として出すだけ
+// で、title などの external text は扱わない。closed / opened は open list の membership 変化のことで、
+// merged や人間による close だと断定しない
+function sortedEvidenceNumbers(values: Iterable<string>) {
+  const numbers: number[] = []
+
+  for (const value of values) {
+    const parsed = Number(value)
+
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      continue
+    }
+
+    if (!numbers.includes(parsed)) {
+      numbers.push(parsed)
+    }
+  }
+
+  return numbers.sort((left, right) => {
+    return left - right
+  }).map((entry) => {
+    return String(entry)
+  })
+}
+
+function closedNumbers(before: readonly string[], after: readonly string[]) {
+  const afterSet = new Set(after)
+
+  return sortedEvidenceNumbers(
+    before.filter((entry) => {
+      return !afterSet.has(entry)
+    })
+  )
+}
+
+function openedNumbers(before: readonly string[], after: readonly string[]) {
+  const beforeSet = new Set(before)
+
+  return sortedEvidenceNumbers(
+    after.filter((entry) => {
+      return !beforeSet.has(entry)
+    })
+  )
+}
+
+// 比較の side に使う repo snapshot。観測に gap がある repo（fingerprint null）は比較しない
+function snapshotRepoOf(snapshot: HootObservationSnapshot | undefined, repo: string) {
+  if (snapshot === undefined) {
+    return undefined
+  }
+
+  const found = snapshot.repos.find((entry) => {
+    return entry.repo === repo
+  })
+
+  return found === undefined || found.fingerprint === null ? undefined : found
+}
+
+// delivery 以前に届いた snapshot（before）と、delivery 以降に届いた最初の snapshot（after）
+function evidenceSidesOf(state: HootState, delivery: HootInjectRequest, nowMs: number) {
+  const before =
+    delivery.deliveredEvidenceKey === null
+      ? undefined
+      : state.loop.observations.find((entry) => {
+          return entry.occurrenceKey === delivery.deliveredEvidenceKey
+        })
+  const injectedAt = parseIso(delivery.injectedAt) ?? 0
+  let after: HootObservationSnapshot | undefined
+
+  for (const snapshot of state.loop.observations) {
+    const observedAt = parseIso(snapshot.observedAt)
+
+    // 時刻を読めない snapshot、delivery までに届いた snapshot、観測に repo が無い snapshot は side にしない
+    if (observedAt === null || observedAt <= injectedAt || observedAt > nowMs || snapshot.repos.length === 0) {
+      continue
+    }
+
+    after = snapshot
+
+    break
+  }
+
+  return { before, after }
+}
+
+function evidenceDeltaOf(
+  before: HootObservationSnapshot | undefined,
+  after: HootObservationSnapshot | undefined,
+  repo: string
+): HootGoalEvidenceDelta {
+  const beforeRepo = snapshotRepoOf(before, repo)
+  const afterRepo = snapshotRepoOf(after, repo)
+
+  // どちらかの side でこの repo が観測できていなければ比較できない（key を空にして比較なしと示す）
+  if (beforeRepo === undefined || afterRepo === undefined) {
+    return {
+      repo,
+      closedIssues: [],
+      closedPrs: [],
+      openedIssues: [],
+      openedPrs: [],
+      beforeKey: '',
+      afterKey: '',
+    }
+  }
+
+  return {
+    repo,
+    closedIssues: closedNumbers(beforeRepo.issueNumbers, afterRepo.issueNumbers),
+    closedPrs: closedNumbers(beforeRepo.prNumbers, afterRepo.prNumbers),
+    openedIssues: openedNumbers(beforeRepo.issueNumbers, afterRepo.issueNumbers),
+    openedPrs: openedNumbers(beforeRepo.prNumbers, afterRepo.prNumbers),
+    beforeKey: before === undefined ? '' : before.occurrenceKey,
+    afterKey: after === undefined ? '' : after.occurrenceKey,
+  }
+}
+
+function githubReposOfScope(scope: readonly string[]) {
+  const repos: string[] = []
+
+  for (const entry of scope) {
+    const matched = GITHUB_SCOPE_PATTERN.exec(entry)
+    const repo = matched === null ? undefined : matched[1]
+
+    if (typeof repo === 'string' && !repos.includes(repo)) {
+      repos.push(repo)
+    }
+  }
+
+  return repos
+}
+
+// goal ごとに delivery（inject）直後の観測差を並べる。retired goal は出さない（比較の意味がない）
+export function goalEvidenceOf(state: HootState, nowMs: number): HootGoalEvidence[] {
+  const injected = state.injectRequests
+    .filter((request) => {
+      return request.status === 'injected' && request.injectedAt !== null
+    })
+    // 「直近の delivery」は injectedAt の新しい順（state の配列は作成順なので、delivery 順とは限らない）
+    .slice()
+    .sort((left, right) => {
+      return (parseIso(left.injectedAt) ?? 0) - (parseIso(right.injectedAt) ?? 0)
+    })
+  const evidence: HootGoalEvidence[] = []
+
+  for (const goal of state.goals) {
+    if (goal.status === 'retired') {
+      continue
+    }
+
+    const repos = githubReposOfScope(goal.scope)
+
+    if (repos.length === 0) {
+      continue
+    }
+
+    const deliveries = injected
+      .filter((request) => {
+        return request.goalKeys.includes(goal.key)
+      })
+      .slice(-MAX_GOAL_EVIDENCE_DELIVERIES)
+      .map((request) => {
+        const sides = evidenceSidesOf(state, request, nowMs)
+        const delta: HootGoalEvidenceDelta[] = []
+
+        for (const repo of repos) {
+          const entry = evidenceDeltaOf(sides.before, sides.after, repo)
+
+          // 比較できた repo だけ並べる（open list の変化がなければ delta は empty のまま「変化なし」で出る）
+          if (entry.beforeKey !== '' && entry.afterKey !== '') {
+            delta.push(entry)
+          }
+        }
+
+        return {
+          injectKey: request.key,
+          proposalKey: request.proposalKey,
+          decision: request.decision,
+          injectedAt: request.injectedAt ?? '',
+          deliveredEvidenceKey: request.deliveredEvidenceKey,
+          delta,
+        } satisfies HootGoalEvidenceDelivery
+      })
+
+    if (deliveries.length === 0) {
+      continue
+    }
+
+    evidence.push({ goalKey: goal.key, deliveries })
+  }
+
+  return evidence
+}
+
+// delivery の時点で届いていた observation snapshot の occurrence key（無ければ null）
+function deliveredEvidenceKeyOf(state: HootState, nowMs: number) {
+  let chosen: { occurrenceKey: string; observedAt: number } | null = null
+
+  for (const snapshot of state.loop.observations) {
+    const observedAt = parseIso(snapshot.observedAt)
+
+    if (observedAt === null || observedAt > nowMs) {
+      continue
+    }
+
+    if (chosen === null || observedAt >= chosen.observedAt) {
+      chosen = { occurrenceKey: snapshot.occurrenceKey, observedAt }
+    }
+  }
+
+  return chosen === null ? null : chosen.occurrenceKey
 }
 
 // digest を送った時刻を記録（1 UTC 日 1 回の抑止）
