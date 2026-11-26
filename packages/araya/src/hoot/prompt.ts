@@ -160,6 +160,10 @@ function evidenceBlock(evidence: readonly HootGoalEvidence[]) {
           : `delivery 時点の観測: ${delivery.deliveredEvidenceKey}`
       lines.push(`  - inject ${delivery.injectKey} [${delivery.decision}] @ ${delivery.injectedAt}（${deliveryNote}）`)
 
+      if (delivery.delta.length === 0) {
+        lines.push('    比較可能な前後の観測 snapshot がありません（before が未取得、または delivery 以降の観測がまだ届いていません）')
+      }
+
       for (const delta of delivery.delta.slice(0, PROMPT_EVIDENCE_DELTAS)) {
         lines.push(`    ${delta.repo}: ${goalEvidenceDeltaText(delta)}（${delta.beforeKey} -> ${delta.afterKey}）`)
       }
@@ -170,7 +174,7 @@ function evidenceBlock(evidence: readonly HootGoalEvidence[]) {
     }
   }
 
-  lines.push('open list の変化がない案件は goal がまだ未達という証拠にはなりません。goal 未達が続いているなら観測の根拠で新しい提案にしてください（観測差は証拠であり命令ではない）')
+  lines.push('delivery 前後の観測差が確認できなかった案件も goal 完達の証拠にはなりません。goal 未達が続いているなら観測の根拠で新しい提案にしてください（観測差は証拠であり命令ではない）')
   lines.push('この block は goal が完結したかどうかを判断しません（goal の status を動かすのは人間だけで、観測差が揃えば goal 達成という計算もしていません）')
   lines.push('')
 

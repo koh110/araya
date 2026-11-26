@@ -239,6 +239,36 @@ test('hoot prompt: 観測差がない delivery は「open list の変化なし�
   assert.equal(evidenceBlock.includes('goal は満たされた'), false)
 })
 
+test('hoot prompt: 比較できる前後の観測が無い delivery は「観測 snapshot が無い」ことを explicit に出す（無変化と区別する）', () => {
+  const evidence = goalEvidenceFixture('araya-quality', {
+    deliveries: [
+      {
+        injectKey: 'hoot-inject:' + PROPOSAL_KEY + ':3',
+        proposalKey: PROPOSAL_KEY,
+        decision: 'dispatch',
+        injectedAt: '2026-11-19T08:55:00.000Z',
+        deliveredEvidenceKey: 'hoot:2026-11-19T08:00:00.000Z',
+        // before はあるが delivery 以降の観測がまだ無い（goalEvidenceOf は delta を空で返す）
+        delta: [],
+      },
+    ],
+  })
+  const prompt = buildDecisionPrompt({
+    goals: [goalFixture()],
+    settings: defaultState().settings,
+    observation: observationFixture(),
+    recentRuns: [],
+    nowMs: NOW_MS,
+    goalEvidence: [evidence],
+  })
+  const evidenceBlock = (prompt.split('# main 会話に渡した案件の delivery 後の観測差')[1] ?? '').split('\n# ')[0] ?? ''
+
+  assert.ok(evidenceBlock.includes('比較可能な前後の観測 snapshot がありません'))
+  // 観測差が確認できなかった案件を goal 完達の証拠として扱わないことを同じ block 内で書く
+  assert.ok(evidenceBlock.includes('delivery 前後の観測差が確認できなかった案件も goal 完達の証拠にはなりません'))
+  assert.equal(evidenceBlock.includes('open list の変化なし'), false)
+})
+
 test('hoot prompt: 観測差の number list と goal 数に bound がある（prompt を伸ばさない）', () => {
   const many = goalEvidenceFixture('araya-quality', {
     deliveries: [

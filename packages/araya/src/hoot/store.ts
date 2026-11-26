@@ -53,6 +53,7 @@ import {
   isHootStateShapeV3,
   isHootStateShapeV4,
   isObservationsShape,
+  isOccurrenceKey,
   isSettingsShape,
   isSettingsShapeV1,
   reviewPassed,
@@ -195,11 +196,7 @@ function migrateStateV4(state: HootStateV4): HootState {
       const raw = request as unknown as Record<string, unknown>
       const evidenceKey = raw.deliveredEvidenceKey
 
-      if (
-        evidenceKey !== undefined &&
-        evidenceKey !== null &&
-        !(typeof evidenceKey === 'string' && evidenceKey !== '')
-      ) {
+      if (evidenceKey !== undefined && evidenceKey !== null && !isOccurrenceKey(evidenceKey)) {
         throw hootError('hoot_state_invalid', `inject request ${request.key} の deliveredEvidenceKey が壊れています`)
       }
 
@@ -1062,14 +1059,24 @@ function snapshotRepoOf(snapshot: HootObservationSnapshot | undefined, repo: str
 
 // delivery 以前に届いた snapshot（before）と、delivery 以降に観測れた最新の snapshot（after）
 function evidenceSidesOf(state: HootState, delivery: HootInjectRequest, nowMs: number) {
+  const injectedAt = parseIso(delivery.injectedAt) ?? 0
+  // before は injectedAt までに届いた snapshot でなければならない。deliveredEvidenceKey が delivery 後の
+  // snapshot を指している state（手で直した file など）では before 未取得として、delivery 後同士の差を
+  // delivery 前後の差として出さない
   const before =
     delivery.deliveredEvidenceKey === null
       ? undefined
       : state.loop.observations.find((entry) => {
-          return entry.occurrenceKey === delivery.deliveredEvidenceKey
+          if (entry.occurrenceKey !== delivery.deliveredEvidenceKey) {
+            return false
+          }
+
+          const observedAt = parseIso(entry.observedAt)
+
+          return observedAt !== null && observedAt <= injectedAt
         })
-  const injectedAt = parseIso(delivery.injectedAt) ?? 0
   let after: HootObservationSnapshot | undefined
+  let afterAt = Number.NEGATIVE_INFINITY
 
   for (const snapshot of state.loop.observations) {
     const observedAt = parseIso(snapshot.observedAt)
@@ -1079,9 +1086,12 @@ function evidenceSidesOf(state: HootState, delivery: HootInjectRequest, nowMs: n
       continue
     }
 
-    // observations は古い順。after は delivery 以降で一番新しい観測（delivery 直後の 1 回だけ見て打ち切らない。
-    // 修正が数 occurrence 後に効いた場合も goal への効果として見える）
-    after = snapshot
+    // after は delivery 以降で一番新しい観測（delivery 直後の 1 回だけ見て打ち切らない。
+    // 修正が数 occurrence 後に効いた場合も goal への効果として見える）。配列順ではなく observedAt の最大で選ぶ
+    if (observedAt > afterAt) {
+      after = snapshot
+      afterAt = observedAt
+    }
   }
 
   return { before, after }

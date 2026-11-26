@@ -919,8 +919,13 @@ export function createHootLoop(deps: HootTickDeps) {
           next.loop.failureCooldownUntil = isoUtc(cooldownAt)
 
           // 判断に失敗した occurrence でも観測は届いている。delivery 後の evidence の side を失わない
+          // （delivery が参照する snapshot は window より古くなっても保持する）
           if (occurrenceSnapshot !== null) {
-            next.loop.observations = appendObservationSnapshot(next.loop.observations, occurrenceSnapshot)
+            next.loop.observations = appendObservationSnapshot(
+              next.loop.observations,
+              occurrenceSnapshot,
+              pinnedEvidenceKeysOf(next)
+            )
           }
         })
       } catch (stateError) {

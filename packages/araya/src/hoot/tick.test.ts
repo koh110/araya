@@ -1775,3 +1775,45 @@ test('hoot tick: model 判断が失敗した occurrence でも観測 snapshot �
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
 })
+
+test('hoot tick: 判断に失敗した occurrence でも delivery が参照している snapshot は window から落ちない', async () => {
+  const prefilled = Array.from({ length: 12 }, (_entry, index) => {
+    return tickSnapshotFixture(`2026-11-18T${String(index).padStart(2, '0')}:30:00.000Z`, {
+      issueNumbers: [String(index)],
+    })
+  })
+  const fixture = await makeHootLoopFixture({
+    settings: { enabled: true, tickMinutes: 5 },
+    goals: [goalFixture()],
+    loop: { observations: prefilled },
+    injectRequests: [
+      pendingInjectFixture({
+        status: 'injected',
+        injectedAt: '2026-11-19T00:35:00.000Z',
+        deliveredEvidenceKey: prefilled[0]?.occurrenceKey ?? null,
+      }),
+    ],
+    decide: async () => {
+      throw new Error('model unavailable')
+    },
+  })
+
+  try {
+    const outcome = await fixture.loop.tickOnce()
+    // 判断は失敗したが観測は届いている
+    assert.equal(outcome.kind, 'failed')
+    const state = await fixture.readState()
+    // window 8 件外加えて、delivery が参照している snapshot は残っている
+    assert.equal(state.loop.observations.length, OBSERVATION_SNAPSHOTS_KEPT + 1)
+    assert.equal(state.loop.observations.some((entry) => {
+      return entry.occurrenceKey === prefilled[0]?.occurrenceKey
+    }), true)
+    assert.equal(state.loop.observations.at(-1)?.occurrenceKey, outcome.occurrenceKey)
+    // 判断失敗の occurrence を挟んでも delivery 前後の比較は保たれる
+    const evidence = goalEvidenceOf(state, Date.parse('2026-11-19T10:00:00.000Z'))
+    assert.equal(evidence[0]?.deliveries[0]?.delta[0]?.beforeKey, prefilled[0]?.occurrenceKey)
+    assert.equal(evidence[0]?.deliveries[0]?.delta[0]?.afterKey, outcome.occurrenceKey)
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
