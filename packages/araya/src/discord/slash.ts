@@ -127,6 +127,7 @@ export const HOOT_COMMAND: SlashCommand = {
     group('inject', 'inject request を操作・一覧する', [
       subcommand('list', 'inject request を直近 20 件、新しい順に出す'),
     ]),
+    subcommand('evidence', 'delivery 前后の観測差（open list の比較。read-only）'),
     group('goal', 'goal を追加・変更・停止する', [
       subcommand('list', 'goal 一覧'),
       subcommand('add', 'goal を追加する', [
@@ -152,7 +153,8 @@ export const HOOT_COMMAND: SlashCommand = {
       subcommand('set', 'settings を変更する（指定した field だけ変わる）', SETTINGS_SET_OPTIONS),
     ]),
     group('proposal', '提案を見る・解決済みにする', [
-      subcommand('list', 'open な proposal 一覧'),
+      subcommand('list', 'open な proposal 一覧（closed は総数と履歴への案内だけ）'),
+      subcommand('history', 'closed になった proposal の履歴（updatedAt の新しい順に最大 5 件）'),
       subcommand('resolve', 'proposal を resolved にする', [
         stringOption('key', 'proposal key', true),
       ]),
