@@ -168,6 +168,35 @@ function proposalLine(proposal: HootProposal) {
   ].join('\n')
 }
 
+// proposal に対して inject request がどう対応しているか。delivery で proposal は resolved になるが、
+// 対応は inject request 側（proposalKey・injectedAt）に残る。pending inject 中は再提醒を抑止していることも出す
+function proposalInjectNotes(state: HootState, proposalKey: string) {
+  const related = state.injectRequests.filter((entry) => {
+    return entry.proposalKey === proposalKey
+  })
+
+  if (related.length === 0) {
+    return []
+  }
+
+  const latest = related.at(-1)
+  const lines = [
+    `  inject: ${related.length} 件（latest ${latest?.key ?? '（なし）'} [${latest?.status ?? '（なし）'}]${
+      latest?.injectedAt === null || latest?.injectedAt === undefined ? '' : ` @ ${latest.injectedAt}`
+    }）`,
+  ]
+
+  if (
+    related.some((entry) => {
+      return entry.status === 'pending'
+    })
+  ) {
+    lines.push('  提醒: main 会話へ渡す列（pending inject）に入っている間は再提醒を抑止中')
+  }
+
+  return lines
+}
+
 function injectLine(request: HootInjectRequest) {
   const error = request.lastError === null ? '' : ` / lastError: ${request.lastError}`
 
@@ -226,7 +255,11 @@ export function formatHootStatus(state: HootState, nowMs: number, dataDir: strin
 
   if (openProposals.length > 0) {
     lines.push(`open proposals: ${openProposals.length}`)
-    lines.push(...openProposals.map(proposalLine))
+    lines.push(
+      ...openProposals.flatMap((proposal) => {
+        return [proposalLine(proposal), ...proposalInjectNotes(state, proposal.key)]
+      }),
+    )
   }
 
   if (state.injectRequests.length > 0) {
@@ -429,8 +462,12 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
       deps.stdout(
         [
           `open ${open.length} / closed ${closed.length}`,
-          ...open.map(proposalLine),
-          ...closed.slice(-5).map(proposalLine),
+          ...open.flatMap((proposal) => {
+            return [proposalLine(proposal), ...proposalInjectNotes(state, proposal.key)]
+          }),
+          ...closed.slice(-5).flatMap((proposal) => {
+            return [proposalLine(proposal), ...proposalInjectNotes(state, proposal.key)]
+          }),
         ].join('\n')
       )
 

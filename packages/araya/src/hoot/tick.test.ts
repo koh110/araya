@@ -1282,8 +1282,53 @@ test('hoot tick: injectOnce は pending を 1 件 main 会話へ渡す（goal・
     assert.equal(state.injectRequests[0]?.status, 'injected')
     assert.equal(state.injectRequests[0]?.attempts, 1)
     assert.equal(state.injectRequests[0]?.injectedAt, '2026-11-19T09:00:00.000Z')
+    // delivery が届いた proposal は resolved に寄せる（open に残さない）
+    assert.deepEqual(
+      state.proposals.map((proposal) => {
+        return proposal.status
+      }),
+      ['resolved'],
+    )
     // inject だけで model は呼ばない
     assert.equal(fixture.decideInputs.length, 0)
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot tick: inject 済みの案件は判断 prompt に「inject 済み」として出し、pending で無いものは再実行しない', async () => {
+  const fixture = await makeHootLoopFixture({
+    settings: { enabled: true, tickMinutes: 5, mode: 'active' },
+    goals: [goalFixture()],
+    proposals: [
+      proposalFixture({
+        key: DISPATCH_PROPOSAL_KEY,
+        decision: 'dispatch',
+        reason: 'open PR 1 件を main 会話で進める',
+        status: 'resolved',
+      }),
+    ],
+    injectRequests: [
+      pendingInjectFixture({
+        status: 'injected',
+        attempts: 1,
+        injectedAt: '2026-11-19T08:55:00.000Z',
+      }),
+    ],
+    inject: async () => {},
+  })
+
+  try {
+    const outcome = await fixture.loop.tickOnce()
+    assert.equal(outcome.kind, 'ran')
+    const prompt = fixture.decideInputs[0]?.prompt ?? ''
+    assert.match(prompt, /# main 会話に渡した案件/u)
+    assert.match(prompt, new RegExp(`proposal=${DISPATCH_PROPOSAL_KEY}`, 'u'))
+    // delivery 済みの案件を「未解決の pending」としては見せない
+    assert.doesNotMatch(prompt, /# 未解決の提案/u)
+    // inject 済み request は next poll で選ばれない
+    assert.equal((await fixture.loop.injectOnce()).kind, 'nothing')
+    assert.equal(fixture.injectInputs.length, 0)
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }

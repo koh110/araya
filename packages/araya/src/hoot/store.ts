@@ -661,8 +661,24 @@ export async function takeProposalReminder(dataDir: string, input: { nowMs: numb
       return null as ProposalReminder | null
     }
 
+    // main 会話へ渡す列に入っている案件（pending inject）を人間に再提醒しない。delivery は bot process
+    // 側で進むので、pending inject が無い場合だけ期限 backoff で提醒する
+    const pendingInjectKeys = new Set(
+      state.injectRequests
+        .filter((entry) => {
+          return entry.status === 'pending'
+        })
+        .map((entry) => {
+          return entry.proposalKey
+        }),
+    )
+
     const due = state.proposals.find((proposal) => {
       if (proposal.status !== 'open' || proposal.reminders >= state.settings.maxProposalReminders) {
+        return false
+      }
+
+      if (pendingInjectKeys.has(proposal.key)) {
         return false
       }
 
@@ -727,16 +743,35 @@ export async function enqueueHootInject(
     }
 
     const key = input.proposalKey.trim()
-    const proposal = state.proposals.find((entry) => {
-      return entry.key === key
+    // 同じ key に open と closed が並びえる（resolved 済みの案件が同じ状況で再提案されるため）。
+    // 人間が承認するのは open の方なので open を先に選ぶ。inject された proposal を人間がもう一度
+    // 承認したときは inject の delivery で resolved になっているので、新しい open を作り直す
+    const openProposal = state.proposals.find((entry) => {
+      return entry.key === key && entry.status === 'open'
     })
+    const closedProposal = state.proposals.find((entry) => {
+      return entry.key === key && entry.status === 'resolved'
+    })
+    const proposal = openProposal ?? closedProposal
 
     if (proposal === undefined) {
-      throw hootError('hoot_proposal_not_found', `proposal key ${key} がありません`)
+      const any = state.proposals.find((entry) => {
+        return entry.key === key
+      })
+      const reason = any === undefined ? 'ありません' : `は open ではありません（status: ${any.status}）`
+
+      throw hootError('hoot_proposal_not_found', `proposal key ${key} ${reason}`)
     }
 
     if (proposal.status !== 'open') {
-      throw hootError('hoot_proposal_not_found', `proposal key ${key} は open ではありません（status: ${proposal.status}）`)
+      const nowIso = isoUtc(input.nowMs)
+      proposal.status = 'open'
+      proposal.createdAt = nowIso
+      proposal.updatedAt = nowIso
+      proposal.lastReminderAt = null
+      proposal.reminders = 0
+      proposal.expiresAt = isoUtc(input.nowMs + state.settings.proposalTtlHours * 3_600_000)
+      proposal.evidenceOccurrenceKeys = proposal.evidenceOccurrenceKeys.slice(-MAX_PROPOSAL_EVIDENCE_KEYS)
     }
 
     if (!INJECTABLE_DECISIONS.includes(proposal.decision)) {
@@ -848,12 +883,20 @@ export async function takePendingInject(dataDir: string, nowMs: number) {
   })
 }
 
+// inject の結末。delivery が届いた proposal は open のまま残さない（spec の「proposal の auto resolve
+// と inject の対応」）。open のまま残すと 再提醒が走り、判断 run に「未完了の pending」として見えて
+// WAIT を繰り返し、期限で expired になる。対応は inject request（proposalKey・injectedAt）で追う。
+export type HootInjectFinish = {
+  request: HootInjectRequest
+  proposalResolved: boolean
+}
+
 export async function finishHootInject(
   dataDir: string,
   key: string,
   input: { ok: boolean; nowMs: number; error?: string }
-) {
-  return await updateHootState(dataDir, (state) => {
+): Promise<HootInjectFinish> {
+  return await updateHootState(dataDir, (state): HootInjectFinish => {
     const request = state.injectRequests.find((entry) => {
       return entry.key === key
     })
@@ -865,11 +908,24 @@ export async function finishHootInject(
     const nowIso = isoUtc(input.nowMs)
     request.updatedAt = nowIso
     request.attempts = Math.max(1, request.attempts)
+    let proposalResolved = false
 
     if (input.ok) {
       request.status = 'injected'
       request.injectedAt = nowIso
       request.lastError = null
+
+      // 同じ key に open があっても closed（resolved / expired）しか無い場合は何もしない。
+      // 人間が `hoot dispatch` で同じ案件を承認し直すと新しい open proposal としてやり直せる
+      const proposal = state.proposals.find((entry) => {
+        return entry.key === request.proposalKey && entry.status === 'open'
+      })
+
+      if (proposal !== undefined) {
+        proposal.status = 'resolved'
+        proposal.updatedAt = nowIso
+        proposalResolved = true
+      }
     } else {
       // attempts が上限に達していれば pending に戻さない（CLI で新しい承認を作り直せる）
       request.status = request.attempts >= MAX_INJECT_ATTEMPTS ? 'failed' : 'pending'
@@ -877,7 +933,7 @@ export async function finishHootInject(
       request.injectedAt = null
     }
 
-    return { ...request } satisfies HootInjectRequest
+    return { request: { ...request } satisfies HootInjectRequest, proposalResolved } satisfies HootInjectFinish
   })
 }
 

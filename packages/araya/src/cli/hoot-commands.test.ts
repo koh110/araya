@@ -1172,6 +1172,12 @@ test('hoot cli: dispatch --key は inject request を作り、inject list / stat
     assert.match(status.output, /inject requests: pending 1 \/ injected 0 \/ failed 0/u)
     assert.match(status.output, /araya hoot dispatch --key <proposal key>/u)
     assert.match(status.output, new RegExp(`proposal=${dispatchKey}`, 'u'))
+    // pending inject が入っている open は「再提醒を抑止中」と出す（delivery まで人間に重ねて押さない）
+    assert.match(
+      status.output,
+      new RegExp(`inject: 1 件（latest hoot-inject:${dispatchKey}:1 \\[pending\\]）`, 'u'),
+    )
+    assert.match(status.output, /pending inject）に入っている間は再提醒を抑止中/u)
 
     let state = await readHootState(fixture.dataDir)
     assert.equal(state.injectRequests.length, 1)
@@ -1227,6 +1233,25 @@ test('hoot cli: dispatch --key は inject request を作り、inject list / stat
 
     const afterInject = await fixture.run(['inject', 'list'])
     assert.match(afterInject.output, /\[injected\]/u)
+
+    // delivery した proposal は resolved（open の pending として残らない）。対応は closed 側に出る
+    state = await readHootState(fixture.dataDir)
+    assert.equal(state.proposals.find((proposal) => proposal.key === dispatchKey)?.status, 'resolved')
+
+    const afterStatus = await fixture.run(['status'])
+    assert.equal(afterStatus.ok, true)
+    assert.doesNotMatch(afterStatus.output, new RegExp(`- ${dispatchKey} \\[open\\]`, 'u'))
+
+    const afterProposalList = await fixture.run(['proposal', 'list'])
+    assert.equal(afterProposalList.ok, true)
+    assert.match(afterProposalList.output, /open 2 \/ closed 1/u)
+    assert.match(
+      afterProposalList.output,
+      new RegExp(
+        `inject: 1 件（latest hoot-inject:${dispatchKey}:1 \\[injected\\] @ ${HOOT_NOW_ISO}）`,
+        'u',
+      ),
+    )
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
