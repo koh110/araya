@@ -25,6 +25,7 @@ import {
   isoUtc,
   parseDecision,
   parseIso,
+  pinnedEvidenceKeysOf,
   conversationReadsOf,
   proposalKeyOf,
   reviewPassed,
@@ -628,7 +629,8 @@ export function createHootLoop(deps: HootTickDeps) {
       // 今回の occurrence の観測 snapshot（model run にも precheck noop にも付ける）。
       // 観測に repo が 1 件も無い occurrence（gh が壊れた・github scope が無い）は比較 side に使えないので作らない
       occurrenceSnapshot = observation.repos.length === 0 ? null : observationSnapshotOf(occurrenceKey, observation)
-      // delivery 後の evidence を prompt に載せるため、state file へ追記する予定の snapshot を込んだ
+      const pinnedEvidenceKeys = pinnedEvidenceKeysOf(state)
+      // delivery 後の evidence を prompt に載せるため、state file へ追記する予定の snapshot を加えた
       // state で計算する（追記しないと同じ値になる。計算は state.json の値だけから決定的）
       const evidenceState =
         occurrenceSnapshot === null
@@ -637,7 +639,11 @@ export function createHootLoop(deps: HootTickDeps) {
               ...state,
               loop: {
                 ...state.loop,
-                observations: appendObservationSnapshot(state.loop.observations, occurrenceSnapshot),
+                observations: appendObservationSnapshot(
+                  state.loop.observations,
+                  occurrenceSnapshot,
+                  pinnedEvidenceKeys
+                ),
               },
             }
       const lastModelRunAt = parseIso(state.loop.lastModelRunAt)
@@ -692,7 +698,11 @@ export function createHootLoop(deps: HootTickDeps) {
           next.loop.failureCooldownUntil = null
 
           if (occurrenceSnapshot !== null) {
-            next.loop.observations = appendObservationSnapshot(next.loop.observations, occurrenceSnapshot)
+            next.loop.observations = appendObservationSnapshot(
+              next.loop.observations,
+              occurrenceSnapshot,
+              pinnedEvidenceKeys
+            )
           }
         })
 
@@ -780,7 +790,11 @@ export function createHootLoop(deps: HootTickDeps) {
         next.loop.goalFingerprints = fingerprints
 
         if (occurrenceSnapshot !== null) {
-          next.loop.observations = appendObservationSnapshot(next.loop.observations, occurrenceSnapshot)
+          next.loop.observations = appendObservationSnapshot(
+            next.loop.observations,
+            occurrenceSnapshot,
+            pinnedEvidenceKeys
+          )
         }
 
         // lastModelRunAt は recordHootRun が source: 'model' で更新済み
