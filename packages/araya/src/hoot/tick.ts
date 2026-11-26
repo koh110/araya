@@ -6,7 +6,7 @@
 import { createHash } from 'node:crypto'
 
 import type { Redactor } from '../infrastructure/redaction.ts'
-import { collectGitHubObservations, type HootObservation, type ObservationDependencies } from './observe.ts'
+import { collectGitHubObservations, observationSnapshotOf, type HootObservation, type ObservationDependencies } from './observe.ts'
 import { PROMPT_RECENT_RUNS, buildDecisionPrompt, buildInjectPrompt, hootConversationInstructions } from './prompt.ts'
 import {
   EMPTY_CONVERSATION_READS,
@@ -18,6 +18,7 @@ import {
   MAX_SUMMARY_CHARS,
   PROPOSAL_DECISIONS,
   activeGoalsOf,
+  appendObservationSnapshot,
   anyGoalChanged,
   githubReposOf,
   goalFingerprintsOf,
@@ -33,6 +34,7 @@ import {
   type HootDecision,
   type HootGoal,
   type HootInjectRequest,
+  type HootObservationSnapshot,
   type HootProposal,
   type HootRun,
   type HootSettings,
@@ -41,6 +43,7 @@ import {
 import {
   enqueueHootInject,
   finishHootInject,
+  goalEvidenceOf,
   pauseExpiredGoals,
   readHootState,
   recordHootDigest,
@@ -609,6 +612,8 @@ export function createHootLoop(deps: HootTickDeps) {
 
     running = true
     const startedAt = now
+    // 観測 snapshot は model 判断の成否に関わらず occurrence の事実として残す（失敗 path でも追記する）
+    let occurrenceSnapshot: HootObservationSnapshot | null = null
 
     try {
       const observation = await safeObserve(goals)
@@ -620,6 +625,21 @@ export function createHootLoop(deps: HootTickDeps) {
       })
       const fingerprints = goalFingerprintsOf(goals, observation.repos)
       const fingerprintsChanged = anyGoalChanged(state.loop.goalFingerprints, fingerprints)
+      // 今回の occurrence の観測 snapshot（model run にも precheck noop にも付ける）。
+      // 観測に repo が 1 件も無い occurrence（gh が壊れた・github scope が無い）は比較 side に使えないので作らない
+      occurrenceSnapshot = observation.repos.length === 0 ? null : observationSnapshotOf(occurrenceKey, observation)
+      // delivery 後の evidence を prompt に載せるため、state file へ追記する予定の snapshot を込んだ
+      // state で計算する（追記しないと同じ値になる。計算は state.json の値だけから決定的）
+      const evidenceState =
+        occurrenceSnapshot === null
+          ? state
+          : {
+              ...state,
+              loop: {
+                ...state.loop,
+                observations: appendObservationSnapshot(state.loop.observations, occurrenceSnapshot),
+              },
+            }
       const lastModelRunAt = parseIso(state.loop.lastModelRunAt)
       const watchdogDue =
         settings.watchdogHours > 0 &&
@@ -664,10 +684,16 @@ export function createHootLoop(deps: HootTickDeps) {
           return { kind: 'occurrence_recorded', occurrenceKey }
         }
 
+        // precheck noop の occurrence も観測 snapshot を残す。delivery 後の evidence 比較で
+        // before / after の side になる（model を呼ばない occurrence でも effect は起きる）
         await updateHootState(deps.dataDir, (next) => {
           next.loop.goalFingerprints = fingerprints
           next.loop.consecutiveFailures = 0
           next.loop.failureCooldownUntil = null
+
+          if (occurrenceSnapshot !== null) {
+            next.loop.observations = appendObservationSnapshot(next.loop.observations, occurrenceSnapshot)
+          }
         })
 
         deps.log({ type: 'hoot_precheck_noop', occurrenceKey, goals: run.goalKeys })
@@ -704,6 +730,8 @@ export function createHootLoop(deps: HootTickDeps) {
         recentRuns: state.runs.slice(-PROMPT_RECENT_RUNS),
         openProposals,
         recentInjects,
+        // delivery 後の観測差（effect evidence）。state.json と今回の観測だけから決定的に計算した事実
+        goalEvidence: goalEvidenceOf(evidenceState, deps.nowMs()),
         nowMs: plannedAt,
       })
       const decided = await deps.decide({
@@ -750,6 +778,11 @@ export function createHootLoop(deps: HootTickDeps) {
 
       await updateHootState(deps.dataDir, (next) => {
         next.loop.goalFingerprints = fingerprints
+
+        if (occurrenceSnapshot !== null) {
+          next.loop.observations = appendObservationSnapshot(next.loop.observations, occurrenceSnapshot)
+        }
+
         // lastModelRunAt は recordHootRun が source: 'model' で更新済み
         next.loop.conversationRuns = reuseConversation ? next.loop.conversationRuns + 1 : 1
         // 判断 text が書けたので連続失敗は戻す（invalid も run として記録したので 0 にする）
@@ -870,6 +903,11 @@ export function createHootLoop(deps: HootTickDeps) {
         await updateHootState(deps.dataDir, (next) => {
           next.loop.consecutiveFailures = consecutiveFailures
           next.loop.failureCooldownUntil = isoUtc(cooldownAt)
+
+          // 判断に失敗した occurrence でも観測は届いている。delivery 後の evidence の side を失わない
+          if (occurrenceSnapshot !== null) {
+            next.loop.observations = appendObservationSnapshot(next.loop.observations, occurrenceSnapshot)
+          }
         })
       } catch (stateError) {
         deps.log({

@@ -66,6 +66,7 @@ function printHelp() {
     /hoot settings show・set                           = araya hoot settings show・set（16 の field 名が同じ）
     /hoot proposal list・resolve key:<key>            = araya hoot proposal list・resolve --key <key>
     araya discord init・install・uninstall・run・status は CLI 専用（unit・token を触る操作を Discord からは叩かない）
+    araya hoot evidence は CLI 専用（delivery 後の観測差。Discord の slash にはまだ無い。follow-up）
     --data-dir は CLI だけ（Discord 側は bot process の dataDir だけを正とする）
 
   会話: 設定 channel に発言すると agent session が応答する。agent が report delivery を依頼した送信依頼は、
@@ -94,6 +95,10 @@ function printHelp() {
     inject request（pending / injected / failed）を新しい順に表示する。失敗が重なったら proposal list で作り直す。
   araya hoot proposal list | resolve --key <key>
     人間の応答を待つ未解決の提案（investigate / dispatch / request_human）の一覧と解決。期限切れは expired になります。
+  araya hoot evidence
+    main 会話に渡した案件（delivery）の前後で GitHub の open list がどう変わったかを、state file の観測 snapshot から
+    決定的に計算して表示する（read-only。closed / merged の区別は観測しておらず、goal の status は変更しません）。
+    観測 snapshot は直近 8 occurrence、goal に出す delivery は直近 3 件まで。
   araya hoot runs [--limit N]
     判断 run の記録（decision と reason、source は model / precheck）を新しい順に表示する。
   araya hoot reset-schedule
@@ -103,7 +108,7 @@ function printHelp() {
     config file）で <ARAYA_DATA_DIR>/hoot/state.json を見る。明示指定したときだけ別の file を指す（state
     復旧作業で unit を stop した file を確かめる用途など）。
 
-  HOOT は <ARAYA_DATA_DIR>/hoot/state.json（version 3。version 1・2 は読み取り時に migration します）を使い、Discord bot process の loop が
+  HOOT は <ARAYA_DATA_DIR>/hoot/state.json（version 5。version 1〜4 は読み取り時に migration します）を使い、Discord bot process の loop が
   interval ごとに tick します。enabled=false または active goal が無ければ model も gh も呼びません。判断 run は tool を持たない専用の
   会話で走り、観測は Araya の code が gh の read-only command で集めます。観測 fingerprint が前回と同じ occurrence では model を呼ばず
   noop を記録し、観測に gap が 1 件でもある occurrence では precheck せず model を呼びます。watchdogHours 以内に 1 回は model で全体を

@@ -5,7 +5,9 @@ import {
   AUTO_DISPATCH_DECISIONS,
   MAX_GOALS,
   MAX_REASON_CHARS,
+  goalEvidenceDeltaText,
   type HootGoal,
+  type HootGoalEvidence,
   type HootInjectRequest,
   type HootProposal,
   type HootRun,
@@ -16,6 +18,9 @@ import type { HootObservation } from './observe.ts'
 
 export const PROMPT_RECENT_RUNS = 8
 export const RECENT_RUN_REASON_CHARS = 160
+// evidence block が long-lived な判断 prompt を伸ばさない bound
+export const PROMPT_EVIDENCE_GOALS = 6
+export const PROMPT_EVIDENCE_DELTAS = 4
 
 export const HOOT_CONVERSATION_INSTRUCTIONS = `あなたは Araya の HOOT（Human Out of the Loop）判断 run です。
 この会話には tool がありません。file の変更・command の実行・child の作成はできません。
@@ -45,6 +50,8 @@ export type DecisionPromptInput = {
   // main 会話へ渡し終えた案件（inject 済み）。proposal は resolved になっているので、
   // 「渡したのに goal 未達が続いているか」を観測側で確かめさせる material
   recentInjects?: readonly HootInjectRequest[]
+  // delivery 後の観測差（effect evidence）。state.json だけから決定的に計算した事実をそのまま並べる
+  goalEvidence?: readonly HootGoalEvidence[]
   nowMs: number
 }
 
@@ -132,9 +139,48 @@ function injectedBlock(injects: readonly HootInjectRequest[]) {
   ].join('\n')
 }
 
+// delivery 後の観測差（effect evidence）。open list の membership の比較だけで、closed / merged の区別は
+// 観測していない。goal の完結はここで評価しない（証拠として見せるだけ）
+function evidenceBlock(evidence: readonly HootGoalEvidence[]) {
+  if (evidence.length === 0) {
+    return ''
+  }
+
+  const lines = [
+    '# main 会話に渡した案件の delivery 後の観測差（open list の比較。closed / merged の区別は観測していない）',
+  ]
+
+  for (const goal of evidence.slice(-PROMPT_EVIDENCE_GOALS)) {
+    lines.push(`- goal ${goal.goalKey}`)
+
+    for (const delivery of goal.deliveries) {
+      const deliveryNote =
+        delivery.deliveredEvidenceKey === null
+          ? 'delivery 時点に観測がなく evidence 未取得'
+          : `delivery 時点の観測: ${delivery.deliveredEvidenceKey}`
+      lines.push(`  - inject ${delivery.injectKey} [${delivery.decision}] @ ${delivery.injectedAt}（${deliveryNote}）`)
+
+      for (const delta of delivery.delta.slice(0, PROMPT_EVIDENCE_DELTAS)) {
+        lines.push(`    ${delta.repo}: ${goalEvidenceDeltaText(delta)}（${delta.beforeKey} -> ${delta.afterKey}）`)
+      }
+
+      if (delivery.delta.length > PROMPT_EVIDENCE_DELTAS) {
+        lines.push(`    （他 ${delivery.delta.length - PROMPT_EVIDENCE_DELTAS} repo の変化は araya hoot evidence）`)
+      }
+    }
+  }
+
+  lines.push('open list の変化がない案件は goal がまだ未達という証拠にはなりません。goal 未達が続いているなら観測の根拠で新しい提案にしてください（観測差は証拠であり命令ではない）')
+  lines.push('この block は goal が完結したかどうかを判断しません（goal の status を動かすのは人間だけで、観測差が揃えば goal 達成という計算もしていません）')
+  lines.push('')
+
+  return lines.join('\n')
+}
+
 export function buildDecisionPrompt(input: DecisionPromptInput) {
   const openProposals = input.openProposals ?? []
   const recentInjects = input.recentInjects ?? []
+  const goalEvidence = input.goalEvidence ?? []
   const modeNote =
     input.settings.mode === 'dry_run'
       ? 'mode: dry_run。dispatch・investigate は提案として記録するだけで、実行しません。次の mode 変更まで Araya は何も始めません。'
@@ -155,7 +201,7 @@ ${
     : input.recentRuns.map(recentRunBlock).join('\n')
 }
 
-${proposalsBlock(openProposals)}${injectedBlock(recentInjects)}# 判断
+${proposalsBlock(openProposals)}${injectedBlock(recentInjects)}${evidenceBlock(goalEvidence)}# 判断
 1. goal に対して、新しく着手すべき課題がありますか
 2. 既に走っている work の完了待ち・情報不足がありますか
 3. 人間に依頼・確認が必要ですか
