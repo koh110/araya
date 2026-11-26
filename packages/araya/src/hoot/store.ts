@@ -158,7 +158,9 @@ function migrateStateV3(state: HootStateV3): HootStateV4 {
     settings: {
       ...state.settings,
       conversationRead:
-        typeof raw.conversationRead === 'boolean' ? raw.conversationRead : defaultSettings().conversationRead,
+        typeof raw.conversationRead === 'boolean'
+          ? raw.conversationRead
+          : defaultSettings().conversationRead,
     },
     goals: state.goals,
     loop: state.loop,
@@ -181,7 +183,7 @@ function migrateStateV4(state: HootStateV4): HootState {
   if (!isObservationsShape(observations)) {
     throw hootError(
       'hoot_state_invalid',
-      'loop.observations が observation snapshot の形ではありません（state file を直してください）'
+      'loop.observations が observation snapshot の形ではありません（state file を直してください）',
     )
   }
 
@@ -197,7 +199,10 @@ function migrateStateV4(state: HootStateV4): HootState {
       const evidenceKey = raw.deliveredEvidenceKey
 
       if (evidenceKey !== undefined && evidenceKey !== null && !isOccurrenceKey(evidenceKey)) {
-        throw hootError('hoot_state_invalid', `inject request ${request.key} の deliveredEvidenceKey が壊れています`)
+        throw hootError(
+          'hoot_state_invalid',
+          `inject request ${request.key} の deliveredEvidenceKey が壊れています`,
+        )
       }
 
       return {
@@ -219,7 +224,8 @@ function migrateStateV2(state: HootStateV2): HootStateV3 {
     settings: {
       ...defaults,
       ...state.settings,
-      autoDispatch: typeof raw.autoDispatch === 'boolean' ? raw.autoDispatch : defaults.autoDispatch,
+      autoDispatch:
+        typeof raw.autoDispatch === 'boolean' ? raw.autoDispatch : defaults.autoDispatch,
       maxInjectsPerDay:
         typeof raw.maxInjectsPerDay === 'number' && Number.isInteger(raw.maxInjectsPerDay)
           ? raw.maxInjectsPerDay
@@ -246,9 +252,10 @@ function migrateStateV1(state: HootStateV1, nowMs: number): HootStateV2 {
   settings.maxRunsPerDay = state.settings.maxRunsPerDay
 
   // v1 の notifyNoop は notifyDecisions の noop 1 本として引き継ぐ（無い場合は既定のまま）
-  settings.notifyDecisions = state.settings.notifyNoop === true
-    ? [...DEFAULT_NOTIFY_DECISIONS, 'noop' as HootDecision]
-    : [...DEFAULT_NOTIFY_DECISIONS]
+  settings.notifyDecisions =
+    state.settings.notifyNoop === true
+      ? [...DEFAULT_NOTIFY_DECISIONS, 'noop' as HootDecision]
+      : [...DEFAULT_NOTIFY_DECISIONS]
 
   return {
     version: HOOT_STATE_VERSION_INJECT,
@@ -276,7 +283,7 @@ function migratedReviewAt(
   state: HootStateV1,
   goal: Omit<HootGoal, 'reviewAt'>,
   defaultDays: number,
-  nowMs: number
+  nowMs: number,
 ) {
   if (defaultDays === 0) {
     return null
@@ -318,7 +325,7 @@ export async function writeHootState(dataDir: string, state: HootState) {
 
 export async function updateHootState<T>(
   dataDir: string,
-  mutate: (state: HootState) => T | Promise<T>
+  mutate: (state: HootState) => T | Promise<T>,
 ): Promise<T> {
   const directory = hootDirectory(dataDir)
   await fs.mkdir(directory, { recursive: true, mode: 0o700 })
@@ -374,7 +381,7 @@ export function mergeSettings(current: HootSettings, patch: Partial<HootSettings
     ) {
       throw hootError(
         'hoot_settings_invalid',
-        `tickMinutes は ${TICK_MINUTES_MIN}〜${TICK_MINUTES_MAX} の integer にしてください`
+        `tickMinutes は ${TICK_MINUTES_MIN}〜${TICK_MINUTES_MAX} の integer にしてください`,
       )
     }
 
@@ -389,7 +396,7 @@ export function mergeSettings(current: HootSettings, patch: Partial<HootSettings
     ) {
       throw hootError(
         'hoot_settings_invalid',
-        `maxRunsPerDay は ${MAX_RUNS_PER_DAY_MIN}〜${MAX_RUNS_PER_DAY_MAX} の integer にしてください`
+        `maxRunsPerDay は ${MAX_RUNS_PER_DAY_MIN}〜${MAX_RUNS_PER_DAY_MAX} の integer にしてください`,
       )
     }
 
@@ -403,7 +410,7 @@ export function mergeSettings(current: HootSettings, patch: Partial<HootSettings
       if (!HOOT_DECISIONS.includes(entry)) {
         throw hootError(
           'hoot_settings_invalid',
-          `notifyDecisions は ${HOOT_DECISIONS.join(' / ')} の組合せにしてください（${entry}）`
+          `notifyDecisions は ${HOOT_DECISIONS.join(' / ')} の組合せにしてください（${entry}）`,
         )
       }
     }
@@ -426,7 +433,12 @@ export function mergeSettings(current: HootSettings, patch: Partial<HootSettings
 
   if (patch.digestHourUtc !== undefined) {
     if (patch.digestHourUtc !== null) {
-      assertBoundedInt(patch.digestHourUtc, DIGEST_HOUR_UTC_MIN, DIGEST_HOUR_UTC_MAX, 'digestHourUtc')
+      assertBoundedInt(
+        patch.digestHourUtc,
+        DIGEST_HOUR_UTC_MIN,
+        DIGEST_HOUR_UTC_MAX,
+        'digestHourUtc',
+      )
     }
 
     next.digestHourUtc = patch.digestHourUtc
@@ -438,17 +450,32 @@ export function mergeSettings(current: HootSettings, patch: Partial<HootSettings
   }
 
   if (patch.goalReviewDays !== undefined) {
-    assertBoundedInt(patch.goalReviewDays, GOAL_REVIEW_DAYS_MIN, GOAL_REVIEW_DAYS_MAX, 'goalReviewDays')
+    assertBoundedInt(
+      patch.goalReviewDays,
+      GOAL_REVIEW_DAYS_MIN,
+      GOAL_REVIEW_DAYS_MAX,
+      'goalReviewDays',
+    )
     next.goalReviewDays = patch.goalReviewDays
   }
 
   if (patch.proposalTtlHours !== undefined) {
-    assertBoundedInt(patch.proposalTtlHours, PROPOSAL_TTL_HOURS_MIN, PROPOSAL_TTL_HOURS_MAX, 'proposalTtlHours')
+    assertBoundedInt(
+      patch.proposalTtlHours,
+      PROPOSAL_TTL_HOURS_MIN,
+      PROPOSAL_TTL_HOURS_MAX,
+      'proposalTtlHours',
+    )
     next.proposalTtlHours = patch.proposalTtlHours
   }
 
   if (patch.maxProposalReminders !== undefined) {
-    assertBoundedInt(patch.maxProposalReminders, MAX_PROPOSAL_REMINDERS_MIN, MAX_PROPOSAL_REMINDERS_MAX, 'maxProposalReminders')
+    assertBoundedInt(
+      patch.maxProposalReminders,
+      MAX_PROPOSAL_REMINDERS_MIN,
+      MAX_PROPOSAL_REMINDERS_MAX,
+      'maxProposalReminders',
+    )
     next.maxProposalReminders = patch.maxProposalReminders
   }
 
@@ -461,12 +488,22 @@ export function mergeSettings(current: HootSettings, patch: Partial<HootSettings
   }
 
   if (patch.maxInjectsPerDay !== undefined) {
-    assertBoundedInt(patch.maxInjectsPerDay, MAX_INJECTS_PER_DAY_MIN, MAX_INJECTS_PER_DAY_MAX, 'maxInjectsPerDay')
+    assertBoundedInt(
+      patch.maxInjectsPerDay,
+      MAX_INJECTS_PER_DAY_MIN,
+      MAX_INJECTS_PER_DAY_MAX,
+      'maxInjectsPerDay',
+    )
     next.maxInjectsPerDay = patch.maxInjectsPerDay
   }
 
   if (patch.injectCooldownMinutes !== undefined) {
-    assertBoundedInt(patch.injectCooldownMinutes, INJECT_COOLDOWN_MINUTES_MIN, INJECT_COOLDOWN_MINUTES_MAX, 'injectCooldownMinutes')
+    assertBoundedInt(
+      patch.injectCooldownMinutes,
+      INJECT_COOLDOWN_MINUTES_MIN,
+      INJECT_COOLDOWN_MINUTES_MAX,
+      'injectCooldownMinutes',
+    )
     next.injectCooldownMinutes = patch.injectCooldownMinutes
   }
 
@@ -475,11 +512,18 @@ export function mergeSettings(current: HootSettings, patch: Partial<HootSettings
 
 function assertBoundedInt(value: unknown, min: number, max: number, name: string) {
   if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max) {
-    throw hootError('hoot_settings_invalid', `${name} は ${min}〜${max} の integer にしてください（${String(value)}）`)
+    throw hootError(
+      'hoot_settings_invalid',
+      `${name} は ${min}〜${max} の integer にしてください（${String(value)}）`,
+    )
   }
 }
 
-export async function setGoal(dataDir: string, input: HootGoalInput, options: { replace?: boolean } = {}) {
+export async function setGoal(
+  dataDir: string,
+  input: HootGoalInput,
+  options: { replace?: boolean } = {},
+) {
   return await updateHootState(dataDir, (state) => {
     const existingIndex = state.goals.findIndex((goal) => {
       return goal.key === input.key.trim()
@@ -508,7 +552,7 @@ export async function setGoal(dataDir: string, input: HootGoalInput, options: { 
               : undefined,
       },
       nowMs,
-      reviewDefaultDays
+      reviewDefaultDays,
     )
 
     if (existingIndex >= 0) {
@@ -566,7 +610,11 @@ export async function resetSchedule(dataDir: string) {
 }
 
 // 同じ occurrenceKey の run があれば書かない（再起動で同じ tick を再び実行しないための guard）
-export async function recordHootRun(dataDir: string, run: HootRun) {
+export async function recordHootRun(
+  dataDir: string,
+  run: HootRun,
+  mutateState?: (state: HootState) => void,
+) {
   return await updateHootState(dataDir, (state) => {
     const existing = state.runs.find((entry) => {
       return entry.occurrenceKey === run.occurrenceKey
@@ -589,6 +637,8 @@ export async function recordHootRun(dataDir: string, run: HootRun) {
     if (run.source === 'model') {
       state.loop.lastModelRunAt = run.decidedAt
     }
+
+    mutateState?.(state)
 
     return { run, recorded: true }
   })
@@ -634,7 +684,7 @@ export async function upsertProposal(
     reason: string
     occurrenceKey: string
     nowMs: number
-  }
+  },
 ) {
   return await updateHootState(dataDir, (state) => {
     const nowIso = isoUtc(input.nowMs)
@@ -652,7 +702,10 @@ export async function upsertProposal(
         existing.evidenceOccurrenceKeys.push(input.occurrenceKey)
 
         if (existing.evidenceOccurrenceKeys.length > MAX_PROPOSAL_EVIDENCE_KEYS) {
-          existing.evidenceOccurrenceKeys.splice(0, existing.evidenceOccurrenceKeys.length - MAX_PROPOSAL_EVIDENCE_KEYS)
+          existing.evidenceOccurrenceKeys.splice(
+            0,
+            existing.evidenceOccurrenceKeys.length - MAX_PROPOSAL_EVIDENCE_KEYS,
+          )
         }
       }
 
@@ -700,7 +753,10 @@ export type ProposalReminder = {
 }
 
 // 期限切れを closed にし、再提醒が約束通り届くものを 1 件取り出す（backoff: tickMinutes * 2^n）
-export async function takeProposalReminder(dataDir: string, input: { nowMs: number; everyMs: number }) {
+export async function takeProposalReminder(
+  dataDir: string,
+  input: { nowMs: number; everyMs: number },
+) {
   return await updateHootState(dataDir, (state) => {
     const nowIso = isoUtc(input.nowMs)
 
@@ -787,13 +843,13 @@ export type HootInjectEnqueue = {
 
 export async function enqueueHootInject(
   dataDir: string,
-  input: { proposalKey: string; authorizedBy: HootInjectAuthorizer; nowMs: number }
+  input: { proposalKey: string; authorizedBy: HootInjectAuthorizer; nowMs: number },
 ): Promise<HootInjectEnqueue> {
   return await updateHootState(dataDir, (state): HootInjectEnqueue => {
     if (state.settings.mode !== 'active') {
       throw hootError(
         'hoot_mode_dry_run',
-        'mode が dry_run の間は main 会話への inject を作りません（araya hoot settings set --mode active / Discord の /hoot settings set mode:active）'
+        'mode が dry_run の間は main 会話への inject を作りません（araya hoot settings set --mode active / Discord の /hoot settings set mode:active）',
       )
     }
 
@@ -813,7 +869,8 @@ export async function enqueueHootInject(
       const any = state.proposals.find((entry) => {
         return entry.key === key
       })
-      const reason = any === undefined ? 'ありません' : `は open ではありません（status: ${any.status}）`
+      const reason =
+        any === undefined ? 'ありません' : `は open ではありません（status: ${any.status}）`
 
       throw hootError('hoot_proposal_not_found', `proposal key ${key} ${reason}`)
     }
@@ -826,13 +883,15 @@ export async function enqueueHootInject(
       proposal.lastReminderAt = null
       proposal.reminders = 0
       proposal.expiresAt = isoUtc(input.nowMs + state.settings.proposalTtlHours * 3_600_000)
-      proposal.evidenceOccurrenceKeys = proposal.evidenceOccurrenceKeys.slice(-MAX_PROPOSAL_EVIDENCE_KEYS)
+      proposal.evidenceOccurrenceKeys = proposal.evidenceOccurrenceKeys.slice(
+        -MAX_PROPOSAL_EVIDENCE_KEYS,
+      )
     }
 
     if (!INJECTABLE_DECISIONS.includes(proposal.decision)) {
       throw hootError(
         'hoot_inject_not_injectable',
-        `proposal ${key} の decision ${proposal.decision} は inject できません（${INJECTABLE_DECISIONS.join(' / ')} だけ）`
+        `proposal ${key} の decision ${proposal.decision} は inject できません（${INJECTABLE_DECISIONS.join(' / ')} だけ）`,
       )
     }
 
@@ -845,9 +904,11 @@ export async function enqueueHootInject(
     })
 
     // 同じ proposal への submit が未完了のうちに重ねて流さない
-    if (sameProposal.some((entry) => {
-      return entry.status === 'pending'
-    })) {
+    if (
+      sameProposal.some((entry) => {
+        return entry.status === 'pending'
+      })
+    ) {
       return { request: null, skipped: 'already_pending' }
     }
 
@@ -951,7 +1012,7 @@ export type HootInjectFinish = {
 export async function finishHootInject(
   dataDir: string,
   key: string,
-  input: { ok: boolean; nowMs: number; error?: string }
+  input: { ok: boolean; nowMs: number; error?: string },
 ): Promise<HootInjectFinish> {
   return await updateHootState(dataDir, (state): HootInjectFinish => {
     const request = state.injectRequests.find((entry) => {
@@ -993,7 +1054,10 @@ export async function finishHootInject(
       request.injectedAt = null
     }
 
-    return { request: { ...request } satisfies HootInjectRequest, proposalResolved } satisfies HootInjectFinish
+    return {
+      request: { ...request } satisfies HootInjectRequest,
+      proposalResolved,
+    } satisfies HootInjectFinish
   })
 }
 
@@ -1017,11 +1081,13 @@ function sortedEvidenceNumbers(values: Iterable<string>) {
     }
   }
 
-  return numbers.sort((left, right) => {
-    return left - right
-  }).map((entry) => {
-    return String(entry)
-  })
+  return numbers
+    .sort((left, right) => {
+      return left - right
+    })
+    .map((entry) => {
+      return String(entry)
+    })
 }
 
 function closedNumbers(before: readonly string[], after: readonly string[]) {
@@ -1030,7 +1096,7 @@ function closedNumbers(before: readonly string[], after: readonly string[]) {
   return sortedEvidenceNumbers(
     before.filter((entry) => {
       return !afterSet.has(entry)
-    })
+    }),
   )
 }
 
@@ -1040,7 +1106,7 @@ function openedNumbers(before: readonly string[], after: readonly string[]) {
   return sortedEvidenceNumbers(
     after.filter((entry) => {
       return !beforeSet.has(entry)
-    })
+    }),
   )
 }
 
@@ -1054,7 +1120,13 @@ function snapshotRepoOf(snapshot: HootObservationSnapshot | undefined, repo: str
     return entry.repo === repo
   })
 
-  return found === undefined || found.fingerprint === null ? undefined : found
+  return found !== undefined &&
+    found.fingerprint !== null &&
+    found.openIssues !== null &&
+    found.openPrs !== null &&
+    found.draftPrs !== null
+    ? found
+    : undefined
 }
 
 // delivery 以前に届いた snapshot（before）と、delivery 以降に観測れた最新の snapshot（after）
@@ -1082,7 +1154,12 @@ function evidenceSidesOf(state: HootState, delivery: HootInjectRequest, nowMs: n
     const observedAt = parseIso(snapshot.observedAt)
 
     // 時刻を読めない snapshot、delivery までに届いた snapshot、観測に repo が無い snapshot は side にしない
-    if (observedAt === null || observedAt <= injectedAt || observedAt > nowMs || snapshot.repos.length === 0) {
+    if (
+      observedAt === null ||
+      observedAt <= injectedAt ||
+      observedAt > nowMs ||
+      snapshot.repos.length === 0
+    ) {
       continue
     }
 
@@ -1100,7 +1177,7 @@ function evidenceSidesOf(state: HootState, delivery: HootInjectRequest, nowMs: n
 function evidenceDeltaOf(
   before: HootObservationSnapshot | undefined,
   after: HootObservationSnapshot | undefined,
-  repo: string
+  repo: string,
 ): HootGoalEvidenceDelta {
   const beforeRepo = snapshotRepoOf(before, repo)
   const afterRepo = snapshotRepoOf(after, repo)

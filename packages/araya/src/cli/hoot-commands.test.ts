@@ -1391,7 +1391,10 @@ test('hoot cli: dispatch --key は inject request を作り、inject list / stat
 
     // delivery した proposal は resolved（open の pending として残らない）。対応は closed 側＝proposal history に出る
     state = await readHootState(fixture.dataDir)
-    assert.equal(state.proposals.find((proposal) => proposal.key === dispatchKey)?.status, 'resolved')
+    assert.equal(
+      state.proposals.find((proposal) => proposal.key === dispatchKey)?.status,
+      'resolved',
+    )
 
     const afterStatus = await fixture.run(['status'])
     assert.equal(afterStatus.ok, true)
@@ -1478,7 +1481,7 @@ const EVIDENCE_GOAL: HootGoal = {
 
 function cliSnapshotFixture(
   at: string,
-  overrides: { issueNumbers?: string[]; prNumbers?: string[] } = {}
+  overrides: { issueNumbers?: string[]; prNumbers?: string[] } = {},
 ) {
   return {
     occurrenceKey: `hoot:${at}`,
@@ -1491,7 +1494,7 @@ function cliSnapshotFixture(
         draftPrs: 0,
         issueNumbers: overrides.issueNumbers ?? [],
         prNumbers: overrides.prNumbers ?? [],
-        fingerprint: `fp-${at}`,
+        fingerprint: '0123456789abcdef',
       },
     ],
   }
@@ -1522,13 +1525,14 @@ function cliInjectFixture(overrides: Partial<HootInjectRequest> = {}): HootInjec
 async function writeCliEvidenceState(
   dataDir: string,
   input: {
+    goals?: HootGoal[]
     observations?: ReturnType<typeof cliSnapshotFixture>[]
     injectRequests?: HootInjectRequest[]
-  } = {}
+  } = {},
 ) {
   await writeHootState(dataDir, {
     ...defaultState(),
-    goals: [EVIDENCE_GOAL],
+    goals: input.goals ?? [EVIDENCE_GOAL],
     loop: { ...defaultState().loop, observations: input.observations ?? [] },
     injectRequests: input.injectRequests ?? [],
   })
@@ -1540,8 +1544,14 @@ test('hoot cli evidence: delivery 前後の open list の変化を出す（goal 
   try {
     await writeCliEvidenceState(fixture.dataDir, {
       observations: [
-        cliSnapshotFixture('2026-11-19T08:00:00.000Z', { issueNumbers: ['10', '12'], prNumbers: ['29'] }),
-        cliSnapshotFixture('2026-11-19T09:00:00.000Z', { issueNumbers: ['12'], prNumbers: ['29', '33'] }),
+        cliSnapshotFixture('2026-11-19T08:00:00.000Z', {
+          issueNumbers: ['10', '12'],
+          prNumbers: ['29'],
+        }),
+        cliSnapshotFixture('2026-11-19T09:00:00.000Z', {
+          issueNumbers: ['12'],
+          prNumbers: ['29', '33'],
+        }),
       ],
       injectRequests: [cliInjectFixture()],
     })
@@ -1552,7 +1562,10 @@ test('hoot cli evidence: delivery 前後の open list の変化を出す（goal 
     assert.match(result.output, /delivery 後の観測差/)
     assert.match(result.output, /closed \/ merged の区別は観測していません/u)
     assert.match(result.output, /goal araya-quality/u)
-    assert.match(result.output, /hoot-inject:cli-proposal:1 \[dispatch\] @ 2026-11-19T08:55:00\.000Z/u)
+    assert.match(
+      result.output,
+      /hoot-inject:cli-proposal:1 \[dispatch\] @ 2026-11-19T08:55:00\.000Z/u,
+    )
     assert.match(result.output, /delivery 時点の観測: hoot:2026-11-19T08:00:00\.000Z/u)
     assert.match(result.output, /koh110\/araya: closed issue #10 \/ opened PR #33/u)
     assert.match(result.output, /hoot:2026-11-19T08:00:00\.000Z -> hoot:2026-11-19T09:00:00\.000Z/u)
@@ -1598,6 +1611,18 @@ test('hoot cli evidence: 比較できる snapshot が無いときは空だと言
     assert.equal(noBefore.ok, true, noBefore.message)
     assert.match(noBefore.output, /evidence 未取得/u)
     assert.match(noBefore.output, /比較可能な前後の観測 snapshot がありません/u)
+    // 成功 delivery はあるが GitHub scope が無い goal。次の tick を待っても比較対象にはならない
+    await writeCliEvidenceState(fixture.dataDir, {
+      goals: [{ ...EVIDENCE_GOAL, key: 'local-only', scope: [] }],
+      injectRequests: [cliInjectFixture({ goalKeys: ['local-only'] })],
+    })
+    const noGithubScope = await fixture.run(['evidence'])
+    assert.equal(noGithubScope.ok, true, noGithubScope.message)
+    assert.match(
+      noGithubScope.output,
+      /GitHub scope 付き goal に比較対象となる成功 delivery がありません/u,
+    )
+    assert.doesNotMatch(noGithubScope.output, /次の tick/u)
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }

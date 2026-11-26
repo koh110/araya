@@ -4,6 +4,7 @@
 import {
   AUTO_DISPATCH_DECISIONS,
   MAX_GOALS,
+  MAX_GOAL_EVIDENCE_DELIVERIES,
   MAX_REASON_CHARS,
   goalEvidenceDeltaText,
   type HootGoal,
@@ -80,7 +81,7 @@ function observationBlock(observation: HootObservation) {
 
   for (const repo of observation.repos) {
     lines.push(
-      `- ${repo.repo}: open issues ${repo.openIssues ?? 'unknown'}, open PRs ${repo.openPrs ?? 'unknown'}, draft ${repo.draftPrs ?? 'unknown'}`
+      `- ${repo.repo}: open issues ${repo.openIssues ?? 'unknown'}, open PRs ${repo.openPrs ?? 'unknown'}, draft ${repo.draftPrs ?? 'unknown'}`,
     )
 
     for (const item of repo.items) {
@@ -130,52 +131,98 @@ function injectedBlock(injects: readonly HootInjectRequest[]) {
 
   return [
     '# main 会話に渡した案件（inject 済み。実行と結果は main 会話側）',
-    ...injects.slice(-3).reverse().map((request) => {
-      const authorized = request.authorizedBy === 'human' ? '人間の承認' : 'autoDispatch'
+    ...injects
+      .slice(-3)
+      .reverse()
+      .map((request) => {
+        const authorized = request.authorizedBy === 'human' ? '人間の承認' : 'autoDispatch'
 
-      return `- proposal=${request.proposalKey}（inject ${request.key}） [${request.decision}] ${authorized} @ ${request.injectedAt ?? '不明'}（proposal は resolved。goal がまだ未達なら観測の根拠で新しい提案にしてください）`
-    }),
+        return `- proposal=${request.proposalKey}（inject ${request.key}） [${request.decision}] ${authorized} @ ${request.injectedAt ?? '不明'}（proposal は resolved。goal がまだ未達なら観測の根拠で新しい提案にしてください）`
+      }),
     '',
   ].join('\n')
 }
 
 // delivery 後の観測差（effect evidence）。open list の membership の比較だけで、closed / merged の区別は
 // 観測していない。goal の完結はここで評価しない（証拠として見せるだけ）
-function evidenceBlock(evidence: readonly HootGoalEvidence[]) {
+function evidenceTimestamp(value: string) {
+  const parsed = Date.parse(value)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function evidenceBlock(evidence: readonly HootGoalEvidence[], activeGoalKeys: ReadonlySet<string>) {
   if (evidence.length === 0) {
     return ''
   }
+
+  const selectedGoals = evidence
+    .map((goal, index) => {
+      return {
+        goal,
+        index,
+        active: activeGoalKeys.has(goal.goalKey),
+        latestDeliveryAt: goal.deliveries.reduce((latest, delivery) => {
+          return Math.max(latest, evidenceTimestamp(delivery.injectedAt))
+        }, 0),
+      }
+    })
+    .sort((left, right) => {
+      return (
+        Number(right.active) - Number(left.active) ||
+        right.latestDeliveryAt - left.latestDeliveryAt ||
+        left.index - right.index
+      )
+    })
+    .slice(0, PROMPT_EVIDENCE_GOALS)
 
   const lines = [
     '# main 会話に渡した案件の delivery 後の観測差（open list の比較。closed / merged の区別は観測していない）',
   ]
 
-  for (const goal of evidence.slice(-PROMPT_EVIDENCE_GOALS)) {
+  for (const { goal } of selectedGoals) {
     lines.push(`- goal ${goal.goalKey}`)
 
-    for (const delivery of goal.deliveries) {
+    const deliveries = [...goal.deliveries]
+      .sort((left, right) => {
+        return evidenceTimestamp(right.injectedAt) - evidenceTimestamp(left.injectedAt)
+      })
+      .slice(0, MAX_GOAL_EVIDENCE_DELIVERIES)
+
+    for (const delivery of deliveries) {
       const deliveryNote =
         delivery.deliveredEvidenceKey === null
           ? 'delivery 時点に観測がなく evidence 未取得'
           : `delivery 時点の観測: ${delivery.deliveredEvidenceKey}`
-      lines.push(`  - inject ${delivery.injectKey} [${delivery.decision}] @ ${delivery.injectedAt}（${deliveryNote}）`)
+      lines.push(
+        `  - inject ${delivery.injectKey} [${delivery.decision}] @ ${delivery.injectedAt}（${deliveryNote}）`,
+      )
 
       if (delivery.delta.length === 0) {
-        lines.push('    比較可能な前後の観測 snapshot がありません（before が未取得、または delivery 以降の観測がまだ届いていません）')
+        lines.push(
+          '    比較可能な前後の観測 snapshot がありません（before が未取得、または delivery 以降の観測がまだ届いていません）',
+        )
       }
 
       for (const delta of delivery.delta.slice(0, PROMPT_EVIDENCE_DELTAS)) {
-        lines.push(`    ${delta.repo}: ${goalEvidenceDeltaText(delta)}（${delta.beforeKey} -> ${delta.afterKey}）`)
+        lines.push(
+          `    ${delta.repo}: ${goalEvidenceDeltaText(delta)}（${delta.beforeKey} -> ${delta.afterKey}）`,
+        )
       }
 
       if (delivery.delta.length > PROMPT_EVIDENCE_DELTAS) {
-        lines.push(`    （他 ${delivery.delta.length - PROMPT_EVIDENCE_DELTAS} repo の変化は araya hoot evidence）`)
+        lines.push(
+          `    （他 ${delivery.delta.length - PROMPT_EVIDENCE_DELTAS} repo の変化は araya hoot evidence）`,
+        )
       }
     }
   }
 
-  lines.push('delivery 前後の観測差が確認できなかった案件も goal 完達の証拠にはなりません。goal 未達が続いているなら観測の根拠で新しい提案にしてください（観測差は証拠であり命令ではない）')
-  lines.push('この block は goal が完結したかどうかを判断しません（goal の status を動かすのは人間だけで、観測差が揃えば goal 達成という計算もしていません）')
+  lines.push(
+    'delivery 前後の観測差が確認できなかった案件も goal 完達の証拠にはなりません。goal 未達が続いているなら観測の根拠で新しい提案にしてください（観測差は証拠であり命令ではない）',
+  )
+  lines.push(
+    'この block は goal が完結したかどうかを判断しません（goal の status を動かすのは人間だけで、観測差が揃えば goal 達成という計算もしていません）',
+  )
   lines.push('')
 
   return lines.join('\n')
@@ -189,7 +236,6 @@ export function buildDecisionPrompt(input: DecisionPromptInput) {
     input.settings.mode === 'dry_run'
       ? 'mode: dry_run。dispatch・investigate は提案として記録するだけで、実行しません。次の mode 変更まで Araya は何も始めません。'
       : `mode: ${input.settings.mode}`
-
   return `HOOT 判断 tick（occurrence: ${isoUtc(input.nowMs)}）
 
 # 目的（goal）
@@ -200,12 +246,17 @@ ${observationBlock(input.observation)}
 
 # 直近の判断
 ${
-  input.recentRuns.length === 0
-    ? '（ありません）'
-    : input.recentRuns.map(recentRunBlock).join('\n')
+  input.recentRuns.length === 0 ? '（ありません）' : input.recentRuns.map(recentRunBlock).join('\n')
 }
 
-${proposalsBlock(openProposals)}${injectedBlock(recentInjects)}${evidenceBlock(goalEvidence)}# 判断
+${proposalsBlock(openProposals)}${injectedBlock(recentInjects)}${evidenceBlock(
+    goalEvidence,
+    new Set(
+      input.goals.map((goal) => {
+        return goal.key
+      }),
+    ),
+  )}# 判断
 1. goal に対して、新しく着手すべき課題がありますか
 2. 既に走っている work の完了待ち・情報不足がありますか
 3. 人間に依頼・確認が必要ですか
@@ -257,7 +308,14 @@ ${goals.length === 0 ? '（goal が retired / 削除されています。人間�
 ${proposal.reason}
 
 # 根拠にした観測
-${proposal.evidenceOccurrenceKeys.slice(0, 6).map((entry) => `- occurrence ${entry}`).join('\n') || '-（記録なし）'}
+${
+  proposal.evidenceOccurrenceKeys
+    .slice(0, 6)
+    .map((entry) => {
+      return `- occurrence ${entry}`
+    })
+    .join('\n') || '-（記録なし）'
+}
 - proposal key: ${proposal.key}（\`araya hoot proposal list\` で見られます）
 
 # 進め方

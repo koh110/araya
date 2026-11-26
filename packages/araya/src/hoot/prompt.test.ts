@@ -48,7 +48,10 @@ function proposalFixture(overrides: Partial<HootProposal> = {}): HootProposal {
   }
 }
 
-function injectFixture(index: number, overrides: Partial<HootInjectRequest> = {}): HootInjectRequest {
+function injectFixture(
+  index: number,
+  overrides: Partial<HootInjectRequest> = {},
+): HootInjectRequest {
   const key = `hoot-inject:${PROPOSAL_KEY}:${index}`
 
   return {
@@ -139,7 +142,7 @@ test('hoot prompt: inject 済みがないと同じ block を出さない（promp
 
 function goalEvidenceFixture(
   goalKey: string,
-  overrides: Partial<HootGoalEvidence> = {}
+  overrides: Partial<HootGoalEvidence> = {},
 ): HootGoalEvidence {
   return {
     goalKey,
@@ -192,8 +195,13 @@ test('hoot prompt: delivery 後の観測差 block を inject 済み block の後
   // goal の完結判定はしないことを同じ block 内で書く（acceptance 5 の「自動完結させない」）
   assert.ok(block.includes('この block は goal が完結したかどうかを判断しません'))
   // inject 済み block の後ろに置く（delivery 前後の話であることを並びで示す）
-  assert.ok(prompt.indexOf('# main 会話に渡した案件（inject 済み') < prompt.indexOf('# main 会話に渡した案件の delivery 後の観測差'))
-  assert.ok(prompt.indexOf('# main 会話に渡した案件の delivery 後の観測差') < prompt.indexOf('# 判断'))
+  assert.ok(
+    prompt.indexOf('# main 会話に渡した案件（inject 済み') <
+      prompt.indexOf('# main 会話に渡した案件の delivery 後の観測差'),
+  )
+  assert.ok(
+    prompt.indexOf('# main 会話に渡した案件の delivery 後の観測差') < prompt.indexOf('# 判断'),
+  )
 })
 
 test('hoot prompt: 観測差がない delivery は「open list の変化なし」と事実だけ書く', () => {
@@ -233,39 +241,47 @@ test('hoot prompt: 観測差がない delivery は「open list の変化なし�
   assert.match(prompt, /delivery 時点に観測がなく evidence 未取得/u)
   // 判断 prompt 側の語彙（完了待ち・proposal resolved）とは別に、evidence block 側で goal 完結を断定しない
   // 次の heading までの evidence block だけを見る（判断 section の語彙と混同しない）
-  const evidenceBlock = (prompt.split('# main 会話に渡した案件の delivery 後の観測差')[1] ?? '').split('\n# ')[0] ?? ''
+  const evidenceBlock =
+    (prompt.split('# main 会話に渡した案件の delivery 後の観測差')[1] ?? '').split('\n# ')[0] ?? ''
   assert.ok(evidenceBlock.includes('open list の変化なし'))
   assert.equal(evidenceBlock.includes('完了'), false)
   assert.equal(evidenceBlock.includes('goal は満たされた'), false)
 })
 
 test('hoot prompt: 比較できる前後の観測が無い delivery は「観測 snapshot が無い」ことを explicit に出す（無変化と区別する）', () => {
-  const evidence = goalEvidenceFixture('araya-quality', {
-    deliveries: [
-      {
-        injectKey: 'hoot-inject:' + PROPOSAL_KEY + ':3',
-        proposalKey: PROPOSAL_KEY,
-        decision: 'dispatch',
-        injectedAt: '2026-11-19T08:55:00.000Z',
-        deliveredEvidenceKey: 'hoot:2026-11-19T08:00:00.000Z',
-        // before はあるが delivery 以降の観測がまだ無い（goalEvidenceOf は delta を空で返す）
-        delta: [],
-      },
-    ],
-  })
-  const prompt = buildDecisionPrompt({
-    goals: [goalFixture()],
-    settings: defaultState().settings,
-    observation: observationFixture(),
-    recentRuns: [],
-    nowMs: NOW_MS,
-    goalEvidence: [evidence],
-  })
-  const evidenceBlock = (prompt.split('# main 会話に渡した案件の delivery 後の観測差')[1] ?? '').split('\n# ')[0] ?? ''
+  const evidenceBlock =
+    (
+      buildDecisionPrompt({
+        goals: [goalFixture()],
+        settings: defaultState().settings,
+        observation: observationFixture(),
+        recentRuns: [],
+        nowMs: NOW_MS,
+        goalEvidence: [
+          goalEvidenceFixture('araya-quality', {
+            deliveries: [
+              {
+                injectKey: 'hoot-inject:' + PROPOSAL_KEY + ':3',
+                proposalKey: PROPOSAL_KEY,
+                decision: 'dispatch',
+                injectedAt: '2026-11-19T08:55:00.000Z',
+                deliveredEvidenceKey: 'hoot:2026-11-19T08:00:00.000Z',
+                // before はあるが delivery 以降の観測がまだ無い（goalEvidenceOf は delta を空で返す）
+                delta: [],
+              },
+            ],
+          }),
+        ],
+      }).split('# main 会話に渡した案件の delivery 後の観測差')[1] ?? ''
+    ).split('\n# ')[0] ?? ''
 
   assert.ok(evidenceBlock.includes('比較可能な前後の観測 snapshot がありません'))
-  // 観測差が確認できなかった案件を goal 完達の証拠として扱わないことを同じ block 内で書く
-  assert.ok(evidenceBlock.includes('delivery 前後の観測差が確認できなかった案件も goal 完達の証拠にはなりません'))
+  // 観測差が確認できなかった案件を goal 完結の証拠として扱わないことを同じ block 内で書く
+  assert.ok(
+    evidenceBlock.includes(
+      'delivery 前後の観測差が確認できなかった案件も goal 完達の証拠にはなりません',
+    ),
+  )
   assert.equal(evidenceBlock.includes('open list の変化なし'), false)
 })
 
@@ -281,9 +297,12 @@ test('hoot prompt: 観測差の number list と goal 数に bound がある（pr
         delta: [
           {
             repo: 'koh110/araya',
-            closedIssues: Array.from({ length: MAX_EVIDENCE_NUMBERS_SHOWN + 4 }, (_entry, index) => {
-              return String(index + 1)
-            }),
+            closedIssues: Array.from(
+              { length: MAX_EVIDENCE_NUMBERS_SHOWN + 4 },
+              (_entry, index) => {
+                return String(index + 1)
+              },
+            ),
             closedPrs: [],
             openedIssues: [],
             openedPrs: [],
@@ -311,9 +330,75 @@ test('hoot prompt: 観測差の number list と goal 数に bound がある（pr
   assert.equal(prompt.includes('#9'), false)
   // goal 数も bound（直近だけ出す）
   const block = prompt.split('# main 会話に渡した案件の delivery 後の観測差')[1] ?? ''
-  assert.equal(block.includes('- goal goal-0'), false)
-  assert.ok(block.includes(`- goal goal-${PROMPT_EVIDENCE_GOALS - 1}`))
   assert.ok(block.includes('- goal araya-quality'))
+  assert.ok(block.includes('- goal goal-0'))
+  assert.ok(block.includes(`- goal goal-${PROMPT_EVIDENCE_GOALS - 2}`))
+  assert.equal(block.includes(`- goal goal-${PROMPT_EVIDENCE_GOALS - 1}`), false)
+})
+
+test('hoot prompt: evidence の bound 内では active goal と直近 delivery を優先する', () => {
+  function timestamped(goalKey: string, injectedAt: string) {
+    const goal = goalEvidenceFixture(goalKey)
+    return {
+      ...goal,
+      deliveries: goal.deliveries.map((delivery) => {
+        return { ...delivery, injectedAt }
+      }),
+    }
+  }
+  const block =
+    buildDecisionPrompt({
+      goals: [{ ...goalFixture(), key: 'active-target' }],
+      settings: defaultState().settings,
+      observation: observationFixture(),
+      recentRuns: [],
+      nowMs: NOW_MS,
+      goalEvidence: [
+        timestamped('active-target', '2026-11-19T08:00:00.000Z'),
+        ...Array.from({ length: PROMPT_EVIDENCE_GOALS + 1 }, (_entry, index) => {
+          return timestamped(`retired-${index}`, `2026-11-19T08:0${index + 1}:00.000Z`)
+        }),
+      ],
+    }).split('# main 会話に渡した案件の delivery 後の観測差')[1] ?? ''
+
+  assert.ok(block.includes('- goal active-target'))
+  assert.ok(block.includes(`- goal retired-${PROMPT_EVIDENCE_GOALS}`))
+  assert.equal(block.includes('- goal retired-0'), false)
+})
+
+test('hoot prompt: 各 goal の直近 delivery を新しい順に最大 3 件表示する', () => {
+  const baseDelivery = goalEvidenceFixture('active-target').deliveries[0]!
+  const block =
+    buildDecisionPrompt({
+      goals: [{ ...goalFixture(), key: 'active-target' }],
+      settings: defaultState().settings,
+      observation: observationFixture(),
+      recentRuns: [],
+      nowMs: NOW_MS,
+      goalEvidence: [
+        {
+          goalKey: 'active-target',
+          deliveries: Array.from({ length: 5 }, (_entry, index) => {
+            const number = index + 1
+
+            return {
+              ...baseDelivery,
+              injectKey: `hoot-inject:${PROPOSAL_KEY}:${number}`,
+              injectedAt: `2026-11-19T08:${String(number).padStart(2, '0')}:00.000Z`,
+            }
+          }),
+        },
+      ],
+    }).split('# main 会話に渡した案件の delivery 後の観測差')[1] ?? ''
+
+  assert.ok(
+    block.indexOf(`hoot-inject:${PROPOSAL_KEY}:5`) >= 0 &&
+      block.indexOf(`hoot-inject:${PROPOSAL_KEY}:5`) <
+        block.indexOf(`hoot-inject:${PROPOSAL_KEY}:4`) &&
+      block.indexOf(`hoot-inject:${PROPOSAL_KEY}:4`) <
+        block.indexOf(`hoot-inject:${PROPOSAL_KEY}:3`),
+  )
+  assert.equal(block.includes(`hoot-inject:${PROPOSAL_KEY}:2`), false)
 })
 
 test('hoot prompt: goalEvidence を渡さない prompt は従来と同じ（evidence block を作らない）', () => {
