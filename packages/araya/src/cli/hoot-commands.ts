@@ -41,6 +41,9 @@ import {
   hootStateFilePath,
 } from '../hoot/store.ts'
 
+// proposal history が 1 画面に出す closed 件数（表示の bound。state の保持 bound は hoot/model.ts の MAX_PROPOSALS_KEPT = 50）
+const PROPOSAL_HISTORY_SHOWN = 5
+
 export type HootCommandDependencies = {
   dataDir: string
   stdout: (text: string) => void
@@ -175,7 +178,7 @@ function proposalLine(proposal: HootProposal) {
 
 // proposal に対して inject request がどう対応しているか。delivery で proposal は resolved になるが、
 // 対応は inject request 側（proposalKey・injectedAt）に残る。pending inject 中は再提醒を抑止していることも出す
-function proposalInjectNotes(state: HootState, proposalKey: string) {
+function proposalInjectNotes(state: HootState, proposalKey: string, options: { showPendingReminder: boolean }) {
   const related = state.injectRequests.filter((entry) => {
     return entry.proposalKey === proposalKey
   })
@@ -191,7 +194,9 @@ function proposalInjectNotes(state: HootState, proposalKey: string) {
     }）`,
   ]
 
+  // 再提醒を抑止している案内は open 側だけ（closed の履歴に載せても人間が打つ列は無い）
   if (
+    options.showPendingReminder &&
     related.some((entry) => {
       return entry.status === 'pending'
     })
@@ -294,7 +299,7 @@ export function formatHootStatus(state: HootState, nowMs: number, dataDir: strin
     lines.push(`open proposals: ${openProposals.length}`)
     lines.push(
       ...openProposals.flatMap((proposal) => {
-        return [proposalLine(proposal), ...proposalInjectNotes(state, proposal.key)]
+        return [proposalLine(proposal), ...proposalInjectNotes(state, proposal.key, { showPendingReminder: true })]
       }),
     )
   }
@@ -496,14 +501,46 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
         return
       }
 
+      // closed の中身はここに出さない（総数だけ）。1 件ずつ読む導線は proposal history
       deps.stdout(
         [
           `open ${open.length} / closed ${closed.length}`,
+          ...(open.length === 0 ? ['open proposal はありません'] : []),
           ...open.flatMap((proposal) => {
-            return [proposalLine(proposal), ...proposalInjectNotes(state, proposal.key)]
+            return [proposalLine(proposal), ...proposalInjectNotes(state, proposal.key, { showPendingReminder: true })]
           }),
-          ...closed.slice(-5).flatMap((proposal) => {
-            return [proposalLine(proposal), ...proposalInjectNotes(state, proposal.key)]
+          ...(closed.length > 0
+            ? ['閉案件の履歴を見るには: araya hoot proposal history / Discord は /hoot proposal history']
+            : []),
+        ].join('\n')
+      )
+
+      return
+    }
+
+    if (subcommand === 'history') {
+      // 読むだけ（closed の status も proposal key も変えず、見た順を変えて出すだけ。保持 bound と life cycle は proposal list と同じ）
+      const state = await readHootState(dataDir)
+      const closed = state.proposals.filter((proposal) => {
+        return proposal.status !== 'open'
+      })
+
+      if (closed.length === 0) {
+        deps.stdout('closed 0\nclosed proposal はありません（proposal list は open だけを出します）')
+
+        return
+      }
+
+      // 総数は総数で出す。1 件ずつは updatedAt（resolved / expired になった時刻）の新しい順に直近 5 件
+      closed.sort((left, right) => {
+        return right.updatedAt.localeCompare(left.updatedAt)
+      })
+
+      deps.stdout(
+        [
+          `closed ${closed.length}（updatedAt の新しい順に直近 ${PROPOSAL_HISTORY_SHOWN} 件）`,
+          ...closed.slice(0, PROPOSAL_HISTORY_SHOWN).flatMap((proposal) => {
+            return [proposalLine(proposal), ...proposalInjectNotes(state, proposal.key, { showPendingReminder: false })]
           }),
         ].join('\n')
       )
@@ -522,7 +559,7 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
       return
     }
 
-    throw new Error('hoot_invalid_argument: proposal の subcommand は list / resolve')
+    throw new Error('hoot_invalid_argument: proposal の subcommand は list / history / resolve')
   }
 
   if (command === 'dispatch') {

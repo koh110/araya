@@ -803,11 +803,164 @@ test('hoot cli: proposal list / proposal resolve --key（open と closed を分�
 
     const listedAfter = await fixture.run(['proposal', 'list'])
     assert.match(listedAfter.output, /open 1 \/ closed 1/u)
-    assert.match(listedAfter.output, new RegExp(`${openKey} \\[resolved\\]`, 'u'))
+    // closed の中身は list に出さない（1 件ずつは proposal history。総数はここに出る）
+    assert.equal(listedAfter.output.includes(`${openKey} [resolved]`), false)
+    assert.match(listedAfter.output, /araya hoot proposal history \/ Discord は \/hoot proposal history/u)
 
     const unknownSubcommand = await fixture.run(['proposal', 'nope'])
     assert.equal(unknownSubcommand.ok, false)
-    assert.match(unknownSubcommand.message, /proposal の subcommand は list \/ resolve/u)
+    assert.match(unknownSubcommand.message, /proposal の subcommand は list \/ history \/ resolve/u)
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot cli proposal history: closed の総数と updatedAt の新しい順の直近 5 件を出す（read-only。state を書き換えない）', async () => {
+  const fixture = await makeHootCliFixture()
+  // 挿入順を updatedAt の順とわざとずらす（history の並びは state の保持順ではない）
+  const closedFixtures = [
+    proposalFixture('hoot-prop-closed-old', { status: 'expired', updatedAt: '2026-11-18T01:00:00.000Z' }),
+    proposalFixture('hoot-prop-closed-2', { status: 'resolved', updatedAt: '2026-11-18T05:00:00.000Z' }),
+    proposalFixture('hoot-prop-closed-4', { status: 'expired', updatedAt: '2026-11-19T02:00:00.000Z' }),
+    proposalFixture('hoot-prop-closed-6', { status: 'resolved', updatedAt: '2026-11-19T07:00:00.000Z' }),
+    proposalFixture('hoot-prop-closed-3', { status: 'resolved', updatedAt: '2026-11-18T23:00:00.000Z' }),
+    proposalFixture('hoot-prop-closed-5', { status: 'expired', updatedAt: '2026-11-19T04:00:00.000Z' }),
+  ]
+
+  try {
+    await writeHootState(fixture.dataDir, {
+      ...defaultState(),
+      proposals: [proposalFixture('hoot-prop-open'), ...closedFixtures],
+    })
+    const before = await readHootState(fixture.dataDir)
+
+    const history = await fixture.run(['proposal', 'history'])
+    assert.equal(history.ok, true, history.message)
+    // 総数は総数で出し、1 件ずつは updatedAt の新しい順に直近 5 件
+    assert.match(history.output, /closed 6（updatedAt の新しい順に直近 5 件）/u)
+
+    let previous = -1
+    for (const key of [
+      'hoot-prop-closed-6',
+      'hoot-prop-closed-5',
+      'hoot-prop-closed-4',
+      'hoot-prop-closed-3',
+      'hoot-prop-closed-2',
+    ]) {
+      const at = history.output.indexOf(`- ${key} [`)
+      assert.ok(at > previous, `${key} が updatedAt の新しい順に並んでいません: ${JSON.stringify(history.output)}`)
+      previous = at
+    }
+
+    // 6 件中最も古い 1 件と open は出さない（history は closed だけ）
+    assert.equal(history.output.includes('hoot-prop-closed-old'), false)
+    assert.equal(history.output.includes('hoot-prop-open'), false)
+    // 1 件は key・status・decision・goals・reason・created / confirmed / expires / reminders（confirmed は閉じた時刻）
+    assert.match(history.output, /\[expired\] request_human/u)
+    assert.match(history.output, /confirmed: 2026-11-19T07:00:00\.000Z/u)
+
+    // 読むだけ（並べ替えを state に書き戻さない）
+    const after = await readHootState(fixture.dataDir)
+    assert.deepEqual(after, before)
+    const status = await fixture.run(['status'])
+    assert.match(status.output, /open proposals: 1/u)
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot cli proposal history: closed 履歴には再提醒の抑止を出さない（open 側だけ。inject 対応行は両方に出す）', async () => {
+  const fixture = await makeHootCliFixture()
+  const openKey = 'hoot-prop-open-pending'
+  const closedKey = 'hoot-prop-closed-pending'
+
+  try {
+    await writeHootState(fixture.dataDir, {
+      ...defaultState(),
+      proposals: [
+        proposalFixture(openKey, { decision: 'dispatch', status: 'open' }),
+        proposalFixture(closedKey, {
+          decision: 'dispatch',
+          status: 'resolved',
+          updatedAt: '2026-11-19T08:30:00.000Z',
+        }),
+      ],
+      injectRequests: [
+        cliInjectFixture({
+          key: `hoot-inject:${openKey}:1`,
+          requestId: `hoot-inject:${openKey}:1`,
+          proposalKey: openKey,
+          status: 'pending',
+          injectedAt: null,
+          deliveredEvidenceKey: null,
+        }),
+        cliInjectFixture({
+          key: `hoot-inject:${closedKey}:1`,
+          requestId: `hoot-inject:${closedKey}:1`,
+          proposalKey: closedKey,
+          status: 'pending',
+          injectedAt: null,
+          deliveredEvidenceKey: null,
+        }),
+      ],
+    })
+
+    const list = await fixture.run(['proposal', 'list'])
+    assert.equal(list.ok, true, list.message)
+    assert.match(list.output, new RegExp(`${openKey} \\[open\\]`, 'u'))
+    assert.match(list.output, /pending inject）に入っている間は再提醒を抑止中/u)
+
+    const history = await fixture.run(['proposal', 'history'])
+    assert.equal(history.ok, true, history.message)
+    assert.match(history.output, new RegExp(`${closedKey} \\[resolved\\]`, 'u'))
+    assert.match(history.output, /inject: 1 件/u)
+    // closed 側に抑止の案内を重ねても人間が打つ列は無い（open 側だけに出す）
+    assert.equal(history.output.includes('再提醒を抑止中'), false)
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot cli proposal list: closed の中身は出さず総数と案内だけ（closed が無ければ案内も出さない）', async () => {
+  const fixture = await makeHootCliFixture()
+
+  try {
+    await writeHootState(fixture.dataDir, {
+      ...defaultState(),
+      proposals: [proposalFixture('hoot-prop-open-only')],
+    })
+
+    const listOpen = await fixture.run(['proposal', 'list'])
+    assert.equal(listOpen.ok, true, listOpen.message)
+    assert.match(listOpen.output, /open 1 \/ closed 0/u)
+    assert.equal(listOpen.output.includes('proposal history'), false)
+
+    const historyOpen = await fixture.run(['proposal', 'history'])
+    assert.equal(historyOpen.ok, true, historyOpen.message)
+    assert.match(historyOpen.output, /closed 0/u)
+    assert.match(historyOpen.output, /closed proposal はありません（proposal list は open だけを出します）/u)
+
+    // open が 0 件で closed があるときは open 側が空だと書いてから履歴の案内を出す
+    await writeHootState(fixture.dataDir, {
+      ...defaultState(),
+      proposals: [
+        proposalFixture('hoot-prop-closed-only', {
+          status: 'expired',
+          updatedAt: '2026-11-19T06:00:00.000Z',
+        }),
+      ],
+    })
+
+    const listClosedOnly = await fixture.run(['proposal', 'list'])
+    assert.equal(listClosedOnly.ok, true, listClosedOnly.message)
+    assert.match(listClosedOnly.output, /open 0 \/ closed 1/u)
+    assert.match(listClosedOnly.output, /open proposal はありません/u)
+    assert.match(listClosedOnly.output, /araya hoot proposal history \/ Discord は \/hoot proposal history/u)
+    assert.equal(listClosedOnly.output.includes('hoot-prop-closed-only'), false)
+
+    const historyClosedOnly = await fixture.run(['proposal', 'history'])
+    assert.equal(historyClosedOnly.ok, true, historyClosedOnly.message)
+    assert.match(historyClosedOnly.output, /hoot-prop-closed-only \[expired\]/u)
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
@@ -1236,7 +1389,7 @@ test('hoot cli: dispatch --key は inject request を作り、inject list / stat
     const afterInject = await fixture.run(['inject', 'list'])
     assert.match(afterInject.output, /\[injected\]/u)
 
-    // delivery した proposal は resolved（open の pending として残らない）。対応は closed 側に出る
+    // delivery した proposal は resolved（open の pending として残らない）。対応は closed 側＝proposal history に出る
     state = await readHootState(fixture.dataDir)
     assert.equal(state.proposals.find((proposal) => proposal.key === dispatchKey)?.status, 'resolved')
 
@@ -1247,8 +1400,13 @@ test('hoot cli: dispatch --key は inject request を作り、inject list / stat
     const afterProposalList = await fixture.run(['proposal', 'list'])
     assert.equal(afterProposalList.ok, true)
     assert.match(afterProposalList.output, /open 2 \/ closed 1/u)
+    // closed の中身は list に出さない。1 件ずつは history で読む
+    assert.doesNotMatch(afterProposalList.output, new RegExp(`- ${dispatchKey} \\[resolved\\]`, 'u'))
+
+    const afterProposalHistory = await fixture.run(['proposal', 'history'])
+    assert.equal(afterProposalHistory.ok, true)
     assert.match(
-      afterProposalList.output,
+      afterProposalHistory.output,
       new RegExp(
         `inject: 1 件（latest hoot-inject:${dispatchKey}:1 \\[injected\\] @ ${HOOT_NOW_ISO}）`,
         'u',
