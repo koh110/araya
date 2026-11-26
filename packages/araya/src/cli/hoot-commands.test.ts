@@ -1576,7 +1576,7 @@ test('hoot cli evidence: 比較できる snapshot が無いときは空だと言
     await writeCliEvidenceState(fixture.dataDir, { injectRequests: [] })
     const noObservation = await fixture.run(['evidence'])
     assert.equal(noObservation.ok, true, noObservation.message)
-    assert.match(noObservation.output, /delivery 前后を比較できる観測 snapshot がまだありません/u)
+    assert.match(noObservation.output, /delivery 前後を比較できる観測 snapshot がまだありません/u)
     assert.match(noObservation.output, /HOOT tick が gh 観測を走らせると snapshot が記録されます/u)
 
     // 観測はあるが delivery（inject）が無い
@@ -1586,7 +1586,7 @@ test('hoot cli evidence: 比較できる snapshot が無いときは空だと言
     })
     const noDelivery = await fixture.run(['evidence'])
     assert.equal(noDelivery.ok, true, noDelivery.message)
-    assert.match(noDelivery.output, /delivery 前后を比較できる観測 snapshot がまだありません/u)
+    assert.match(noDelivery.output, /delivery 前後を比較できる観測 snapshot がまだありません/u)
     assert.match(noDelivery.output, /araya hoot dispatch --key <proposal key>/u)
 
     // delivery があるが before snapshot が未取得（pruned も含む）

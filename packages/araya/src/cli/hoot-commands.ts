@@ -671,7 +671,7 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
 
       deps.stdout(
         [
-          'delivery 前后を比較できる観測 snapshot がまだありません（観測は直近 ' + OBSERVATION_SNAPSHOTS_KEPT + ' occurrence だけ保持します）',
+          'delivery 前後を比較できる観測 snapshot がまだありません（観測は直近 ' + OBSERVATION_SNAPSHOTS_KEPT + ' occurrence だけ保持します）',
           guidance,
         ].join('\n')
       )

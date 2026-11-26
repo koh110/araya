@@ -127,7 +127,7 @@ export const HOOT_COMMAND: SlashCommand = {
     group('inject', 'inject request を操作・一覧する', [
       subcommand('list', 'inject request を直近 20 件、新しい順に出す'),
     ]),
-    subcommand('evidence', 'delivery 前后の観測差（open list の比較。read-only）'),
+    subcommand('evidence', 'delivery 前後の観測差（open list の比較。read-only）'),
     group('goal', 'goal を追加・変更・停止する', [
       subcommand('list', 'goal 一覧'),
       subcommand('add', 'goal を追加する', [
