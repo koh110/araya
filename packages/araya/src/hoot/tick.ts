@@ -397,12 +397,13 @@ export function createHootLoop(deps: HootTickDeps) {
         nowMs: deps.nowMs(),
         error: 'hoot_inject_unavailable: main 会話を持つ Discord bot process で実行してください',
       })
-      deps.log({ type: 'hoot_inject_unavailable', injectKey: taken.key, attempts: settled.attempts })
+      // ok: false なので proposal は open のまま（人間が dispatch をやり直せる）
+      deps.log({ type: 'hoot_inject_unavailable', injectKey: taken.key, attempts: settled.request.attempts })
 
-      if (settled.status === 'failed') {
+      if (settled.request.status === 'failed') {
         await notify(
           [
-            `HOOT dispatch の inject をできませんでした（proposal: ${taken.proposalKey} / attempt ${settled.attempts}）。main 会話を持つ Discord bot process で動かしてください`,
+            `HOOT dispatch の inject をできませんでした（proposal: ${taken.proposalKey} / attempt ${settled.request.attempts}）。main 会話を持つ Discord bot process で動かしてください`,
             `hoot inject list（CLI か Discord）で状態を確認し、必要なら hoot dispatch --key ${taken.proposalKey} で新しい承認を作り直してください（同じ案件は自動で再実行しません）`,
           ].join('\n'),
           noticeNonce(`inject-unavailable:${taken.key}`)
@@ -412,7 +413,7 @@ export function createHootLoop(deps: HootTickDeps) {
       return {
         kind: 'unavailable',
         injectKey: taken.key,
-        message: settled.lastError ?? 'hoot_inject_unavailable',
+        message: settled.request.lastError ?? 'hoot_inject_unavailable',
       }
     }
 
@@ -430,10 +431,10 @@ export function createHootLoop(deps: HootTickDeps) {
       })
       deps.log({ type: 'hoot_inject_proposal_missing', injectKey: taken.key, proposalKey: taken.proposalKey })
 
-      if (settled.status === 'failed') {
+      if (settled.request.status === 'failed') {
         await notify(
           [
-            `HOOT dispatch の inject をできませんでした（proposal: ${taken.proposalKey} が state から消えました / attempt ${settled.attempts}）`,
+            `HOOT dispatch の inject をできませんでした（proposal: ${taken.proposalKey} が state から消えました / attempt ${settled.request.attempts}）`,
             `araya hoot proposal list / araya hoot inject list で状態を確認してください`,
           ].join('\n'),
           noticeNonce(`inject-proposal-missing:${taken.key}`)
@@ -444,8 +445,8 @@ export function createHootLoop(deps: HootTickDeps) {
         kind: 'failed',
         injectKey: taken.key,
         proposalKey: taken.proposalKey,
-        attempts: settled.attempts,
-        message: settled.lastError ?? 'hoot_proposal_not_found',
+        attempts: settled.request.attempts,
+        message: settled.request.lastError ?? 'hoot_proposal_not_found',
       }
     }
 
@@ -479,15 +480,15 @@ export function createHootLoop(deps: HootTickDeps) {
         type: 'hoot_inject_failed',
         injectKey: taken.key,
         proposalKey: taken.proposalKey,
-        attempts: settled.attempts,
-        status: settled.status,
+        attempts: settled.request.attempts,
+        status: settled.request.status,
         message,
       })
 
-      if (settled.status === 'failed') {
+      if (settled.request.status === 'failed') {
         await notify(
           [
-            `HOOT dispatch の inject に失敗しました（proposal: ${taken.proposalKey} / attempt ${settled.attempts}）`,
+            `HOOT dispatch の inject に失敗しました（proposal: ${taken.proposalKey} / attempt ${settled.request.attempts}）`,
             `error: ${message}`,
             `hoot inject list（CLI か Discord）で状態を確認し、必要なら hoot dispatch --key ${taken.proposalKey} で新しい承認を作り直してください（同じ案件は自動で再実行しません）`,
           ].join('\n'),
@@ -499,7 +500,7 @@ export function createHootLoop(deps: HootTickDeps) {
         kind: 'failed',
         injectKey: taken.key,
         proposalKey: taken.proposalKey,
-        attempts: settled.attempts,
+        attempts: settled.request.attempts,
         message,
       }
     }
@@ -513,11 +514,18 @@ export function createHootLoop(deps: HootTickDeps) {
       injectKey: taken.key,
       proposalKey: taken.proposalKey,
       authorizedBy: taken.authorizedBy,
-      attempts: settled.attempts,
+      attempts: settled.request.attempts,
       contentChars: content.length,
+      // proposal を resolved に寄せたかどうか（寄せた場合は後続 run には「inject 済み」側で見る）
+      proposalResolved: settled.proposalResolved,
     })
 
-    return { kind: 'injected', injectKey: taken.key, proposalKey: taken.proposalKey, attempts: settled.attempts }
+    return {
+      kind: 'injected',
+      injectKey: taken.key,
+      proposalKey: taken.proposalKey,
+      attempts: settled.request.attempts,
+    }
   }
 
   async function tickOnce(): Promise<HootTickOutcome> {
@@ -686,12 +694,16 @@ export function createHootLoop(deps: HootTickDeps) {
       const openProposals = state.proposals.filter((proposal) => {
         return proposal.status === 'open'
       })
+      const recentInjects = state.injectRequests.filter((request) => {
+        return request.status === 'injected'
+      })
       const prompt = buildDecisionPrompt({
         goals,
         settings,
         observation,
         recentRuns: state.runs.slice(-PROMPT_RECENT_RUNS),
         openProposals,
+        recentInjects,
         nowMs: plannedAt,
       })
       const decided = await deps.decide({

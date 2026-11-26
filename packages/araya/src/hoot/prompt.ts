@@ -42,6 +42,9 @@ export type DecisionPromptInput = {
   recentRuns: readonly HootRun[]
   // 既に人間に渡していて未応答の提案。同じ状況を重ねて提案しないための material
   openProposals?: readonly HootProposal[]
+  // main 会話へ渡し終えた案件（inject 済み）。proposal は resolved になっているので、
+  // 「渡したのに goal 未達が続いているか」を観測側で確かめさせる material
+  recentInjects?: readonly HootInjectRequest[]
   nowMs: number
 }
 
@@ -111,8 +114,27 @@ function proposalsBlock(proposals: readonly HootProposal[]) {
   ].join('\n')
 }
 
+// delivery が届いた案件。proposal 側は resolved になっている（inject request が proposalKey を持つ）ので、
+// 同じ goal 課題が解決したのか観測で確かめる手がかりとして見せる
+function injectedBlock(injects: readonly HootInjectRequest[]) {
+  if (injects.length === 0) {
+    return ''
+  }
+
+  return [
+    '# main 会話に渡した案件（inject 済み。実行と結果は main 会話側）',
+    ...injects.slice(-3).reverse().map((request) => {
+      const authorized = request.authorizedBy === 'human' ? '人間の承認' : 'autoDispatch'
+
+      return `- proposal=${request.proposalKey}（inject ${request.key}） [${request.decision}] ${authorized} @ ${request.injectedAt ?? '不明'}（proposal は resolved。goal がまだ未達なら観測の根拠で新しい提案にしてください）`
+    }),
+    '',
+  ].join('\n')
+}
+
 export function buildDecisionPrompt(input: DecisionPromptInput) {
   const openProposals = input.openProposals ?? []
+  const recentInjects = input.recentInjects ?? []
   const modeNote =
     input.settings.mode === 'dry_run'
       ? 'mode: dry_run。dispatch・investigate は提案として記録するだけで、実行しません。次の mode 変更まで Araya は何も始めません。'
@@ -133,7 +155,7 @@ ${
     : input.recentRuns.map(recentRunBlock).join('\n')
 }
 
-${proposalsBlock(openProposals)}# 判断
+${proposalsBlock(openProposals)}${injectedBlock(recentInjects)}# 判断
 1. goal に対して、新しく着手すべき課題がありますか
 2. 既に走っている work の完了待ち・情報不足がありますか
 3. 人間に依頼・確認が必要ですか
