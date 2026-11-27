@@ -827,6 +827,13 @@ test('discord install: 暗号化 credential と LoadCredentialEncrypted を使�
     assert.equal(await exists(installEnv.legacyOpTokenFile), false)
     assert.equal((await fs.stat(unitPath)).mode & 0o777, 0o600)
     assert.equal((await fs.stat(path.join(installEnv.dataDir, 'logs'))).mode & 0o777, 0o700)
+    // launcher log は systemd の StandardError=append: が書くが、install が unit を書く前に 0600 で用意する
+    // （#13 の受け入れ検証で 0664 だった。unit の restart 前に作るので、unit 作成・enable より前の state になる）
+    const launcherLogPath = path.join(installEnv.dataDir, 'logs', 'discord-launcher.log')
+
+    assert.equal((await fs.stat(launcherLogPath)).isFile(), true)
+    assert.equal((await fs.stat(launcherLogPath)).mode & 0o777, 0o600)
+    assert.equal(await fs.readFile(launcherLogPath, 'utf8'), '')
 
     assert.deepEqual(systemdCalls(fake), [
       ['systemctl', '--user', 'is-system-running', '10000'],
@@ -1138,6 +1145,12 @@ test('discord install: 平文 .env は1Passwordなしで systemd LoadCredential 
   }
   await writePlainDiscordEnv(installEnv)
   await fs.rm(installEnv.opTokenFile, { force: true })
+  // systemd が先に書いていた状態（実測 0664・trace 済み）を再現する。install は mode だけ整えて本文は消さない
+  const launcherLogPath = path.join(installEnv.dataDir, 'logs', 'discord-launcher.log')
+
+  await fs.mkdir(path.dirname(launcherLogPath), { recursive: true, mode: 0o700 })
+  await fs.writeFile(launcherLogPath, 'previous launcher trace\n', 'utf8')
+  await fs.chmod(launcherLogPath, 0o664)
   const fake = createFakeSystemd({
     systemctl: defaultSystemctl(installEnv),
   })
@@ -1175,6 +1188,59 @@ test('discord install: 平文 .env は1Passwordなしで systemd LoadCredential 
     assert.ok(!unitText.includes(BOT_TOKEN), unitText)
     assert.ok(!unitText.includes('Environment=ARAYA_DISCORD_'), unitText)
     assert.ok(!stderr.includes(BOT_TOKEN), stderr)
+    assert.deepEqual(
+      systemdCalls(fake)
+        .filter((call) => {
+          return ['daemon-reload', 'enable', 'restart'].includes(call[2] ?? '')
+        })
+        .map((call) => {
+          return call[2]
+        }),
+      ['daemon-reload', 'enable', 'restart'],
+    )
+    // 0664 の既存 launcher log を 0600 に整え、本文はそのまま（warning も出ない）
+    assert.equal((await fs.stat(launcherLogPath)).mode & 0o777, 0o600)
+    assert.equal(await fs.readFile(launcherLogPath, 'utf8'), 'previous launcher trace\n')
+  } finally {
+    await fs.rm(installEnv.root, { recursive: true, force: true })
+  }
+})
+
+test('discord install: launcher log を 0600 に整えられなくても warning だけ出して unit・restart を続ける', async () => {
+  const installEnv = await makeInstallEnv()
+
+  await writePlainDiscordEnv(installEnv)
+  const dataDirReal = await fs.realpath(installEnv.dataDir)
+  // append: の先に directory が有る状態（file にできない）。mode を整える処理は失敗しても install を止めない
+  const launcherLogPath = path.join(dataDirReal, 'logs', 'discord-launcher.log')
+
+  await fs.mkdir(launcherLogPath, { recursive: true, mode: 0o700 })
+  const fake = createFakeSystemd({
+    systemctl: defaultSystemctl(installEnv),
+  })
+
+  try {
+    const { output, stderr } = await runDiscord(installEnv, ['install'], fake, {
+      resolveOpCliPath: async () => {
+        throw new Error('plain .env mode は op CLI を探さない')
+      },
+      resolveDiscordOpRunnerEntrypoint: async () => {
+        throw new Error('plain .env mode は1Password launcherを探さない')
+      },
+    })
+
+    assert.equal(readField(output, 'authMode'), 'env-file')
+    assert.equal(readField(output, 'ready'), true)
+    assert.ok(
+      stderr.includes('warning: launcher log を mode 0600 にできませんでした'),
+      stderr,
+    )
+    assert.ok(
+      await exists(unitPathOf(installEnv, unitOf(dataDirReal))),
+      'unit file は残る',
+    )
+    // directory の mode を log file の約束（0600）で潰さない
+    assert.equal((await fs.stat(launcherLogPath)).mode & 0o777, 0o700)
     assert.deepEqual(
       systemdCalls(fake)
         .filter((call) => {

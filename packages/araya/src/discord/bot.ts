@@ -8,6 +8,7 @@ import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import { collectSecretValues, createRedactor } from '../infrastructure/redaction.ts'
+import { ensurePrivateLogFile } from '../infrastructure/private-file-mode.ts'
 import { dataDirHash, discordUnitName } from '../infrastructure/systemd.ts'
 import { loadDiscordConfig, type DiscordConfig } from './config.ts'
 import {
@@ -147,6 +148,8 @@ function defaultSleep(ms: number, signal: AbortSignal) {
 }
 
 // log 失敗で bot を止めない。appendFileSync は 1 行ずつ開く（小さい log なので十分）
+// mode については appendFileSync だけでは決まらない: 新規 file は process の umask を引いた mode で作られ
+// （実測 0664）、既にある file の mode はそのまま残る。mode の約束は下の createFileLogger で整える
 function fileLogger(filePath: string) {
   return (entry: Record<string, unknown>) => {
     try {
@@ -156,6 +159,21 @@ function fileLogger(filePath: string) {
       // log が書けないことは診断の失敗で、処理は続けないよりマシに扱う（次 tick でまた試みる）
     }
   }
+}
+
+// <dataDir>/logs を 0700、discord.log を 0600 に整えてから logger を作る（docs の「log file は mode 0600」を
+// 実側の値にする）。整えられなくても bot は止めず、discord.log 自身に discord_log_mode_failed を出す
+// （log が書けない状況だとその 1 行も落ちない。fileLogger は append 失敗を握る）
+async function createFileLogger(dataDir: string) {
+  const filePath = path.join(dataDir, 'logs', 'discord.log')
+  const log = fileLogger(filePath)
+  const outcome = await ensurePrivateLogFile(filePath)
+
+  if (!outcome.ok) {
+    log({ type: 'discord_log_mode_failed', message: outcome.message.slice(0, 500) })
+  }
+
+  return log
 }
 
 // systemd unit process であることを INVOCATION_ID と cgroup で確かめる
@@ -348,7 +366,7 @@ export async function runDiscordBot(deps: DiscordBotDependencies) {
     // runDiscordBotUnlocked が設定の誤りを処理し、必要なら失敗を記録する
   }
 
-  const log = deps.log ?? fileLogger(path.join(deps.dataDir, 'logs', 'discord.log'))
+  const log = deps.log ?? (await createFileLogger(deps.dataDir))
   const redactor = createRedactor(collectSecretValues(deps.env))
   // lock の維持が壊れた（stale を越えて mtime を更新できなかった）ときは library の既定である timer 内 throw
   // （未処理例外で process が死んで残留 lock を残すもう一つの入口）にせず、clean shutdown に入る
@@ -396,6 +414,8 @@ export async function runDiscordBot(deps: DiscordBotDependencies) {
   try {
     return await runDiscordBotUnlocked({
       ...deps,
+      // lock 用に整えた logger をそのまま使い回す（mode を整える作業を 1 起動で 2 度やらない）
+      log,
       stopSignal: shutdown.signal,
     })
   } finally {
@@ -419,7 +439,7 @@ async function runDiscordBotUnlocked(deps: DiscordBotDependencies) {
   const sleep = deps.sleep ?? defaultSleep
   const pollMs = deps.pollMs ?? DEFAULT_POLL_MS
 
-  const log = deps.log ?? fileLogger(path.join(dataDir, 'logs', 'discord.log'))
+  const log = deps.log ?? (await createFileLogger(dataDir))
   const environmentSecretValues = collectSecretValues(deps.env)
   let redactor = createRedactor(environmentSecretValues)
   function logSafe(entry: Record<string, unknown>) {
