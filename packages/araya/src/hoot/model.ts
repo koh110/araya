@@ -25,8 +25,27 @@ const SNAPSHOT_NUMBER_PATTERN = /^\d{1,12}$/u
 // 識別子ではない text（改行入りの external text など）を state file 経由で evidence の表示・prompt に入れないため
 export const OCCURRENCE_KEY_PATTERN = /^hoot:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u
 
+function isCanonicalIsoUtc(value: unknown): value is string {
+  if (
+    typeof value !== 'string' ||
+    value.length !== 24 ||
+    !OCCURRENCE_KEY_PATTERN.test(`hoot:${value}`)
+  ) {
+    return false
+  }
+
+  const parsedAt = Date.parse(value)
+
+  return Number.isFinite(parsedAt) && new Date(parsedAt).toISOString() === value
+}
+
 export function isOccurrenceKey(value: unknown) {
-  return typeof value === 'string' && OCCURRENCE_KEY_PATTERN.test(value)
+  return (
+    typeof value === 'string' &&
+    value.length === 'hoot:'.length + 24 &&
+    OCCURRENCE_KEY_PATTERN.test(value) &&
+    isCanonicalIsoUtc(value.slice('hoot:'.length))
+  )
 }
 
 export const MAX_GOALS = 20
@@ -34,6 +53,7 @@ export const MAX_RUNS_KEPT = 200
 export const MAX_OBJECTIVE_CHARS = 1500
 export const MAX_SCOPE_ENTRIES = 12
 export const MAX_SCOPE_CHARS = 200
+export const MAX_GITHUB_SCOPE_REPO_CHARS = MAX_SCOPE_CHARS - 'github:'.length
 export const MAX_CONSTRAINT_ENTRIES = 12
 export const MAX_CONSTRAINT_CHARS = 300
 export const MAX_REASON_CHARS = 300
@@ -94,13 +114,24 @@ export type HootMode = 'dry_run' | 'active'
 export type HootGoalStatus = 'active' | 'paused' | 'retired'
 
 // `invalid` は model が決められない形式で答えたことを表す Araya 側の値。Issue #21 の decision には含まれない
-export const HOOT_DECISIONS = ['noop', 'wait', 'investigate', 'dispatch', 'request_human', 'invalid'] as const
+export const HOOT_DECISIONS = [
+  'noop',
+  'wait',
+  'investigate',
+  'dispatch',
+  'request_human',
+  'invalid',
+] as const
 export type HootDecision = (typeof HOOT_DECISIONS)[number]
 
 // dispatch・investigate を実行してよいかは mode が決める。dry_run では判断の記録だけ
 export const AUTO_DISPATCH_DECISIONS: readonly HootDecision[] = ['investigate', 'dispatch']
 // 人間の応答を待つ「未解決の提案」として state に残す decision
-export const PROPOSAL_DECISIONS: readonly HootDecision[] = ['investigate', 'dispatch', 'request_human']
+export const PROPOSAL_DECISIONS: readonly HootDecision[] = [
+  'investigate',
+  'dispatch',
+  'request_human',
+]
 // 人間が CLI で resolve / expire できる status
 export const HOOT_PROPOSAL_STATUSES = ['open', 'resolved', 'expired'] as const
 
@@ -231,7 +262,11 @@ export type HootConversationReads = {
 
 export const EMPTY_CONVERSATION_READS: HootConversationReads = { calls: 0, entries: 0, chars: 0 }
 
-export function conversationReadsOf(calls: number, entries: number, chars: number): HootConversationReads {
+export function conversationReadsOf(
+  calls: number,
+  entries: number,
+  chars: number,
+): HootConversationReads {
   return {
     calls: Math.max(0, Math.trunc(calls)),
     entries: Math.max(0, Math.trunc(entries)),
@@ -296,9 +331,11 @@ export const MAX_EVIDENCE_NUMBERS_SHOWN = 8
 function evidenceNumbersText(label: string, kind: string, numbers: readonly string[]) {
   const shown = numbers.slice(0, MAX_EVIDENCE_NUMBERS_SHOWN)
   const rest = numbers.length - shown.length
-  const listed = shown.map((entry) => {
-    return `#${entry}`
-  }).join(' ')
+  const listed = shown
+    .map((entry) => {
+      return `#${entry}`
+    })
+    .join(' ')
 
   return `${label} ${kind} ${listed}${rest > 0 ? ` (+${rest})` : ''}`
 }
@@ -349,7 +386,7 @@ export function pinnedEvidenceKeysOf(state: HootState): Set<string> {
 export function appendObservationSnapshot(
   observations: readonly HootObservationSnapshot[],
   snapshot: HootObservationSnapshot,
-  pinnedKeys: ReadonlySet<string> = new Set()
+  pinnedKeys: ReadonlySet<string> = new Set(),
 ): HootObservationSnapshot[] {
   const kept = observations.filter((entry) => {
     return entry.occurrenceKey !== snapshot.occurrenceKey
@@ -405,7 +442,11 @@ export type HootGoalInput = {
   reviewAt?: string | null
 }
 
-export function parseReviewAt(value: string | undefined | null, nowMs: number, defaultDays: number) {
+export function parseReviewAt(
+  value: string | undefined | null,
+  nowMs: number,
+  defaultDays: number,
+) {
   if (value === undefined) {
     return defaultDays === 0 ? null : isoUtc(nowMs + defaultDays * 86_400_000)
   }
@@ -419,7 +460,10 @@ export function parseReviewAt(value: string | undefined | null, nowMs: number, d
   const parsed = Date.parse(asDate)
 
   if (Number.isNaN(parsed)) {
-    throw hootError('hoot_goal_invalid', `reviewAt は YYYY-MM-DD または ISO datetime、または 'none' にしてください（${trimmed}）`)
+    throw hootError(
+      'hoot_goal_invalid',
+      `reviewAt は YYYY-MM-DD または ISO datetime、または 'none' にしてください（${trimmed}）`,
+    )
   }
 
   return isoUtc(parsed)
@@ -517,13 +561,16 @@ export function defaultState(): HootState {
 export function normalizeGoalInput(
   input: HootGoalInput,
   nowMs = Date.now(),
-  defaultReviewDays = DEFAULT_GOAL_REVIEW_DAYS
+  defaultReviewDays = DEFAULT_GOAL_REVIEW_DAYS,
 ): HootGoal {
   const key = input.key.trim()
   const objective = input.objective.trim()
 
   if (!HOOT_GOAL_KEY_PATTERN.test(key)) {
-    throw hootError('hoot_goal_invalid', `goal key は ${HOOT_GOAL_KEY_RULE} にしてください（${key}）`)
+    throw hootError(
+      'hoot_goal_invalid',
+      `goal key は ${HOOT_GOAL_KEY_RULE} にしてください（${key}）`,
+    )
   }
 
   if (objective === '') {
@@ -531,11 +578,18 @@ export function normalizeGoalInput(
   }
 
   if (objective.length > MAX_OBJECTIVE_CHARS) {
-    throw hootError('hoot_goal_invalid', `objective は ${MAX_OBJECTIVE_CHARS} 文字までにしてください`)
+    throw hootError(
+      'hoot_goal_invalid',
+      `objective は ${MAX_OBJECTIVE_CHARS} 文字までにしてください`,
+    )
   }
 
   const scope = normalizeEntries(input.scope ?? [], MAX_SCOPE_ENTRIES, MAX_SCOPE_CHARS)
-  const constraints = normalizeEntries(input.constraints ?? [], MAX_CONSTRAINT_ENTRIES, MAX_CONSTRAINT_CHARS)
+  const constraints = normalizeEntries(
+    input.constraints ?? [],
+    MAX_CONSTRAINT_ENTRIES,
+    MAX_CONSTRAINT_CHARS,
+  )
   const now = isoUtc(Date.now())
 
   return {
@@ -618,11 +672,19 @@ export function goalFingerprintOf(goal: HootGoal, repos: readonly RepoFingerprin
       return entry.repo === repo
     })
 
-    return found === undefined || found.fingerprint === null ? `${repo}:unknown` : `${repo}:${found.fingerprint}`
+    return found === undefined || found.fingerprint === null
+      ? `${repo}:unknown`
+      : `${repo}:${found.fingerprint}`
   })
-  const goalText = createHash('sha256').update(`${goal.objective}\n${goal.constraints.join('\n')}`).digest('hex').slice(0, 16)
+  const goalText = createHash('sha256')
+    .update(`${goal.objective}\n${goal.constraints.join('\n')}`)
+    .digest('hex')
+    .slice(0, 16)
 
-  return createHash('sha256').update(`${goal.updatedAt}|${goalText}|${parts.join(';')}`).digest('hex').slice(0, 16)
+  return createHash('sha256')
+    .update(`${goal.updatedAt}|${goalText}|${parts.join(';')}`)
+    .digest('hex')
+    .slice(0, 16)
 }
 
 export function goalFingerprintsOf(goals: readonly HootGoal[], repos: readonly RepoFingerprint[]) {
@@ -650,13 +712,13 @@ export function anyGoalChanged(previous: Record<string, string>, current: Record
 
 // 同じ goal に対する同じ種類の提案は 1 件に寄せる（人間が応答していない間、観測が変わるたびに積み上がらない）。
 // 根拠の occurrence key と観測 fingerprint は evidence として proposal に残す
-export function proposalKeyOf(input: {
-  goalKeys: readonly string[]
-  decision: HootDecision
-}) {
+export function proposalKeyOf(input: { goalKeys: readonly string[]; decision: HootDecision }) {
   const goalKeys = [...new Set(input.goalKeys)].sort()
 
-  return createHash('sha256').update(`${input.decision}|${goalKeys.join(',')}`).digest('hex').slice(0, 16)
+  return createHash('sha256')
+    .update(`${input.decision}|${goalKeys.join(',')}`)
+    .digest('hex')
+    .slice(0, 16)
 }
 
 // 同じ proposal に対する inject request。人間が再度承認すれば index が上がって新しい key になる
@@ -751,17 +813,26 @@ function isSettingsShapeBase(value: unknown) {
     }) &&
     typeof value.precheckObservation === 'boolean' &&
     isBoundedInt(value.watchdogHours, WATCHDOG_HOURS_MIN, WATCHDOG_HOURS_MAX) &&
-    (digestHourUtc === null || isBoundedInt(digestHourUtc, DIGEST_HOUR_UTC_MIN, DIGEST_HOUR_UTC_MAX)) &&
+    (digestHourUtc === null ||
+      isBoundedInt(digestHourUtc, DIGEST_HOUR_UTC_MIN, DIGEST_HOUR_UTC_MAX)) &&
     isBoundedInt(value.resetConversationAfterRuns, 0, 1000) &&
     isBoundedInt(value.goalReviewDays, GOAL_REVIEW_DAYS_MIN, GOAL_REVIEW_DAYS_MAX) &&
     isBoundedInt(value.proposalTtlHours, PROPOSAL_TTL_HOURS_MIN, PROPOSAL_TTL_HOURS_MAX) &&
-    isBoundedInt(value.maxProposalReminders, MAX_PROPOSAL_REMINDERS_MIN, MAX_PROPOSAL_REMINDERS_MAX) &&
+    isBoundedInt(
+      value.maxProposalReminders,
+      MAX_PROPOSAL_REMINDERS_MIN,
+      MAX_PROPOSAL_REMINDERS_MAX,
+    ) &&
     (value.autoDispatch === undefined || typeof value.autoDispatch === 'boolean') &&
     (value.conversationRead === undefined || typeof value.conversationRead === 'boolean') &&
     (value.maxInjectsPerDay === undefined ||
       isBoundedInt(value.maxInjectsPerDay, MAX_INJECTS_PER_DAY_MIN, MAX_INJECTS_PER_DAY_MAX)) &&
     (value.injectCooldownMinutes === undefined ||
-      isBoundedInt(value.injectCooldownMinutes, INJECT_COOLDOWN_MINUTES_MIN, INJECT_COOLDOWN_MINUTES_MAX))
+      isBoundedInt(
+        value.injectCooldownMinutes,
+        INJECT_COOLDOWN_MINUTES_MIN,
+        INJECT_COOLDOWN_MINUTES_MAX,
+      ))
   )
 }
 
@@ -780,7 +851,11 @@ export function isSettingsShapeV3(value: unknown): value is HootSettingsV3 {
   return (
     typeof candidate.autoDispatch === 'boolean' &&
     isBoundedInt(candidate.maxInjectsPerDay, MAX_INJECTS_PER_DAY_MIN, MAX_INJECTS_PER_DAY_MAX) &&
-    isBoundedInt(candidate.injectCooldownMinutes, INJECT_COOLDOWN_MINUTES_MIN, INJECT_COOLDOWN_MINUTES_MAX)
+    isBoundedInt(
+      candidate.injectCooldownMinutes,
+      INJECT_COOLDOWN_MINUTES_MIN,
+      INJECT_COOLDOWN_MINUTES_MAX,
+    )
   )
 }
 
@@ -824,7 +899,8 @@ function isInjectShapeBase(value: unknown) {
     Number.isInteger(value.attempts) &&
     value.attempts >= 0 &&
     (value.injectedAt === null || typeof value.injectedAt === 'string') &&
-    (value.lastError === null || (typeof value.lastError === 'string' && value.lastError.length <= MAX_INJECT_ERROR_CHARS))
+    (value.lastError === null ||
+      (typeof value.lastError === 'string' && value.lastError.length <= MAX_INJECT_ERROR_CHARS))
   )
 }
 
@@ -926,7 +1002,9 @@ function isGoalFingerprints(value: unknown) {
   }
 
   return Object.entries(value).every(([key, fingerprint]) => {
-    return HOOT_GOAL_KEY_PATTERN.test(key) && typeof fingerprint === 'string' && fingerprint.length <= 64
+    return (
+      HOOT_GOAL_KEY_PATTERN.test(key) && typeof fingerprint === 'string' && fingerprint.length <= 64
+    )
   })
 }
 
@@ -935,12 +1013,10 @@ function isLoopBase(loop: Record<string, unknown>) {
   return (
     (loop.lastOccurrenceAt === null || typeof loop.lastOccurrenceAt === 'string') &&
     (loop.lastRunAt === null || typeof loop.lastRunAt === 'string') &&
-    (
-      loop.conversationId === null ||
+    (loop.conversationId === null ||
       (typeof loop.conversationId === 'number' &&
         Number.isInteger(loop.conversationId) &&
-        loop.conversationId >= 1)
-    ) &&
+        loop.conversationId >= 1)) &&
     typeof loop.consecutiveFailures === 'number' &&
     Number.isInteger(loop.consecutiveFailures) &&
     loop.consecutiveFailures >= 0 &&
@@ -962,12 +1038,18 @@ export type HootStateV1 = {
   version: number
   settings: HootSettingsV1
   goals: Omit<HootGoal, 'reviewAt'>[]
-  loop: Omit<HootLoopStateV4, 'lastModelRunAt' | 'lastDigestAt' | 'conversationRuns' | 'goalFingerprints'>
+  loop: Omit<
+    HootLoopStateV4,
+    'lastModelRunAt' | 'lastDigestAt' | 'conversationRuns' | 'goalFingerprints'
+  >
   runs: Omit<HootRun, 'source'>[]
 }
 
 // version 2（precheck・proposal・goal review あり、inject request なし）。v4 への migration 入力
-export type HootSettingsV2 = Omit<HootSettings, 'autoDispatch' | 'maxInjectsPerDay' | 'injectCooldownMinutes' | 'conversationRead'>
+export type HootSettingsV2 = Omit<
+  HootSettings,
+  'autoDispatch' | 'maxInjectsPerDay' | 'injectCooldownMinutes' | 'conversationRead'
+>
 
 export type HootStateV2 = {
   version: number
@@ -1027,7 +1109,7 @@ export function isHootStateShapeV1(value: unknown): value is HootStateV1 {
 function isStateBodyShape(
   value: Record<string, unknown>,
   settingsOk: (candidate: unknown) => boolean,
-  runsOk: (candidate: unknown) => boolean
+  runsOk: (candidate: unknown) => boolean,
 ) {
   const loop = value.loop
 
@@ -1051,7 +1133,35 @@ function isStateBodyShape(
 }
 
 function isNullableCount(value: unknown) {
-  return value === null || (typeof value === 'number' && Number.isInteger(value) && value >= 0)
+  return (
+    value === null ||
+    (typeof value === 'number' &&
+      Number.isInteger(value) &&
+      value >= 0 &&
+      value <= OBSERVATION_SNAPSHOT_ITEMS_MAX)
+  )
+}
+
+// fingerprint がある repo は issue / pull の両方を観測でき、件数と number list が一致する。
+function isRepoSnapshotCountsConsistent(value: Record<string, unknown>) {
+  const issueNumbers = value.issueNumbers
+  const prNumbers = value.prNumbers
+
+  return (
+    Array.isArray(issueNumbers) &&
+    Array.isArray(prNumbers) &&
+    (value.openIssues === null
+      ? issueNumbers.length === 0
+      : value.openIssues === issueNumbers.length) &&
+    (value.openPrs === null ? prNumbers.length === 0 : value.openPrs === prNumbers.length) &&
+    (value.openPrs === null
+      ? value.draftPrs === null
+      : typeof value.openPrs === 'number' &&
+        typeof value.draftPrs === 'number' &&
+        value.draftPrs <= value.openPrs) &&
+    (value.fingerprint === null ||
+      (value.openIssues !== null && value.openPrs !== null && value.draftPrs !== null))
+  )
 }
 
 // snapshot の number list は number 文字列だけ（title・`(draft)` などの飾りは入れない）
@@ -1065,7 +1175,16 @@ function isNumberStrings(value: unknown) {
   )
 }
 
-const REPO_SNAPSHOT_KEYS = ['repo', 'openIssues', 'openPrs', 'draftPrs', 'issueNumbers', 'prNumbers', 'fingerprint'] as const
+const REPO_SNAPSHOT_KEYS = [
+  'repo',
+  'openIssues',
+  'openPrs',
+  'draftPrs',
+  'issueNumbers',
+  'prNumbers',
+  'fingerprint',
+] as const
+const SNAPSHOT_FINGERPRINT_PATTERN = /^[a-f0-9]{16}$/u
 
 function isRepoSnapshotShape(value: unknown): value is HootRepoSnapshot {
   if (!isRecord(value)) {
@@ -1078,13 +1197,17 @@ function isRepoSnapshotShape(value: unknown): value is HootRepoSnapshot {
 
   return (
     typeof value.repo === 'string' &&
+    value.repo.length <= MAX_GITHUB_SCOPE_REPO_CHARS &&
     GITHUB_SCOPE_REPO_PATTERN.test(value.repo) &&
     isNullableCount(value.openIssues) &&
     isNullableCount(value.openPrs) &&
     isNullableCount(value.draftPrs) &&
     isNumberStrings(value.issueNumbers) &&
     isNumberStrings(value.prNumbers) &&
-    (value.fingerprint === null || (typeof value.fingerprint === 'string' && value.fingerprint.length <= 64))
+    isRepoSnapshotCountsConsistent(value) &&
+    (value.fingerprint === null ||
+      (typeof value.fingerprint === 'string' &&
+        SNAPSHOT_FINGERPRINT_PATTERN.test(value.fingerprint)))
   )
 }
 
@@ -1105,8 +1228,7 @@ export function isObservationsShape(value: unknown): value is HootObservationSna
 
     return (
       isOccurrenceKey(entry.occurrenceKey) &&
-      typeof entry.observedAt === 'string' &&
-      parseIso(entry.observedAt) !== null &&
+      isCanonicalIsoUtc(entry.observedAt) &&
       Array.isArray(entry.repos) &&
       entry.repos.length <= OBSERVATION_SNAPSHOT_REPOS_MAX &&
       entry.repos.every(isRepoSnapshotShape)
@@ -1116,11 +1238,7 @@ export function isObservationsShape(value: unknown): value is HootObservationSna
 
 // inject request の list 検査。version で required field が違うので entry の検査を受け取る
 function isInjectRequestsShape(value: unknown, entryOk: (candidate: unknown) => boolean) {
-  return (
-    Array.isArray(value) &&
-    value.length <= MAX_INJECTS_KEPT &&
-    value.every(entryOk)
-  )
+  return Array.isArray(value) && value.length <= MAX_INJECTS_KEPT && value.every(entryOk)
 }
 
 // version 2（inject request のない state file）。migration 入力に使う
@@ -1248,7 +1366,9 @@ export function parseDecision(text: string): DecisionParse {
   const reasonLine = lines.slice(decisionIndex + 1).find((line) => {
     return REASON_LINE_PATTERN.test(line)
   })
-  const reason = (reasonLine === undefined ? '' : (REASON_LINE_PATTERN.exec(reasonLine)?.[1] ?? '')).trim()
+  const reason = (
+    reasonLine === undefined ? '' : (REASON_LINE_PATTERN.exec(reasonLine)?.[1] ?? '')
+  ).trim()
 
   return {
     decision,

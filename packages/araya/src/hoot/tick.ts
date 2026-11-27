@@ -6,8 +6,18 @@
 import { createHash } from 'node:crypto'
 
 import type { Redactor } from '../infrastructure/redaction.ts'
-import { collectGitHubObservations, observationSnapshotOf, type HootObservation, type ObservationDependencies } from './observe.ts'
-import { PROMPT_RECENT_RUNS, buildDecisionPrompt, buildInjectPrompt, hootConversationInstructions } from './prompt.ts'
+import {
+  collectGitHubObservations,
+  observationSnapshotOf,
+  type HootObservation,
+  type ObservationDependencies,
+} from './observe.ts'
+import {
+  PROMPT_RECENT_RUNS,
+  buildDecisionPrompt,
+  buildInjectPrompt,
+  hootConversationInstructions,
+} from './prompt.ts'
 import {
   EMPTY_CONVERSATION_READS,
   HOOT_DECISIONS,
@@ -192,8 +202,18 @@ function dispatchNoteOf(decision: HootDecision, settings: HootSettings) {
 function buildReviewPauseNotice(goal: HootGoal) {
   return [
     `HOOT goal review: ${goal.key} を自動 paused にしました（reviewAt ${goal.reviewAt}）`,
-    '続けるには araya hoot goal resume --key ' + goal.key + '（Discord なら `hoot goal resume --key ' + goal.key + '`）、終わらせるなら araya hoot goal retire --key ' + goal.key + '（`hoot goal retire --key ' + goal.key + '`）',
-  ].join('\n').slice(0, HOOT_NOTICE_MAX_CHARS)
+    '続けるには araya hoot goal resume --key ' +
+      goal.key +
+      '（Discord なら `hoot goal resume --key ' +
+      goal.key +
+      '`）、終わらせるなら araya hoot goal retire --key ' +
+      goal.key +
+      '（`hoot goal retire --key ' +
+      goal.key +
+      '`）',
+  ]
+    .join('\n')
+    .slice(0, HOOT_NOTICE_MAX_CHARS)
 }
 
 function buildReminderNotice(proposal: HootProposal, reminderIndex: number, maxReminders: number) {
@@ -202,10 +222,17 @@ function buildReminderNotice(proposal: HootProposal, reminderIndex: number, maxR
     `REASON: ${proposal.reason}`,
     `goals: ${proposal.goalKeys.join(', ') || '（なし）'}`,
     `期限: ${proposal.expiresAt}（応答がなければ期限切れになります）`,
-  ].join('\n').slice(0, HOOT_NOTICE_MAX_CHARS)
+  ]
+    .join('\n')
+    .slice(0, HOOT_NOTICE_MAX_CHARS)
 }
 
-function buildDigestNotice(runs: readonly HootRun[], openProposals: readonly HootProposal[], gaps: number, nowMs: number) {
+function buildDigestNotice(
+  runs: readonly HootRun[],
+  openProposals: readonly HootProposal[],
+  gaps: number,
+  nowMs: number,
+) {
   const counts = new Map<string, number>()
 
   for (const run of runs) {
@@ -225,11 +252,16 @@ function buildDigestNotice(runs: readonly HootRun[], openProposals: readonly Hoo
   })
   const lines = [
     `HOOT digest ${utcDayKey(nowMs)}`,
-    `runs: ${runs.length}（model 判断 ${runs.filter((run) => {
-      return run.source === 'model'
-    }).length} / precheck noop ${runs.length - runs.filter((run) => {
-      return run.source === 'model'
-    }).length}）`,
+    `runs: ${runs.length}（model 判断 ${
+      runs.filter((run) => {
+        return run.source === 'model'
+      }).length
+    } / precheck noop ${
+      runs.length -
+      runs.filter((run) => {
+        return run.source === 'model'
+      }).length
+    }）`,
     decisionLines.length > 0 ? decisionLines.join(' / ') : '判断なし',
   ]
 
@@ -245,7 +277,9 @@ function buildDigestNotice(runs: readonly HootRun[], openProposals: readonly Hoo
   }
 
   if (openProposals.length > HOOT_DIGEST_PROPOSAL_LINES) {
-    lines.push(`  （他 ${openProposals.length - HOOT_DIGEST_PROPOSAL_LINES} 件は araya hoot proposal list）`)
+    lines.push(
+      `  （他 ${openProposals.length - HOOT_DIGEST_PROPOSAL_LINES} 件は araya hoot proposal list）`,
+    )
   }
 
   if (gaps > 0) {
@@ -284,7 +318,10 @@ export function createHootLoop(deps: HootTickDeps) {
         timeoutMs: deps.observationTimeoutMs,
       })
     } catch (error) {
-      deps.log({ type: 'hoot_observation_failed', message: deps.redactor.redact(errorMessage(error)) })
+      deps.log({
+        type: 'hoot_observation_failed',
+        message: deps.redactor.redact(errorMessage(error)),
+      })
 
       return { collectedAt: isoUtc(deps.nowMs()), repos: [] } satisfies HootObservation
     }
@@ -300,7 +337,11 @@ export function createHootLoop(deps: HootTickDeps) {
 
       return true
     } catch (error) {
-      deps.log({ type: 'hoot_notice_failed', nonce, message: deps.redactor.redact(errorMessage(error)) })
+      deps.log({
+        type: 'hoot_notice_failed',
+        nonce,
+        message: deps.redactor.redact(errorMessage(error)),
+      })
 
       return false
     }
@@ -312,7 +353,10 @@ export function createHootLoop(deps: HootTickDeps) {
 
     for (const goal of paused) {
       deps.log({ type: 'hoot_goal_review_paused', key: goal.key, reviewAt: goal.reviewAt ?? '' })
-      await notify(buildReviewPauseNotice(goal), noticeNonce(`review:${goal.key}:${goal.reviewAt ?? ''}`))
+      await notify(
+        buildReviewPauseNotice(goal),
+        noticeNonce(`review:${goal.key}:${goal.reviewAt ?? ''}`),
+      )
     }
 
     return paused
@@ -329,7 +373,7 @@ export function createHootLoop(deps: HootTickDeps) {
     const state = await readHootState(deps.dataDir)
     const sent = await notify(
       buildReminderNotice(taken.proposal, taken.reminderIndex, state.settings.maxProposalReminders),
-      noticeNonce(`reminder:${taken.proposal.key}:${taken.reminderIndex}`)
+      noticeNonce(`reminder:${taken.proposal.key}:${taken.reminderIndex}`),
     )
     deps.log({
       type: 'hoot_proposal_reminder',
@@ -368,13 +412,22 @@ export function createHootLoop(deps: HootTickDeps) {
     const gaps = runs.reduce((total, run) => {
       return total + run.observationGaps.length
     }, 0)
-    const sent = await notify(buildDigestNotice(runs, openProposals, gaps, now), noticeNonce(`digest:${day}`))
+    const sent = await notify(
+      buildDigestNotice(runs, openProposals, gaps, now),
+      noticeNonce(`digest:${day}`),
+    )
 
     if (sent) {
       await recordHootDigest(deps.dataDir, now)
     }
 
-    deps.log({ type: 'hoot_digest', day, runs: runs.length, openProposals: openProposals.length, sent })
+    deps.log({
+      type: 'hoot_digest',
+      day,
+      runs: runs.length,
+      openProposals: openProposals.length,
+      sent,
+    })
 
     return sent
   }
@@ -402,7 +455,11 @@ export function createHootLoop(deps: HootTickDeps) {
         error: 'hoot_inject_unavailable: main 会話を持つ Discord bot process で実行してください',
       })
       // ok: false なので proposal は open のまま（人間が dispatch をやり直せる）
-      deps.log({ type: 'hoot_inject_unavailable', injectKey: taken.key, attempts: settled.request.attempts })
+      deps.log({
+        type: 'hoot_inject_unavailable',
+        injectKey: taken.key,
+        attempts: settled.request.attempts,
+      })
 
       if (settled.request.status === 'failed') {
         await notify(
@@ -410,7 +467,7 @@ export function createHootLoop(deps: HootTickDeps) {
             `HOOT dispatch の inject をできませんでした（proposal: ${taken.proposalKey} / attempt ${settled.request.attempts}）。main 会話を持つ Discord bot process で動かしてください`,
             `hoot inject list（CLI か Discord）で状態を確認し、必要なら hoot dispatch --key ${taken.proposalKey} で新しい承認を作り直してください（同じ案件は自動で再実行しません）`,
           ].join('\n'),
-          noticeNonce(`inject-unavailable:${taken.key}`)
+          noticeNonce(`inject-unavailable:${taken.key}`),
         )
       }
 
@@ -433,7 +490,11 @@ export function createHootLoop(deps: HootTickDeps) {
         nowMs: deps.nowMs(),
         error: `hoot_proposal_not_found: proposal ${taken.proposalKey} が state から消えました`,
       })
-      deps.log({ type: 'hoot_inject_proposal_missing', injectKey: taken.key, proposalKey: taken.proposalKey })
+      deps.log({
+        type: 'hoot_inject_proposal_missing',
+        injectKey: taken.key,
+        proposalKey: taken.proposalKey,
+      })
 
       if (settled.request.status === 'failed') {
         await notify(
@@ -441,7 +502,7 @@ export function createHootLoop(deps: HootTickDeps) {
             `HOOT dispatch の inject をできませんでした（proposal: ${taken.proposalKey} が state から消えました / attempt ${settled.request.attempts}）`,
             `araya hoot proposal list / araya hoot inject list で状態を確認してください`,
           ].join('\n'),
-          noticeNonce(`inject-proposal-missing:${taken.key}`)
+          noticeNonce(`inject-proposal-missing:${taken.key}`),
         )
       }
 
@@ -496,7 +557,7 @@ export function createHootLoop(deps: HootTickDeps) {
             `error: ${message}`,
             `hoot inject list（CLI か Discord）で状態を確認し、必要なら hoot dispatch --key ${taken.proposalKey} で新しい承認を作り直してください（同じ案件は自動で再実行しません）`,
           ].join('\n'),
-          noticeNonce(`inject-failed:${taken.key}`)
+          noticeNonce(`inject-failed:${taken.key}`),
         )
       }
 
@@ -594,9 +655,11 @@ export function createHootLoop(deps: HootTickDeps) {
       return { kind: 'not_due', occurrenceKey, dueAt: isoUtc(plannedAt) }
     }
 
-    if (state.runs.some((run) => {
-      return run.occurrenceKey === occurrenceKey
-    })) {
+    if (
+      state.runs.some((run) => {
+        return run.occurrenceKey === occurrenceKey
+      })
+    ) {
       // crash などで schedule だけ戻っていない状態。同じ occurrence を再び走らせない
       await updateHootState(deps.dataDir, (next) => {
         next.loop.lastOccurrenceAt = isoUtc(plannedAt)
@@ -628,8 +691,8 @@ export function createHootLoop(deps: HootTickDeps) {
       const fingerprintsChanged = anyGoalChanged(state.loop.goalFingerprints, fingerprints)
       // 今回の occurrence の観測 snapshot（model run にも precheck noop にも付ける）。
       // 観測に repo が 1 件も無い occurrence（gh が壊れた・github scope が無い）は比較 side に使えないので作らない
-      occurrenceSnapshot = observation.repos.length === 0 ? null : observationSnapshotOf(occurrenceKey, observation)
-      const pinnedEvidenceKeys = pinnedEvidenceKeysOf(state)
+      occurrenceSnapshot =
+        observation.repos.length === 0 ? null : observationSnapshotOf(occurrenceKey, observation)
       // delivery 後の evidence を prompt に載せるため、state file へ追記する予定の snapshot を加えた
       // state で計算する（追記しないと同じ値になる。計算は state.json の値だけから決定的）
       const evidenceState =
@@ -642,7 +705,7 @@ export function createHootLoop(deps: HootTickDeps) {
                 observations: appendObservationSnapshot(
                   state.loop.observations,
                   occurrenceSnapshot,
-                  pinnedEvidenceKeys
+                  pinnedEvidenceKeysOf(state),
                 ),
               },
             }
@@ -682,7 +745,19 @@ export function createHootLoop(deps: HootTickDeps) {
           observationGaps: [],
           conversationReads: { ...EMPTY_CONVERSATION_READS },
         }
-        const recorded = await recordHootRun(deps.dataDir, run)
+        const recorded = await recordHootRun(deps.dataDir, run, (next) => {
+          next.loop.goalFingerprints = fingerprints
+          next.loop.consecutiveFailures = 0
+          next.loop.failureCooldownUntil = null
+
+          if (occurrenceSnapshot !== null) {
+            next.loop.observations = appendObservationSnapshot(
+              next.loop.observations,
+              occurrenceSnapshot,
+              pinnedEvidenceKeysOf(next),
+            )
+          }
+        })
 
         if (recorded.run.occurrenceKey !== occurrenceKey) {
           deps.log({ type: 'hoot_run_conflict', occurrenceKey })
@@ -692,20 +767,6 @@ export function createHootLoop(deps: HootTickDeps) {
 
         // precheck noop の occurrence も観測 snapshot を残す。delivery 後の evidence 比較で
         // before / after の side になる（model を呼ばない occurrence でも effect は起きる）
-        await updateHootState(deps.dataDir, (next) => {
-          next.loop.goalFingerprints = fingerprints
-          next.loop.consecutiveFailures = 0
-          next.loop.failureCooldownUntil = null
-
-          if (occurrenceSnapshot !== null) {
-            next.loop.observations = appendObservationSnapshot(
-              next.loop.observations,
-              occurrenceSnapshot,
-              pinnedEvidenceKeys
-            )
-          }
-        })
-
         deps.log({ type: 'hoot_precheck_noop', occurrenceKey, goals: run.goalKeys })
 
         const remindersSent = await sendOneReminder(deps.nowMs(), everyMs)
@@ -721,7 +782,8 @@ export function createHootLoop(deps: HootTickDeps) {
       }
 
       const reuseConversation =
-        settings.resetConversationAfterRuns === 0 || state.loop.conversationRuns < settings.resetConversationAfterRuns
+        settings.resetConversationAfterRuns === 0 ||
+        state.loop.conversationRuns < settings.resetConversationAfterRuns
 
       if (!reuseConversation) {
         deps.log({ type: 'hoot_conversation_reset', conversationRuns: state.loop.conversationRuns })
@@ -775,34 +837,29 @@ export function createHootLoop(deps: HootTickDeps) {
         conversationReads: conversationReadsOf(
           decided.conversationReads?.calls ?? 0,
           decided.conversationReads?.entries ?? 0,
-          decided.conversationReads?.chars ?? 0
+          decided.conversationReads?.chars ?? 0,
         ),
       }
-      const recorded = await recordHootRun(deps.dataDir, run)
+      const recorded = await recordHootRun(deps.dataDir, run, (next) => {
+        next.loop.goalFingerprints = fingerprints
+        next.loop.conversationRuns = reuseConversation ? next.loop.conversationRuns + 1 : 1
+        next.loop.consecutiveFailures = 0
+        next.loop.failureCooldownUntil = null
+
+        if (occurrenceSnapshot !== null) {
+          next.loop.observations = appendObservationSnapshot(
+            next.loop.observations,
+            occurrenceSnapshot,
+            pinnedEvidenceKeysOf(next),
+          )
+        }
+      })
 
       if (recorded.run.occurrenceKey !== occurrenceKey) {
         deps.log({ type: 'hoot_run_conflict', occurrenceKey })
 
         return { kind: 'occurrence_recorded', occurrenceKey }
       }
-
-      await updateHootState(deps.dataDir, (next) => {
-        next.loop.goalFingerprints = fingerprints
-
-        if (occurrenceSnapshot !== null) {
-          next.loop.observations = appendObservationSnapshot(
-            next.loop.observations,
-            occurrenceSnapshot,
-            pinnedEvidenceKeys
-          )
-        }
-
-        // lastModelRunAt は recordHootRun が source: 'model' で更新済み
-        next.loop.conversationRuns = reuseConversation ? next.loop.conversationRuns + 1 : 1
-        // 判断 text が書けたので連続失敗は戻す（invalid も run として記録したので 0 にする）
-        next.loop.consecutiveFailures = 0
-        next.loop.failureCooldownUntil = null
-      })
 
       if (decided.conversationId !== state.loop.conversationId) {
         // 会話を新しくしたのは tick 側か host 側か。host 側（resume 失敗）も state に新しい id を覚えさせる
@@ -817,7 +874,11 @@ export function createHootLoop(deps: HootTickDeps) {
         }
 
         await setHootConversationId(deps.dataDir, decided.conversationId)
-        deps.log({ type: 'hoot_conversation_id_saved', reason, conversationId: decided.conversationId })
+        deps.log({
+          type: 'hoot_conversation_id_saved',
+          reason,
+          conversationId: decided.conversationId,
+        })
       }
 
       let proposalKey: string | null = null
@@ -895,7 +956,9 @@ export function createHootLoop(deps: HootTickDeps) {
         watchdog: watchdogDue,
       })
 
-      const remindersSent = hasOpenProposals(state) ? await sendOneReminder(deps.nowMs(), everyMs) : 0
+      const remindersSent = hasOpenProposals(state)
+        ? await sendOneReminder(deps.nowMs(), everyMs)
+        : 0
       const digestSent = await sendDigestIfNeeded(deps.nowMs())
 
       return {
@@ -924,7 +987,7 @@ export function createHootLoop(deps: HootTickDeps) {
             next.loop.observations = appendObservationSnapshot(
               next.loop.observations,
               occurrenceSnapshot,
-              pinnedEvidenceKeysOf(next)
+              pinnedEvidenceKeysOf(next),
             )
           }
         })
@@ -947,7 +1010,7 @@ export function createHootLoop(deps: HootTickDeps) {
       if (consecutiveFailures === HOOT_FAILURE_NOTICE_AFTER) {
         await notify(
           `HOOT 判断 run が ${consecutiveFailures} 回続けて失敗しました。araya hoot status と discord.log を確認してください`,
-          noticeNonce(`${occurrenceKey}:failure:${consecutiveFailures}`)
+          noticeNonce(`${occurrenceKey}:failure:${consecutiveFailures}`),
         )
       }
 
@@ -968,13 +1031,19 @@ export function createHootLoop(deps: HootTickDeps) {
       try {
         await injectOnce()
       } catch (error) {
-        deps.log({ type: 'hoot_inject_poll_failed', message: deps.redactor.redact(errorMessage(error)).slice(0, 500) })
+        deps.log({
+          type: 'hoot_inject_poll_failed',
+          message: deps.redactor.redact(errorMessage(error)).slice(0, 500),
+        })
       }
 
       try {
         await tickOnce()
       } catch (error) {
-        deps.log({ type: 'hoot_tick_failed', message: deps.redactor.redact(errorMessage(error)).slice(0, 500) })
+        deps.log({
+          type: 'hoot_tick_failed',
+          message: deps.redactor.redact(errorMessage(error)).slice(0, 500),
+        })
       }
 
       await sleep(pollMs, controller.signal)

@@ -129,7 +129,9 @@ function decisionsOf(value: string | undefined) {
   })
 
   if (invalid.length > 0) {
-    throw new Error(`hoot_invalid_argument: --notify-decisions は ${HOOT_DECISIONS.join(' / ')} の組合せにしてください（${invalid.join(', ')}）`)
+    throw new Error(
+      `hoot_invalid_argument: --notify-decisions は ${HOOT_DECISIONS.join(' / ')} の組合せにしてください（${invalid.join(', ')}）`,
+    )
   }
 
   return entries as HootDecision[]
@@ -190,7 +192,9 @@ function proposalInjectNotes(state: HootState, proposalKey: string, options: { s
   const latest = related.at(-1)
   const lines = [
     `  inject: ${related.length} 件（latest ${latest?.key ?? '（なし）'} [${latest?.status ?? '（なし）'}]${
-      latest?.injectedAt === null || latest?.injectedAt === undefined ? '' : ` @ ${latest.injectedAt}`
+      latest?.injectedAt === null || latest?.injectedAt === undefined
+        ? ''
+        : ` @ ${latest.injectedAt}`
     }）`,
   ]
 
@@ -231,17 +235,23 @@ function evidenceGoalLines(evidence: readonly HootGoalEvidence[]) {
           ? 'delivery までに観測がなく evidence 未取得'
           : `delivery 時点の観測: ${delivery.deliveredEvidenceKey}`
       lines.push(
-        `  inject ${delivery.injectKey} [${delivery.decision}] @ ${delivery.injectedAt}（${evidenceNote}）`
+        `  inject ${delivery.injectKey} [${delivery.decision}] @ ${delivery.injectedAt}（${evidenceNote}）`,
       )
 
       if (delivery.delta.length === 0) {
-        lines.push('    比較可能な前後の観測 snapshot がありません（before が未取得、または delivery 以降の観測がまだ届いていません。観測は直近 ' + OBSERVATION_SNAPSHOTS_KEPT + ' occurrence と delivery が参照する snapshot を保持します）')
+        lines.push(
+          '    比較可能な前後の観測 snapshot がありません（before が未取得、または delivery 以降の観測がまだ届いていません。観測は直近 ' +
+            OBSERVATION_SNAPSHOTS_KEPT +
+            ' occurrence と delivery が参照する snapshot を保持します）',
+        )
 
         continue
       }
 
       for (const delta of delivery.delta) {
-        lines.push(`    ${delta.repo}: ${goalEvidenceDeltaText(delta)}（${delta.beforeKey} -> ${delta.afterKey}）`)
+        lines.push(
+          `    ${delta.repo}: ${goalEvidenceDeltaText(delta)}（${delta.beforeKey} -> ${delta.afterKey}）`,
+        )
       }
     }
   }
@@ -251,7 +261,8 @@ function evidenceGoalLines(evidence: readonly HootGoalEvidence[]) {
 
 function nextOccurrenceOf(state: HootState, nowMs: number) {
   const lastOccurrenceAt = parseIso(state.loop.lastOccurrenceAt)
-  const plannedAt = lastOccurrenceAt === null ? nowMs : lastOccurrenceAt + state.settings.tickMinutes * 60_000
+  const plannedAt =
+    lastOccurrenceAt === null ? nowMs : lastOccurrenceAt + state.settings.tickMinutes * 60_000
 
   return {
     at: isoUtc(plannedAt),
@@ -313,7 +324,7 @@ export function formatHootStatus(state: HootState, nowMs: number, dataDir: strin
     }).length
 
     lines.push(
-      `inject requests: pending ${pending} / injected ${injected} / failed ${state.injectRequests.length - pending - injected}（保持 ${MAX_INJECTS_KEPT} 件）`
+      `inject requests: pending ${pending} / injected ${injected} / failed ${state.injectRequests.length - pending - injected}（保持 ${MAX_INJECTS_KEPT} 件）`,
     )
     lines.push(...state.injectRequests.slice(-3).map(injectLine))
   }
@@ -325,7 +336,7 @@ export function formatHootStatus(state: HootState, nowMs: number, dataDir: strin
       `last run: ${lastRun.decidedAt} ${lastRun.decision} — ${lastRun.reason}`,
       `  observed: ${lastRun.observedRepos.join(', ') || '（なし）'}`,
       `  gaps: ${lastRun.observationGaps.join(' / ') || '（なし）'}`,
-      `  conversation reads: ${reads.calls} calls / ${reads.entries} entries / ${reads.chars} chars`
+      `  conversation reads: ${reads.calls} calls / ${reads.entries} entries / ${reads.chars} chars`,
     )
   }
 
@@ -374,7 +385,7 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
       deps.stdout(
         state.goals.length === 0
           ? 'goal はありません。araya hoot goal add --key <key> --objective "<目的>" [--scope github:owner/repo] で追加してください'
-          : state.goals.map(goalLine).join('\n')
+          : state.goals.map(goalLine).join('\n'),
       )
 
       return
@@ -397,7 +408,9 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
       })
 
       if (subcommand === 'add' && exists) {
-        throw new Error(`hoot_goal_exists: goal key ${key} は既にあります（update を使ってください）`)
+        throw new Error(
+          `hoot_goal_exists: goal key ${key} は既にあります（update を使ってください）`,
+        )
       }
 
       if (subcommand === 'update' && !exists) {
@@ -412,8 +425,13 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
       // --review-at を渡さない限り現在の期限を保つ（goal 編集で review 期限を伸ばさない）。
       // 新しい goal で未指定なら store の settings.goalReviewDays 既定に委ねる（ここで 'none' を強いない）
       const reviewAt =
-        options['review-at'] ?? (existingGoal !== undefined ? (existingGoal.reviewAt ?? 'none') : undefined)
-      const result = await setGoal(dataDir, { key, objective, scope, constraints, reviewAt }, { replace: true })
+        options['review-at'] ??
+        (existingGoal !== undefined ? (existingGoal.reviewAt ?? 'none') : undefined)
+      const result = await setGoal(
+        dataDir,
+        { key, objective, scope, constraints, reviewAt },
+        { replace: true },
+      )
 
       deps.stdout(`${subcommand === 'add' ? '追加' : '更新'}しました:\n${goalLine(result.goal)}`)
 
@@ -422,7 +440,9 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
 
     if (subcommand === 'pause' || subcommand === 'resume' || subcommand === 'retire') {
       if (key === undefined || key === '') {
-        throw new Error(`hoot_invalid_argument: --key が必要です（araya hoot goal ${subcommand} --key <key>）`)
+        throw new Error(
+          `hoot_invalid_argument: --key が必要です（araya hoot goal ${subcommand} --key <key>）`,
+        )
       }
 
       const status: HootGoalStatus =
@@ -433,7 +453,9 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
       return
     }
 
-    throw new Error('hoot_invalid_argument: goal の subcommand は list / add / update / pause / resume / retire')
+    throw new Error(
+      'hoot_invalid_argument: goal の subcommand は list / add / update / pause / resume / retire',
+    )
   }
 
   if (command === 'settings') {
@@ -448,7 +470,7 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
       const mode = options.mode
 
       if (mode !== undefined && mode !== 'dry_run' && mode !== 'active') {
-        throw new Error("hoot_invalid_argument: --mode は dry_run または active")
+        throw new Error('hoot_invalid_argument: --mode は dry_run または active')
       }
 
       const settings = await updateSettings(dataDir, {
@@ -467,15 +489,21 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
               : integerOf('digest-hour-utc', options['digest-hour-utc']),
         resetConversationAfterRuns: integerOf(
           'reset-conversation-after-runs',
-          options['reset-conversation-after-runs']
+          options['reset-conversation-after-runs'],
         ),
         goalReviewDays: integerOf('goal-review-days', options['goal-review-days']),
         proposalTtlHours: integerOf('proposal-ttl-hours', options['proposal-ttl-hours']),
-        maxProposalReminders: integerOf('max-proposal-reminders', options['max-proposal-reminders']),
+        maxProposalReminders: integerOf(
+          'max-proposal-reminders',
+          options['max-proposal-reminders'],
+        ),
         autoDispatch: booleanOf('auto-dispatch', options['auto-dispatch']),
         conversationRead: booleanOf('conversation-read', options['conversation-read']),
         maxInjectsPerDay: integerOf('max-injects-per-day', options['max-injects-per-day']),
-        injectCooldownMinutes: integerOf('inject-cooldown-minutes', options['inject-cooldown-minutes']),
+        injectCooldownMinutes: integerOf(
+          'inject-cooldown-minutes',
+          options['inject-cooldown-minutes'],
+        ),
       })
       deps.stdout(`settings を更新しました:\n${settingsSummary(settings)}`)
 
@@ -542,7 +570,7 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
           ...closed.slice(0, PROPOSAL_HISTORY_SHOWN).flatMap((proposal) => {
             return [proposalLine(proposal), ...proposalInjectNotes(state, proposal.key, { showPendingReminder: false })]
           }),
-        ].join('\n')
+        ].join('\n'),
       )
 
       return
@@ -576,13 +604,17 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
     if (enqueued.request === null) {
       const reason = enqueued.skipped ?? 'unknown'
       const guidance: Record<string, string> = {
-        cooldown: '前の inject からの cooldown 中です（araya hoot settings set --inject-cooldown-minutes <分> / Discord の /hoot settings set inject-cooldown-minutes:<分>）',
-        daily_limit: '1 UTC 日の inject 上限です（araya hoot settings set --max-injects-per-day <件数> / Discord の /hoot settings set max-injects-per-day:<件数>）',
+        cooldown:
+          '前の inject からの cooldown 中です（araya hoot settings set --inject-cooldown-minutes <分> / Discord の /hoot settings set inject-cooldown-minutes:<分>）',
+        daily_limit:
+          '1 UTC 日の inject 上限です（araya hoot settings set --max-injects-per-day <件数> / Discord の /hoot settings set max-injects-per-day:<件数>）',
         already_pending: '同じ proposal への inject がまだ未完了です（araya hoot inject list）',
         auto_dispatch_off: 'autoDispatch=false では人間の dispatch だけが inject されます',
       }
 
-      deps.stdout(`inject request を作りませんでした（${reason}）\n  ${guidance[reason] ?? ''}`.trimEnd())
+      deps.stdout(
+        `inject request を作りませんでした（${reason}）\n  ${guidance[reason] ?? ''}`.trimEnd(),
+      )
 
       return
     }
@@ -592,7 +624,7 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
         `inject request を作りました: ${enqueued.request.key}`,
         `  proposal: ${enqueued.request.proposalKey} [${enqueued.request.decision}] goals=${enqueued.request.goalKeys.join(', ') || '（なし）'}`,
         '  Discord bot process が次の poll で main 会話に渡します（bot が動いていないと pending のままです）',
-      ].join('\n')
+      ].join('\n'),
     )
 
     return
@@ -607,19 +639,13 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
 
     if (state.injectRequests.length === 0) {
       deps.stdout(
-        `inject request の記録はありません（araya hoot dispatch --key <proposal key> / Discord の /hoot dispatch key:<proposal key> で作ります。保持は直近 ${MAX_INJECTS_KEPT} 件）`
+        `inject request の記録はありません（araya hoot dispatch --key <proposal key> / Discord の /hoot dispatch key:<proposal key> で作ります。保持は直近 ${MAX_INJECTS_KEPT} 件）`,
       )
 
       return
     }
 
-    deps.stdout(
-      state.injectRequests
-        .slice(-20)
-        .reverse()
-        .map(injectLine)
-        .join('\n')
-    )
+    deps.stdout(state.injectRequests.slice(-20).reverse().map(injectLine).join('\n'))
 
     return
   }
@@ -639,7 +665,8 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
     deps.stdout(
       shown
         .map((run) => {
-          const gaps = run.observationGaps.length > 0 ? ` gaps: ${run.observationGaps.join(' / ')}` : ''
+          const gaps =
+            run.observationGaps.length > 0 ? ` gaps: ${run.observationGaps.join(' / ')}` : ''
           const reads =
             run.conversationReads.calls > 0
               ? `\n  reads: ${run.conversationReads.calls} calls / ${run.conversationReads.entries} entries / ${run.conversationReads.chars} chars`
@@ -647,7 +674,7 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
 
           return `${run.decidedAt} ${run.decision} [${run.occurrenceKey}]\n  reason: ${run.reason}${gaps}${reads}`
         })
-        .join('\n')
+        .join('\n'),
     )
 
     return
@@ -662,18 +689,42 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
     }, 0)
 
     if (evidence.length === 0) {
+      const githubScopedGoalKeys = new Set(
+        state.goals
+          .filter((goal) => {
+            return goal.scope.some((scope) => {
+              return scope.startsWith('github:')
+            })
+          })
+          .map((goal) => {
+            return goal.key
+          }),
+      )
+      const hasSuccessfulGitHubDelivery = state.injectRequests.some((request) => {
+        return (
+          request.status === 'injected' &&
+          request.injectedAt !== null &&
+          request.goalKeys.some((key) => {
+            return githubScopedGoalKeys.has(key)
+          })
+        )
+      })
       const guidance =
-        state.loop.observations.length === 0
-          ? 'HOOT tick が gh 観測を走らせると snapshot が記録されます（観測は直近 ' + OBSERVATION_SNAPSHOTS_KEPT + ' occurrence）'
-          : state.injectRequests.length === 0
-            ? 'delivery（inject）の記録がありません（araya hoot dispatch --key <proposal key> / Discord の /hoot dispatch key:<proposal key>）'
-            : 'delivery までに届いた観測 snapshot と delivery 以降の観測がまだ揃っていません（次の tick の観測で比較できるようになります）'
+        githubScopedGoalKeys.size === 0
+          ? 'GitHub scope 付き goal に比較対象となる成功 delivery がありません（goal の scope を追加してください）'
+          : !hasSuccessfulGitHubDelivery && state.loop.observations.length === 0
+            ? `HOOT tick が gh 観測を走らせると snapshot が記録されます（観測は直近 ${OBSERVATION_SNAPSHOTS_KEPT} occurrence）。成功 delivery は araya hoot dispatch --key <proposal key> で作成します`
+            : !hasSuccessfulGitHubDelivery
+              ? 'GitHub scope 付き goal の成功 delivery がありません（araya hoot dispatch --key <proposal key> / Discord の /hoot dispatch key:<proposal key>）'
+              : 'GitHub scope 付き goal と成功 delivery はありますが、比較可能な before / after snapshot がありません（delivery 時点の観測と delivery 以降の観測を確認してください）'
 
       deps.stdout(
         [
-          'delivery 前後を比較できる観測 snapshot がまだありません（観測は直近 ' + OBSERVATION_SNAPSHOTS_KEPT + ' occurrence だけ保持します）',
+          'delivery 前後を比較できる観測 snapshot がまだありません（観測は直近 ' +
+            OBSERVATION_SNAPSHOTS_KEPT +
+            ' occurrence だけ保持します）',
           guidance,
-        ].join('\n')
+        ].join('\n'),
       )
 
       return
@@ -684,7 +735,7 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
         `delivery 後の観測差（open list の比較。closed / merged の区別は観測していません）: ${deliveries} delivery / 観測 snapshot ${state.loop.observations.length} 件（goal あたり直近 ${MAX_GOAL_EVIDENCE_DELIVERIES} delivery）`,
         ...evidenceGoalLines(evidence),
         'goal の status は変更していません（Goal が完結したかどうかは人間が決めます。観測差は事実の照合であり命令ではありません）',
-      ].join('\n')
+      ].join('\n'),
     )
 
     return
@@ -698,6 +749,6 @@ export async function runHootCommand(args: readonly string[], deps: HootCommandD
   }
 
   throw new Error(
-    `hoot_invalid_argument: 不明な command: ${command}（status / goal / settings / proposal / dispatch / inject / evidence / runs / reset-schedule、記録の保持は直近 ${MAX_RUNS_KEPT} 件）`
+    `hoot_invalid_argument: 不明な command: ${command}（status / goal / settings / proposal / dispatch / inject / evidence / runs / reset-schedule、記録の保持は直近 ${MAX_RUNS_KEPT} 件）`,
   )
 }

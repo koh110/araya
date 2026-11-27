@@ -57,6 +57,7 @@ import {
   type HootGoal,
   type HootGoalInput,
   type HootInjectRequest,
+  type HootObservationSnapshot,
   type HootProposal,
   type HootRun,
   type HootSettings,
@@ -479,6 +480,49 @@ test('hoot store: 同じ occurrenceKey の run は書き込まず、記録は直
     assert.equal(state.loop.lastOccurrenceAt, null)
     // schedule reset は run 記録・settings・proposals を保つ
     assert.equal(state.runs.length, MAX_RUNS_KEPT)
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot store evidence: 同じ occurrence の run と observation を同じ更新で保存し、重複時は追加変更しない', async () => {
+  const fixture = await makeHootFixture()
+  const snapshot = evidenceSnapshotFixture('2026-11-20T09:00:00.000Z', { issueNumbers: ['10'] })
+  let mutationCalls = 0
+
+  try {
+    const run = runFixture('hoot:2026-11-20T09:00:00.000Z', '2026-11-20T09:00:01.000Z')
+    const recorded = await recordHootRun(fixture.dataDir, run, (state) => {
+      mutationCalls += 1
+      state.loop.observations = appendObservationSnapshot(
+        state.loop.observations,
+        snapshot,
+        pinnedEvidenceKeysOf(state),
+      )
+    })
+    assert.equal(recorded.recorded, true)
+
+    const persisted = await readHootState(fixture.dataDir)
+    assert.deepEqual(
+      persisted.runs.map((entry) => entry.occurrenceKey),
+      [run.occurrenceKey],
+    )
+    assert.deepEqual(
+      persisted.loop.observations.map((entry) => entry.occurrenceKey),
+      [snapshot.occurrenceKey],
+    )
+
+    const replay = await recordHootRun(fixture.dataDir, run, (state) => {
+      mutationCalls += 1
+      state.loop.observations = appendObservationSnapshot(
+        state.loop.observations,
+        evidenceSnapshotFixture('2026-11-20T09:01:00.000Z'),
+        pinnedEvidenceKeysOf(state),
+      )
+    })
+    assert.equal(replay.recorded, false)
+    assert.equal(mutationCalls, 1)
+    assert.deepEqual(await readHootState(fixture.dataDir), persisted)
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
@@ -2132,7 +2176,12 @@ test('hoot store: 同じ key に open と closed が並ぶとき dispatch は op
     const key = proposalKeyOf({ goalKeys: ['quality'], decision: 'dispatch' })
     await writeHootState(fixture.dataDir, {
       ...defaultState(),
-      settings: { ...defaultState().settings, mode: 'active', injectCooldownMinutes: 0, maxInjectsPerDay: 10 },
+      settings: {
+        ...defaultState().settings,
+        mode: 'active',
+        injectCooldownMinutes: 0,
+        maxInjectsPerDay: 10,
+      },
       proposals: [
         proposalFixture(key, { decision: 'dispatch', goalKeys: ['quality'], status: 'resolved' }),
         proposalFixture(key, {
@@ -2164,7 +2213,9 @@ test('hoot store: 同じ key に open と closed が並ぶとき dispatch は op
     // expired だけの key は承認できない（open に戻さない）
     await writeHootState(fixture.dataDir, {
       ...state,
-      proposals: [proposalFixture(key, { decision: 'dispatch', goalKeys: ['quality'], status: 'expired' })],
+      proposals: [
+        proposalFixture(key, { decision: 'dispatch', goalKeys: ['quality'], status: 'expired' }),
+      ],
       injectRequests: [],
     })
 
@@ -2266,7 +2317,10 @@ test('hoot store: pending inject が入った open proposal は再提醒を抑�
 const EVIDENCE_GOAL_KEY = 'evidence-quality'
 const EVIDENCE_REPO = 'koh110/araya'
 
-function evidenceInjectFixture(index: number, overrides: Partial<HootInjectRequest> = {}): HootInjectRequest {
+function evidenceInjectFixture(
+  index: number,
+  overrides: Partial<HootInjectRequest> = {},
+): HootInjectRequest {
   const key = `hoot-inject:evidence-proposal:${index}`
 
   return {
@@ -2290,7 +2344,7 @@ function evidenceInjectFixture(index: number, overrides: Partial<HootInjectReque
 
 function evidenceSnapshotFixture(
   at: string,
-  overrides: { issueNumbers?: string[]; prNumbers?: string[]; fingerprint?: string | null } = {}
+  overrides: { issueNumbers?: string[]; prNumbers?: string[]; fingerprint?: string | null } = {},
 ) {
   return {
     occurrenceKey: `hoot:${at}`,
@@ -2303,7 +2357,8 @@ function evidenceSnapshotFixture(
         draftPrs: 0,
         issueNumbers: overrides.issueNumbers ?? [],
         prNumbers: overrides.prNumbers ?? [],
-        fingerprint: overrides.fingerprint === undefined ? `fp-${at}` : overrides.fingerprint,
+        fingerprint:
+          overrides.fingerprint === undefined ? '0123456789abcdef' : overrides.fingerprint,
       },
     ],
   }
@@ -2313,12 +2368,14 @@ async function writeEvidenceState(
   dataDir: string,
   input: {
     goals?: HootGoal[]
-    observations?: ReturnType<typeof evidenceSnapshotFixture>[]
+    observations?: HootObservationSnapshot[]
     injectRequests?: HootInjectRequest[]
-  }
+  },
 ) {
   await updateHootState(dataDir, (state) => {
-    state.goals = input.goals ?? [goalFixture(EVIDENCE_GOAL_KEY, { scope: [`github:${EVIDENCE_REPO}`] })]
+    state.goals = input.goals ?? [
+      goalFixture(EVIDENCE_GOAL_KEY, { scope: [`github:${EVIDENCE_REPO}`] }),
+    ]
     state.loop.observations = input.observations ?? []
     state.injectRequests = input.injectRequests ?? []
   })
@@ -2336,8 +2393,10 @@ test('hoot store evidence migration: version 4 の file は observations と del
         ...defaultState(),
         version: HOOT_STATE_VERSION_PRE_OBSERVATION_EVIDENCE,
         goals: [goalFixture(EVIDENCE_GOAL_KEY, { scope: [`github:${EVIDENCE_REPO}`] })],
-        injectRequests: [evidenceInjectFixture(1, { status: 'injected', injectedAt: '2026-11-20T09:30:00.000Z' })],
-      })
+        injectRequests: [
+          evidenceInjectFixture(1, { status: 'injected', injectedAt: '2026-11-20T09:30:00.000Z' }),
+        ],
+      }),
     )
     delete v4.loop.observations
 
@@ -2366,7 +2425,9 @@ test('hoot store evidence migration: version 4 の file は observations と del
     assert.deepEqual(saved.loop.observations, [])
 
     // v3 は v4 を経由して v5（conversationRead と conversationReads が無い file でも読める）
-    const v3 = JSON.parse(JSON.stringify({ ...v4, version: HOOT_STATE_VERSION_PRE_CONVERSATION_READ }))
+    const v3 = JSON.parse(
+      JSON.stringify({ ...v4, version: HOOT_STATE_VERSION_PRE_CONVERSATION_READ }),
+    )
     delete v3.settings.conversationRead
 
     for (const run of v3.runs) {
@@ -2406,10 +2467,12 @@ test('hoot store evidence migration: v4 file に observations が入っている
         ...defaultState(),
         version: HOOT_STATE_VERSION_PRE_OBSERVATION_EVIDENCE,
         goals: [goalFixture(EVIDENCE_GOAL_KEY, { scope: [`github:${EVIDENCE_REPO}`] })],
-      })
+      }),
     )
     // v4 の形の file に snapshot が入っている（手工編集・rollback など）。そのまま残す
-    v4.loop.observations = [evidenceSnapshotFixture('2026-11-20T08:00:00.000Z', { issueNumbers: ['10'] })]
+    v4.loop.observations = [
+      evidenceSnapshotFixture('2026-11-20T08:00:00.000Z', { issueNumbers: ['10'] }),
+    ]
 
     await fs.mkdir(path.dirname(hootStateFilePath(fixture.dataDir)), { recursive: true })
     await fs.writeFile(hootStateFilePath(fixture.dataDir), JSON.stringify(v4, null, 2), 'utf8')
@@ -2431,7 +2494,7 @@ test('hoot store evidence migration: loop.observations が壊れている file �
         ...defaultState(),
         version: HOOT_STATE_VERSION_PRE_OBSERVATION_EVIDENCE,
         goals: [goalFixture(EVIDENCE_GOAL_KEY)],
-      })
+      }),
     )
     // snapshot の形が合わない（repo が owner/repo でない・number list が string でない）
     broken.loop.observations = [
@@ -2455,25 +2518,23 @@ test('hoot store evidence migration: loop.observations が壊れている file �
     await fs.mkdir(path.dirname(hootStateFilePath(fixture.dataDir)), { recursive: true })
     await fs.writeFile(hootStateFilePath(fixture.dataDir), JSON.stringify(broken, null, 2), 'utf8')
 
-    await assert.rejects(
-      async () => {
-        await readHootState(fixture.dataDir)
-      },
-      /hoot_state_invalid/
-    )
+    await assert.rejects(async () => {
+      await readHootState(fixture.dataDir)
+    }, /hoot_state_invalid/)
 
     // v5 の file で observations が array でない場合も同じ（壊れた state を黙って直さない）
     const brokenV5 = JSON.parse(JSON.stringify(broken))
     brokenV5.version = HOOT_STATE_VERSION
     brokenV5.loop.observations = 'oops'
-    await fs.writeFile(hootStateFilePath(fixture.dataDir), JSON.stringify(brokenV5, null, 2), 'utf8')
-
-    await assert.rejects(
-      async () => {
-        await readHootState(fixture.dataDir)
-      },
-      /hoot_state_invalid/
+    await fs.writeFile(
+      hootStateFilePath(fixture.dataDir),
+      JSON.stringify(brokenV5, null, 2),
+      'utf8',
     )
+
+    await assert.rejects(async () => {
+      await readHootState(fixture.dataDir)
+    }, /hoot_state_invalid/)
 
     // deliveredEvidenceKey が string か null 以外（number など）も同じ
     const brokenKey = JSON.parse(
@@ -2481,18 +2542,138 @@ test('hoot store evidence migration: loop.observations が壊れている file �
         ...defaultState(),
         version: HOOT_STATE_VERSION_PRE_OBSERVATION_EVIDENCE,
         injectRequests: [evidenceInjectFixture(1)],
-      })
+      }),
     )
     delete brokenKey.loop.observations
     brokenKey.injectRequests[0].deliveredEvidenceKey = 123
-    await fs.writeFile(hootStateFilePath(fixture.dataDir), JSON.stringify(brokenKey, null, 2), 'utf8')
-
-    await assert.rejects(
-      async () => {
-        await readHootState(fixture.dataDir)
-      },
-      /hoot_state_invalid/
+    await fs.writeFile(
+      hootStateFilePath(fixture.dataDir),
+      JSON.stringify(brokenKey, null, 2),
+      'utf8',
     )
+
+    await assert.rejects(async () => {
+      await readHootState(fixture.dataDir)
+    }, /hoot_state_invalid/)
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot store evidence validation rejects malformed bounded snapshot fields on v4 migration and v5 reads', async () => {
+  const fixture = await makeHootFixture()
+  const invalidSnapshotCases: {
+    name: string
+    mutate: (snapshot: HootObservationSnapshot) => void
+  }[] = [
+    {
+      name: 'calendar-invalid occurrence key',
+      mutate: (snapshot) => {
+        snapshot.occurrenceKey = 'hoot:2026-99-20T09:00:00.000Z'
+      },
+    },
+    {
+      name: 'occurrence key does not permit trailing newline',
+      mutate: (snapshot) => {
+        snapshot.occurrenceKey += '\n'
+      },
+    },
+    {
+      name: 'calendar-invalid observation timestamp',
+      mutate: (snapshot) => {
+        snapshot.observedAt = '2026-02-30T09:00:00.000Z'
+      },
+    },
+    {
+      name: 'observation timestamp must be canonical UTC',
+      mutate: (snapshot) => {
+        snapshot.observedAt = '2026-11-20T18:00:00.000+09:00'
+      },
+    },
+    {
+      name: 'repo name exceeds the scope bound',
+      mutate: (snapshot) => {
+        snapshot.repos[0]!.repo = `${'a'.repeat(194)}/b`
+      },
+    },
+    {
+      name: 'fingerprint is not a fixed-size digest',
+      mutate: (snapshot) => {
+        snapshot.repos[0]!.fingerprint = 'g'.repeat(16)
+      },
+    },
+    {
+      name: 'fingerprint is present while issue count is missing',
+      mutate: (snapshot) => {
+        snapshot.repos[0]!.openIssues = null
+      },
+    },
+    {
+      name: 'fingerprint is present while count and list disagree',
+      mutate: (snapshot) => {
+        snapshot.repos[0]!.openIssues = 1
+      },
+    },
+  ]
+
+  try {
+    await fs.mkdir(path.dirname(hootStateFilePath(fixture.dataDir)), { recursive: true })
+
+    for (const version of [HOOT_STATE_VERSION_PRE_OBSERVATION_EVIDENCE, HOOT_STATE_VERSION]) {
+      for (const invalidCase of invalidSnapshotCases) {
+        const rawState = JSON.parse(
+          JSON.stringify({
+            ...defaultState(),
+            version,
+            goals: [goalFixture(EVIDENCE_GOAL_KEY, { scope: [`github:${EVIDENCE_REPO}`] })],
+            loop: {
+              ...defaultState().loop,
+              observations: [evidenceSnapshotFixture('2026-11-20T09:00:00.000Z')],
+            },
+            injectRequests: [evidenceInjectFixture(1)],
+          }),
+        )
+        invalidCase.mutate(rawState.loop.observations[0])
+
+        if (version === HOOT_STATE_VERSION_PRE_OBSERVATION_EVIDENCE) {
+          delete rawState.injectRequests[0].deliveredEvidenceKey
+        }
+
+        await fs.writeFile(hootStateFilePath(fixture.dataDir), JSON.stringify(rawState), 'utf8')
+        await assert.rejects(
+          () => {
+            return readHootState(fixture.dataDir)
+          },
+          /hoot_state_invalid/u,
+          `${version}: ${invalidCase.name}`,
+        )
+      }
+
+      await fs.writeFile(
+        hootStateFilePath(fixture.dataDir),
+        JSON.stringify({
+          ...defaultState(),
+          version,
+          goals: [goalFixture(EVIDENCE_GOAL_KEY, { scope: [`github:${EVIDENCE_REPO}`] })],
+          loop: { ...defaultState().loop, observations: [] },
+          injectRequests: [
+            evidenceInjectFixture(1, {
+              status: 'injected',
+              injectedAt: '2026-11-20T09:30:00.000Z',
+              deliveredEvidenceKey: 'hoot:2026-99-20T09:00:00.000Z',
+            }),
+          ],
+        }),
+        'utf8',
+      )
+      await assert.rejects(
+        () => {
+          return readHootState(fixture.dataDir)
+        },
+        /hoot_state_invalid/u,
+        `${version}: calendar-invalid deliveredEvidenceKey`,
+      )
+    }
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
@@ -2507,7 +2688,11 @@ test('hoot store evidence: delivery に成功した request だけ delivery 時�
         evidenceSnapshotFixture('2026-11-20T08:00:00.000Z', { issueNumbers: ['10'] }),
         evidenceSnapshotFixture('2026-11-20T10:00:00.000Z', { issueNumbers: ['10', '12'] }),
       ],
-      injectRequests: [evidenceInjectFixture(1), evidenceInjectFixture(2), evidenceInjectFixture(3)],
+      injectRequests: [
+        evidenceInjectFixture(1),
+        evidenceInjectFixture(2),
+        evidenceInjectFixture(3),
+      ],
     })
 
     const delivered = await finishHootInject(fixture.dataDir, evidenceInjectFixture(1).key, {
@@ -2519,10 +2704,14 @@ test('hoot store evidence: delivery に成功した request だけ delivery 時�
     assert.equal(delivered.request.deliveredEvidenceKey, 'hoot:2026-11-20T10:00:00.000Z')
 
     // 観測が届く前の delivery は null のまま（evidence 未取得）
-    const beforeObservation = await finishHootInject(fixture.dataDir, evidenceInjectFixture(2).key, {
-      ok: true,
-      nowMs: Date.parse('2026-11-20T07:00:00.000Z'),
-    })
+    const beforeObservation = await finishHootInject(
+      fixture.dataDir,
+      evidenceInjectFixture(2).key,
+      {
+        ok: true,
+        nowMs: Date.parse('2026-11-20T07:00:00.000Z'),
+      },
+    )
     assert.equal(beforeObservation.request.deliveredEvidenceKey, null)
 
     // 失敗 delivery は evidence を記録しない（届いていない案件が evidence を持つように見せない）
@@ -2590,7 +2779,43 @@ test('hoot store evidence: delivery 前後の open list の変化を決定的に
     assert.deepEqual(goalEvidenceOf(state, Date.parse('2026-11-20T11:00:00.000Z')), evidence)
 
     // delivery 以降の観測がまだ無い時点では比較できない（as of 時刻より future の snapshot は使わない）
-    assert.deepEqual(goalEvidenceOf(state, Date.parse('2026-11-20T09:30:00.000Z'))[0]?.deliveries[0]?.delta, [])
+    assert.deepEqual(
+      goalEvidenceOf(state, Date.parse('2026-11-20T09:30:00.000Z'))[0]?.deliveries[0]?.delta,
+      [],
+    )
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('hoot store evidence: fingerprint が無い partial snapshot は repo evidence の delta に使わない', async () => {
+  const fixture = await makeHootFixture()
+
+  try {
+    const before = evidenceSnapshotFixture('2026-11-20T09:00:00.000Z', { issueNumbers: ['10'] })
+    const partialAfter: HootObservationSnapshot = evidenceSnapshotFixture(
+      '2026-11-20T10:00:00.000Z',
+    )
+    partialAfter.repos[0]!.openIssues = null
+    partialAfter.repos[0]!.fingerprint = null
+    await writeEvidenceState(fixture.dataDir, {
+      observations: [before, partialAfter],
+      injectRequests: [
+        evidenceInjectFixture(1, {
+          status: 'injected',
+          injectedAt: '2026-11-20T09:30:00.000Z',
+          deliveredEvidenceKey: before.occurrenceKey,
+        }),
+      ],
+    })
+
+    assert.deepEqual(
+      goalEvidenceOf(
+        await readHootState(fixture.dataDir),
+        Date.parse('2026-11-20T11:00:00.000Z'),
+      )[0]?.deliveries[0]?.delta,
+      [],
+    )
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
   }
@@ -2615,8 +2840,14 @@ test('hoot store evidence: 観測 gap・delivery の無い goal・delivery 数�
         goalFixture('local-goal', { scope: [] }),
       ],
       observations: [
-        evidenceSnapshotFixture('2026-11-20T00:00:00.000Z', { issueNumbers: ['10'], fingerprint: null }),
-        evidenceSnapshotFixture('2026-11-20T06:00:00.000Z', { issueNumbers: ['10'], fingerprint: null }),
+        evidenceSnapshotFixture('2026-11-20T00:00:00.000Z', {
+          issueNumbers: ['10'],
+          fingerprint: null,
+        }),
+        evidenceSnapshotFixture('2026-11-20T06:00:00.000Z', {
+          issueNumbers: ['10'],
+          fingerprint: null,
+        }),
       ],
       injectRequests: many,
     })
@@ -2629,7 +2860,7 @@ test('hoot store evidence: 観測 gap・delivery の無い goal・delivery 数�
       evidence.map((entry) => {
         return entry.goalKey
       }),
-      [EVIDENCE_GOAL_KEY]
+      [EVIDENCE_GOAL_KEY],
     )
     // goal あたり直近 MAX_GOAL_EVIDENCE_DELIVERIES delivery だけ（古い delivery を prompt に伸ばさない）
     assert.equal(evidence[0]?.deliveries.length, MAX_GOAL_EVIDENCE_DELIVERIES)
@@ -2637,7 +2868,7 @@ test('hoot store evidence: 観測 gap・delivery の無い goal・delivery 数�
       evidence[0]?.deliveries.map((entry) => {
         return entry.injectKey
       }),
-      [many[2]?.key, many[3]?.key, many[4]?.key]
+      [many[2]?.key, many[3]?.key, many[4]?.key],
     )
     // 観測に gap がある repo（fingerprint null）は比較 side にしない。goal の status は変わらない
     assert.deepEqual(evidence[0]?.deliveries[0]?.delta, [])
@@ -2645,7 +2876,7 @@ test('hoot store evidence: 観測 gap・delivery の無い goal・delivery 数�
       state.goals.every((goal) => {
         return goal.status === (goal.key === 'retired-goal' ? 'retired' : 'active')
       }),
-      true
+      true,
     )
 
     // delivery の記録が無い goal は evidence 自体を出さない
@@ -2663,8 +2894,14 @@ test('hoot store evidence: goal あたり直近 3 delivery は injectedAt の新
   try {
     await writeEvidenceState(fixture.dataDir, {
       observations: [
-        evidenceSnapshotFixture('2026-11-20T00:00:00.000Z', { issueNumbers: ['10'], prNumbers: ['29'] }),
-        evidenceSnapshotFixture('2026-11-20T12:00:00.000Z', { issueNumbers: [], prNumbers: ['29', '31'] }),
+        evidenceSnapshotFixture('2026-11-20T00:00:00.000Z', {
+          issueNumbers: ['10'],
+          prNumbers: ['29'],
+        }),
+        evidenceSnapshotFixture('2026-11-20T12:00:00.000Z', {
+          issueNumbers: [],
+          prNumbers: ['29', '31'],
+        }),
       ],
       // 配列は作成順。injectedAt は違う順（古い pending が後で injected になった状態）
       injectRequests: [
@@ -2697,7 +2934,7 @@ test('hoot store evidence: goal あたり直近 3 delivery は injectedAt の新
       evidence[0]?.deliveries.map((entry) => {
         return entry.injectKey
       }),
-      [evidenceInjectFixture(3).key, evidenceInjectFixture(1).key, evidenceInjectFixture(4).key]
+      [evidenceInjectFixture(3).key, evidenceInjectFixture(1).key, evidenceInjectFixture(4).key],
     )
     // 選んだ delivery すべてで比較ができている（before / after が決定的）
     assert.deepEqual(evidence[0]?.deliveries[0]?.delta[0]?.closedIssues, ['10'])
@@ -2744,7 +2981,7 @@ test('hoot store evidence: retired goal も delivery があれば evidence に�
       evidence.map((entry) => {
         return entry.goalKey
       }),
-      ['retired-goal']
+      ['retired-goal'],
     )
     assert.deepEqual(evidence[0]?.deliveries[0]?.delta[0]?.closedIssues, ['36'])
     // evidence を出しても goal の status は動かさない
@@ -2760,10 +2997,19 @@ test('hoot store evidence: after は delivery 以降で一番新しい観測（d
   try {
     await writeEvidenceState(fixture.dataDir, {
       observations: [
-        evidenceSnapshotFixture('2026-11-20T09:00:00.000Z', { issueNumbers: ['10'], prNumbers: ['29'] }),
-        evidenceSnapshotFixture('2026-11-20T10:00:00.000Z', { issueNumbers: ['10'], prNumbers: ['29'] }),
+        evidenceSnapshotFixture('2026-11-20T09:00:00.000Z', {
+          issueNumbers: ['10'],
+          prNumbers: ['29'],
+        }),
+        evidenceSnapshotFixture('2026-11-20T10:00:00.000Z', {
+          issueNumbers: ['10'],
+          prNumbers: ['29'],
+        }),
         // 修正が数 occurrence 後に効いた case。delivery 直後の観測は変わっていないが、今は変わっている
-        evidenceSnapshotFixture('2026-11-20T12:00:00.000Z', { issueNumbers: ['12'], prNumbers: ['29', '33'] }),
+        evidenceSnapshotFixture('2026-11-20T12:00:00.000Z', {
+          issueNumbers: ['12'],
+          prNumbers: ['29', '33'],
+        }),
       ],
       injectRequests: [
         evidenceInjectFixture(1, {
@@ -2784,8 +3030,9 @@ test('hoot store evidence: after は delivery 以降で一番新しい観測（d
     assert.deepEqual(delta?.openedPrs, ['33'])
     // as of 時刻より前の観測までしか使わない（future の snapshot を比較しない）
     assert.equal(
-      goalEvidenceOf(state, Date.parse('2026-11-20T10:30:00.000Z'))[0]?.deliveries[0]?.delta[0]?.afterKey,
-      'hoot:2026-11-20T10:00:00.000Z'
+      goalEvidenceOf(state, Date.parse('2026-11-20T10:30:00.000Z'))[0]?.deliveries[0]?.delta[0]
+        ?.afterKey,
+      'hoot:2026-11-20T10:00:00.000Z',
     )
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
@@ -2800,34 +3047,51 @@ test('hoot store evidence: delivery が参照している snapshot は window �
   })
   const next = evidenceSnapshotFixture('2026-11-20T01:00:00.000Z', { issueNumbers: ['99'] })
   const pinnedKeys = (count: number) => {
-    return new Set(all.slice(0, count).map((entry) => {
-      return entry.occurrenceKey
-    }))
+    return new Set(
+      all.slice(0, count).map((entry) => {
+        return entry.occurrenceKey
+      }),
+    )
   }
 
   // pinned 10 件 + window 8 件。pinned でも window でもない中間だけが落ちる
   const kept = appendObservationSnapshot(all, next, pinnedKeys(10))
   assert.equal(kept.length, 10 + OBSERVATION_SNAPSHOTS_KEPT)
-  assert.equal(kept.some((entry) => {
-    return entry.occurrenceKey === all[0]?.occurrenceKey
-  }), true)
-  assert.equal(kept.some((entry) => {
-    return entry.occurrenceKey === all[9]?.occurrenceKey
-  }), true)
-  assert.equal(kept.some((entry) => {
-    return entry.occurrenceKey === all[10]?.occurrenceKey
-  }), false)
-  assert.equal(kept.some((entry) => {
-    return entry.occurrenceKey === all[26]?.occurrenceKey
-  }), true)
+  assert.equal(
+    kept.some((entry) => {
+      return entry.occurrenceKey === all[0]?.occurrenceKey
+    }),
+    true,
+  )
+  assert.equal(
+    kept.some((entry) => {
+      return entry.occurrenceKey === all[9]?.occurrenceKey
+    }),
+    true,
+  )
+  assert.equal(
+    kept.some((entry) => {
+      return entry.occurrenceKey === all[10]?.occurrenceKey
+    }),
+    false,
+  )
+  assert.equal(
+    kept.some((entry) => {
+      return entry.occurrenceKey === all[26]?.occurrenceKey
+    }),
+    true,
+  )
   assert.equal(kept.at(-1)?.occurrenceKey, next.occurrenceKey)
 
   // pinned が window 分以上あっても bound（OBSERVATION_SNAPSHOTS_MAX）までに収める（pinned は inject 数以下）
   const capped = appendObservationSnapshot(all, next, pinnedKeys(20))
   assert.equal(capped.length, OBSERVATION_SNAPSHOTS_MAX)
-  assert.equal(capped.some((entry) => {
-    return entry.occurrenceKey === all[0]?.occurrenceKey
-  }), true)
+  assert.equal(
+    capped.some((entry) => {
+      return entry.occurrenceKey === all[0]?.occurrenceKey
+    }),
+    true,
+  )
 
   // pinned していない同じ occurrenceKey は window 内で 1 件に揃う
   const rewritten = appendObservationSnapshot(kept, next)
@@ -2835,16 +3099,15 @@ test('hoot store evidence: delivery が参照している snapshot は window �
     rewritten.filter((entry) => {
       return entry.occurrenceKey === next.occurrenceKey
     }).length,
-    1
+    1,
   )
   assert.equal(rewritten.length <= OBSERVATION_SNAPSHOTS_MAX, true)
 
   const state = defaultState()
-  state.injectRequests = [evidenceInjectFixture(1, { deliveredEvidenceKey: 'hoot:2026-11-20T00:00:00.000Z' })]
-  assert.deepEqual(
-    [...pinnedEvidenceKeysOf(state)],
-    ['hoot:2026-11-20T00:00:00.000Z']
-  )
+  state.injectRequests = [
+    evidenceInjectFixture(1, { deliveredEvidenceKey: 'hoot:2026-11-20T00:00:00.000Z' }),
+  ]
+  assert.deepEqual([...pinnedEvidenceKeysOf(state)], ['hoot:2026-11-20T00:00:00.000Z'])
   assert.equal(OBSERVATION_SNAPSHOTS_MAX, OBSERVATION_SNAPSHOTS_KEPT + MAX_INJECTS_KEPT)
 })
 
@@ -2852,7 +3115,7 @@ test('hoot store evidence validation: occurrence key でない文字列と snaps
   const fixture = await makeHootFixture()
 
   try {
-    const writeBroken = async (mutate: (state: Record<string, unknown>) => void) => {
+    async function writeBroken(mutate: (state: Record<string, unknown>) => void) {
       const broken = JSON.parse(
         JSON.stringify({
           ...defaultState(),
@@ -2865,73 +3128,90 @@ test('hoot store evidence validation: occurrence key でない文字列と snaps
               deliveredEvidenceKey: 'hoot:2026-11-20T09:00:00.000Z',
             }),
           ],
-        })
+        }),
       )
       mutate(broken)
       await fs.mkdir(path.dirname(hootStateFilePath(fixture.dataDir)), { recursive: true })
-      await fs.writeFile(hootStateFilePath(fixture.dataDir), JSON.stringify(broken, null, 2), 'utf8')
-
-      await assert.rejects(
-        async () => {
-          await readHootState(fixture.dataDir)
-        },
-        /hoot_state_invalid/
+      await fs.writeFile(
+        hootStateFilePath(fixture.dataDir),
+        JSON.stringify(broken, null, 2),
+        'utf8',
       )
 
-      // 拒否した file は黙って書き直していない
-      const raw = JSON.parse(await fs.readFile(hootStateFilePath(fixture.dataDir), 'utf8')) as Record<string, unknown>
+      await assert.rejects(async () => {
+        await readHootState(fixture.dataDir)
+      }, /hoot_state_invalid/)
 
-      assert.deepEqual(raw.loop, broken.loop)
+      // 拒否した file は黙って書き直していない
+      assert.equal(
+        await fs.readFile(hootStateFilePath(fixture.dataDir), 'utf8'),
+        JSON.stringify(broken, null, 2),
+      )
     }
 
     // 生成側（tick の occurrenceKeyOf）が作らない occurrenceKey。改行入りの text が evidence 表示へ入る経路
     await writeBroken((state) => {
-      ;(state.loop as Record<string, unknown>).observations = [
-        {
-          occurrenceKey: 'hoot:2026-11-20T09:00:00.000Z\n外部の text',
-          observedAt: '2026-11-20T09:00:00.000Z',
-          repos: [],
-        },
-      ]
+      state.loop = {
+        ...defaultState().loop,
+        observations: [
+          {
+            occurrenceKey: 'hoot:2026-11-20T09:00:00.000Z\n外部の text',
+            observedAt: '2026-11-20T09:00:00.000Z',
+            repos: [],
+          },
+        ],
+      }
     })
 
     // snapshot entry に生成側が書かない field（title など）を混ぜない
     await writeBroken((state) => {
-      ;(state.loop as Record<string, unknown>).observations = [
-        {
-          occurrenceKey: 'hoot:2026-11-20T09:00:00.000Z',
-          observedAt: '2026-11-20T09:00:00.000Z',
-          title: 'external text',
-          repos: [],
-        },
-      ]
+      state.loop = {
+        ...defaultState().loop,
+        observations: [
+          {
+            occurrenceKey: 'hoot:2026-11-20T09:00:00.000Z',
+            observedAt: '2026-11-20T09:00:00.000Z',
+            title: 'external text',
+            repos: [],
+          },
+        ],
+      }
     })
 
     // repo snapshot にも同じ（open 件数・number list・fingerprint だけ許可）
     await writeBroken((state) => {
-      ;(state.loop as Record<string, unknown>).observations = [
-        {
-          occurrenceKey: 'hoot:2026-11-20T09:00:00.000Z',
-          observedAt: '2026-11-20T09:00:00.000Z',
-          repos: [
-            {
-              repo: EVIDENCE_REPO,
-              openIssues: 1,
-              openPrs: 0,
-              draftPrs: 0,
-              issueNumbers: ['10'],
-              prNumbers: [],
-              fingerprint: 'fp-1',
-              gapText: 'gh が読めませんでした',
-            },
-          ],
-        },
-      ]
+      state.loop = {
+        ...defaultState().loop,
+        observations: [
+          {
+            occurrenceKey: 'hoot:2026-11-20T09:00:00.000Z',
+            observedAt: '2026-11-20T09:00:00.000Z',
+            repos: [
+              {
+                repo: EVIDENCE_REPO,
+                openIssues: 1,
+                openPrs: 0,
+                draftPrs: 0,
+                issueNumbers: ['10'],
+                prNumbers: [],
+                fingerprint: '0123456789abcdef',
+                gapText: 'gh が読めませんでした',
+              },
+            ],
+          },
+        ],
+      }
     })
 
     // deliveredEvidenceKey は occurrence key の形式か null だけ受理する（proposal key など別の id space を入れない）
     await writeBroken((state) => {
-      ;(state.injectRequests as Record<string, unknown>[])[0]!.deliveredEvidenceKey = `hoot-inject:evidence-proposal:1`
+      state.injectRequests = [
+        evidenceInjectFixture(1, {
+          status: 'injected',
+          injectedAt: '2026-11-20T09:30:00.000Z',
+          deliveredEvidenceKey: 'hoot-inject:evidence-proposal:1',
+        }),
+      ]
     })
 
     // 正規の形は通る（検証が必要以上に厳しくなって運用を止めないこと）。先に壊れた file をどかす
@@ -3006,7 +3286,8 @@ test('hoot store evidence: after は observations の配列順ではなく obser
       ],
     })
     const state = await readHootState(fixture.dataDir)
-    const delta = goalEvidenceOf(state, Date.parse('2026-11-20T13:00:00.000Z'))[0]?.deliveries[0]?.delta[0]
+    const delta = goalEvidenceOf(state, Date.parse('2026-11-20T13:00:00.000Z'))[0]?.deliveries[0]
+      ?.delta[0]
 
     assert.equal(delta?.beforeKey, 'hoot:2026-11-20T09:00:00.000Z')
     assert.equal(delta?.afterKey, 'hoot:2026-11-20T12:00:00.000Z')
@@ -3014,8 +3295,9 @@ test('hoot store evidence: after は observations の配列順ではなく obser
     assert.deepEqual(delta?.openedIssues, ['12'])
     // as of より後の観測は使わない（配列の先頭が最新でも同じ）
     assert.equal(
-      goalEvidenceOf(state, Date.parse('2026-11-20T10:30:00.000Z'))[0]?.deliveries[0]?.delta[0]?.afterKey,
-      'hoot:2026-11-20T10:00:00.000Z'
+      goalEvidenceOf(state, Date.parse('2026-11-20T10:30:00.000Z'))[0]?.deliveries[0]?.delta[0]
+        ?.afterKey,
+      'hoot:2026-11-20T10:00:00.000Z',
     )
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true })
