@@ -797,7 +797,11 @@ test('discord chat: 許可外の user / channel の slash command は拒否し�
     },
   )
   await handler.handleCommand(
-    commandRequest({ subcommand: 'status', channelId: '62345678901234567' }),
+    commandRequest({
+      subcommand: 'status',
+      channelId: '62345678901234567',
+      options: { note: 'synthetic-option-value' },
+    }),
     async (content) => {
       replies.push(content)
     },
@@ -805,11 +809,95 @@ test('discord chat: 許可外の user / channel の slash command は拒否し�
 
   assert.equal(replies.length, 2)
   assert.match(replies[0] ?? '', /使える channel/u)
+  const denied = logs.filter((entry) => {
+    return entry.type === 'discord_command_denied'
+  })
+  assert.equal(denied.length, 2)
+  // どの許可条件を落としたか事後に特定できるように、拒否理由と境界 IDs を載せる
+  assert.deepEqual(
+    denied.map((entry) => {
+      return {
+        commandName: entry.commandName,
+        guildId: entry.guildId,
+        channelId: entry.channelId,
+        userId: entry.userId,
+        failures: entry.failures,
+      }
+    }),
+    [
+      {
+        commandName: 'araya',
+        guildId: '22345678901234567',
+        channelId: '32345678901234567',
+        userId: '99999999999999999',
+        failures: ['user_not_allowed'],
+      },
+      {
+        commandName: 'araya',
+        guildId: '22345678901234567',
+        channelId: '62345678901234567',
+        userId: '42345678901234567',
+        failures: ['channel_mismatch'],
+      },
+    ],
+  )
+  // log は IDs と拒否理由だけ（command の option 値・token を載せない）
+  const denialText = JSON.stringify(denied)
+  assert.equal(denialText.includes('synthetic-option-value'), false)
+  assert.equal(denialText.includes(config.botToken), false)
+})
+
+test('discord chat: 別 guild / channel 無し interaction の拒否も理由と IDs を log に載せる', async () => {
+  const logs: Record<string, unknown>[] = []
+  const handler = createDiscordChatHandler({
+    config,
+    botUserId: '12345678901234567',
+    dataDir: chatDataDir,
+    redactor: createRedactor([]),
+    session: {
+      submit: async () => 'unexpected',
+      reset: async () => {},
+    },
+    log: (entry) => {
+      logs.push(entry)
+    },
+  })
+
+  // 設定と違う guild。channel が無い interaction は channelId を null のまま残す
+  await handler.handleCommand(
+    { ...commandRequest({ subcommand: 'status' }), guildId: '52345678901234567' },
+    async () => {},
+  )
+  await handler.handleCommand(
+    { ...commandRequest({ subcommand: 'stop' }), channelId: null },
+    async () => {},
+  )
+
   assert.deepEqual(
     logs.filter((entry) => {
       return entry.type === 'discord_command_denied'
-    }).length,
-    2,
+    }).map((entry) => {
+      return {
+        commandName: entry.commandName,
+        guildId: entry.guildId,
+        channelId: entry.channelId,
+        failures: entry.failures,
+      }
+    }),
+    [
+      {
+        commandName: 'araya',
+        guildId: '52345678901234567',
+        channelId: '32345678901234567',
+        failures: ['guild_mismatch'],
+      },
+      {
+        commandName: 'araya',
+        guildId: '22345678901234567',
+        channelId: null,
+        failures: ['channel_mismatch'],
+      },
+    ],
   )
 })
 

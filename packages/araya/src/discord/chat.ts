@@ -391,7 +391,10 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
   return {
     // slash command の interaction。allowlist 検証と redaction は chat と同じ規則にする
     handleCommand: async (request: DiscordCommandRequest, reply: DiscordCommandReply) => {
-      const allowed = isDiscordChatMessageAllowed(
+      // allowlist 判定は message と同じ規則。拒否したときは落とした条件（guild / channel / user など）を
+      // log に残して、事後に「どの境界で弾かれたか」特定できるようにする。
+      // log に載せるのは IDs と拒否理由だけで、command の option 値・ユーザー入力・token は載せない
+      const failures = discordChatAdmissionFailures(
         {
           guildId: request.guildId,
           channelId: request.channelId ?? '',
@@ -404,8 +407,16 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
         deps.config,
       )
 
-      if (!allowed) {
-        deps.log({ type: 'discord_command_denied', commandName: request.commandName, userId: request.userId })
+      if (failures.length > 0) {
+        deps.log({
+          type: 'discord_command_denied',
+          commandName: request.commandName,
+          userId: request.userId,
+          guildId: request.guildId,
+          // interaction に channel が無い場合（DM など）は null のまま出す（空文字で channel を pseudo 化しない）
+          channelId: request.channelId,
+          failures,
+        })
 
         try {
           await reply('この command を使える channel / user ではありません。')
