@@ -12,11 +12,13 @@ import path from 'node:path'
 import process from 'node:process'
 import { parseArgs } from 'node:util'
 import { collectSecretValues, createRedactor, type Redactor } from '../infrastructure/redaction.ts'
+import { ensurePrivateLogFile } from '../infrastructure/private-file-mode.ts'
 import {
   buildDiscordUnitFile,
   commandSucceeded,
   dataDirHash,
   discordOpServiceAccountTokenFilePath,
+  DISCORD_LAUNCHER_LOG_NAME,
   encryptSystemdCredential,
   legacyDiscordOpServiceAccountTokenFilePath,
   discordUnitName,
@@ -664,6 +666,20 @@ async function installDiscord(
   }
 
   // 4. unit file を書いて reader に読ませ、有効にして起動し直す
+  // launcher log は bot ではなく systemd の StandardError=append:（生成は src/infrastructure/systemd.ts）が書く。
+  // systemd は file が無いとき process の umask を引いた mode で作り（実測 0664）、既に有る file の mode は変えない
+  // ので、unit を書いて bot を起動し直す前に install 側で 0600 に整える（unit の path と同一の file を狙うため
+  // dataDirReal を使う）。整えられなくても install は止めず warning だけ出す
+  const launcherLog = await ensurePrivateLogFile(
+    path.join(dataDirReal, 'logs', DISCORD_LAUNCHER_LOG_NAME),
+  )
+
+  if (!launcherLog.ok) {
+    deps.stderr(
+      `warning: launcher log を mode 0600 にできませんでした（${redactor.redact(launcherLog.message)}）。service の restart は続行します`,
+    )
+  }
+
   await writeUnitFile(unitPath, content)
   await runSystemctl(ops, ['--user', 'daemon-reload'], SYSTEMCTL_TIMEOUT_MS, redactor)
   const fragmentPath = (
@@ -764,7 +780,7 @@ async function installDiscord(
 
   if (!ready) {
     deps.stderr(
-      `warning: ${unit} の起動が確認できませんでした。${path.join(config.dataDir, 'logs', 'discord.log')}、${path.join(config.dataDir, 'logs', 'discord-launcher.log')} と systemctl --user status ${unit} を確認してください`,
+      `warning: ${unit} の起動が確認できませんでした。${path.join(config.dataDir, 'logs', 'discord.log')}、${path.join(config.dataDir, 'logs', DISCORD_LAUNCHER_LOG_NAME)} と systemctl --user status ${unit} を確認してください`,
     )
   }
 

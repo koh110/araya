@@ -252,6 +252,74 @@ test('discord bot: crash 後に残った stale process lock を回収する', as
   }
 })
 
+// #13 の受け入れ検証で <dataDir>/logs/discord.log は 0664 だった（fs.appendFileSync は file を作る mode を
+// 決めず、既存 file の mode はそのまま残る）。bot は起動時に logs を 0700・discord.log を 0600 に整えてから
+// append することを実側で固定する（mode 以外の挙動・既存の log 本文は変えない）
+test('discord bot: 0664 の既存 discord.log を 0600 に整えて追記し、logs dir を 0700 にする', async () => {
+  const dataDir = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'araya-discord-bot-log-mode-test-')),
+  )
+  const logsDir = path.join(dataDir, 'logs')
+  const logFile = path.join(logsDir, 'discord.log')
+  const stopController = new AbortController()
+
+  await fs.mkdir(logsDir, { mode: 0o755 })
+  await fs.writeFile(logFile, 'previous run line\n', 'utf8')
+  await fs.chmod(logFile, 0o664)
+
+  try {
+    const exitCode = await runDiscordBot({
+      fetch: noticeStubFetch,
+      dataDir,
+      env: {
+        ARAYA_DISCORD_BOT_TOKEN: BOT_TOKEN,
+        ARAYA_DISCORD_APPLICATION_ID: APPLICATION_ID,
+        ARAYA_DISCORD_GUILD_ID: GUILD_ID,
+        ARAYA_DISCORD_CHANNEL_ID: CHANNEL_ID,
+        ARAYA_DISCORD_ALLOWED_USER_IDS: USER_ID,
+      },
+      stopSignal: stopController.signal,
+      verifyUnit: false,
+      createChatSession: createInertChatSession,
+      createGateway: async (_config, handlers) => {
+        return {
+          connect: async () => {
+            handlers.onReady()
+            stopController.abort()
+          },
+          sendText: async () => {},
+          async registerCommands() {
+            return 2
+          },
+          close: async () => {},
+        }
+      },
+    })
+
+    assert.equal(exitCode, 0)
+    assert.equal((await fs.stat(logsDir)).mode & 0o777, 0o700)
+    assert.equal((await fs.stat(logFile)).mode & 0o777, 0o600)
+
+    const lines = (await fs.readFile(logFile, 'utf8'))
+      .split('\n')
+      .filter((line) => {
+        return line !== ''
+      })
+    // 既存の log を空にしない（mode だけ整える）
+    assert.equal(lines[0], 'previous run line')
+    const types = lines.slice(1).map((line) => {
+      return (JSON.parse(line) as { type?: string }).type
+    })
+
+    assert.ok(types.includes('discord_started'), types.join(','))
+    // mode を整えられたので診断は出ない
+    assert.ok(!types.includes('discord_log_mode_failed'), types.join(','))
+  } finally {
+    stopController.abort()
+    await fs.rm(dataDir, { recursive: true, force: true })
+  }
+})
+
 // 実測の deploy 事故（#36 / #37）の再現: unit が main process を exit させて cgroup ごと SIGKILL すると
 // lock が残る。stale 30 s を待つと 20〜40 s 起動できないので、owner record で即回収できることを確かめる
 test('discord bot: SIGKILL 後の残留 lock を stale 待ちなく起動直後に回収する', async () => {

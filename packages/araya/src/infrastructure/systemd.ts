@@ -25,6 +25,9 @@ const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/u
 // unit file では % が specifier、$ が変数として展開され、空白・引用符・\ にも意味がある。; は ExecStart の区切り
 const UNIT_FILE_UNSAFE_PATTERN = /[\u0000-\u001f\u007f "'\\$%;]/u
 const UNIT_ENV_NAMES = ['PATH', 'LANG', 'LANGUAGE', 'TZ']
+// unit の StandardError=append: が書く file。install 側が同じ file を 0600 で用意するので、名前を here に置く
+// （unit file の path と install が chmod する path がずれないことを実装側で保つ）
+export const DISCORD_LAUNCHER_LOG_NAME = 'discord-launcher.log'
 export type UnitEnvironment = (readonly [string, string])[]
 
 export type CommandResult = {
@@ -210,7 +213,7 @@ export function discordUnitSections(input: DiscordUnitFileInput) {
     ['TimeoutStopSec', '30'],
     ['StandardInput', 'null'],
     ['StandardOutput', 'null'],
-    ['StandardError', `append:${path.join(input.dataDir, 'logs', 'discord-launcher.log')}`],
+    ['StandardError', `append:${path.join(input.dataDir, 'logs', DISCORD_LAUNCHER_LOG_NAME)}`],
   ]
   const install: (readonly [string, string])[] = [['WantedBy', 'default.target']]
 
