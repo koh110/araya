@@ -26,66 +26,329 @@ export function stripDiscordBotMention(content: string, botUserId: string) {
   return content.replace(new RegExp(`<@!?${escapedUserId}>`, 'gu'), '').trim()
 }
 
-export function splitDiscordChatReply(content: string, maxChars = 1900) {
-  const trimmed = content.trim()
+const DISCORD_REPLY_MAX_CHARS = 1900
+const FENCE_LINE_PATTERN = /^ {0,3}(`{3,}|~{3,})(.*)$/u
 
-  if (trimmed === '') {
-    return []
+type FenceBlock = {
+  kind: 'fence'
+  lines: string[]
+  marker: string
+  info: string
+}
+
+type ReplyBlock = { kind: 'text'; line: string } | FenceBlock
+
+export type DiscordChatReplySplit = {
+  chunks: string[]
+  // 1 つの fenced code block を複数 message に割る時、chunk 頭で開き直した fence の数
+  fenceReopens: number
+}
+
+function codeLength(value: string) {
+  return Array.from(value).length
+}
+
+function fenceMatchOf(value: string) {
+  return FENCE_LINE_PATTERN.exec(value)
+}
+
+// fence を閉じる行か。開始行と同じ記号で、長さが高さ以上、info string を持たない
+function closesFence(block: FenceBlock, value: string) {
+  const match = fenceMatchOf(value)
+
+  if (match === null) {
+    return false
   }
 
-  const limit = Math.max(1, Math.floor(maxChars))
-  const characters = Array.from(trimmed)
-  const chunks: string[] = []
-  let start = 0
+  const marker = match[1] ?? ''
+  const info = (match[2] ?? '').trim()
 
-  while (start < characters.length) {
-    let end = start
-    let length = 0
+  return marker.charAt(0) === block.marker.charAt(0) && marker.length >= block.marker.length && info === ''
+}
 
-    while (end < characters.length) {
-      const nextLength = characters[end]?.length ?? 0
+// 本文を「fence のまとまり」と「普通の行」に分割する。fence の中身を chunk 候補の外側へ逃がさないための前処理
+function replyBlocksOf(text: string): ReplyBlock[] {
+  const lines = text.split('\n')
+  const blocks: ReplyBlock[] = []
+  let index = 0
 
-      if (length + nextLength > limit) {
-        break
-      }
+  while (index < lines.length) {
+    const line = lines[index] ?? ''
+    const match = fenceMatchOf(line)
 
-      length += nextLength
-      end += 1
+    if (match === null) {
+      blocks.push({ kind: 'text', line })
+      index += 1
+      continue
     }
 
-    if (end === characters.length) {
-      chunks.push(characters.slice(start).join(''))
+    const block: FenceBlock = { kind: 'fence', lines: [line], marker: match[1] ?? '```', info: (match[2] ?? '').trim() }
+    index += 1
+
+    while (index < lines.length) {
+      const candidate = lines[index] ?? ''
+      index += 1
+      block.lines.push(candidate)
+
+      if (closesFence(block, candidate)) {
+        break
+      }
+    }
+
+    blocks.push(block)
+  }
+
+  return blocks
+}
+
+function splitLineFitting(line: string, capacity: number) {
+  const characters = Array.from(line)
+
+  if (characters.length <= capacity) {
+    return { head: line, rest: '' }
+  }
+
+  let end = 0
+  let length = 0
+
+  while (end < characters.length) {
+    const nextLength = characters[end]?.length ?? 0
+
+    if (length + nextLength > capacity) {
       break
     }
 
-    // 上限ちょうどの後が空白なら単語を分けずにそのまま切る。
-    let breakAt = characters[end]?.trim() === '' ? end : -1
+    length += nextLength
+    end += 1
+  }
 
-    if (breakAt < 0) {
-      for (let index = end - 1; index > start; index -= 1) {
-        if (characters[index]?.trim() === '') {
-          breakAt = index
-          break
-        }
+  // 上限ちょうどの後が空白なら単語を分けずにそのまま切る。
+  let breakAt = characters[end]?.trim() === '' ? end : -1
+
+  if (breakAt < 0) {
+    for (let index = end - 1; index > 0; index -= 1) {
+      if (characters[index]?.trim() === '') {
+        breakAt = index
+        break
       }
-    }
-
-    if (breakAt > start) {
-      chunks.push(characters.slice(start, breakAt).join('').trimEnd())
-      start = breakAt
-
-      while (characters[start]?.trim() === '') {
-        start += 1
-      }
-    } else {
-      chunks.push(characters.slice(start, end).join(''))
-      start = end
     }
   }
 
-  return chunks.filter((chunk) => {
-    return chunk !== ''
-  })
+  const head = breakAt > 0 ? characters.slice(0, breakAt).join('').trimEnd() : ''
+
+  if (head !== '') {
+    let start = breakAt
+
+    while (characters[start]?.trim() === '') {
+      start += 1
+    }
+
+    return { head, rest: characters.slice(start).join('') }
+  }
+
+  // 空白が無い行（code の行など）は文字数で切る
+  const cut = Math.max(1, Math.min(end, characters.length))
+
+  return { head: characters.slice(0, cut).join(''), rest: characters.slice(cut).join('') }
+}
+
+export function splitDiscordChatReplyWithFences(content: string, maxChars = DISCORD_REPLY_MAX_CHARS): DiscordChatReplySplit {
+  const trimmed = content.trim()
+
+  if (trimmed === '') {
+    return { chunks: [], fenceReopens: 0 }
+  }
+
+  const limit = Math.max(1, Math.floor(maxChars))
+  const chunks: string[] = []
+  let current: string[] = []
+  let currentLength = 0
+  let fenceReopens = 0
+
+  const append = (line: string) => {
+    if (current.length > 0) {
+      currentLength += 1
+    }
+
+    current.push(line)
+    currentLength += codeLength(line)
+  }
+
+  const flush = () => {
+    if (current.length > 0) {
+      chunks.push(current.join('\n'))
+    }
+
+    current = []
+    currentLength = 0
+  }
+
+  const fitsLine = (line: string) => {
+    return currentLength + (current.length > 0 ? 1 : 0) + codeLength(line) <= limit
+  }
+
+  for (const block of replyBlocksOf(trimmed)) {
+    if (block.kind === 'text') {
+      let pending: string | null = block.line
+
+      while (pending !== null) {
+        if (fitsLine(pending)) {
+          append(pending)
+          break
+        }
+
+        if (current.length === 0) {
+          const { head, rest } = splitLineFitting(pending, limit)
+
+          if (head === '') {
+            break
+          }
+
+          append(head)
+          flush()
+          pending = rest === '' ? null : rest
+          continue
+        }
+
+        const capacity = limit - currentLength - 1
+
+        if (capacity <= 0) {
+          flush()
+          continue
+        }
+
+        const { head, rest } = splitLineFitting(pending, capacity)
+
+        if (head === '') {
+          flush()
+          continue
+        }
+
+        append(head)
+        flush()
+        pending = rest === '' ? null : rest
+      }
+
+      continue
+    }
+
+    const blockCost = block.lines.reduce((total, line, index) => {
+      return total + (index > 0 ? 1 : 0) + codeLength(line)
+    }, 0)
+
+    // fence のまとまりは 1 つの message に収める。収まらない時だけ閉じて開き直す
+    if (currentLength + (current.length > 0 ? 1 : 0) + blockCost <= limit) {
+      for (const line of block.lines) {
+        append(line)
+      }
+
+      continue
+    }
+
+    if (current.length > 0) {
+      flush()
+    }
+
+    if (blockCost <= limit) {
+      for (const line of block.lines) {
+        append(line)
+      }
+
+      continue
+    }
+
+    const closingLine = block.marker
+    const reopenLine = block.info === '' ? block.marker : `${block.marker}${block.info}`
+    const reopen = codeLength(reopenLine) <= limit ? reopenLine : block.marker
+    let pendingLines: string[] = block.lines.slice()
+    let reopenPrefix: string | null = null
+
+    while (pendingLines.length > 0) {
+      const lines: string[] = []
+      let length = 0
+
+      const pushLine = (value: string) => {
+        if (lines.length > 0) {
+          length += 1
+        }
+
+        lines.push(value)
+        length += codeLength(value)
+      }
+
+      if (reopenPrefix !== null) {
+        pushLine(reopenPrefix)
+      }
+
+      const closingCost = codeLength(closingLine) + 1
+      let taken = 0
+
+      while (taken < pendingLines.length) {
+        const line = pendingLines[taken] ?? ''
+        const cost = (lines.length > 0 ? 1 : 0) + codeLength(line)
+        const reserve = taken < pendingLines.length - 1 ? closingCost : 0
+
+        if (length + cost + reserve > limit) {
+          break
+        }
+
+        pushLine(line)
+        taken += 1
+      }
+
+      if (taken === 0) {
+        // 1 行も収まらない: 行そのものを割って残りを次の chunk に回す
+        const capacity = Math.max(1, limit - length - (lines.length > 0 ? 1 : 0) - (pendingLines.length > 1 ? closingCost : 0))
+        const { head, rest } = splitLineFitting(pendingLines[0] ?? '', capacity)
+        pushLine(head)
+
+        if (rest === '') {
+          pendingLines.shift()
+        } else {
+          pendingLines[0] = rest
+        }
+      } else {
+        pendingLines = pendingLines.slice(taken)
+      }
+
+      const closingOnly = pendingLines.length === 1 && closesFence(block, pendingLines[0] ?? '')
+      let closedHere = false
+
+      if (pendingLines.length > 0 && length + (lines.length > 0 ? 1 : 0) + codeLength(closingLine) <= limit) {
+        pushLine(closingLine)
+        closedHere = true
+
+        // 残りが本物の閉じ行だけなら、この chunk の closing と同一。同じ行を 2 回出さない
+        if (closingOnly) {
+          pendingLines = []
+        }
+      }
+
+      current = lines
+      currentLength = length
+      flush()
+
+      if (closedHere && pendingLines.length > 0) {
+        fenceReopens += 1
+        reopenPrefix = reopen
+      } else {
+        reopenPrefix = null
+      }
+    }
+  }
+
+  flush()
+
+  return {
+    chunks: chunks.filter((chunk) => {
+      return chunk !== ''
+    }),
+    fenceReopens,
+  }
+}
+
+export function splitDiscordChatReply(content: string, maxChars = DISCORD_REPLY_MAX_CHARS) {
+  return splitDiscordChatReplyWithFences(content, maxChars).chunks
 }
 
 export function discordChatReplyNonce(messageId: string, chunkIndex: number) {
@@ -277,7 +540,8 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
   }
 
   async function sendText(reply: DiscordChatReply, messageId: string, content: string) {
-    const chunks = splitDiscordChatReply(deps.redactor.redact(content))
+    const redacted = deps.redactor.redact(content)
+    const { chunks, fenceReopens } = splitDiscordChatReplyWithFences(redacted)
 
     for (let index = 0; index < chunks.length; index += 1) {
       try {
@@ -287,6 +551,17 @@ export function createDiscordChatHandler(deps: DiscordChatHandlerDependencies) {
 
         return
       }
+    }
+
+    // 複数 message に割れた境界の数値だけ残す（本文は出さない）。「code block が途中で切れた」報告の追跡用
+    if (chunks.length > 1) {
+      deps.log({
+        type: 'discord_chat_reply_chunked',
+        messageId,
+        chunks: chunks.length,
+        chars: codeLength(redacted),
+        fenceReopens,
+      })
     }
   }
 
