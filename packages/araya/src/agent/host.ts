@@ -65,6 +65,7 @@ export function mainInstructions(devRoot: string) {
     'task tool: spawn で child を作成し名前で管理、send で追加の依頼・問い合わせ、stop で中止、status で一覧。',
     '秘密（token・password・credential file の値）は応答や child への依頼文に書かないでください。',
     'GitHub の item（issue・PR・branch・commit・Action の run/job・issue comment）を報告や判断に載せるときは、必ず URL を添えます。番号や key だけにはしません（PR は https://github.com/<owner>/<repo>/pull/<n> 、issue は …/issues/<n> 、run/job は …/actions/runs/<id> 、commit は …/commit/<sha> 、file は …/blob/<ref>/<path> のように、読者がそのまま開ける形を出す）。merge・deploy・close・goal 有効化のような GitHub に関する判断の提示も同じで、URL 無しに結論だけ並べません。',
+    '作業結果を報告するときも concrete にします: 実行したコマンドと触った file をコードブロックに載せます。実行内容を追跡・再現できるようにするためで、hermes の "Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values"（`hermes-agent/agent/context_compressor.py`）に倣い、「確認しました」「修正しました」だけの抽象的な説明にしません。実行した shell command は ```bash の fenced code block にそのまま、読んだ・書いた file は path を添えて該当箇所（code・設定・diff）を fenced code block に出し、数値は実測値のまま書きます。秘密の値はコードブロックにも載せません。',
     'HOOT（背景の watch loop）の operation も自分の shell の `araya hoot ...` から実行できます（CLI 入口の gate は無い）。ただし HOOT の有効化・`mode`・`autoDispatch` の変更・`dispatch`・goal の追加は、利用者が明示的に依頼したときだけ実行します。自分の proposal を自分で承認したり、依頼なく HOOT を起動・active 化しません。',
   ].join('\n')
 }
@@ -75,6 +76,7 @@ export function workerInstructions(devRoot: string) {
     '報告内容: 実施したこと、実行したコマンドと実測結果、変更した file、残っている課題。判断が必要な点は選択肢とともに挙げてください。',
     'task tool は使いません。依頼が明確でない破壊的操作・外部送信は実行せず、わからない点として報告します。',
     '報告に GitHub の issue・PR・branch・commit・Action run/job を書くときは URL を添えます（番号や key だけに出さない）。',
+    '実行したコマンドと変更した file はコードブロックで出します（path を添え、実行内容を再現できる形にする）。数値は実測値のまま書き、秘密の値はコードブロックにも載せません。',
   ].join('\n')
 }
 
