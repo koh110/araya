@@ -31,7 +31,7 @@
 
 ## 出力
 
-- reply は channel へ送る。1 件の reply を 2000 文字ごとに分割する。thread には返信しない（parent channel の reply thread には返信できる）。全返信で `allowedMentions` を無効にする。
+- reply は channel へ送る。1 件の reply を 2000 文字ごとに分割する。分割は fenced code block（``` と ~~~）を跨がない: 上限に収まる fence は割らず 1 件の message にまとめ、fence 単体が上限を超える時だけ chunk 末で fence を閉じ、次の chunk を同じ info string で開き直す（閉じ行は二重に出さない）。複数 message に割った時は境界の数値だけを `discord_chat_reply_chunked`（`chunks` / `chars` / `fenceReopens`。本文は載せない）に残す。thread には返信しない（parent channel の reply thread には返信できる）。全返信で `allowedMentions` を無効にする。
 - main agent が宣言した report delivery（子 session の報告など channel へ届ける送信依頼）は、`<dataDir>/agent/agent.sqlite` に durable な outbox として記録し、設定 channel へ届くまで再送する。nonce は chunk ごとに安定で、再送でも同じ nonce を使う。
 - Discord へ出る文字列と log への external 由来文字列は、既知の secret 相当を `[REDACTED]` に置き換えてから書く。Pi durable の保存 transcript（reply・tool 実行ログ）は redaction 対象外で、そのまま保存される。credential 等を会話に投稿しないことは利用者の責務である。
 - HOOT inject は main conversation に submit する前に content を redaction する（state に残った model・gh 由来の text をそのまま渡さない）。inject に対して channel へ返すのは「何を自動化したか」の 1 文（notice）と main conversation の answer の 2 件で、notice と answer は別の messageId を使う（同じ messageId / chunk index だと reply nonce が重複して送信 dedupe で answer が落ちる）。answer が空だった場合は `応答を生成できませんでした。` を送る。

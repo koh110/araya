@@ -10,6 +10,7 @@ import {
   discordChatReplyNonce,
   isDiscordChatMessageAllowed,
   splitDiscordChatReply,
+  splitDiscordChatReplyWithFences,
   stripDiscordBotMention,
   type DiscordChatMessageMetadata,
 } from './chat.ts'
@@ -82,6 +83,149 @@ test('discord chat: reply を Discord の上限より短く分割し、surrogate
       return chunk.length <= 1900
     }),
   )
+})
+
+function fenceLineCountOf(chunk: string) {
+  return chunk.split('\n').filter((line) => {
+    return /^ {0,3}(`{3,}|~{3,})/u.test(line)
+  }).length
+}
+
+function codeLinesOf(chunks: string[]) {
+  return chunks.flatMap((chunk) => {
+    return chunk.split('\n')
+  }).filter((line) => {
+    return line.startsWith('  line_')
+  })
+}
+
+function codeBodyOf(count: number) {
+  return Array.from({ length: count }, (_unused, index) => {
+    return `  line_${index} = some_reasonably_long_identifier(${index}, "value_${index}")`
+  }).join('\n')
+}
+
+function codeLinesOfCount(count: number) {
+  return Array.from({ length: count }, (_unused, index) => {
+    return `  line_${index} = some_reasonably_long_identifier(${index}, "value_${index}")`
+  })
+}
+
+test('discord chat: fenced code block を chunk 境界で閉じて次 message で同じ info string で開き直す', () => {
+  const text =
+    `${'前置きの説明です。 '.repeat(40)}
+\`\`\`ts
+${codeBodyOf(40)}
+\`\`\`
+
+${'後続の説明です。 '.repeat(40)}`
+  const { chunks, fenceReopens } = splitDiscordChatReplyWithFences(text, 600)
+
+  assert.ok(chunks.length >= 3)
+  assert.ok(fenceReopens >= 1)
+  assert.ok(chunks.every((chunk) => {
+    return Array.from(chunk).length <= 600
+  }))
+  // どの message も fence を閉じた状態で終わる（開いたまま終わらない）
+  assert.ok(chunks.every((chunk) => {
+    return fenceLineCountOf(chunk) % 2 === 0
+  }))
+  // code の行は順番そのまま 1 回ずつ
+  assert.deepEqual(codeLinesOf(chunks), codeLinesOfCount(40))
+  assert.ok(chunks.some((chunk) => {
+    return chunk.startsWith('```ts\n')
+  }))
+})
+
+test('discord chat: 単一の fence が上限を超える時は閉じて開き直し、閉じ行を二重に出さない', () => {
+  const text = `\`\`\`python
+${codeBodyOf(60)}
+\`\`\``
+  const { chunks, fenceReopens } = splitDiscordChatReplyWithFences(text, 300)
+
+  assert.ok(chunks.length >= 4)
+  assert.ok(fenceReopens >= 3)
+  assert.ok(chunks.every((chunk) => {
+    return Array.from(chunk).length <= 300
+  }))
+  // 1 message = 開き 1 + 閉じ 1
+  assert.deepEqual(chunks.map(fenceLineCountOf), chunks.map(() => 2))
+  assert.ok(chunks.every((chunk) => {
+    return chunk.startsWith('```python\n')
+  }))
+  assert.deepEqual(codeLinesOf(chunks), codeLinesOfCount(60))
+})
+
+test('discord chat: 上限に収まる fence は割らず、fence の外で message を分ける', () => {
+  const text = `${'前置きの説明です。 '.repeat(40)}
+\`\`\`sh
+npm ci
+npm test
+\`\`\`
+
+${'後続の説明です。 '.repeat(40)}`
+  const { chunks, fenceReopens } = splitDiscordChatReplyWithFences(text, 400)
+
+  assert.equal(fenceReopens, 0)
+  assert.ok(chunks.some((chunk) => {
+    return chunk.includes('```sh\nnpm ci\nnpm test\n```')
+  }))
+  assert.ok(chunks.every((chunk) => {
+    return fenceLineCountOf(chunk) % 2 === 0
+  }))
+})
+
+test('discord chat: 複数 message に割れた reply は本文を出さず境界の数値だけを log に残す', async () => {
+  const logs: Record<string, unknown>[] = []
+  const sent: string[] = []
+  const handler = createDiscordChatHandler({
+    config,
+    botUserId: '12345678901234567',
+    dataDir: chatDataDir,
+    redactor: createRedactor([]),
+    session: {
+      submit: async () => `\`\`\`ts\n${codeBodyOf(40)}\n\`\`\``,
+      reset: async () => {},
+    },
+    log: (entry) => {
+      logs.push(entry)
+    },
+  })
+
+  await handler.handle(
+    { ...message, messageId: '92345678901234607', content: '長い code block をお願いします' },
+    async (content) => {
+      sent.push(content)
+    },
+  )
+
+  const chunked = logs.find((entry) => {
+    return entry.type === 'discord_chat_reply_chunked'
+  })
+  assert.ok(chunked, 'chunk 境界の log がある')
+  assert.equal(chunked?.messageId, '92345678901234607')
+  assert.equal(chunked?.chunks, sent.length)
+  assert.ok(sent.length >= 2)
+  assert.ok(Number(chunked?.fenceReopens) >= 1)
+  // 本文は log に載せない
+  assert.equal(JSON.stringify(chunked).includes('line_0'), false)
+  assert.ok(sent.every((chunk) => {
+    return fenceLineCountOf(chunk) % 2 === 0
+  }))
+})
+
+test('discord chat: ~~~ fence も info string を保って開き直す', () => {
+  const text = `~~~json
+${codeBodyOf(20)}
+~~~`
+  const { chunks, fenceReopens } = splitDiscordChatReplyWithFences(text, 200)
+
+  assert.ok(chunks.length >= 4)
+  assert.ok(fenceReopens >= 1)
+  assert.ok(chunks.every((chunk) => {
+    return chunk.startsWith('~~~json\n') && chunk.trimEnd().endsWith('~~~')
+  }))
+  assert.deepEqual(codeLinesOf(chunks), codeLinesOfCount(20))
 })
 
 test('discord chat: reply nonce は同じ message/chunk で安定し、25文字以内', () => {
